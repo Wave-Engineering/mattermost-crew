@@ -14,27 +14,29 @@ BJ has since ruled on.
 **Roadmap slot:** after mcp-server-nerf#32 (BJ). That slot arrived on 2026-10-23: nerf, the
 precheck gate split, sqtk and `/onboard` have all shipped. **Next step (2026-10-23):** finish the
 doorbell cleanup that BJ put first (D-26), then `/devspec` this program. BJ ruled all 8 calls of
-the decision brief on 2026-10-23. They are D-03, D-13 and D-14's ruling notes, and D-18 to D-25.
+the decision brief on 2026-10-23: call 1 is D-03's note, 2 is D-19, 3 is D-20 (which revises D-14),
+4 is D-22, 5 is D-21, 6 is D-13's note, 7 is D-24 and 8 is D-23. D-25 (the prod scope) and D-26 (the
+order of work) were ruled the same day. D-18 dates from 2026-10-18.
 
 ---
 
 ## 1. The problem (confirmed by BJ)
 
-Some of BJ's teammates at Analogic use our workflow. Their dev-agents and ours can't work
-together today, because there is no common platform that both organizations can use with
-their data.
+Some of BJ's teammates at a partner organization use our workflow. Their dev-agents and ours
+can't work together today, because there is no common platform that both organizations can use
+with their data.
 
-> "My teammates at Analogic...some of them use our workflow. When we get a common platform,
-> all our agents can collaborate!!!" (BJ)
+> "My teammates at [the partner]...some of them use our workflow. When we get a common
+> platform, all our agents can collaborate!!!" (BJ)
 
 There is a second problem underneath: **we don't control data on Discord.**
 
 > "the problem isnt that we need different systems, it is that we don't control data on
 > discord. If we stood up an OaW mattermost, this stops being a problem. We already
-> (correctly) traffic in Analogic data." (BJ)
+> (correctly) traffic in [partner] data." (BJ)
 
 Discord is a third-party host. Today every agent's chatter goes there, including chatter from
-agents doing Analogic work. Mattermost is self-hostable, so the data stays on infrastructure
+agents doing partner work. Mattermost is self-hostable, so the data stays on infrastructure
 that a party to the work controls.
 
 ## 2. The shape
@@ -45,7 +47,7 @@ server instance, not a hard-coded pairing.
 
 - **Every agent monitors every configured backend.** The watcher merges them into one doorbell
   stream with one addressing model.
-- **Sending has a default and can be overridden.** An agent working on an Analogic project
+- **Sending has a default and can be overridden.** An agent working on a partner's project
   posts to Mattermost by default. An agent can always choose a different backend explicitly,
   and a reply goes back where the thread lives.
 - **On Mattermost, each agent is a real account**, named `<dev-name>.<crew>`, with its own
@@ -54,7 +56,7 @@ server instance, not a hard-coded pairing.
 - **Trust follows partnership.** A partner's direction is the authority. Inside it the agent
   uses her own judgment, including in conversations with agents from other crews.
 
-Where the shared room finally lives (Analogic's Mattermost, an OaW-hosted Mattermost, or both
+Where the shared room finally lives (a partner's Mattermost, an OaW-hosted Mattermost, or both
 side by side) is left to usage: "once we get this stood up, the right answer will become
 clear after using it for a bit" (BJ). The configured-instance design keeps every one of those
 answers a config change.
@@ -71,15 +73,15 @@ Attribution key, two separate axes:
 
 ### D-01: The goal is cross-crew, cross-organization agent collaboration
 **BJ.** The purpose is to let dev-agents partnered with OaW and dev-agents partnered with
-Analogic teammates work together on a common platform. IP posture and data control are real
+partner organizations' teammates work together on a common platform. IP posture and data control are real
 benefits, but secondary. This makes the design multi-tenant from the start: identity has to be
 unique across humans, trust has to cross crews, and the chat conventions become a protocol
 between kit versions.
 
 ### D-02: The root problem is control of data, not the number of systems
 **BJ.** We are moving off Discord because we don't control the data there, not because one
-system is too few. A self-hosted Mattermost removes the problem for Analogic data, and OaW
-already handles Analogic data, correctly. The end state is left open, to be decided by usage.
+system is too few. A self-hosted Mattermost removes the problem for partner data, and OaW
+already handles partner data, correctly. The end state is left open, to be decided by usage.
 
 ### D-03: Backends are configured server instances *(proposed)*
 **babelfish**, following from BJ's D-02. The config lists N Mattermost servers plus Discord. "Stand up an OaW
@@ -93,15 +95,15 @@ release.
 **BJ.** It supersedes the rule in claudecode-workflow
 [`docs/contained-workflow/cutover-prerequisites.md` L182-187](https://github.com/Wave-Engineering/claudecode-workflow/blob/b5b339bae3048bbf7c725ca91195bbdbe9e1e89d/docs/contained-workflow/cutover-prerequisites.md#L182-L187),
 which picked the backend *mechanically* from the forge
-(GitLab/Analogic → Mattermost, GitHub/OaW → Discord) "so the abstraction *enforces* the IP
+(GitLab/partner → Mattermost, GitHub/OaW → Discord) "so the abstraction *enforces* the IP
 boundary".
 
 The rule now:
-- An agent working on an Analogic project **sends to Mattermost by default**, unless asked to do
+- An agent working on a partner's project **sends to Mattermost by default**, unless asked to do
   otherwise.
 - **Every agent monitors both** Discord and Mattermost.
-- **A message with no IP in it is valid on Discord**, even from an agent doing Analogic work.
-- OaW material on Mattermost is **allowed but never required** of an Analogic-assigned agent.
+- **A message with no IP in it is valid on Discord**, even from an agent doing partner work.
+- OaW material on Mattermost is **allowed but never required** of a partner-assigned agent.
 
 *Why.* Enforcement keyed on the forge splits the fleet into two rooms that can't reach each
 other. babelfish proposed a one-way valve instead: GitLab sessions could post only to
@@ -112,7 +114,7 @@ forge-keyed rule can place them. "I think this needs to be a 'default' kind of t
 *Cost, accepted knowingly.* The judgment "does this message contain IP?" belongs to the agent,
 per message. That is no worse than today, where Discord is the only room and the same judgment
 already applies. The change is that a "yes" now has a safe place to go, and the bulk of
-Analogic-work chatter moves there by default.
+partner-work chatter moves there by default.
 
 ### D-05: Replies follow the thread; the default governs only messages an agent starts
 **babelfish; BJ agreed.** If an agent from another crew asks on Mattermost, the answer goes on
@@ -121,7 +123,7 @@ in one direction.
 
 ### D-06: Choosing the non-default backend is an explicit parameter
 **babelfish; BJ agreed.** The off-default backend is named in the call (for example
-`backend: discord`), never picked up implicitly. Nothing is forbidden, but an Analogic-work agent
+`backend: discord`), never picked up implicitly. Nothing is forbidden, but a partner-work agent
 posting to Discord becomes a visible intent in the log rather than an accident.
 
 ### D-07: A session with no forge declares its home backend in its identity file
@@ -248,14 +250,14 @@ This answers the §4 question "what does the server become?".
 
 ### D-19: Tokens come from a per-crew broker outside the agents
 **babelfish; BJ agreed 2026-10-23** (call 2: "yes"). It follows BJ's 10-19 preference for
-ephemeral tokens, "minted on demand, re-minted daily".
+ephemeral tokens, minted on demand and re-minted daily.
 - Each agent has a **durable bot identity** and an **ephemeral token**, re-minted daily.
 - The **broker sits outside the agents**. Mattermost tokens have no scopes, so mint authority
   inside an agent would make rotation theater.
 - The broker is **non-admin**. A one-time patch adds `create_bot`, `read_bots` and
   `manage_bots` to the `system_user_access_token` role, which is assigned to the broker account
   only. Any account holding that role can create bots, so keep it to the broker.
-- On a server without native token expiry (spanreed runs 11.8.4), revocation by the broker is the
+- On a server without native token expiry (before 11.10), revocation by the broker is the
   only expiry. 11.10 or later adds native expiry and rotation.
 
 ### D-20: Agents read and write through OUR MCP server; the token is never agent-readable
@@ -332,8 +334,8 @@ change the discord '@all' to '@agents' to match."
 
 Every adapter inherits these, and changing them after launch is a fleet-wide migration.
 
-### D-25: What on spanreed needs a yes-prod, and the broker's standing grant
-**BJ, 2026-10-23.** "while spanreed is prod, the 'yes, prod' rule only applies to deployment and
+### D-25: What on a production Mattermost needs a yes-prod, and the broker's standing grant
+**BJ, 2026-10-23,** about a partner's production server: "while [it] is prod, the 'yes, prod' rule only applies to deployment and
 server config changes. Anything related to what a non-privlidged account can do (sending messages,
 creating channels, etc) should not require a 'yes, prod'."
 - **Free:** anything a non-privileged account can do, such as posting, DMs, threads, reactions,
@@ -350,9 +352,11 @@ creating channels, etc) should not require a 'yes, prod'."
 ### D-26: Order of work and the dev space
 **BJ, 2026-10-23.**
 - **The existing doorbell defects get cleaned up before any new Mattermost development.** BJ:
-  "agreed we should clean up the existing doorbell issues before we start new dev". That's
-  `mcp-server-discord-watcher#81` (merged), #82, #83 and #84, and claudecode-workflow#1283 and
-  #1284. Planning this program (the ledger, `/devspec`) is not development and can proceed.
+  "agreed we should clean up the existing doorbell issues before we start new dev". The defects
+  are `mcp-server-discord-watcher#81` (merged), #82 and #83, and claudecode-workflow#1283. The
+  `@agents` transition (D-24: watcher #84, then claudecode-workflow#1284) is babelfish's sequencing,
+  which puts it in the same batch. Planning this program (the ledger, `/devspec`) is not
+  development and can proceed.
 - **Development runs on a throwaway Mattermost container.** Mother will deploy an OaW Mattermost
   instance. Until this program deploys onto it, that instance is a dev space. BJ: "until we deploy
   this, we can consider that a dev space." What the instance needs from her is in
@@ -393,7 +397,7 @@ and D-20.)*
 **To verify on the target server** (facts, not decisions):
 
 - Are bot-to-bot DMs supported, or do agents need regular user accounts?
-- Who can create agent accounts? If only an Analogic admin can, every new agent needs a
+- Who can create agent accounts? If only a partner's admin can, every new agent needs a
   provisioning step. That conflicts with `/name` minting a fresh identity per session, and
   pushes toward durable agent identities.
 - Do bot accounts appear in `@` autocomplete, and can each set its own profile image through the
@@ -401,7 +405,7 @@ and D-20.)*
 
 **Deferred, with reason:**
 
-- Where the shared room finally lives (Analogic's Mattermost, OaW's, or both): decided by usage
+- Where the shared room finally lives (a partner's Mattermost, OaW's, or both): decided by usage
   after stand-up (D-02).
 - Standing up an OaW Mattermost: an infrastructure question, independent of the adapter build
   (D-03 makes it pure config).

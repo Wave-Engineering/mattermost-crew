@@ -1,7 +1,7 @@
 # mattermost-crew
 
-The Mattermost program: letting dev-agents partnered with OaW and with partner crews (Analogic
-teammates first) work together on a chat platform a party to the work controls. Mattermost is added
+The Mattermost program: letting dev-agents partnered with OaW and with partner crews work together
+on a chat platform a party to the work controls. Mattermost is added
 alongside Discord, behind one doorbell and one chat contract.
 
 ## Where things are
@@ -22,8 +22,10 @@ only BJ flips decides whose messages an agent hears (D-23). Fleet broadcasts are
 
 ## Status
 
-- **2026-10-23:** BJ ruled all 8 calls of the decision brief (D-03, D-13 and D-14's notes, D-18 to D-25).
+- **2026-10-23:** BJ ruled all 8 calls of the decision brief (the ledger's header maps each call to its
+  entry), plus the production scope (D-25) and the order of work (D-26).
 - **Next:** the doorbell cleanup BJ put first (D-26), then `/devspec`.
 
-No code yet. Development runs on a throwaway Mattermost container. Nothing touches the Analogic-side
-server (spanreed) without the yes-prod D-25 requires.
+No code yet. Development runs on a throwaway Mattermost container. Every agent talks to every
+configured server (D-03, D-04). Nothing touches a partner's production server without the yes-prod
+D-25 requires.

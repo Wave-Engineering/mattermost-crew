@@ -7,8 +7,9 @@ the server. It's a brief, not a spec: the program's devspec comes later and will
 ## What we're building
 
 The agent fleet (about 25–30 Claude agents, mostly on BJ's workstation) talks today through Discord.
-We're adding Mattermost as a second chat backend, so OaW agents and Analogic teammates' agents can
-work together on a platform we control. Every agent will monitor both Discord and Mattermost.
+We're adding Mattermost as a second chat backend, so OaW agents and partner teammates' agents can
+work together on a platform we control. Every agent will monitor Discord and every configured
+Mattermost server: ours, and a partner's.
 
 The pieces:
 
@@ -41,7 +42,7 @@ deploys onto it, so it can be reset or wiped while we build.
 
 **Version and edition**
 - **Mattermost 11.10 or later, please.** It has native token expiry and rotation. Older versions
-  (the Analogic-side server is on 11.8.4) leave broker revocation as the only expiry we get.
+  leave broker revocation as the only expiry we get.
 - The free or team edition is fine. Nothing we plan needs a paid feature.
 
 **Settings (System Console)**
@@ -51,8 +52,14 @@ deploys onto it, so it can be reset or wiped while we build.
   two hosts, so a per-IP limit throttles the whole fleet as one client. Set `VaryByUser: true`, or
   raise the per-IP limit. Expect a couple of REST calls per agent per message, plus bursts while a
   thread is busy.
-- **Leave out:** OAuth/SSO, email, Calls, the AI or Agents plugin. Email matters only if you want
-  it for human accounts.
+- **SSO: keep it, set it up as you would for humans.** The agents don't use SSO, but nothing in the
+  design needs it off:
+  - **Bots** authenticate with access tokens, which work the same alongside SSO.
+  - **The broker** is the one regular account that needs a non-SSO login. If signup is SSO-only,
+    BJ creates it as an admin (System Console, or `mmctl user create`).
+  - **Humans** log in through SSO as normal.
+- **Not needed by the agents:** email, Calls, and the AI/Agents plugin. Enable any of them for
+  humans if you want them; the agents neither use nor mind them.
 
 **One role patch**, for the broker. Add `create_bot`, `read_bots` and `manage_bots` to the
 `system_user_access_token` role, and assign that role **only to the broker account(s)**. Every
@@ -91,8 +98,8 @@ we can do it once the broker exists.
 
 ## Not part of this
 
-- **Nothing about the Analogic-side server changes because of this.** Any server config or deploy
-  there stays behind BJ's yes-prod. Ordinary account activity (posting, creating channels) doesn't
+- **Nothing about a partner's production server changes because of this.** Any server config or
+  deploy there stays behind BJ's yes-prod. Ordinary account activity (posting, creating channels) doesn't
   need one.
 - **No secrets in this document or in replies to it.** Hand tokens and admin credentials to BJ
   directly.
