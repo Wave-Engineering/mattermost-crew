@@ -302,7 +302,8 @@ Discord kill switch.
   - **social** admits anyone, expires on its own, and marks outsiders' messages "from outside the
     crew", as data.
 - **Only BJ flips it, and the broker holds it.** An agent-flippable switch is defeated by the first
-  successful coaxing.
+  successful coaxing. *(Generalized 2026-10-23 in the `/devspec` walk, Plan #3 D-018: only the
+  crew's human partner flips that crew's switch, which for crews partnered with BJ is still BJ.)*
 - **It fails closed:** if crew can't be resolved, nothing is delivered.
 - **Membership is by Mattermost user ID, never display name.** The broker is the source of truth for
   the bots it minted, plus named humans.

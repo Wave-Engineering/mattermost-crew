@@ -169,9 +169,9 @@ Requirements follow the **EARS** notation:
 | R-22 | Unwanted | If a sender's crew cannot be resolved, the message shall not be delivered. [D-044] |
 | R-23 | State-driven | While a crew is in social, messages from outside the crew shall be marked as such. Social shall lapse at its expiry, which is checked on every delivery and never by a timer. When it lapses it shall revert to the setting it was flipped from (or to crew only if that can't be read), and the human partner shall be notified. [D-045] |
 | R-24 | Ubiquitous | Only the crew's human partner shall be able to change the switch, and the broker shall hold its state. [D-046] |
-| R-25 | Ubiquitous | An agent shall respond only in conversations it has opted into, and only to an inline mention. It shall drop anything past about 20 bot messages per conversation in a sliding window. [D-047] |
+| R-25 | Ubiquitous | An agent shall respond to a message from a bot account only in a conversation it has opted into, and only to an inline mention. It shall drop anything past about 20 messages from bot accounts per conversation in a sliding window. Human messages shall be admitted when addressed per R-16 to R-19. A conversation is opted into when the agent started it, posted in it, or was mentioned into it, and every DM is opted into. A mention is `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token. [D-047; amended in the PR #5 review] |
 | R-31 | Event-driven | When social is off and a message arrives from outside the crew, the daemon shall route it to the expert agent's kiosk session, started on the first such message, and never to the working agent. The kiosk shall have no tools. One kiosk session per expert shall serve every outsider, and its transcript shall be kept. [D-067] |
-| R-32 | Ubiquitous | The kiosk shall be seeded only from the `## Kiosk` section of the expert's reseed seed (`.claude/reseed-revive.md`), which the daemon extracts mechanically; the kiosk shall never see the rest of the file. If the section is missing or empty, the kiosk shall say it has nothing to offer yet. The kiosk shall refresh on each reseed. [D-072, superseding D-068] |
+| R-32 | Ubiquitous | The kiosk shall be seeded only from the `## Kiosk` section of the expert's reseed seed (`.claude/reseed-revive.md`), which code extracts mechanically (the shim, running as the agent's user, extracts it and pushes only that section to the daemon); the kiosk shall never see the rest of the file. If the section is missing or empty, the kiosk shall say it has nothing to offer yet. The kiosk shall refresh on each reseed. [D-072, superseding D-068] |
 | R-33 | Event-driven | When the human partner engages social, the daemon shall deliver the kiosk transcript since the last review to the working agent, marked as outsider content. The agent's first action shall be to review it and raise anything notable to its human partner. The review cursor shall then advance. [D-069] |
 | R-34 | Optional | Where the crew's human partner turns the kiosk off, outsider messages shall be dropped. The kiosk shall be on by default. [D-070] |
 
@@ -209,21 +209,21 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 ### 4.2 Session Start
 
-1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, crew, repo_root}`.
-2. The daemon asks the broker for a token for `<dev-name>.<crew>`. The broker creates the bot account if it is missing (R-03) and mints a token (R-05).
+1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, crew, session_id}`. `crew` comes from the identity file's `crew` field, or else the host's default crew in `servers.toml`. The shim then pushes the agent's kiosk brief and squawk IDs (`kiosk_brief`, `squawk_ids`), because the daemon never reads agent-home or repo paths.
+2. The daemon asks that crew's broker for a token for `<dev-name>.<crew>` (`mint{dev_name, crew}`). The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
 3. The daemon opens that agent's Mattermost websocket, pinging every 30 s (CT-07), and attaches the Discord and squawkie adapters.
 
 ### 4.3 Send
 
 1. A skill calls `chat_send` without naming a backend.
-2. The daemon resolves the default: the identity file, then `~/.claude/chat-defaults.json`, then asking the human (R-11).
+2. The **shim**, running as the agent's user, resolves the default: the identity file, then `~/.claude/chat-defaults.json`, then asking the human (R-11). It passes the resolved backend to the daemon.
 3. The adapter posts the message with the protocol marker (R-14).
 4. A reply goes to the thread it answers (R-12). A backend named in the call is used and logged (R-13).
 
 ### 4.4 Inbound (Crew or Trusted)
 
 1. An event arrives from any backend.
-2. The sender's crew is resolved by user ID. If it can't be resolved, the event is dropped (R-22).
+2. The sender's crew is resolved by user ID (Mattermost: bot account `owner_id` or a listed human ID; Discord is crew-equivalent; squawkie is exempt; §5.9). If it can't be resolved, the event is dropped (R-22).
 3. The social switch applies (R-20, R-21), then the loop guard (R-25).
 4. The daemon checks whether the event is addressed to this agent (R-16 to R-19, R-29).
 5. The one-shot doorbell exits (R-26). The agent wakes, reads through the MCP (filtered again, R-21) and re-arms.
@@ -232,7 +232,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 1. The sender is resolved as outside the crew.
 2. **If social is on:** the message is delivered to the working agent, marked as outsider content (R-23).
-3. **If social is off and the kiosk is on:** the message goes to the expert's kiosk session (R-31). The session starts on first use, seeded from the `## Kiosk` section of the seed (R-32). The kiosk answers in the thread, and its transcript is kept.
+3. **If social is off and the kiosk is on:** the message goes to the expert's kiosk session (R-31). The session starts on first use, seeded from the `## Kiosk` section the shim pushed (R-32). The kiosk answers in the thread with its mentions stripped, and the post is tagged `props.crew_kiosk=1`. Its transcript is kept.
 4. **If social is off and the kiosk is off:** the message is dropped (R-34).
 
 ### 4.6 Switch Flip and Kiosk Review
@@ -249,9 +249,9 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 ### 4.8 Daily Upkeep
 
-1. The broker re-mints every live token, paced under the rate limit (R-05, CT-06).
-2. It deactivates bot accounts that have been idle for 30 days (R-30).
-3. The kiosk re-reads its brief whenever the seed is rewritten (R-32).
+1. The **daemon** rotates each agent registered in the last 30 days, paced under the rate limit (R-05, CT-06). It requests a new token (`remint`), swaps it in, reconnects that agent's websocket, then asks the broker to revoke the old token (`revoke`). Revocation does not close a websocket, so rotating without reconnecting would leave the agent deaf.
+2. The broker deactivates bot accounts with no `register` in 30 days (R-30).
+3. The kiosk takes a new brief whenever the shim pushes one after the seed is rewritten (R-32).
 
 ---
 
@@ -272,8 +272,7 @@ mattermost-crew/
 │   │   ├── server.py                 # socket server, frame dispatch
 │   │   ├── protocol.py               # frame schema, proto version
 │   │   ├── registry.py               # agent registration
-│   │   ├── tokens.py                 # broker client, token store
-│   │   ├── defaults.py               # R-11 default-backend resolution
+│   │   ├── tokens.py                 # broker clients (per crew), token store, rotation
 │   │   ├── addressing.py             # R-16..R-19
 │   │   ├── filters.py                # switch cache, loop guard
 │   │   ├── doorbell.py               # event queue, cursors, backend.down
@@ -283,6 +282,8 @@ mattermost-crew/
 │   │   ├── service.py  mint.py  prune.py  switch.py  config.py
 │   └── clients/  src/crewchat_clients/
 │       ├── mcp_shim.py               # thin MCP server: chat_* tools
+│       ├── defaults.py               # R-11 default-backend resolution (agent's user)
+│       ├── brief.py                  # extract_brief: the seed's `## Kiosk` section
 │       └── doorbell.py               # thin one-shot: exits on one event
 ├── tests/  unit/  integration/  e2e/
 └── docs/   SKETCHBOOK.md  for-mother.md  architecture.md  runbook.md
@@ -306,7 +307,8 @@ The broker remains a separate package, a separate service and a separate OS user
 ### 5.3 Caller Identity
 
 - Each host has **one** daemon socket, `/run/crewchat/crewchat.sock`. It is mode `0660`, owned by `crewchat:crewchat-clients`, and mounted into every container on that host.
-- A thin client registers with the Dev-Name from `.claude/agent-identity.json`, and the daemon accepts it.
+- A thin client registers with the Dev-Name and `crew` from `.claude/agent-identity.json`, and the daemon accepts it. If the file has no `crew`, the host's `default_crew` in `/etc/crewchat/servers.toml` is used.
+- The daemon never reads files in an agent's home or repo. Its `~` is `crewchat`'s home, and in containers the agent's paths aren't host paths. Anything it needs from the agent's side (the kiosk brief, squawk IDs, the resolved default backend) is pushed by the shim over the socket.
 - Agents on one host are one trust boundary (D-055). The accepted cost is that a same-host agent could post as a crewmate, which falls under D-005.
 
 ### 5.4 Socket Protocol
@@ -315,11 +317,14 @@ JSON lines over the unix socket. Every frame carries `"proto": 1` (D-056). Reque
 
 | op | args | result |
 |----|------|--------|
-| `register` | `dev_name, crew, repo_root, session_id` | `{account, backends}` |
-| `send` | `to, text, thread?, backend?` | `{backend, post_id, thread}` |
+| `register` | `dev_name, crew, session_id` | `{account, backends}` |
+| `send` | `to, text, backend, thread?` (`backend` already resolved by the shim) | `{backend, post_id, thread}` |
+| `dm` | `to, text, backend` | `{backend, post_id, channel}` |
 | `read` | `channel, since?, limit?` | `{messages:[...]}` (filtered, R-21) |
 | `thread` | `post_id` | `{messages:[...]}` |
 | `react` | `post_id, emoji` | `{}` |
+| `kiosk_brief` | `dev_name, text` | `{}`. The shim pushes the extracted `## Kiosk` section whenever the seed's mtime changes (R-32). |
+| `squawk_ids` | `dev_name, ids` | `{}`. The shim pushes the ids from `.claude/sqtk-mine.json` (R-26). |
 | `subscribe` | `dev_name` | stream of events; the thin one-shot exits on the first |
 | `health` | — | `{backends:{name:{state, since}}}` |
 
@@ -327,17 +332,37 @@ Unknown ops, and frames with a `proto` higher than the daemon supports, get `ok:
 
 ### 5.5 MCP Tool Contract
 
-The tools are `chat_send(to, text, thread?, backend?)`, `chat_read(channel, since?, limit?)`, `chat_thread(post_id)`, `chat_dm(to, text, backend?)`, `chat_react(post_id, emoji)` and `chat_health()` (D-057). The old `disc_*` names stay as deprecated aliases for one kit minor version, then are removed. Each alias call logs one deprecation line.
+The tools are `chat_send(to, text, thread?, backend?)`, `chat_read(channel, since?, limit?)`, `chat_thread(post_id)`, `chat_dm(to, text, backend?)`, `chat_react(post_id, emoji)`, `chat_health()` and `chat_set_default(backend)` (D-057). `chat_set_default` records the human partner's answer to the R-11 question in `~/.claude/chat-defaults.json`. The old `disc_*` names stay as deprecated aliases for one kit minor version, then are removed. Each alias call logs one deprecation line.
 
 ### 5.6 Broker
 
-The broker is a Python service under the `crewbroker` user. It holds the broker account's credential in `/etc/crewbroker/credential` (mode `0600`). Its configuration lives in `/etc/crewbroker/crew.toml`: the crew name, the human partner user IDs, the trusted crews and the server URL.
+The broker is a Python service under the `crewbroker` user, with **one instance per crew**. Several crews can share a host. Each crew's broker has its own files:
 
-It serves the daemon on `/run/crewbroker/crewbroker.sock`, using the same frame shape (D-058):
-- `mint{dev_name}` creates the bot account if it is missing (R-03), mints a token, sets native expiry when the server supports it (R-07), and returns the token to the daemon only.
-- `switch_state{}` returns the switch setting, its expiry and the setting it reverts to, plus the kiosk on/off flag.
+| What | Path |
+|---|---|
+| broker account credential (mode `0600`) | `/etc/crewbroker/<crew>.credential` |
+| configuration | `/etc/crewbroker/<crew>.toml` |
+| state | `/var/lib/crewbroker/<crew>/` |
+| socket | `/run/crewbroker/<crew>.sock` |
 
-A daily job re-mints live tokens and deactivates bot accounts idle for 30 days. The broker also listens on its own websocket for DMs from the configured human user IDs, and parses switch commands from them (§4.6).
+The daemon finds each broker through `[crews.<name>] broker_socket` in `/etc/crewchat/servers.toml`.
+
+The configuration names:
+- the crew;
+- the server URL;
+- the crew's human partner user IDs;
+- the trusted crews, as one `[trusted.<crew>]` table each, with `broker_user_id` and `human_user_ids`.
+
+It serves the daemon over its socket, using the same frame shape (D-058). Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat`.
+
+| op | What it does |
+|---|---|
+| `mint{dev_name, crew}` | Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
+| `remint{dev_name, crew}` | Mints a fresh token for an existing account and returns it, **without** revoking the old one. |
+| `revoke{token_id}` | Revokes a token. The daemon calls it after it has swapped in the new token and reconnected. |
+| `switch_state{}` | Returns the switch setting, its expiry, the setting it reverts to, and the kiosk on/off flag. |
+
+The daemon owns rotation (§4.8). The broker's daily job only deactivates bot accounts whose `last_register` is more than 30 days old (R-30), so an account that is merely re-minted is never counted as active. The broker also listens on its own websocket for DMs from the configured human user IDs, and parses switch commands from them (§4.6).
 
 ### 5.7 Protocol Marker
 
@@ -346,7 +371,7 @@ A daily job re-mints live tokens and deactivates bot accounts idle for 30 days. 
 
 ### 5.8 Doorbell Core
 
-- The daemon keeps one queue per registered agent, fed by three adapters: Mattermost (websocket), Discord (scream-hole) and squawkie (SSE, filtered to the agent's squawks, the same logic as `sqtk-doorbell.sh`).
+- The daemon keeps one queue per registered agent, fed by three adapters: Mattermost (websocket), Discord (scream-hole) and squawkie (SSE, filtered to the squawk IDs the shim pushed with `squawk_ids`, the same predicate as `sqtk-doorbell.sh`).
 - Each event passes the filters (§5.9) and is queued.
 - `subscribe` returns the first queued event; the thin one-shot prints it as JSON and exits 0.
 - Cursors are kept per agent per backend under `/var/lib/crewchat/cursors/`.
@@ -365,9 +390,32 @@ One-shot exit codes:
 ### 5.9 Switch and Loop Guard Placement
 
 - Both run inside the daemon, before an event is queued and before a `read` result is returned (D-061).
-- The daemon caches `switch_state` from the broker, and checks expiry against the cached timestamp on every delivery.
+- The daemon caches `switch_state` from each crew's broker, and checks expiry against the cached timestamp on every delivery.
 - With no cached state, nothing is delivered (R-22).
-- The loop guard keeps a sliding window of bot messages per conversation and drops anything past the threshold (default 20, configurable).
+
+**Crew membership on Mattermost:**
+- A bot account is in crew X **if and only if** its Mattermost `owner_id` equals X's broker account user ID. That holds for X = the agent's own crew, and for each `[trusted.<crew>]` table by its `broker_user_id`.
+- A human is in X if and only if their user ID is listed: in `human_user_ids` for the agent's own crew, or for a trusted crew in its `[trusted.<crew>]` table.
+- **Username suffixes are never used for membership.** Anyone can register a username like `x.oaw`.
+- Anything else is an outsider. A user the server can't resolve is unresolvable, and is dropped (R-22).
+
+**Per backend:**
+
+| Backend | Rule |
+|---|---|
+| Mattermost | The switch and the kiosk apply, by the membership rule above. |
+| Discord | Messages are **crew-equivalent**: our guild is membership-controlled, and its existing kill switch still applies. This keeps today's Discord behaviour (R-15). The switch and the kiosk do not apply to Discord. |
+| squawkie | **Exempt.** The adapter delivers only the agent's own squawks (R-26). |
+
+**Verdicts by path:**
+- **Push:** `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK` (the event goes to the kiosk's holding queue), or `DROP`.
+- **Pull** (`read`, `thread`): a `KIOSK` verdict means **omit and never enqueue**, so reading a channel never re-sends old outsider posts to the kiosk, and never returns them to the working agent.
+- **Kiosk posts:** a post carrying `props.crew_kiosk=1` is treated as outsider content whoever authored it. A crewmate never receives outsider-steered kiosk text as crewmate traffic.
+
+**Loop guard (R-25):**
+- It applies to messages from **bot accounts**. Human messages are admitted when addressed (R-16 to R-19).
+- A message from a bot account is admitted only in an opted-in conversation and only with an inline mention. A conversation is opted in when the agent started it, posted in it, or was mentioned into it, and every DM is opted in. A mention is `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token.
+- A sliding window counts messages from bot accounts per conversation, and drops anything past the threshold (default 20, configurable).
 
 ### 5.10 Default-Backend File
 
@@ -377,14 +425,21 @@ One-shot exit codes:
 {"gitlab.com/example-group": "mattermost:oaw-dev", "/home/u/sandbox/scratch": "discord"}
 ```
 
-Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. Values are `mattermost:<server-id>` (a server id from `/etc/crewchat/servers.toml`) or `discord`. The daemon writes this file only through the thin client, after asking the human partner.
+Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. Values are `mattermost:<server-id>` (a server id from `/etc/crewchat/servers.toml`) or `discord`. Only the shim reads and writes this file, as the agent's user: it reads it to resolve the default, and writes it through `chat_set_default` after asking the human partner. The daemon never touches it (§5.3).
 
 ### 5.11 Kiosk
 
 - **Routing:** when social is off and the kiosk is on, an outsider's message goes to the expert's kiosk session (R-31). There is one session per expert, started lazily on the first outsider message.
-- **Seed:** the daemon reads the expert's `<repo_root>/.claude/reseed-revive.md` and extracts **only** the `## Kiosk` section, from that heading to the next `## ` heading or the end of the file (`kiosk.extract_brief`). Nothing else from the file is passed (R-32, D-072). An absent or empty section gives a fixed reply: "I have nothing to share yet." The brief is re-read whenever the file's mtime changes.
-- **Session:** the kiosk is a tool-less model session. Its prompt is a fixed kiosk header, then the brief, then the thread history. The transcript is appended to `/var/lib/crewchat/kiosk/<dev-name>.jsonl`.
+- **Seed:** the shim, as the agent's user, reads `.claude/reseed-revive.md`, extracts **only** the `## Kiosk` section with `crewchat_clients.brief.extract_brief` (from that heading to the next `## ` heading or the end of the file), and pushes only that text with `kiosk_brief`. It pushes again whenever the file's mtime changes. Nothing else from the seed ever crosses the socket (R-32, D-072). An absent or empty section gives a fixed reply: "I have nothing to share yet."
+- **Session:** the kiosk is a tool-less model session. Its prompt is:
+  - a fixed kiosk header;
+  - the brief;
+  - **only the asker's own posts in the thread, and the kiosk's own earlier answers.** Crewmates' posts in the same thread are never included, so an outsider can't pull crew conversation into the kiosk.
+
+  The transcript is appended to `/var/lib/crewchat/kiosk/<dev-name>.jsonl`.
+- **Output:** @mentions are stripped from the kiosk's answer before posting. The post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
 - **Mechanism:** open. Spike 1.2 decides between `claude -p` with tools and MCP disabled, and a direct model API call with no tool definitions (D-071). A 2026-10-23 test of `claude -p --resume --fork-session --tools ""` hung to its timeout.
+- **If the CLI runner is chosen,** it runs as its own unprivileged OS user, `crewkiosk`, not as `crewchat`, which holds every token. It has an empty HOME and an empty working directory, and runs `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. `--restricted` ignores user, project and local settings, so no hooks or settings load. The empty working directory means no project `CLAUDE.md`. Spike 1.2 must prove, from the CLI's own transcript or debug output and not from our argv, that no settings, hooks or `CLAUDE.md` loaded.
 - **Review:** when the switch moves to social, the daemon enqueues a `kiosk.review` event for the working agent. It carries the transcript lines since `/var/lib/crewchat/kiosk/<dev-name>.cursor`, marked as outsider content, and the cursor then advances (R-33).
 - **Off:** with the kiosk off, outsider messages are dropped (R-34).
 
@@ -392,14 +447,14 @@ Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. 
 
 | ID | Deliverable | Category | Tier | File Path | Produced In | Status | Notes |
 |----|-------------|----------|------|-----------|-------------|--------|-------|
-| DM-01 | README.md | Docs | 1 | `README.md` | P1W1 (Story 1.1); updated in P3W5 (Story 3.9) | required | Program overview, workspace layout, quickstart |
+| DM-01 | README.md | Docs | 1 | `README.md` | P1W1 (Story 1.1); updated in P3W6 (Story 3.9) | required | Program overview, workspace layout, quickstart |
 | DM-02 | Unified build system | Code | 1 | `Makefile` | P1W1 (Story 1.1) | required | Targets `lint`, `test`, `ci`, `verify-install`, wrapping uv |
 | DM-03 | CI/CD pipeline | Code | 1 | `.github/workflows/ci.yml` + `scripts/ci/*.sh` | P1W1 (Story 1.1) | required | Mattermost Team and Enterprise service containers; a two-user image |
 | DM-04 | Automated test suite | Test | 1 | `tests/unit/`, `tests/integration/`, `tests/e2e/` | P1W1 (Story 1.1) onward | required | pytest |
 | DM-05 | Test results (JUnit XML) | Test | 1 | `reports/junit.xml` | P1W1 (Story 1.1) | required | CI artifact |
 | DM-06 | Coverage report | Test | 1 | `reports/coverage.xml` | P1W1 (Story 1.1) | required | A completeness signal, with no fail-under gate |
 | DM-07 | CHANGELOG | Docs | 1 | `CHANGELOG.md` | P1W1 (Story 1.1); each release | required | Release-by-release summary |
-| DM-08 | VRTM | Trace | 1 | Dev Spec Appendix V | P3W5 (Story 3.9) | required | Every R-01 to R-34 |
+| DM-08 | VRTM | Trace | 1 | Dev Spec Appendix V | P3W6 (Story 3.9) | required | Every R-01 to R-34 |
 | DM-09a | Operator runbook | Docs | 1 | `docs/runbook.md` | P3W4 (Story 3.7) | required | Install, configure and verify the daemon and broker. **Includes** the Tier 2 deployment verification procedures and environment prerequisites (folded in); its install and verify commands are run by IT-20. |
 | DM-09b | `chat_*` tool reference | Docs | 1 | claudecode-workflow skill docs (K-1, IP-2) | IP-2 (K-1) | required | For agents; made outside the Plan's stories |
 | DM-09c | Human partner guide | Docs | 1 | `docs/partner-guide.md` | P3W4 (Story 3.7) | required | Broker DM commands: switch modes, expiry, kiosk on/off, kiosk review |
@@ -418,15 +473,21 @@ Tier 2 triggers, recorded:
 2. **Daemon:** create the `crewchat` user and the `crewchat-clients` group.
    - `uv sync --frozen --package crewchat`
    - Install `packaging/crewchat.service` as a systemd system service.
-   - `/etc/crewchat/servers.toml` lists the configured servers (D-032).
+   - `/etc/crewchat/servers.toml` lists the configured servers (D-032), the host's `default_crew`, and a `[crews.<name>] broker_socket` entry per crew on the host.
    - The socket is `/run/crewchat/crewchat.sock`. The agents' user, and each container's mount, must be in `crewchat-clients`.
-3. **Broker:** create the `crewbroker` user.
+3. **Kiosk user** (only if spike 1.2 picks the CLI runner): create the unprivileged `crewkiosk` user with an empty HOME. It holds no credentials.
+4. **Broker:** create the `crewbroker` user.
    - `uv sync --frozen --package crewbroker`
-   - Install `packaging/crewbroker.service`.
-   - Configure `/etc/crewbroker/crew.toml` and `/etc/crewbroker/credential`.
+   - Install `packaging/crewbroker@.service`, a template unit with one instance per crew.
+   - Configure `/etc/crewbroker/<crew>.toml` and `/etc/crewbroker/<crew>.credential`.
    - For the OaW crew during development, run it only against the dev space (CP-06).
-4. **Thin clients:** shipped by the kit's `./install` from a tagged `mattermost-crew` release (K-1 and K-2). Fleet installs need BJ.
-5. `make verify-install` runs the runbook's verify section: daemon `health`, broker `mint` for a canary, the socket's permissions, and that the token is not readable by the agent's user.
+5. **Thin clients:** shipped by the kit's `./install` from a tagged `mattermost-crew` release (K-1 and K-2). Fleet installs need BJ.
+6. `make verify-install` runs the runbook's verify section:
+   - daemon `health`;
+   - broker `mint` for a canary;
+   - the sockets' permissions;
+   - that the agent's user cannot read any credential. It checks each **known file name** with `test -e <file> && ! sudo -u agent test -r <file>`, never a glob: the daemon token store, `/etc/crewbroker/<crew>.credential`, the Discord credential, `/var/lib/crewbroker/<crew>/`;
+   - that `crewkiosk` (if created) can read none of them either.
 
 #### CI/CD Pipeline
 
@@ -445,13 +506,16 @@ Deploying onto any production Mattermost needs a yes-prod from the agent's human
 
 Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` entry on Plan #3:
 
-1. **Enterprise Entry's own limits:** e.g. a cap on message history that would affect the read path (D-007).
+1. **Enterprise Entry's own limits:** e.g. a cap on message history that would affect the read path (D-007). Answered from the vendor's docs, plus a check against a licensed image where one is available.
 2. **One client per token in one process:** does the upstream library support it? If not, §5.2 is revisited (D-054).
 3. **The Discord `·p1` suffix:** is it safe for today's parsers (the watcher's echo filter and signature regex)? (D-059)
-4. **The kiosk mechanism:** `claude -p` with tools and MCP disabled, or a direct model API call with no tools. If the API, which credentials? (D-071)
-5. **An unlicensed Enterprise image as a stand-in for Entry in CI:** is it faithful? (§6.1)
-6. **Carried from the sketchbook:** are bot-to-bot DMs supported? Do bot accounts appear in `@` autocomplete, with their own avatars? What about private DMs vs. visibility? How does `@<dev-team>` behave across crews? Do crew names need to be unique for `@crew` routing?
-7. **Broker transport when the broker is on another host:** for the dev phase the daemon and broker share one host, using the unix socket.
+4. **The kiosk mechanism:** `claude -p` with tools and MCP disabled, or a direct model API call with no tools. If the API, which credentials? If the CLI, prove that nothing loads (§5.11). (D-071)
+5. **An unlicensed Enterprise image as a stand-in for Entry in CI:** is it faithful? (§6.1) Answered from the vendor's docs, plus a licensed-image check where one is available.
+6. **Facts carried from the sketchbook:** are bot-to-bot DMs supported? Do bot accounts appear in `@` autocomplete, with their own avatars?
+7. **Broker transport when the broker is on another host:** for the dev phase the daemon and broker share one host, using the unix socket. Spike 1.2 records the remote option (e.g. mutual-TLS TCP) as a design note, for a later Plan.
+8. **Bot `owner_id`:** verify that a bot account's `owner_id` is the creating broker account, is reported by the API to any user, and cannot be changed by the bot itself. Crew membership rests on it (§5.9).
+
+**Deferred, decided by usage** (policy for BJ, not facts a spike can settle): private DMs vs. visibility; how `@<dev-team>` behaves across crews; whether crew names need to be unique for `@crew` routing.
 
 ---
 
@@ -469,16 +533,16 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 
 | ID | Boundary | Description | Req IDs |
 |----|----------|-------------|---------|
-| IT-01 | daemon ↔ broker ↔ Mattermost | The broker creates the bot account and mints a token; the daemon stores it; the agent's user gets EACCES reading the token store | R-01, R-03, R-05, R-06, R-08 |
-| IT-02 | broker ↔ Mattermost | Daily re-mint replaces the token; native expiry is set where supported, and revocation applies otherwise | R-05, R-07 |
-| IT-03 | broker ↔ Mattermost | With an injected clock, a bot account idle for 30 days is deactivated | R-30 |
+| IT-01 | daemon ↔ broker ↔ Mattermost | The broker creates the bot account and mints a token, and the daemon stores it. For each known credential file (the daemon token store, `/etc/crewbroker/<crew>.credential`, the Discord credential, `/var/lib/crewbroker/<crew>/`), `test -e` succeeds and `sudo -u agent test -r` fails; no globs. No socket op returns a token to a non-daemon peer. The broker account holds the patched role, holds no system-admin role, and is the only account with the patched role | R-01, R-03, R-05, R-06, R-08 |
+| IT-02 | daemon ↔ broker ↔ Mattermost | Daemon-driven rotation: `remint` issues a new token, the daemon swaps it in and reconnects the websocket, then `revoke` retires the old one; events keep arriving across the rotation; native expiry is set where supported | R-05, R-07 |
+| IT-03 | broker ↔ Mattermost | With an injected clock, a bot account with no `register` for 31 days is deactivated even though it was re-minted daily; one registered 29 days ago is kept | R-30 |
 | IT-04 | thin MCP ↔ daemon | Default resolution order, and the loud failure plus squawk in headless mode | R-11 |
 | IT-05 | daemon ↔ adapters | A reply follows its thread and backend; an explicit backend is used and logged | R-12, R-13 |
 | IT-06 | adapters | The protocol marker is written on both backends; a proto-0 message (no marker) still parses | R-14 |
 | IT-07 | daemon addressing | `@agents` and `@all` (Discord, during the transition), `@name.crew` kept, "reply to me" semantics | R-16, R-17, R-18, R-19 |
-| IT-08 | daemon filters | The three switch modes; push and pull both gated; an unresolvable crew is dropped | R-20, R-21, R-22 |
+| IT-08 | daemon filters | The three switch modes; push and pull both gated; an unresolvable crew is dropped. A spoofed username (`x.<crew>` owned by another account) is **not** admitted as crew; membership follows bot account `owner_id` only. Discord messages are crew-equivalent and squawkie events are exempt | R-20, R-21, R-22 |
 | IT-09 | daemon ↔ broker | Social lapses on delivery after expiry and reverts, the partner is notified, a dead broker can't hold social open, and only the partner's user ID can flip | R-23, R-24 |
-| IT-10 | daemon filters | Loop guard: opt-in, mention required, sliding-window drop | R-25 |
+| IT-10 | daemon filters | Loop guard on messages from bot accounts: opt-in (started, posted in, mentioned into, or a DM), mention required (`@<dev>`, `@<dev>.<crew>`, `@agents`, crew or team token), sliding-window drop; an addressed human message is admitted without a mention | R-25 |
 | IT-11 | doorbell | Events from all three adapters merge, one exit per event | R-26 |
 | IT-12 | doorbell | One backend down: a `backend.down` event, and the others keep flowing | R-27 |
 | IT-13 | doorbell | Reconnect replays from the cursor exactly once | R-28 |
@@ -487,9 +551,9 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-16 | daemon | One contract across N configured Mattermost servers plus Discord | R-09, R-10 |
 | IT-17 | broker | Account naming fits CT-05; the crew defaults to the partner's username and can be overridden | R-01, R-02 |
 | IT-18 | broker ↔ Mattermost | A test user standing in for the human partner DMs `social 2h`, `crew` and `kiosk off`; the state, expiry and lapse notice change | R-23, R-24, R-34 |
-| IT-19 | Mattermost API | Each bot account's avatar is set (`GET /users/{id}/image`) and the bot is listed by `GET /users/autocomplete` | R-01 |
+| IT-19 | Mattermost API | Each bot account's avatar is set (`GET /users/{id}/image`) and the bot account is listed by `GET /users/autocomplete` | R-01 |
 | IT-20 | runbook | The install and verify commands, **extracted from `docs/runbook.md`**, run in a fresh container | R-06, R-08 |
-| IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply | R-31, R-32 |
+| IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply. A crewmate's post in the same thread never reaches the kiosk's prompt. The kiosk's answer carries `props.crew_kiosk=1` and no @mentions, and is treated as outsider content by `admit` | R-31, R-32 |
 | IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances | R-33 |
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
 
@@ -569,10 +633,11 @@ P3W2 ─┬─ 3.3 Daemon filters
 P3W3 ─── 3.5 Kiosk
            │
 P3W4 ─┬─ 3.6 Social-engage kiosk review
-      ├─ 3.7 Docs: runbook, partner guide, architecture
-      └─ 3.8 E2E suite and remaining API tests
+      └─ 3.7 Docs: runbook, partner guide, architecture
            │
-P3W5 ─── 3.9 Closing: VRTM, manifest, partner-name grep, dev-space smoke
+P3W5 ─── 3.8 E2E suite and remaining API tests
+           │
+P3W6 ─── 3.9 Closing: VRTM, manifest, partner-name grep, dev-space smoke
            │
    ⇒ IP-3: tag release → K-2 (babelfish, claudecode-workflow): doorbell wiring to the chat
            one-shot (old one-shots kept as fallback), /reseed writes the `## Kiosk` section,
@@ -589,8 +654,9 @@ P3W5 ─── 3.9 Closing: VRTM, manifest, partner-name grep, dev-space smoke
 | P3W1 | 3.1, 3.2 | P3W1 master | Yes — 2 independent stories |
 | P3W2 | 3.3, 3.4 | P3W2 master | Yes — 2 independent stories |
 | P3W3 | 3.5 | Story 3.5 | Single story |
-| P3W4 | 3.6, 3.7, 3.8 | P3W4 master | Yes — 3 independent stories |
-| P3W5 | 3.9 | Story 3.9 | Single story |
+| P3W4 | 3.6, 3.7 | P3W4 master | Yes — 2 independent stories |
+| P3W5 | 3.8 | Story 3.8 | Single story |
+| P3W6 | 3.9 | Story 3.9 | Single story |
 
 ### Co-production Rule
 
@@ -606,7 +672,7 @@ Each story that delivers a deployable service (1.3 broker, 1.4 daemon) adds its 
 
 - [ ] `make ci` passes locally and in CI against both Mattermost images. [CT-01]
 - [ ] Every §5.N question has a recorded answer on Plan #3.
-- [ ] IT-01, IT-02, IT-03 and IT-17 pass. [R-01, R-02, R-03, R-05, R-06, R-07, R-08, R-30]
+- [ ] IT-01, IT-03 and IT-17 pass. [R-01, R-02, R-03, R-05, R-06, R-08, R-30]
 - [ ] `make verify-install` checks the broker and the daemon on a fresh host. [R-06, R-08]
 - [ ] All Phase 1 unit tests pass.
 
@@ -639,7 +705,7 @@ Creates the uv workspace, the build system and the CI that every later story rel
    - `verify-install`: runs `scripts/verify-install.sh`, which starts empty and gains checks in 1.3 and 1.4.
 5. Create `tests/integration/conftest.py` with a `mattermost` fixture. It reads `MM_URL` and `MM_ADMIN_TOKEN` from the environment, and skips with a clear reason when they are absent.
 6. Create `scripts/ci/mattermost-up.sh`. It starts the image named by `MM_IMAGE` (`mattermost/mattermost-team-edition:11.11.3` or `mattermost/mattermost-enterprise-edition:11.11.3`), waits for `/api/v4/system/ping`, creates an admin, sets `EnableBotAccountCreation` and `EnableUserAccessTokens` and the dev-space rate limits, and exports `MM_URL` and `MM_ADMIN_TOKEN`.
-7. Create `scripts/ci/two-user-setup.sh`. It creates the `crewchat`, `crewbroker` and `agent` users and the `crewchat-clients` group in the CI image, so tests can run as `agent` while services run as their own users.
+7. Create `scripts/ci/two-user-setup.sh`. It creates the `crewchat`, `crewbroker`, `crewkiosk` (empty HOME) and `agent` users and the `crewchat-clients` group in the CI image, so tests can run as `agent` while services run as their own users.
 8. Create `.github/workflows/ci.yml`, with each step one line calling `scripts/ci/*.sh`: a matrix over the two `MM_IMAGE` values, running `make ci`, then uploading `reports/`.
 9. Write `README.md` (overview, layout, `make` targets) and `CHANGELOG.md` with an "Unreleased" section.
 
@@ -677,15 +743,17 @@ Answers the open questions that could overturn a locked decision, before any cod
 
 **Implementation Steps:**
 
-1. Against the OaW dev space, or a local Team Edition container, answer §5.N questions 1, 2, 3, 5 and 6 by experiment. For each one, record the command run and its output in `docs/spikes/2026-10-spike-1.2.md`.
+1. Against the OaW dev space, or a local Team Edition container, answer §5.N questions 6 and 8 by experiment. Answer questions 1 and 5 from the vendor's docs, plus a check against a licensed image where one is available. For each question, record the command or source and its output in `docs/spikes/2026-10-spike-1.2.md`.
+   - **Question 8 (bot `owner_id`):** create a bot account as the broker account, then read it as a second user. Assert `owner_id` is the broker's user ID. Attempt to change `owner_id` with the bot's own token, and record that it is refused.
 2. **Question 2 (one client per token):** write `spikes/two_clients.py`. It imports the upstream library, creates two client objects with two different bot tokens in one process, and posts as each. Record which author IDs the server reports.
 3. **Question 3 (`·p1`):** run the signature-parsing code from mcp-server-discord and the watcher, as of their current release tags, against a signature line ending in ` ·p1`, and record whether the name still parses.
 4. **Question 4 (the kiosk mechanism):** time and test both options with a fixture brief.
-   - (a) `claude -p --tools "" --disallowedTools "mcp__*" --strict-mcp-config` with the brief in the prompt. Ask it to run a shell command, and record whether it ran.
+   - (a) As the `crewkiosk` user, with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`, with the brief in the prompt. Ask it to run a shell command and record whether it ran. Then prove, **from the CLI's own transcript or debug output and not from our argv**, that no user, project or local settings, no hooks and no `CLAUDE.md` loaded. Plant a hook and a `CLAUDE.md` in the usual locations first, so the proof is against something present.
    - (b) a direct model API call with no tool definitions.
    Record latency, cost per question and the credentials each needs.
-5. Post one `[ledger D-NNN]` comment per answer on Plan #3. Where an answer changes a locked decision, the entry carries `**Supersedes:**`.
-6. Update §5.N of this Dev Spec with the answer and the ledger ID for each question.
+5. **Question 7 (remote broker transport):** write a one-page design note in the spike doc for a broker on another host, e.g. mutual-TLS TCP. It is not built in this Plan.
+6. Post one `[ledger D-NNN]` comment per answer on Plan #3. Where an answer changes a locked decision, the entry carries `**Supersedes:**`.
+7. Update §5.N of this Dev Spec with the answer and the ledger ID for each question.
 
 **Test Procedures:**
 
@@ -703,6 +771,8 @@ Answers the open questions that could overturn a locked decision, before any cod
 
 - [ ] `docs/spikes/2026-10-spike-1.2.md` records a command, its output and an answer for every §5.N question. [CT-01]
 - [ ] The kiosk mechanism is chosen, with measured latency and cost per question, and recorded as a ledger entry. [R-31]
+- [ ] If the CLI runner is chosen, the spike doc shows from the CLI's own output that no settings, hooks or `CLAUDE.md` loaded, with a planted hook and `CLAUDE.md` present. [R-31, R-32]
+- [ ] Bot `owner_id` behaviour is verified as §5.9's membership rule needs: set by the creator, visible to other users, and not changeable by the bot. [R-22]
 - [ ] Every answer has a `[ledger]` entry on Plan #3; those that change a decision supersede it.
 - [ ] §5.N of the Dev Spec cites each answer's ledger ID.
 
@@ -718,17 +788,31 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
 
 **Implementation Steps:**
 
-1. `packages/broker/src/crewbroker/config.py`: `load_config(path="/etc/crewbroker/crew.toml") -> CrewConfig`, a dataclass with `crew`, `server_url`, `human_user_ids: list[str]` and `trusted_crews: list[str]`. If `crew` is absent, it defaults to the username of the first human user ID, fetched from the server (R-02).
+1. `packages/broker/src/crewbroker/config.py`: `load_config(crew: str) -> CrewConfig` reads `/etc/crewbroker/<crew>.toml` into a dataclass with these fields:
+   - `crew`;
+   - `server_url`;
+   - `broker_user_id`, filled at startup from `/users/me`;
+   - `human_user_ids: list[str]`;
+   - `trusted: list[TrustedCrew]`, where `TrustedCrew` holds `crew`, `broker_user_id` and `human_user_ids` (§5.9).
+
+   If `crew` is absent from the file, it defaults to the username of the first human user ID, fetched from the server (R-02). Paths are per crew (§5.6), so several crews' brokers can share a host.
 2. `crewbroker/mint.py`:
    - `account_name(dev_name, crew) -> str` returns `f"{dev_name}.{crew}"`. It raises `ValueError` past 64 characters, or on characters outside `a-z0-9._-` (CT-05).
    - `ensure_bot(client, name) -> bot_user_id` looks up a bot account by username and creates it if absent (R-03).
-   - `mint_token(client, bot_user_id, ttl_hours=26) -> Token` creates a user access token. Where the server supports expiry, it sets the expiry, detected by a capability probe cached per server (R-07). It records the token's id and creation time in `/var/lib/crewbroker/tokens.json`.
-3. `crewbroker/prune.py`:
-   - `remint_all(client, now)` revokes and re-mints each live token older than 24 hours, paced at 5/s or less (R-05, CT-06).
-   - `prune_idle(client, now, idle_days=30)` deactivates bot accounts whose last mint is more than 30 days old (R-30).
-4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/crewbroker.sock` (mode `0660`, group `crewchat`), using the §5.4 frame shape. The op `mint{dev_name}` returns `{account, token}`. The token goes only to the daemon's user, checked with `SO_PEERCRED` against the `crewchat` UID. A daily scheduler thread runs `remint_all` and `prune_idle`.
-5. `packaging/crewbroker.service`: a systemd unit with `User=crewbroker`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/crewbroker /run/crewbroker`.
-6. `scripts/verify-install.sh`: add checks that the broker socket exists with the right mode and group, and that a `mint` for `verify-canary` succeeds.
+   - `mint_token(client, bot_user_id, ttl_hours=26) -> Token` creates a user access token. Where the server supports expiry, it sets the expiry, detected by a capability probe cached per server (R-07). It records the token's id and creation time in `/var/lib/crewbroker/<crew>/tokens.json`.
+   - `record_register(account, now)` writes `last_register` for the account to `/var/lib/crewbroker/<crew>/accounts.json`. `mint` calls it; `remint` does not.
+3. `crewbroker/prune.py`: `prune_idle(client, now, idle_days=30)` deactivates bot accounts whose `last_register` is more than 30 days old (R-30). Rotation is the daemon's job (Story 1.4), so a re-minted but unregistered account still ages out.
+4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/<crew>.sock` (mode `0660`, group `crewchat`), using the §5.4 frame shape. Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat` (R-08). The ops are:
+   - `mint{dev_name, crew}` → `{account, token, token_id}`;
+   - `remint{dev_name, crew}` → `{token, token_id}`, without revoking the old token;
+   - `revoke{token_id}` → `{}`.
+
+   A daily scheduler thread runs `prune_idle`.
+5. `packaging/crewbroker@.service`: a systemd template unit, one instance per crew (`%i` is the crew), with `User=crewbroker`, `ProtectSystem=strict` and `ReadWritePaths=/var/lib/crewbroker/%i /run/crewbroker`.
+6. `scripts/verify-install.sh`: add these checks:
+   - each broker socket exists with the right mode and group;
+   - a `mint` for `verify-canary` succeeds;
+   - for the known files `/etc/crewbroker/<crew>.credential` and `/var/lib/crewbroker/<crew>/tokens.json`: `test -e <file> && ! sudo -u agent test -r <file>`. Never use a glob (R-08).
 7. `scripts/ci/broker-role-patch.sh` (CI only): applies the `create_bot`, `read_bots` and `manage_bots` patch to `system_user_access_token`, and assigns that role to the broker account in the test server. On real servers this step is covered by CP-03 and is never automated against production.
 
 **Test Procedures:**
@@ -740,14 +824,16 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
 | `test_account_name_format_and_limits` | `<dev>.<crew>`; rejects over 64 characters and bad characters | `tests/unit/broker/test_mint.py` |
 | `test_ensure_bot_creates_once` | A second call returns the same ID with no second create | `tests/unit/broker/test_mint.py` |
 | `test_mint_sets_expiry_when_supported` | The capability probe drives whether expiry is set | `tests/unit/broker/test_mint.py` |
-| `test_remint_paces_under_limit` | A burst of 40 tokens is paced at 5/s or less | `tests/unit/broker/test_prune.py` |
-| `test_prune_idle_30_days` | With an injected clock, 31 days idle → deactivated; 29 → kept | `tests/unit/broker/test_prune.py` |
-| `test_mint_refused_to_non_daemon_peer` | `SO_PEERCRED` ≠ the crewchat UID → error, and no token returned | `tests/unit/broker/test_service.py` |
+| `test_remint_keeps_old_token_until_revoke` | `remint` returns a new token and the old one still works until `revoke` | `tests/unit/broker/test_service.py` |
+| `test_prune_idle_30_days_since_register` | With an injected clock: re-minted daily but no `register` for 31 days → deactivated; registered 29 days ago → kept | `tests/unit/broker/test_prune.py` |
+| `test_every_op_refused_to_non_daemon_peer` | `SO_PEERCRED` ≠ the crewchat UID → every op errors, and no token is returned | `tests/unit/broker/test_service.py` |
+| `test_trusted_config_parses` | `[trusted.<crew>]` tables load with `broker_user_id` and `human_user_ids` | `tests/unit/broker/test_config.py` |
 | `test_crew_defaults_to_partner_username` | `crew` is absent from the config → the partner's username | `tests/unit/broker/test_config.py` |
 
 *Integration/E2E Coverage:*
 
-- IT-02 and IT-03 are now runnable.
+- IT-03 is now runnable.
+- IT-02 is partially runnable: the daemon's rotation arrives in 1.4, and the websocket reconnect in 2.1.
 - IT-17 is partially runnable; the daemon-side naming arrives in 1.4.
 - IT-01 is partially runnable; the daemon arrives in 1.4.
 
@@ -756,8 +842,9 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
 - [ ] `ensure_bot` creates `<dev>.<crew>` on the first call only, against the CI Mattermost. [R-01, R-03]
 - [ ] `mint_token` returns a working token, and sets native expiry when the server supports it. [R-05, R-07]
 - [ ] The broker account holds the patched role and no system-admin role; a test asserts this through the API. [R-06]
-- [ ] IT-02 and IT-03 pass on both images. [R-05, R-07, R-30]
-- [ ] `mint` from a peer that isn't `crewchat` is refused. [R-08]
+- [ ] IT-03 passes on both images. [R-30]
+- [ ] `remint` and `revoke` work as separate steps, so the old token stays valid until the daemon revokes it. [R-05]
+- [ ] Every broker op from a peer that isn't `crewchat` is refused. [R-08]
 - [ ] `make verify-install` includes the broker checks, and they pass in CI. [R-06]
 
 ---
@@ -777,13 +864,22 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
    - `parse_frame(line: bytes) -> Request` validates `proto`, `id`, `op` and `args`. It accepts `proto <= PROTO` and rejects a higher `proto` with `unsupported` (CP-05);
    - `ok(id, result)` and `err(id, msg)`.
 2. `crewchat/server.py`: an asyncio unix server on `/run/crewchat/crewchat.sock` (mode `0660`, group `crewchat-clients`) that dispatches ops to handlers. Unknown ops return `unsupported`.
-3. `crewchat/registry.py`: `register(dev_name, crew, repo_root, session_id) -> Registration`. It keeps a registration per Dev-Name and accepts the declared name (D-055).
+3. `crewchat/registry.py`: `register(dev_name, crew, session_id) -> Registration`. It keeps a registration per Dev-Name and accepts the declared name (D-055). It never reads a path from the agent's side (§5.3).
 4. `crewchat/tokens.py`:
-   - `BrokerClient.mint(dev_name)` calls the broker socket;
-   - `TokenStore` keeps tokens in memory, plus `/var/lib/crewchat/tokens/` (mode `0700`, owner `crewchat`), refreshing on mint failure or a 401.
-5. `crewchat/__main__.py`: loads `/etc/crewchat/servers.toml` (an array of `mattermost` tables with `id` and `url`, plus a `discord` table with `enabled`) and starts the server.
+   - `BrokerClient(socket_path)`, one per crew, from `[crews.<name>] broker_socket`, with `mint(dev_name, crew)`, `remint(dev_name, crew)` and `revoke(token_id)`;
+   - `TokenStore` keeps tokens in memory, plus `/var/lib/crewchat/tokens/<dev>.json` (mode `0600`; directory `0700`; owner `crewchat`), refreshing on mint failure or a 401.
+   - `Rotator.run_daily(now)`: for each agent registered in the last 30 days, it does four steps, paced at 5/s or less (R-05, CT-06):
+     1. call `remint`;
+     2. swap the token in the store;
+     3. call each adapter's `on_token_rotated(dev_name)` hook (a no-op until Story 2.1 adds the websocket reconnect);
+     4. call `revoke` on the old `token_id`.
+5. `crewchat/__main__.py`: loads `/etc/crewchat/servers.toml` and starts the server. The file holds:
+   - an array of `mattermost` tables with `id` and `url`;
+   - a `discord` table with `enabled`;
+   - `default_crew`;
+   - a `[crews.<name>] broker_socket` entry per crew.
 6. `packaging/crewchat.service`: a systemd unit with `User=crewchat`, `ReadWritePaths=/var/lib/crewchat /run/crewchat`.
-7. `scripts/verify-install.sh`: add checks that the daemon socket exists with mode `0660` and group `crewchat-clients`, that `health` answers, and that `sudo -u agent cat /var/lib/crewchat/tokens/*` fails with EACCES.
+7. `scripts/verify-install.sh`: add checks that the daemon socket exists with mode `0660` and group `crewchat-clients`, and that `health` answers. For a canary agent's known token file `/var/lib/crewchat/tokens/verify-canary.json`, check `test -e <file> && ! sudo -u agent test -r <file>`. Never use a glob, because a shell that can't list the directory would make the check pass vacuously (R-08).
 
 **Test Procedures:**
 
@@ -796,16 +892,26 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 | `test_register_returns_account_name` | `register` → `<dev>.<crew>` | `tests/unit/daemon/test_registry.py` |
 | `test_token_store_mode_0700` | The store directory and files are not readable by others | `tests/unit/daemon/test_tokens.py` |
 | `test_token_refresh_on_401` | A 401 triggers one re-mint, then a retry | `tests/unit/daemon/test_tokens.py` |
+| `test_rotation_order` | remint → swap → `on_token_rotated` → revoke, in that order; revoke is never called before the swap | `tests/unit/daemon/test_tokens.py` |
+| `test_rotation_skips_unregistered_30_days` | Agents not registered in 30 days aren't rotated | `tests/unit/daemon/test_tokens.py` |
+| `test_broker_client_per_crew` | Two crews → two broker sockets from `servers.toml` | `tests/unit/daemon/test_tokens.py` |
 
 *Integration/E2E Coverage:*
 
 - IT-01 and IT-17 are now runnable.
+- IT-02 is partially runnable; the websocket reconnect arrives in 2.1.
 
 **Acceptance Criteria:**
 
-- [ ] IT-01 passes on both images: the daemon runs as `crewchat`, a test running as `agent` gets EACCES reading the token store, and the minted token works. [R-01, R-03, R-05, R-06, R-08]
+- [ ] IT-01 passes on both images [R-01, R-03, R-05, R-06, R-08]:
+  - the daemon runs as `crewchat`;
+  - for every known credential file, `test -e` succeeds and `sudo -u agent test -r` fails;
+  - no socket op returns a token to a non-daemon peer;
+  - the minted token works;
+  - the broker account is the only account holding the patched role.
 - [ ] IT-17 passes. [R-01, R-02]
-- [ ] A frame with `proto: 2` gets `unsupported`; a frame with `proto: 0` is handled. [R-14]
+- [ ] A frame with `proto: 2` gets `unsupported`; a frame with `proto: 0` is handled. [CP-05, D-056]
+- [ ] Rotation calls remint, swap, the reconnect hook and revoke in that order. [R-05]
 - [ ] `make verify-install` includes the daemon checks, and they pass in CI. [R-08]
 
 ---
@@ -816,7 +922,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 
 #### Phase 2 Definition of Done
 
-- [ ] IT-04 to IT-07, and IT-14 to IT-16, pass on both images. [R-04, R-09 to R-19, R-29]
+- [ ] IT-02, IT-04 to IT-07, and IT-14 to IT-16, pass on both images. [R-04, R-05, R-07, R-09 to R-19, R-29]
 - [ ] Every `disc_*` alias is covered by IT-15. [R-15]
 - [ ] A `mattermost-crew` release is tagged, ready for IP-2 (K-1).
 - [ ] All Phase 2 unit tests pass.
@@ -840,6 +946,8 @@ Implements send, read, thread, DM and react against Mattermost through the upstr
    - `read` and `thread` map posts to `InboundMessage`, taking `proto` from `props.crew_proto`, defaulting to 0.
 3. `stream()` opens `/api/v4/websocket` per agent, pings every 30 s and reconnects with exponential backoff, capped at 60 s (CT-07). It emits a `posted` event as an `InboundMessage`, with `mentions` taken from the event's `mentions` field (R-29).
 4. Echo filter: drop any `InboundMessage` whose `author_id` equals the receiving agent's own user ID (R-04).
+5. `on_token_rotated(dev_name)`: close that agent's websocket and reopen it with the new token from `token_for`. Reconnecting is required, because revoking a token doesn't close an open websocket; it only stops events (§5.6). Replay from the cursor covers the gap (R-28).
+6. `InboundMessage` gains `owner_id` (the author's bot `owner_id`, or `None` for a human) and `kiosk` (true when `props.crew_kiosk == 1`), both read from the post and user objects for §5.9's membership rule.
 
 **Test Procedures:**
 
@@ -856,6 +964,7 @@ Implements send, read, thread, DM and react against Mattermost through the upstr
 *Integration/E2E Coverage:*
 
 - IT-14 is now runnable.
+- IT-02 is now fully runnable: rotation reconnects the websocket, and events keep arriving.
 - IT-06 (the Mattermost half) and IT-16 are partially runnable.
 
 **Acceptance Criteria:**
@@ -864,6 +973,7 @@ Implements send, read, thread, DM and react against Mattermost through the upstr
 - [ ] Posts made through the adapter carry `props.crew_proto = 1`, and older posts parse with `proto` 0. [R-14]
 - [ ] Two agents post from one daemon process as two distinct authors (two client objects). [R-01]
 - [ ] Websocket reconnect after a forced close is covered by a unit test. [CT-07]
+- [ ] IT-02 passes on both images: across a daemon-driven rotation, the agent's websocket reconnects with the new token and no event is lost. [R-05, R-07]
 
 ---
 
@@ -962,16 +1072,19 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 **Implementation Steps:**
 
 1. `packages/clients/src/crewchat_clients/mcp_shim.py`: a stdio MCP server built with the `mcp` SDK. It holds no credentials.
-   - It defines the §5.5 tools (`chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react`, `chat_health`), each forwarding one frame to `/run/crewchat/crewchat.sock`.
-   - On start it sends `register` with the Dev-Name from `<repo_root>/.claude/agent-identity.json`.
-2. `crewchat/defaults.py`: `resolve_default(reg, repo_root) -> Backend | NeedsHuman`, following R-11's order:
+   - It defines the §5.5 tools (`chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react`, `chat_health`, `chat_set_default`), each forwarding one frame to `/run/crewchat/crewchat.sock`.
+   - On start it sends `register` with the Dev-Name and `crew` from `<repo_root>/.claude/agent-identity.json`; `crew` is omitted when the file has none. The result includes the crew's `needs_list` name.
+   - It runs as the agent's user, so it reads the agent's files; the daemon never does (§5.3).
+     - It pushes `kiosk_brief{dev_name, text}`, where `text` is `crewchat_clients.brief.extract_brief` of `<repo_root>/.claude/reseed-revive.md`, at start and whenever that file's mtime changes.
+     - It pushes `squawk_ids{dev_name, ids}` from `<repo_root>/.claude/sqtk-mine.json` at start and on change.
+2. `packages/clients/src/crewchat_clients/defaults.py`: `resolve_default(identity, repo_root) -> Backend | NeedsHuman`, run in the shim as the agent's user, following R-11's order:
    1. the identity file's `home_backend`;
    2. `~/.claude/chat-defaults.json`, keyed by `<forge-host>/<org>` from `git remote get-url origin`, or by `repo_root` when there is no remote;
    3. otherwise, `NeedsHuman`.
 3. In the shim, `NeedsHuman`:
    - **interactive:** the tool returns a structured question for the agent to ask its human. A follow-up tool `chat_set_default(key, backend)` writes `chat-defaults.json` atomically.
-   - **headless** (`CLAUDE_CODE_ENTRYPOINT` is not interactive, or `--print`): the send fails with a loud error, and the shim runs `sqtk add <needs-list> "<question>"`, where `<needs-list>` is the crew's human partner's needs list, named in `/etc/crewchat/servers.toml` (`bj:needs` for crews partnered with BJ) (R-11, CP-02).
-4. A backend named in the call is used, and the daemon logs `off-default: <dev> <backend>` (R-13).
+   - **headless** (`CLAUDE_CODE_ENTRYPOINT` is not interactive, or `--print`): the send fails with a loud error, and the shim runs `sqtk add <needs-list> "<question>"`, where `<needs-list>` is the crew's human partner's needs list, returned by `register` from `/etc/crewchat/servers.toml` (`bj:needs` for crews partnered with BJ) (R-11, CP-02). The question is the shim's own text, never message content.
+4. A backend named in the call is used, and the daemon logs `off-default: <dev> <backend>` (R-13). The shim always sends the resolved `backend` in the `send` and `dm` frames; the daemon does no resolution.
 5. Aliases: `disc_send` maps to `chat_send(backend="discord")`, and likewise for each `disc_*` tool. Each alias logs one deprecation warning per session.
 6. `chat_send` with `thread` replies on that thread's backend, whatever the default is (R-12).
 
@@ -981,8 +1094,11 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 
 | Test Name | Purpose | File Location |
 |-----------|---------|---------------|
-| `test_resolution_order` | identity file > defaults file > NeedsHuman | `tests/unit/daemon/test_defaults.py` |
-| `test_forge_key_from_remote` | The SSH and HTTPS remote forms give `<host>/<org>` | `tests/unit/daemon/test_defaults.py` |
+| `test_resolution_order` | identity file > defaults file > NeedsHuman | `tests/unit/clients/test_defaults.py` |
+| `test_forge_key_from_remote` | The SSH and HTTPS remote forms give `<host>/<org>` | `tests/unit/clients/test_defaults.py` |
+| `test_extract_brief_only_kiosk_section` | Only the `## Kiosk` section is returned; other sections are excluded | `tests/unit/clients/test_brief.py` |
+| `test_pushes_brief_on_mtime_change` | A rewritten seed → one new `kiosk_brief` frame, carrying only the section | `tests/unit/clients/test_mcp_shim.py` |
+| `test_pushes_squawk_ids` | `sqtk-mine.json` ids are pushed at start and on change | `tests/unit/clients/test_mcp_shim.py` |
 | `test_headless_fails_loud_and_squawks` | Headless + no default → an error and a squawk | `tests/unit/clients/test_mcp_shim.py` |
 | `test_set_default_atomic_write` | `chat_set_default` writes atomically | `tests/unit/clients/test_mcp_shim.py` |
 | `test_reply_follows_thread_backend` | A reply goes to the thread's backend | `tests/unit/clients/test_mcp_shim.py` |
@@ -1000,6 +1116,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 - [ ] A headless send with no default fails, and leaves a squawk on the crew's configured needs list; there is no Discord fallback. [R-11]
 - [ ] `grep -rn "token" packages/clients/` finds no credential handling. [R-08]
 - [ ] Every `disc_*` alias forwards and warns. [R-15]
+- [ ] No daemon module opens a path under an agent's home or repo; a test asserts the daemon package has no reference to `agent-identity.json`, `chat-defaults.json`, `reseed-revive.md` or `sqtk-mine.json`. [R-11, R-32]
 
 ---
 
@@ -1028,13 +1145,13 @@ The broker holds each crew's social switch and kiosk flag, and changes them only
 
 **Implementation Steps:**
 
-1. `crewbroker/switch.py`: a `SwitchState` dataclass with `mode` (`crew` | `trusted` | `social`), `expires_at: datetime | None`, `revert_to` and `kiosk_on: bool = True`, persisted to `/var/lib/crewbroker/switch.json`. The default is `mode="crew"`, `kiosk_on=True` (R-20, R-34).
+1. `crewbroker/switch.py`: a `SwitchState` dataclass with `mode` (`crew` | `trusted` | `social`), `expires_at: datetime | None`, `revert_to` and `kiosk_on: bool = True`, persisted to `/var/lib/crewbroker/<crew>/switch.json`. The default is `mode="crew"`, `kiosk_on=True` (R-20, R-34). Invariant: `revert_to` is never `social`.
 2. `apply_command(state, sender_user_id, text, cfg, now) -> (SwitchState, reply)`:
    - It accepts `social <dur>`, `trusted`, `crew`, `kiosk off` and `kiosk on`.
    - It rejects any sender not in `cfg.human_user_ids`, and the state stays unchanged (R-24).
-   - `social <dur>` stores `revert_to` as the current mode, plus the expiry.
-3. `effective_mode(state, now) -> (mode, lapsed: bool)`: past the expiry it returns `revert_to` (or `crew` if that is unreadable) and `lapsed=True` (R-23).
-4. The broker's websocket listener in `crewbroker/service.py`: on a DM to the broker account, call `apply_command` and post the reply. When a lapse is detected, DM the human partner "social lapsed → <mode>".
+   - `social <dur>`: first it applies any pending lapse (step 3). Then, if social is already in effect, it **extends** the expiry and keeps the existing `revert_to`. Otherwise it sets `revert_to` to the current effective mode, which by the invariant is `crew` or `trusted`.
+3. `effective_mode(state, now) -> (mode, lapsed: bool)`: past the expiry it returns `revert_to` (or `crew` if that is unreadable or is somehow `social`) and `lapsed=True` (R-23). `settle(state, now) -> SwitchState` **persists** a lapse: it writes `mode = revert_to`, clears `expires_at`, and is called before every command and on every `switch_state` request, so a lapsed social never lingers in storage.
+4. The broker's websocket listener in `crewbroker/service.py`: on a DM to the broker account, call `apply_command` and post the reply. When `settle` records a lapse, DM the human partner "social lapsed → <mode>".
 5. A socket op `switch_state{}` returns the stored state plus `effective_mode`.
 
 **Test Procedures:**
@@ -1047,6 +1164,9 @@ The broker holds each crew's social switch and kiosk flag, and changes them only
 | `test_only_partner_can_flip` | A non-partner's command → refused, state unchanged | `tests/unit/broker/test_switch.py` |
 | `test_social_lapses_and_reverts` | After expiry → `revert_to`; `lapsed` is reported | `tests/unit/broker/test_switch.py` |
 | `test_unreadable_revert_falls_back_crew` | A corrupt `revert_to` → `crew` | `tests/unit/broker/test_switch.py` |
+| `test_social_extend_keeps_revert` | `trusted` → `social 1h` → `social 2h`: `revert_to` stays `trusted`, and the expiry moves | `tests/unit/broker/test_switch.py` |
+| `test_reengage_after_lapse` | Social lapses, then `social 1h` again: `revert_to` is the lapsed-to mode, never `social`, and the second lapse reverts | `tests/unit/broker/test_switch.py` |
+| `test_lapse_persisted` | After `settle`, the stored `mode` is the reverted mode | `tests/unit/broker/test_switch.py` |
 | `test_kiosk_off_on` | The flag toggles | `tests/unit/broker/test_switch.py` |
 
 *Integration/E2E Coverage:*
@@ -1059,6 +1179,7 @@ The broker holds each crew's social switch and kiosk flag, and changes them only
 - [ ] IT-18 passes: the partner test user's DMs change the mode, the expiry and the kiosk flag, and a lapse DMs the partner. [R-23, R-24, R-34]
 - [ ] A DM from any other user leaves the state unchanged and is answered with a refusal. [R-24]
 - [ ] The defaults are crew only, with the kiosk on. [R-20, R-34]
+- [ ] Extending or re-engaging social always lapses back to a non-social mode; `revert_to` is never `social`. [R-23]
 
 ---
 
@@ -1073,7 +1194,7 @@ Merges the Mattermost, Discord and squawkie streams into one queue per agent, wi
 **Implementation Steps:**
 
 1. `crewchat/adapters/squawkie.py`: `SquawkieBackend(url, token)`.
-   - `stream()` subscribes to `GET /api/stream` and emits `squawk.updated` events for the IDs in `<repo_root>/.claude/sqtk-mine.json`, with the same predicate as `sqtk-doorbell.sh`.
+   - `stream()` subscribes to `GET /api/stream` and emits `squawk.updated` events for the IDs the shim pushed with `squawk_ids` (Story 2.4), using the same predicate as `sqtk-doorbell.sh`. The daemon never reads `sqtk-mine.json` itself (§5.3).
    - On connect it runs a catch-up check, mirroring `sqtk-drain.sh --pending`.
 2. `crewchat/doorbell.py`: `Doorbell` runs one task per (agent, backend) that consumes `stream()`. The filter hook (`filters.admit`) is a pass-through in this story; 3.3 fills it in. Events go into an `asyncio.Queue` per agent.
 3. Cursors: `CursorStore` at `/var/lib/crewchat/cursors/<dev>/<backend>.json` saves the last delivered event ID. On reconnect, the stream replays events after the cursor and de-duplicates by ID (R-28).
@@ -1115,18 +1236,31 @@ Applies the social switch and the loop guard on both the push path and the pull 
 **Implementation Steps:**
 
 1. `crewchat/filters.py`:
-   - `SwitchCache` fetches `switch_state` from the broker every 30 s, and on demand. It stores the state with its expiry.
-   - `admit(msg, reg, now) -> Verdict` returns one of `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK`, or `DROP(reason)`.
-2. `admit` resolves the sender's crew from `author_id` (broker-known bot IDs plus configured human IDs plus trusted crews). If the crew is unresolvable, or no switch state is cached, it returns `DROP` (R-22).
+   - `SwitchCache` fetches `switch_state` from each crew's broker every 30 s, and on demand. It stores the state with its expiry.
+   - `admit(msg, reg, now, path) -> Verdict` returns one of `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK`, or `DROP(reason)`. `path` is `push` or `pull`.
+2. **Per backend first (§5.9):**
+   - Discord messages are crew-equivalent → `DELIVER` (the loop guard still applies; R-15).
+   - squawkie events are exempt → `DELIVER`.
+   - **Mattermost:** `admit` resolves the sender's crew by membership:
+     - a bot account is in crew X **if and only if** `msg.owner_id` equals X's `broker_user_id`, for the agent's own crew and for each `[trusted.<crew>]` table;
+     - a human is in X if and only if `author_id` is in that crew's `human_user_ids`;
+     - **username suffixes are never used for membership.**
+
+     If the author can't be resolved by the server, or no switch state is cached, it returns `DROP` (R-22).
+   - A post with `msg.kiosk` true (`props.crew_kiosk=1`) is classed as an outsider whoever authored it (§5.9).
    - A crewmate → `DELIVER`.
    - A trusted crew under `trusted` or `social` → `DELIVER`.
    - An outsider under `social` (per `effective_mode`, checked now) → `DELIVER_MARKED_OUTSIDER` (R-23).
    - An outsider under `crew` or `trusted`, with the kiosk on → `KIOSK`; with the kiosk off → `DROP` (R-31, R-34).
-3. Loop guard, `LoopGuard.admit(msg, reg)`:
-   - Require the conversation to be opted in, meaning the agent has posted in it or was invited.
-   - Require an inline mention of the agent, unless it's a reply in the agent's own thread (R-19).
-   - Drop once there are more than 20 bot messages in the conversation's sliding window, which is configurable (R-25).
-4. Wire `admit` into `Doorbell` before the queue (push), and into the `read` and `thread` handlers before results are returned (pull) (R-21). In this story, `KIOSK` verdicts go into a holding queue; 3.5 consumes it.
+3. Loop guard, `LoopGuard.admit(msg, reg)` (R-25):
+   - **Messages from bot accounts:**
+     - require an opted-in conversation: the agent started it, posted in it, or was mentioned into it; every DM counts as opted in;
+     - require an inline mention: `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token;
+     - drop once there are more than 20 messages from bot accounts in the conversation's sliding window, which is configurable.
+   - **Human messages** are admitted when addressed per R-16 to R-19, with no mention required. That way the human partner's first DM, or a reply in the agent's thread, always gets through.
+4. Wire `admit` into `Doorbell` before the queue (push), and into the `read` and `thread` handlers before results are returned (pull) (R-21).
+   - On **push**, `KIOSK` verdicts go into a holding queue, which 3.5 consumes.
+   - On **pull**, a `KIOSK` verdict means **omit, and never enqueue**. Reading a channel never re-sends old outsider posts to the kiosk, and never returns them to the working agent.
 5. Mark outsider content: `DELIVER_MARKED_OUTSIDER` adds `{"outsider": true}` to the event, and the shim prefixes its text with `[from outside the crew]`.
 
 **Test Procedures:**
@@ -1139,9 +1273,15 @@ Applies the social switch and the loop guard on both the push path and the pull 
 | `test_no_cache_drops` | No switch state → DROP | `tests/unit/daemon/test_filters.py` |
 | `test_modes_matrix` | Every mode × sender class → the expected verdict | `tests/unit/daemon/test_filters.py` |
 | `test_expiry_checked_per_delivery` | A stale cached social past its expiry → reverted verdict | `tests/unit/daemon/test_filters.py` |
-| `test_read_path_filtered` | `read` omits dropped posts and marks outsiders | `tests/unit/daemon/test_filters.py` |
-| `test_loop_guard_window` | The 21st bot message in the window is dropped | `tests/unit/daemon/test_loopguard.py` |
-| `test_loop_guard_requires_mention_and_optin` | No mention or no opt-in → dropped | `tests/unit/daemon/test_loopguard.py` |
+| `test_read_path_filtered` | `read` omits dropped posts, marks outsiders, and omits `KIOSK`-verdict posts **without** enqueuing them to the kiosk | `tests/unit/daemon/test_filters.py` |
+| `test_membership_by_owner_id_not_suffix` | A bot account named `x.<crew>` but owned by another account → outsider; a bot owned by the crew's broker → crew | `tests/unit/daemon/test_filters.py` |
+| `test_trusted_membership_by_broker_user_id` | A trusted crew's bot is recognised by its broker's `owner_id`, and its humans by listed IDs | `tests/unit/daemon/test_filters.py` |
+| `test_discord_crew_equivalent_squawkie_exempt` | Discord → DELIVER (subject to the loop guard); squawkie → DELIVER | `tests/unit/daemon/test_filters.py` |
+| `test_kiosk_post_classed_outsider` | A post with `props.crew_kiosk=1` from a crewmate's account → outsider verdict | `tests/unit/daemon/test_filters.py` |
+| `test_loop_guard_window` | The 21st message from bot accounts in the window is dropped | `tests/unit/daemon/test_loopguard.py` |
+| `test_loop_guard_requires_mention_and_optin` | A message from a bot account with no mention, or no opt-in, → dropped | `tests/unit/daemon/test_loopguard.py` |
+| `test_loop_guard_mention_set` | `@<dev>`, `@<dev>.<crew>`, `@agents`, crew and team tokens all count as mentions | `tests/unit/daemon/test_loopguard.py` |
+| `test_human_addressed_admitted_without_mention` | The human partner's DM, and a human reply in the agent's thread, are admitted | `tests/unit/daemon/test_loopguard.py` |
 
 *Integration/E2E Coverage:*
 
@@ -1152,6 +1292,8 @@ Applies the social switch and the loop guard on both the push path and the pull 
 - [ ] IT-08, IT-09, IT-10 and IT-23 pass on both images. [R-20, R-21, R-22, R-23, R-24, R-25, R-34]
 - [ ] With the broker stopped and the cached social past its expiry, deliveries use the reverted mode. [R-23]
 - [ ] The same filter applies to `subscribe` and to `read`, and a test asserts both. [R-21]
+- [ ] Membership never uses username suffixes: IT-08's spoofed-username case is not admitted. [R-22]
+- [ ] On the pull path, `KIOSK` posts are omitted and never enqueued. [R-21, R-31]
 
 ---
 
@@ -1186,7 +1328,7 @@ Gives agents a one-shot doorbell client that exits once per event, so an idle ag
 **Acceptance Criteria:**
 
 - [ ] `crewchat-doorbell` exits 0 after printing exactly one event. [R-26, CT-08]
-- [ ] It exits 4 when the daemon socket is absent, and never exits 0 without an event. [R-27]
+- [ ] It exits 4 when the daemon socket is absent, and never exits 0 without an event. [CT-08]
 
 ---
 
@@ -1200,19 +1342,20 @@ Answers outsiders while social is off, through a tool-less session seeded only f
 
 **Implementation Steps:**
 
-1. `crewchat/kiosk.py`: `extract_brief(seed_text) -> str | None` returns the text from the `## Kiosk` heading up to the next `^## ` heading or the end of the file, or `None` (R-32).
-2. `KioskSession(dev_name, repo_root, runner)`:
+1. `crewchat/kiosk.py`: `BriefStore` holds the latest brief per Dev-Name, as received in `kiosk_brief` frames from the shim (Story 2.4). The shim has already extracted the `## Kiosk` section, and the daemon never reads the seed file (§5.3, R-32).
+2. `KioskSession(dev_name, runner)`:
    - It starts lazily on the first `KIOSK` verdict for that expert (R-31).
-   - It re-reads `<repo_root>/.claude/reseed-revive.md` whenever its mtime changes, and passes **only** `extract_brief`'s output.
-   - With no brief, it replies "I have nothing to share yet."
-   - Its prompt is `KIOSK_HEADER + brief + thread history`.
+   - It uses the current brief from `BriefStore`. With no brief, it replies "I have nothing to share yet."
+   - Its prompt is `KIOSK_HEADER + brief + history`. **`history` holds only the asker's own posts in that thread and the kiosk's own earlier answers to that asker.** Crewmates' posts in the thread are never included (§5.11).
 3. `runner` implements the mechanism chosen in spike 1.2. Either:
-   - `ClaudeCliRunner`, which runs `claude -p` with `--tools ""`, `--disallowedTools "mcp__*"` and `--strict-mcp-config`, using the daemon's own auth; or
-   - `ApiRunner`, which makes a direct model API call with no tool definitions, using the credential decided in 1.2.
+   - `ClaudeCliRunner` runs, as OS user `crewkiosk` (never `crewchat`), with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. It is started through a fixed `sudo -u crewkiosk` rule that allows only this command line. `crewkiosk` can read no credential; or
+   - `ApiRunner` makes a direct model API call with no tool definitions, using the credential decided in 1.2.
 
    Both expose `answer(prompt) -> str`.
 4. One session per expert serves every outsider, so their contexts mingle (D-067). Each Q&A is appended to `/var/lib/crewchat/kiosk/<dev>.jsonl` as `{ts, thread, asker_id, question, answer}`.
-5. Consume the `KIOSK` holding queue from 3.3: answer in the outsider's thread on the originating backend.
+5. Consume the `KIOSK` holding queue from 3.3. Answer in the outsider's thread on the originating backend (Mattermost only; §5.9):
+   - `strip_mentions(answer)` removes every `@token` before posting;
+   - the post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
 6. `KIOSK_HEADER`: "You are this agent's kiosk. Answer questions using only the brief below. You cannot act, and you cannot share anything that is not in the brief."
 
 **Test Procedures:**
@@ -1221,21 +1364,25 @@ Answers outsiders while social is off, through a tool-less session seeded only f
 
 | Test Name | Purpose | File Location |
 |-----------|---------|---------------|
-| `test_extract_brief_only_kiosk_section` | Only the section is returned; other sections are excluded | `tests/unit/daemon/test_kiosk.py` |
-| `test_missing_section_fixed_reply` | No section → "nothing to share yet" | `tests/unit/daemon/test_kiosk.py` |
+| `test_missing_brief_fixed_reply` | No brief pushed → "nothing to share yet" | `tests/unit/daemon/test_kiosk.py` |
 | `test_lazy_start` | No session until the first outsider message | `tests/unit/daemon/test_kiosk.py` |
-| `test_brief_reload_on_mtime` | A rewritten seed → new brief | `tests/unit/daemon/test_kiosk.py` |
-| `test_runner_has_no_tools` | The CLI runner's argv carries `--tools ""` and the MCP exclusions; the API runner sends no tools | `tests/unit/daemon/test_kiosk_runner.py` |
+| `test_new_brief_replaces_old` | A new `kiosk_brief` frame → the next answer uses it | `tests/unit/daemon/test_kiosk.py` |
+| `test_history_only_asker_and_kiosk` | A crewmate's post in the thread never appears in the prompt | `tests/unit/daemon/test_kiosk.py` |
+| `test_answer_mentions_stripped_and_tagged` | `@` tokens removed; the post carries `props.crew_kiosk=1` | `tests/unit/daemon/test_kiosk.py` |
+| `test_runner_has_no_tools` | The CLI runner runs as `crewkiosk` with `--restricted --strict-mcp-config --tools ""` and the MCP exclusions, with an empty HOME and working directory; the API runner sends no tools | `tests/unit/daemon/test_kiosk_runner.py` |
+| `test_daemon_never_reads_seed` | The kiosk code has no file read of `reseed-revive.md` | `tests/unit/daemon/test_kiosk.py` |
 | `test_transcript_appended` | Every Q&A is written to the JSONL | `tests/unit/daemon/test_kiosk.py` |
 
 *Integration/E2E Coverage:*
 
-- IT-21 is now runnable, using a fixture seed with a `## Kiosk` section and a secret elsewhere in the file.
+- IT-21 is now runnable. It uses a fixture seed with a `## Kiosk` section and a secret elsewhere in the file, pushed through the real shim, and a thread containing a crewmate's post.
 
 **Acceptance Criteria:**
 
 - [ ] IT-21 passes: the outsider is answered from the `## Kiosk` section, and a secret placed elsewhere in the fixture seed never appears in any prompt the runner receives (asserted on the captured prompt). [R-31, R-32]
-- [ ] The kiosk's runner cannot run a tool, and a test asserts the invocation. [R-31]
+- [ ] Neither does a crewmate's post in the same thread. [R-31, R-32]
+- [ ] The kiosk's runner cannot run a tool, and a test asserts the invocation. If the CLI runner is used, it runs as `crewkiosk` and cannot read any credential file (checked with `test -r` on the known paths). [R-31, R-08]
+- [ ] Kiosk posts carry `props.crew_kiosk=1` and no @mentions. [R-31]
 - [ ] Every answered question is recorded in the kiosk transcript. [R-31]
 
 ---
@@ -1267,7 +1414,7 @@ When the human partner engages social, the working agent reviews what the kiosk 
 *Integration/E2E Coverage:*
 
 - IT-22 is now runnable.
-- E2E-02 is partially runnable; it completes in 3.8.
+- E2E-02 is partially runnable; it completes in 3.8, which depends on this story.
 
 **Acceptance Criteria:**
 
@@ -1287,14 +1434,14 @@ Delivers the operator runbook (with its prerequisites and install verification f
 **Implementation Steps:**
 
 1. `docs/runbook.md` has these sections:
-   - "Prerequisites": the OS users and group, Python 3.12, uv, and the socket mount into containers;
-   - "Install the daemon" and "Install the broker", as fenced `bash` blocks taken from §5.B;
-   - "Configure": `servers.toml` and `crew.toml`;
-   - "Verify the install": a fenced `bash` block that runs `make verify-install`;
+   - "Prerequisites": the OS users `crewchat`, `crewbroker` and (if the CLI kiosk runner is used) `crewkiosk` with an empty HOME, the group `crewchat-clients`, Python 3.12, uv, and the socket mount into containers;
+   - "Install the daemon" and "Install the broker", as fenced `bash` blocks taken from §5.B, the broker as one `crewbroker@<crew>` instance per crew;
+   - "Configure": `servers.toml` (servers, `default_crew`, `[crews.<name>] broker_socket`) and `/etc/crewbroker/<crew>.toml` (including `[trusted.<crew>]` tables by `broker_user_id`);
+   - "Verify the install": a fenced `bash` block that runs `make verify-install`. That target checks every known credential file with `test -e <file> && ! sudo -u agent test -r <file>`, and the same for `crewkiosk`;
    - "Rollback".
 2. `tests/integration/test_runbook.py` (IT-20) extracts every fenced `bash` block under "Install …" and "Verify the install" from `docs/runbook.md` and runs them in order, in a fresh container in CI. Every block must exit 0.
 3. `docs/partner-guide.md`: the broker DM commands (`social <dur>`, `trusted`, `crew`, `kiosk off`, `kiosk on`); what each mode delivers; expiry and lapse notices; the kiosk and its review on social engage; and how to write a `## Kiosk` section.
-4. `docs/architecture.md`: the §4.1 diagram, the components, the data paths for push, pull and kiosk, and the trust boundaries (the per-host socket, the `crewchat` and `crewbroker` users).
+4. `docs/architecture.md`: the §4.1 diagram, the components, the data paths for push, pull and kiosk, and the trust boundaries (the per-host socket, the `crewchat`, `crewbroker` and `crewkiosk` users), the membership rule (bot account `owner_id`, never username suffixes), and the per-backend rule (Discord crew-equivalent, squawkie exempt).
 
 **Test Procedures:**
 
@@ -1319,15 +1466,15 @@ Delivers the operator runbook (with its prerequisites and install verification f
 
 #### Story 3.8: E2E suite and remaining API tests
 
-**Wave:** P3W4
+**Wave:** P3W5
 **Repository:** Wave-Engineering/mattermost-crew
-**Dependencies:** 3.5
+**Dependencies:** 3.5, 3.6
 
 Runs the three end-to-end flows and the remaining API tests in CI.
 
 **Implementation Steps:**
 
-1. `tests/e2e/conftest.py`: two crews (`oaw` and `synth`), each with its own human test user, its own broker config and two registered agents; plus one unlisted outsider user.
+1. `tests/e2e/conftest.py`: two crews (`oaw` and `synth`), each with its own human test user, its own `crewbroker@<crew>` instance and two registered agents. Each crew lists the other as `[trusted.<crew>]` by the other broker's `broker_user_id` and human IDs. There is also one unlisted outsider user, plus one outsider bot account named `x.oaw` but **not** owned by the `oaw` broker, to prove membership ignores username suffixes.
 2. `tests/e2e/test_cross_crew.py` (E2E-01): under `trusted`, an agent from each crew converses in a shared channel; replies follow the thread, and each doorbell exits once per addressed message.
 3. `tests/e2e/test_outsider_switch.py` (E2E-02):
    - The outsider asks a crew-only agent a question → the kiosk answers.
@@ -1358,7 +1505,7 @@ Runs the three end-to-end flows and the remaining API tests in CI.
 
 #### Story 3.9: Closing — VRTM, manifest, partner-name grep, dev-space smoke
 
-**Wave:** P3W5
+**Wave:** P3W6
 **Repository:** Wave-Engineering/mattermost-crew
 **Dependencies:** 3.6, 3.7, 3.8
 
