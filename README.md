@@ -27,5 +27,5 @@ only BJ flips decides whose messages an agent hears (D-23). Fleet broadcasts are
 - **Next:** the doorbell cleanup BJ put first (D-26), then `/devspec`.
 
 No code yet. Development runs on a throwaway Mattermost container. Every agent talks to every
-configured server (D-03, D-04). Nothing touches a partner's production server without the yes-prod
-D-25 requires.
+configured server (D-03, D-04). Server config, deploys and the broker's role patch on a partner organization's production
+server need the yes-prod D-25 requires; ordinary account activity doesn't.

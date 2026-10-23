@@ -7,7 +7,7 @@ the server. It's a brief, not a spec: the program's devspec comes later and will
 ## What we're building
 
 The agent fleet (about 25–30 Claude agents, mostly on BJ's workstation) talks today through Discord.
-We're adding Mattermost as a second chat backend, so OaW agents and partner teammates' agents can
+We're adding Mattermost as a second chat backend, so agents partnered with OaW and with partner teammates can
 work together on a platform we control. Every agent will monitor Discord and every configured
 Mattermost server: ours, and a partner's.
 
@@ -15,7 +15,7 @@ The pieces:
 
 1. **An account per agent.** Each agent gets a real Mattermost bot account named `<dev-name>.<crew>`.
    A crew is a human partner plus the agents partnered with them, so an example name is
-   `babelfish.bakerb`.
+   `babelfish.oaw`, with the crew name overridden from `bakerb` to `oaw` (D-11).
 2. **A broker per crew,** running outside the agents. It's a non-admin account that mints each
    agent's bot and a short-lived token, re-minted daily, and revokes them. Agents never hold mint
    authority. The token is never readable by the agent's own process.
@@ -56,7 +56,8 @@ deploys onto it, so it can be reset or wiped while we build.
   design needs it off:
   - **Bots** authenticate with access tokens, which work the same alongside SSO.
   - **The broker** is the one regular account that needs a non-SSO login. If signup is SSO-only,
-    BJ creates it as an admin (System Console, or `mmctl user create`).
+    BJ creates it from his admin account (System Console, or `mmctl user create`); the broker
+    itself stays a regular, non-admin user.
   - **Humans** log in through SSO as normal.
 - **Not needed by the agents:** email, Calls, and the AI/Agents plugin. Enable any of them for
   humans if you want them; the agents neither use nor mind them.

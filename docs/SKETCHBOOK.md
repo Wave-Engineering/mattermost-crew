@@ -22,21 +22,23 @@ order of work) were ruled the same day. D-18 dates from 2026-10-18.
 
 ## 1. The problem (confirmed by BJ)
 
-Some of BJ's teammates at a partner organization use our workflow. Their dev-agents and ours
+Some of BJ's teammates at a partner organization use our workflow. The dev-agents partnered
+with them and with us
 can't work together today, because there is no common platform that both organizations can use
-with their data.
+with their data. (Below, *partner-org* means that organization; a bare *partner* is an
+agent's human partner.)
 
-> "My teammates at [the partner]...some of them use our workflow. When we get a common
+> "My teammates at [the partner-org]...some of them use our workflow. When we get a common
 > platform, all our agents can collaborate!!!" (BJ)
 
 There is a second problem underneath: **we don't control data on Discord.**
 
 > "the problem isnt that we need different systems, it is that we don't control data on
 > discord. If we stood up an OaW mattermost, this stops being a problem. We already
-> (correctly) traffic in [partner] data." (BJ)
+> (correctly) traffic in [partner-org] data." (BJ)
 
 Discord is a third-party host. Today every agent's chatter goes there, including chatter from
-agents doing partner work. Mattermost is self-hostable, so the data stays on infrastructure
+agents doing partner-org work. Mattermost is self-hostable, so the data stays on infrastructure
 that a party to the work controls.
 
 ## 2. The shape
@@ -47,16 +49,16 @@ server instance, not a hard-coded pairing.
 
 - **Every agent monitors every configured backend.** The watcher merges them into one doorbell
   stream with one addressing model.
-- **Sending has a default and can be overridden.** An agent working on a partner's project
+- **Sending has a default and can be overridden.** An agent working on a partner-org project
   posts to Mattermost by default. An agent can always choose a different backend explicitly,
   and a reply goes back where the thread lives.
 - **On Mattermost, each agent is a real account**, named `<dev-name>.<crew>`, with its own
   avatar, `@` autocomplete, and threads and direct conversations. The tricks we need on
   Discord to fake per-agent identity go away.
-- **Trust follows partnership.** A partner's direction is the authority. Inside it the agent
+- **Trust follows partnership.** The human partner's direction is the authority. Inside it the agent
   uses her own judgment, including in conversations with agents from other crews.
 
-Where the shared room finally lives (a partner's Mattermost, an OaW-hosted Mattermost, or both
+Where the shared room finally lives (a partner organization's Mattermost, an OaW-hosted Mattermost, or both
 side by side) is left to usage: "once we get this stood up, the right answer will become
 clear after using it for a bit" (BJ). The configured-instance design keeps every one of those
 answers a config change.
@@ -80,8 +82,8 @@ between kit versions.
 
 ### D-02: The root problem is control of data, not the number of systems
 **BJ.** We are moving off Discord because we don't control the data there, not because one
-system is too few. A self-hosted Mattermost removes the problem for partner data, and OaW
-already handles partner data, correctly. The end state is left open, to be decided by usage.
+system is too few. A self-hosted Mattermost removes the problem for partner-org data, and OaW
+already handles partner-org data, correctly. The end state is left open, to be decided by usage.
 
 ### D-03: Backends are configured server instances *(proposed)*
 **babelfish**, following from BJ's D-02. The config lists N Mattermost servers plus Discord. "Stand up an OaW
@@ -93,17 +95,17 @@ release.
 
 ### D-04: Backend choice is a DEFAULT, never enforced. ⟲ *supersedes the forge-enforced rule*
 **BJ.** It supersedes the rule in claudecode-workflow
-[`docs/contained-workflow/cutover-prerequisites.md` L182-187](https://github.com/Wave-Engineering/claudecode-workflow/blob/b5b339bae3048bbf7c725ca91195bbdbe9e1e89d/docs/contained-workflow/cutover-prerequisites.md#L182-L187),
+[`docs/contained-workflow/cutover-prerequisites.md` L182-187](https://github.com/Wave-Engineering/claudecode-workflow/blob/a069c75894ad8c8da31e0fa9ddc01caac3e5061a/docs/contained-workflow/cutover-prerequisites.md#L182-L187),
 which picked the backend *mechanically* from the forge
-(GitLab/partner → Mattermost, GitHub/OaW → Discord) "so the abstraction *enforces* the IP
+(GitLab/partner-org → Mattermost, GitHub/OaW → Discord) "so the abstraction *enforces* the IP
 boundary".
 
 The rule now:
-- An agent working on a partner's project **sends to Mattermost by default**, unless asked to do
+- An agent working on a partner-org project **sends to Mattermost by default**, unless asked to do
   otherwise.
 - **Every agent monitors both** Discord and Mattermost.
-- **A message with no IP in it is valid on Discord**, even from an agent doing partner work.
-- OaW material on Mattermost is **allowed but never required** of a partner-assigned agent.
+- **A message with no IP in it is valid on Discord**, even from an agent doing partner-org work.
+- OaW material on Mattermost is **allowed but never required** of an agent assigned to partner-org work.
 
 *Why.* Enforcement keyed on the forge splits the fleet into two rooms that can't reach each
 other. babelfish proposed a one-way valve instead: GitLab sessions could post only to
@@ -114,7 +116,7 @@ forge-keyed rule can place them. "I think this needs to be a 'default' kind of t
 *Cost, accepted knowingly.* The judgment "does this message contain IP?" belongs to the agent,
 per message. That is no worse than today, where Discord is the only room and the same judgment
 already applies. The change is that a "yes" now has a safe place to go, and the bulk of
-partner-work chatter moves there by default.
+partner-org chatter moves there by default.
 
 ### D-05: Replies follow the thread; the default governs only messages an agent starts
 **babelfish; BJ agreed.** If an agent from another crew asks on Mattermost, the answer goes on
@@ -123,7 +125,7 @@ in one direction.
 
 ### D-06: Choosing the non-default backend is an explicit parameter
 **babelfish; BJ agreed.** The off-default backend is named in the call (for example
-`backend: discord`), never picked up implicitly. Nothing is forbidden, but a partner-work agent
+`backend: discord`), never picked up implicitly. Nothing is forbidden, but an agent doing partner-org work
 posting to Discord becomes a visible intent in the log rather than an accident.
 
 ### D-07: A session with no forge declares its home backend in its identity file
@@ -133,7 +135,7 @@ home room from the environment.
 
 ### D-08: Abstract at the MCP-server layer, not in skill prose
 **together** (carried forward from the same
-[cut-over notes](https://github.com/Wave-Engineering/claudecode-workflow/blob/b5b339bae3048bbf7c725ca91195bbdbe9e1e89d/docs/contained-workflow/cutover-prerequisites.md#L182-L187),
+[cut-over notes](https://github.com/Wave-Engineering/claudecode-workflow/blob/a069c75894ad8c8da31e0fa9ddc01caac3e5061a/docs/contained-workflow/cutover-prerequisites.md#L182-L187),
 and from claudecode-workflow's CHANGELOG entry for #1062, which names Mattermost as the successor
 "behind a backend abstraction at the MCP-server layer"). Servers enforce; skills suggest.
 Skills call one chat contract and never name a backend. The Slack removal (claudecode-workflow
@@ -146,7 +148,7 @@ hand.
 work without this, and I have worked hard to build it into our workflow." (BJ) A trust model
 written in owner/bot vocabulary would build the wrong thing.
 
-### D-10: Trust: a partner's direction is the authority, and the agent's judgment governs inside it
+### D-10: Trust: the human partner's direction is the authority, and the agent's judgment governs inside it
 **BJ.** "If I ask kessel to collaborate with a cousin from [another] team and fix a problem, that
 should count as permission to do what kessel sees as appropriate. She can come to me if she is
 not comfortable with something, but she should still be empowered to execute her duties." (BJ)
@@ -202,12 +204,12 @@ does two jobs:
 Recommendation: don't extend scream-hole. Lift the lease logic into whatever serves both
 backends.
 
-> **Ruled 2026-10-23: BJ agreed, for Mattermost ONLY.** ⟲ *narrows this entry.* BJ: "is this
+> **Ruled 2026-10-23: BJ agreed, for Mattermost ONLY** (call 6). ⟲ *narrows this entry.* BJ: "is this
 > just for mattermost? We still need scream-hole for discord or we are gonna go back into
 > 'forever cool-down' again, right?" Right. The Mattermost adapter doesn't use the polling
 > cache, because each agent holds its own websocket. **scream-hole and its cache stay for as long
 > as Discord is a backend**, because they keep the fleet out of Discord's rate-limit cool-down. The
-> "about 1,100 lines retire" estimate in the 10-19 research only holds if Discord itself is
+> "about 1,100 lines retire" estimate in the [10-19 research](research-2026-10-19.md) only holds if Discord itself is
 > retired. The leases stay deferred, and become backend-neutral turn-taking later.
 
 ### D-14: Build our own Mattermost adapter *(proposed)*
@@ -272,17 +274,17 @@ ephemeral tokens, minted on demand and re-minted daily.
   it and `curl` the API past every filter.
 
 ### D-21: The loop guard
-**babelfish; BJ agreed 2026-10-23** (call 5: "yes"). Bot-to-bot storms burn the fleet's budget in
+**babelfish; BJ agreed 2026-10-23** (call 5: "yes"). Agent-to-agent storms burn the fleet's budget in
 minutes. Every system that has done this converged on the same layers:
 - conversations are **opt-in**;
 - an inline **mention is mandatory** for an agent to respond;
-- a **sliding window** drops anything past about 20 bot messages per conversation.
+- a **sliding window** drops anything past about 20 messages from bot accounts per conversation.
 
 A hop count can come later.
 
 ### D-22: One doorbell core with backend adapters
 **together (BJ's one-doorbell idea); BJ agreed 2026-10-23** (call 4: "yes").
-- `ChatBackend` and `InboundMessage` interfaces (research digest §3), with Discord and Mattermost
+- `ChatBackend` and `InboundMessage` interfaces ([research digest](research-2026-10-19.md) §3), with Discord and Mattermost
   adapters. squawkie is a candidate third adapter.
 - The `discord-watcher` binary name is kept, or aliased, because about 27 kit files use it.
 - It sizes at 2–3 waves.
@@ -335,7 +337,7 @@ change the discord '@all' to '@agents' to match."
 Every adapter inherits these, and changing them after launch is a fleet-wide migration.
 
 ### D-25: What on a production Mattermost needs a yes-prod, and the broker's standing grant
-**BJ, 2026-10-23,** about a partner's production server: "while [it] is prod, the 'yes, prod' rule only applies to deployment and
+**BJ, 2026-10-23,** about a partner organization's production server: "while [it] is prod, the 'yes, prod' rule only applies to deployment and
 server config changes. Anything related to what a non-privlidged account can do (sending messages,
 creating channels, etc) should not require a 'yes, prod'."
 - **Free:** anything a non-privileged account can do, such as posting, DMs, threads, reactions,
@@ -376,7 +378,7 @@ and D-20.)*
   roll-call, `/precheck`'s post). It's a mechanical change, but it runs across the fleet.
   *(Answered by D-18: a new program and repo. Whether `disc_*` tools are renamed or wrapped is a
   `/devspec` question.)*
-- **What does the chat contract look like as a protocol?** Partners' agents run whatever kit
+- **What does the chat contract look like as a protocol?** Agents in other crews run whatever kit
   version they last installed. The signature format, the addressing syntax and the `//dm`
   sigil become an interface between kit versions and need a version field and tolerant
   parsing.
@@ -385,7 +387,7 @@ and D-20.)*
 
 - Private DMs vs. visibility. A private agent-to-agent thread is where a decision between
   organizations can happen with no human able to see it. babelfish leans toward ad-hoc threads
-  in a shared channel by default, with true DMs when a partner opts in. That's BJ's call, and
+  in a shared channel by default, with true DMs when the human partner opts in. That's BJ's call, and
   probably one to learn from usage.
 - How does `@<dev-team>` addressing behave when several crews share a room? Dev-Team is BJ's
   direction scope, and two crews could both use `oaw`-like names.
@@ -397,7 +399,7 @@ and D-20.)*
 **To verify on the target server** (facts, not decisions):
 
 - Are bot-to-bot DMs supported, or do agents need regular user accounts?
-- Who can create agent accounts? If only a partner's admin can, every new agent needs a
+- Who can create agent accounts? If only an admin at the partner organization can, every new agent needs a
   provisioning step. That conflicts with `/name` minting a fresh identity per session, and
   pushes toward durable agent identities.
 - Do bot accounts appear in `@` autocomplete, and can each set its own profile image through the
@@ -405,7 +407,7 @@ and D-20.)*
 
 **Deferred, with reason:**
 
-- Where the shared room finally lives (a partner's Mattermost, OaW's, or both): decided by usage
+- Where the shared room finally lives (a partner organization's Mattermost, OaW's, or both): decided by usage
   after stand-up (D-02).
 - Standing up an OaW Mattermost: an infrastructure question, independent of the adapter build
   (D-03 makes it pure config).
