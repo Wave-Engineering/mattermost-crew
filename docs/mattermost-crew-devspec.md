@@ -446,7 +446,7 @@ Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. 
 
 ### 5.11 Kiosk
 
-- **Routing:** when social is off and the kiosk is on, an outsider's message goes to the expert's kiosk session (R-31). There is **one session per expert per server**, matching the per-server transcripts, started lazily on the first outsider message on that server. Outsiders on different servers never share a session (D-02).
+- **Routing:** when social is off and the kiosk is on, an outsider's message goes to the expert's kiosk session (R-31). There is **one session per expert per server**, matching the per-server transcripts, started lazily on the first outsider message on that server. Outsiders on different servers never share a session (S-02).
 - **Seed:** the shim, as the agent's user, reads `.claude/reseed-revive.md`, extracts **only** the `## Kiosk` section with `crewchat_clients.brief.extract_brief` (from that heading to the next `## ` heading or the end of the file), and pushes only that text with `kiosk_brief`. It pushes again whenever the file's mtime changes. Nothing else from the seed ever crosses the socket (R-32, D-072). An absent or empty section gives a fixed reply: "I have nothing to share yet."
 - **Session:** the kiosk is a tool-less model session. Its prompt is:
   - a fixed kiosk header;
@@ -775,9 +775,10 @@ Answers the open questions that could overturn a locked decision, before any cod
    - (a) As the `crewkiosk` user, with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`, with the brief in the prompt. Ask it to run a shell command and record whether it ran. Then prove, **from the CLI's own transcript or debug output and not from our argv**, that no user, project or local settings, no hooks and no `CLAUDE.md` loaded. Plant a hook and a `CLAUDE.md` in the usual locations first, **and a hook in the managed-settings location**, so the proof is against something present; then confirm the kiosk host has no managed settings configured.
    - (b) a direct model API call with no tool definitions.
    Record latency, cost per question and the credentials each needs. **Name the kiosk's model credential: its path and its owner.** It must not be any chat or broker credential.
-5. **Question 7 (remote broker transport):** write a one-page design note in the spike doc for a broker on another host, e.g. mutual-TLS TCP. It is not built in this Plan.
-6. Post one `[ledger D-NNN]` comment per answer on Plan #3. Where an answer changes a locked decision, the entry carries `**Supersedes:**`.
-7. Update §5.N of this Dev Spec with the answer and the ledger ID for each question.
+5. **Question 9 (11.8 compatibility):** start a local `mattermost-team-edition` 11.8 container at the same patch Story 1.1 pins. Repeat question 8's `owner_id` and reassignment checks, apply the `system_user_access_token` role patch, create and revoke a token, and record that `expires_at` is detected as absent (R-07). Record anything that behaves differently from 11.11 as a §5.N answer with its ledger ID.
+6. **Question 7 (remote broker transport):** write a one-page design note in the spike doc for a broker on another host, e.g. mutual-TLS TCP. It is not built in this Plan.
+7. Post one `[ledger D-NNN]` comment per answer on Plan #3. Where an answer changes a locked decision, the entry carries `**Supersedes:**`.
+8. Update §5.N of this Dev Spec with the answer and the ledger ID for each question.
 
 **Test Procedures:**
 
@@ -794,6 +795,7 @@ Answers the open questions that could overturn a locked decision, before any cod
 - [ ] If the CLI runner is chosen, the spike doc shows from the CLI's own output that no user, project or local settings, hooks or `CLAUDE.md` loaded, with a planted hook (including in the managed-settings location) and `CLAUDE.md` present. [R-31, R-32]
 - [ ] The kiosk's model credential is named, with its path and owner, and is not a chat or broker credential. [R-08, R-31]
 - [ ] Bot `owner_id` behaviour is verified as §5.9's membership rule needs: set by the creator, visible to other users, not changeable by the bot, and reassignable by the owner. [R-22]
+- [ ] On an 11.8 container, the `owner_id` and reassignment checks, the role patch, and token create/revoke are re-run and recorded, and the absence of `expires_at` is detected. [CT-11, R-07]
 - [ ] Every answer has a `[ledger]` entry on Plan #3; those that change a decision supersede it.
 - [ ] §5.N of the Dev Spec cites each answer's ledger ID.
 

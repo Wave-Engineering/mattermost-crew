@@ -14,8 +14,7 @@ BJ has since ruled on.
 **Roadmap slot:** after mcp-server-nerf#32 (BJ). That slot arrived on 2026-10-23: nerf, the
 precheck gate split, sqtk and `/onboard` have all shipped. **Status (2026-10-24):** the Dev Spec is
 approved (Plan #3 D-088) and amended pre-kickoff (D-089 to D-092); phases run as Plans #26, #27, #28.
-BJ ruled all 8 calls of
-the decision brief on 2026-10-23: call 1 is D-03's note, 2 is D-19, 3 is D-20 (which revises D-14),
+BJ ruled all 8 calls of the decision brief on 2026-10-23: call 1 is D-03's note, 2 is D-19, 3 is D-20 (which revises D-14),
 4 is D-22, 5 is D-21, 6 is D-13's note, 7 is D-24 and 8 is D-23. D-25 (the prod scope) and D-26 (the
 order of work) were ruled the same day. D-18 dates from 2026-10-18.
 
