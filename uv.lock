@@ -420,6 +420,12 @@ wheels = [
 name = "crewbroker"
 version = "0.1.0"
 source = { editable = "packages/broker" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28" }]
 
 [[package]]
 name = "crewchat"
