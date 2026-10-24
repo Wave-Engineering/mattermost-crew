@@ -1,0 +1,28 @@
+# The mattermost-crew broker: one instance per (crew, Mattermost server) (Dev Spec §5.6).
+#
+#   systemctl enable --now crewbroker@<crew>-<server_id>
+#
+# Needs packaging/crewbroker.tmpfiles.conf installed first (/run/crewbroker, setgid crewchat),
+# /etc/crewbroker/%i.toml and /etc/crewbroker/%i.credential (mode 0600, owner crewbroker).
+[Unit]
+Description=mattermost-crew broker for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=crewbroker
+Group=crewbroker
+ExecStart=/opt/mattermost-crew/.venv/bin/crewbroker serve %i
+Restart=on-failure
+RestartSec=5
+UMask=0077
+ProtectSystem=strict
+StateDirectory=crewbroker/%i
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/crewbroker/%i /run/crewbroker
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

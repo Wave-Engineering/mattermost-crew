@@ -27,6 +27,11 @@ MM_PREFIX="${MM_PREFIX:-mmcrew}"
 MM_ENV_FILE="${MM_ENV_FILE:-.mattermost.env}"
 MM_PG_IMAGE="${MM_PG_IMAGE:-postgres:16-alpine}"
 MM_READY_TIMEOUT="${MM_READY_TIMEOUT:-240}"
+# Resource caps: malory is a shared host, so every container is capped there.
+MM_CPUS="${MM_CPUS:-1}"
+MM_MEMORY="${MM_MEMORY:-1g}"
+MM_PG_CPUS="${MM_PG_CPUS:-0.5}"
+MM_PG_MEMORY="${MM_PG_MEMORY:-512m}"
 
 ADMIN_USER="${MM_ADMIN_USER:-crewadmin}"
 ADMIN_EMAIL="${MM_ADMIN_EMAIL:-crewadmin@example.com}"
@@ -52,7 +57,7 @@ fi
 
 log "starting $MM_IMAGE on $MM_URL"
 docker network create "$NET" >/dev/null
-docker run -d --name "$PG" --network "$NET" \
+docker run -d --name "$PG" --network "$NET" --cpus "$MM_PG_CPUS" --memory "$MM_PG_MEMORY" \
   -e POSTGRES_USER=mmuser -e POSTGRES_PASSWORD=mmuser-pw -e POSTGRES_DB=mattermost \
   "$MM_PG_IMAGE" >/dev/null
 
@@ -60,6 +65,7 @@ docker run -d --name "$PG" --network "$NET" \
 # environment locks them in the System Console, which is what we want: the dev space's limits
 # are fixed, and tests must live within them.
 docker run -d --name "$MM" --network "$NET" -p "127.0.0.1:${MM_PORT}:8065" \
+  --cpus "$MM_CPUS" --memory "$MM_MEMORY" \
   -e MM_SQLSETTINGS_DRIVERNAME=postgres \
   -e "MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mmuser-pw@${PG}:5432/mattermost?sslmode=disable&connect_timeout=10" \
   -e "MM_SERVICESETTINGS_SITEURL=${MM_URL}" \
