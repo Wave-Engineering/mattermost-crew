@@ -1,0 +1,120 @@
+
+## server
+GET /system/ping -> 200
+X-Version-Id: 11.11.3.39677079611.ed689ba8be41c67e67e1d3a5b03880c6ec2e0086b58602eb45cca0b282b97d12.false
+
+## setup: users broker, observer, newowner and a team (as admin)
+POST /users -> 201
+POST /users -> 201
+POST /users -> 201
+broker=fgc5ebwibi86jp5kwhjch7mo7a observer=h7g3hbwpyjfam8pdzejtwohyuw newowner=fsosh3zfojfxdq1pmbrxihssjy
+POST /teams -> 201
+POST /teams/hug86wq6rbb13dbwk7ym61njte/members -> 201
+POST /teams/hug86wq6rbb13dbwk7ym61njte/members -> 201
+POST /teams/hug86wq6rbb13dbwk7ym61njte/members -> 201
+
+## role patch: add create_bot, read_bots, manage_bots to system_user_access_token
+GET /roles/name/system_user_access_token -> 200
+["create_bot","create_user_access_token","manage_bots","read_bots","read_user_access_token","revoke_user_access_token"]
+PUT /roles/reezzzwiitny7j64x9feo9d4yh/patch -> 200
+["create_bot","create_user_access_token","manage_bots","read_bots","read_user_access_token","revoke_user_access_token"]
+PUT /users/fgc5ebwibi86jp5kwhjch7mo7a/roles -> 200
+GET /users/me -> 200
+{"id":"fgc5ebwibi86jp5kwhjch7mo7a","roles":"system_user system_user_access_token"}
+
+## Q8: the broker creates a bot account
+POST /bots -> 201
+{"user_id":"5tbsrxwpt7bu5x4hriihkgef3o","username":"agent-a-0cb9ff","owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}
+POST /bots -> 201
+POST /teams/hug86wq6rbb13dbwk7ym61njte/members -> 201
+POST /teams/hug86wq6rbb13dbwk7ym61njte/members -> 201
+
+## Q8: read the bot as a second user (observer, a plain system_user)
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 404
+{"user_id":null,"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+GET /users/5tbsrxwpt7bu5x4hriihkgef3o -> 200
+{"id":"5tbsrxwpt7bu5x4hriihkgef3o","is_bot":true,"bot_description":null,"roles":"system_user"}
+user object keys: ["auth_data","auth_service","create_at","delete_at","disable_welcome_email","email","first_name","id","is_bot","last_name","locale","nickname","position","roles","timezone","update_at","username"]
+
+## Q8: mint the bot's own token (broker), then read as the bot itself
+POST /users/5tbsrxwpt7bu5x4hriihkgef3o/tokens -> 200
+{"id":"56xamxgosfyjxnuxwwgqnksxar","user_id":"5tbsrxwpt7bu5x4hriihkgef3o","description":"spike bot a","is_active":true,"expires_at":0}
+POST /users/jqu17gkrz38wxb8p6azm31gs4e/tokens -> 200
+GET /bots/jqu17gkrz38wxb8p6azm31gs4e -> 404
+{"user_id":null,"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 404
+{"user_id":null,"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+
+## Q8: who CAN read owner_id: the owner (broker, read_bots) and an admin (read_others_bots)
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 200
+{"user_id":"5tbsrxwpt7bu5x4hriihkgef3o","owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}
+GET /bots?per_page=200 -> 200
+[{"user_id":"5tbsrxwpt7bu5x4hriihkgef3o","owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"},{"user_id":"jqu17gkrz38wxb8p6azm31gs4e","owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}]
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 200
+{"user_id":"5tbsrxwpt7bu5x4hriihkgef3o","owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}
+
+## Q8: the bot tries to change its own owner
+POST /bots/5tbsrxwpt7bu5x4hriihkgef3o/assign/h7g3hbwpyjfam8pdzejtwohyuw -> 404
+{"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+POST /bots/5tbsrxwpt7bu5x4hriihkgef3o/assign/5tbsrxwpt7bu5x4hriihkgef3o -> 404
+{"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+PUT /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 404
+{"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 200
+{"owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}
+
+## Q8: the owner (broker) reassigns the bot
+POST /bots/5tbsrxwpt7bu5x4hriihkgef3o/assign/fsosh3zfojfxdq1pmbrxihssjy -> 200
+{"owner_id":"fsosh3zfojfxdq1pmbrxihssjy","status_code":null,"id":null}
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 200
+GET /bots/5tbsrxwpt7bu5x4hriihkgef3o -> 404
+{"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+POST /bots/5tbsrxwpt7bu5x4hriihkgef3o/assign/fgc5ebwibi86jp5kwhjch7mo7a -> 404
+{"owner_id":null,"status_code":404,"id":"store.sql_bot.get.missing.app_error"}
+(broker re-assigning back after losing ownership -> 404)
+POST /bots/5tbsrxwpt7bu5x4hriihkgef3o/assign/fgc5ebwibi86jp5kwhjch7mo7a -> 200
+{"owner_id":"fgc5ebwibi86jp5kwhjch7mo7a"}
+
+## Q6: a bot-to-bot DM
+POST /channels/direct -> 201
+{"id":"5xbrwjtksbgj3g1dmsi6utjhow","type":"D","status_code":null}
+POST /posts -> 201
+{"id":"errnakyggtga5q6u55utkka9ae","user_id":"5tbsrxwpt7bu5x4hriihkgef3o","props":{"crew_proto":1,"from_bot":"true"},"status_code":null}
+GET /channels/5xbrwjtksbgj3g1dmsi6utjhow/posts?per_page=5 -> 200
+[{"user_id":"5tbsrxwpt7bu5x4hriihkgef3o","message":"bot a to bot b","props":{"crew_proto":1,"from_bot":"true"}}]
+
+## Q6: bots in @ autocomplete, and their avatars
+GET /users/autocomplete?in_team=hug86wq6rbb13dbwk7ym61njte&name=agent-a -> 200
+[{"id":"5tbsrxwpt7bu5x4hriihkgef3o","username":"agent-a-0cb9ff","is_bot":true,"last_picture_update":null}]
+POST /users/{bot}/image as the bot -> 403
+POST /users/{bot}/image as the owner (broker) -> 200
+POST /bots/{bot}/icon (SVG) as the owner (broker) -> 404
+GET /users/autocomplete?in_team=hug86wq6rbb13dbwk7ym61njte&name=agent- -> 200
+[{"username":"agent-a-0cb9ff","is_bot":true,"last_picture_update":1792828293200},{"username":"agent-b-0cb9ff","is_bot":true,"last_picture_update":null}]
+avatar sha256 as seen by observer: bot a 3f65ab4a24b24dfd, bot b (default) c522e18110f6c0fd
+
+## Q9/R-07: token create, native expiry detection, revoke
+GET /users/tokens/56xamxgosfyjxnuxwwgqnksxar -> 200
+{"id":"56xamxgosfyjxnuxwwgqnksxar","user_id":"5tbsrxwpt7bu5x4hriihkgef3o","description":"spike bot a","is_active":true,"expires_at":0}
+native token expiry: present (detected by the expires_at key on the token object)
+POST /users/jqu17gkrz38wxb8p6azm31gs4e/tokens -> 200
+{"id":"3kw135r6hf837mzqguio3wmicc","user_id":"jqu17gkrz38wxb8p6azm31gs4e","description":"spike expiring","is_active":true,"expires_at":1792914693000}
+GET /users/me -> 200
+POST /users/tokens/revoke -> 200
+GET /users/me -> 401
+
+## summary
+PASS  role patch applied  (PUT /roles/{id}/patch -> 200)
+PASS  role assigned to broker  (PUT /users/{id}/roles -> 200)
+PASS  owner_id set to the creator  (POST /bots -> 201, owner_id=fgc5ebwibi86jp5kwhjch7mo7a)
+PASS  owner_id readable by its owner (broker)  (broker GET /bots/{id} -> 200)
+FAIL  owner_id visible to another user  (observer GET /bots/{id} -> 404, bot GET /bots/{id} -> 404)
+PASS  bot cannot change its owner  (assign->observer 404, assign->self 404, PUT /bots owner_id 404 (owner_id in reply: none); owner after: fgc5ebwibi86jp5kwhjch7mo7a)
+PASS  owner can reassign the bot  (POST /bots/{id}/assign/{user} as broker -> 200; owner now fsosh3zfojfxdq1pmbrxihssjy)
+PASS  former owner no longer sees the bot  (broker GET /bots/{id} after reassignment -> 404)
+PASS  bot-to-bot DM supported  (create DM 201, post 201, other bot reads 200)
+PASS  bots appear in @ autocomplete  (GET /users/autocomplete?in_team&name -> 200)
+PASS  bots carry their own avatars (set by the owner)  (as bot 403, as owner 200, icon 404; hashes a=3f65ab4a24b24dfd b=c522e18110f6c0fd)
+PASS  native expiry detected  (expires_at key present)
+PASS  token created with native expiry  (POST /users/{id}/tokens expires_at -> 200)
+PASS  token create/revoke  (bot token works 200, revoke 200, after revoke 401)
