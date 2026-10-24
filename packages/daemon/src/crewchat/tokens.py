@@ -102,12 +102,19 @@ class BrokerClient:
             raise BrokerUnavailable(f"{self.name}: {op}: the result is not an object")
         return result
 
-    async def mint(self, dev_name: str, crew: str) -> dict[str, Any]:
-        """`{account, token, token_id}`. Only `Registry.register` may call this (R-30)."""
-        return await self.call("mint", {"dev_name": dev_name, "crew": crew})
+    async def mint(self, dev_name: str, crew: str, current_token_id: str | None) -> dict[str, Any]:
+        """`{account, token, token_id}`. Only `Registry.register` may call this (R-30).
 
-    async def remint(self, dev_name: str, crew: str) -> dict[str, Any]:
-        return await self.call("remint", {"dev_name": dev_name, "crew": crew})
+        `current_token_id` is the token the daemon holds for this account on this server, or
+        None. The broker revokes the account's other tokens, so one minted by a call whose
+        reply timed out here is not left live (#41).
+        """
+        args = {"dev_name": dev_name, "crew": crew, "current_token_id": current_token_id}
+        return await self.call("mint", args)
+
+    async def remint(self, dev_name: str, crew: str, current_token_id: str) -> dict[str, Any]:
+        args = {"dev_name": dev_name, "crew": crew, "current_token_id": current_token_id}
+        return await self.call("remint", args)
 
     async def revoke(self, token_id: str) -> dict[str, Any]:
         return await self.call("revoke", {"token_id": token_id})
@@ -275,6 +282,13 @@ class TokenStore:
     def agent(self, dev_name: str) -> AgentTokens | None:
         return self._agents.get(dev_name)
 
+    def held_token_id(self, dev_name: str, crew: str, server_id: str) -> str | None:
+        """The token id `dev_name` holds in `crew` on `server_id`, if any."""
+        agent = self._agents.get(dev_name)
+        if agent is None or agent.crew != crew or server_id not in agent.servers:
+            return None
+        return agent.servers[server_id].token_id
+
     def agents(self) -> list[AgentTokens]:
         return [self._agents[name] for name in sorted(self._agents)]
 
@@ -352,8 +366,9 @@ class TokenStore:
         if agent is None or server_id not in agent.servers:
             raise KeyError(f"{dev_name} holds no token on {server_id}")
         client = self._client(agent, server_id)
-        result = await client.remint(dev_name, agent.crew)
-        await self._swap(agent, server_id, _server_token(result, agent.servers[server_id].account))
+        held = agent.servers[server_id]
+        result = await client.remint(dev_name, agent.crew, held.token_id)
+        await self._swap(agent, server_id, _server_token(result, held.account))
 
     async def refresh(self, dev_name: str, server_id: str, failed_token: str) -> None:
         """A 401 on `failed_token`: the rotation sequence with `remint`, never `mint` (R-30).

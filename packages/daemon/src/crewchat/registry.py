@@ -124,7 +124,8 @@ class Registry:
                     continue
                 client = self.brokers[(crew, server.id)]
                 try:
-                    minted = await client.mint(dev_name, crew)
+                    held = self.store.held_token_id(dev_name, crew, server.id)
+                    minted = await client.mint(dev_name, crew, held)
                 except (BrokerError, BrokerUnavailable) as exc:
                     log.error("register %s on %s: %s", account, server.id, exc)
                     unavailable.append(server.id)

@@ -29,6 +29,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from types import EllipsisType
 from typing import Any
 
 from crewbroker import config as cfg
@@ -41,8 +42,9 @@ from crewbroker.mint import (
     mint_token,
     native_expiry_supported,
     record_register,
+    revoke_superseded,
 )
-from crewbroker.prune import prune_idle, reconcile_tokens
+from crewbroker.prune import prune_idle
 from crewbroker.state import AccountStore, TokenStore
 
 PROTO = 1
@@ -106,9 +108,38 @@ class Broker:
     def _expiry(self) -> bool:
         return native_expiry_supported(self.client, self.server_key, self.config.broker_user_id)
 
+    def _held(self, args: dict[str, Any]) -> str | EllipsisType | None:
+        """`current_token_id`: the token the daemon holds for this account, or null for none.
+
+        Absent (an older daemon) returns `...`, and nothing is revoked.
+        """
+        if "current_token_id" not in args:
+            return ...
+        held = args["current_token_id"]
+        if held is not None and (not isinstance(held, str) or not held):
+            raise OpError("bad_request", "current_token_id is a token id or null")
+        return held
+
+    def _supersede(self, bot_id: str, held: str | EllipsisType | None, new_id: str) -> None:
+        """Revoke the account's tokens other than `held` and `new_id` (#41).
+
+        A best-effort cleanup after the mint: its errors are logged and never fail the op.
+        """
+        if held is ...:
+            return
+        keep = {new_id} | ({held} if held else set())
+        try:
+            gone = revoke_superseded(self.client, bot_id, self.tokens, keep)
+        except Exception:
+            log.exception("revoking superseded tokens of %s failed", bot_id)
+            return
+        if gone:
+            log.info("revoked superseded tokens of %s: %s", bot_id, ", ".join(gone))
+
     def mint(self, args: dict[str, Any]) -> dict[str, Any]:
         """Only the daemon's `register` causes a mint; it is the one op that records it."""
         name = self._name(args)
+        held = self._held(args)
         with self._lock:
             try:
                 bot_id = ensure_bot(self.client, name, self.accounts, self.config.broker_user_id)
@@ -120,12 +151,14 @@ class Broker:
             token = mint_token(
                 self.client, bot_id, self.tokens, expiry_supported=self._expiry(), now=now
             )
+            self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
         return {"account": name, "token": token.token, "token_id": token.token_id}
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
-        """A fresh token for an existing account; the old one stays valid until `revoke`."""
+        """A fresh token for an existing account; the held one stays valid until `revoke`."""
         name = self._name(args)
+        held = self._held(args)
         with self._lock:
             acct = self.accounts.get(name)
             if acct is None:
@@ -145,6 +178,7 @@ class Broker:
                 expiry_supported=self._expiry(),
                 now=self.clock(),
             )
+            self._supersede(acct.bot_user_id, held, token.token_id)
         log.info("remint: %s token %s", name, token.token_id)
         return {"token": token.token, "token_id": token.token_id}
 
@@ -190,12 +224,8 @@ class Broker:
         }
 
     def prune(self) -> list[str]:
-        """The daily job: deactivate idle accounts, then revoke orphaned tokens."""
         with self._lock:
-            now = self.clock()
-            pruned = prune_idle(self.client, self.accounts, now)
-            reconcile_tokens(self.client, self.tokens, now)
-            return pruned
+            return prune_idle(self.client, self.accounts, self.clock())
 
     def ops(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
         return {
@@ -288,7 +318,7 @@ class BrokerServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def start_prune_scheduler(
     broker: Broker, stop: threading.Event, interval_s: float = PRUNE_INTERVAL_S
 ) -> threading.Thread:
-    """Run the daily job (`Broker.prune`) now and then daily, until `stop` is set."""
+    """Run `prune_idle` now and then daily, until `stop` is set."""
 
     def loop() -> None:
         while not stop.is_set():

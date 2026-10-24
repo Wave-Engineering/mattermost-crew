@@ -3,10 +3,6 @@
 Only `register` (through `mint`) counts as activity. Rotation is the daemon's job (Story
 1.4), and a `remint` never touches `last_register`, so an account that is re-minted daily
 but never registered still ages out.
-
-The same daily job reconciles `tokens.json` (`reconcile_tokens`): a token the daemon never
-learned of, because its `mint` or `remint` timed out on the daemon's side, would otherwise
-stay live forever on a server with no native expiry.
 """
 
 from __future__ import annotations
@@ -14,14 +10,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from crewbroker.mattermost import MattermostAPI, MattermostError, NotFound
-from crewbroker.state import AccountStore, TokenRecord, TokenStore
+from crewbroker.mattermost import MattermostAPI, NotFound
+from crewbroker.state import AccountStore
 
 DEFAULT_IDLE_DAYS = 30
-# The daemon rotates at startup and every 24 h, so the token an agent uses is never older than
-# that plus a swap. A token that is not its bot's newest and is older than this is one the
-# daemon will never revoke: most often a mint whose reply the daemon timed out on (#41).
-ORPHAN_AGE = timedelta(hours=27)
 
 log = logging.getLogger(__name__)
 
@@ -54,39 +46,3 @@ def prune_idle(
         pruned.append(acct.name)
         log.info("prune: deactivated %s, last registered %s", acct.name, acct.last_register)
     return pruned
-
-
-def reconcile_tokens(
-    client: MattermostAPI,
-    tokens: TokenStore,
-    now: datetime,
-    max_age: timedelta = ORPHAN_AGE,
-) -> list[str]:
-    """Revoke every token that is not its bot's newest and is older than `max_age`.
-
-    Each bot's newest token is always kept, however old: the daemon may be down, and that
-    token is the one it will use when it comes back. Returns the token ids revoked. An
-    upstream 404 means the token is already gone and clears the entry. Any other error keeps
-    the entry for the next day's run.
-    """
-    by_bot: dict[str, list[TokenRecord]] = {}
-    for rec in tokens.all():
-        by_bot.setdefault(rec.user_id, []).append(rec)
-    cutoff = now - max_age
-    revoked: list[str] = []
-    for recs in by_bot.values():
-        recs.sort(key=lambda r: r.created_at)
-        for rec in recs[:-1]:
-            if rec.created_at >= cutoff:
-                continue
-            try:
-                client.revoke_token(rec.token_id)
-            except NotFound:
-                log.warning("reconcile: token %s is already gone upstream", rec.token_id)
-            except MattermostError as exc:
-                log.error("reconcile: revoke %s failed: %s; will retry", rec.token_id, exc)
-                continue
-            tokens.remove(rec.token_id)
-            revoked.append(rec.token_id)
-            log.info("reconcile: revoked orphan token %s, minted %s", rec.token_id, rec.created_at)
-    return revoked

@@ -19,7 +19,9 @@ def test_register_returns_account_name(daemon: Any) -> None:
     reg = register(daemon)
     assert reg.account == "babel.oaw"
     assert reg.result()["account"] == "babel.oaw"
-    assert daemon.broker().ops("mint") == [{"dev_name": "babel", "crew": "oaw"}]
+    assert daemon.broker().ops("mint") == [
+        {"dev_name": "babel", "crew": "oaw", "current_token_id": None}
+    ]
     # One registration per Dev-Name, taken at its word (D-055).
     assert daemon.registry.get("babel") is reg
     assert reg.session_id == "s1"
@@ -56,6 +58,8 @@ def test_reregister_revokes_previous_token(daemon: Any) -> None:
         ("broker", "revoke"),
         ("broker", "crew_info"),
     ]
+    # The mint names the token held, so the broker keeps it live until the swap (#41).
+    assert broker.ops("mint")[-1]["current_token_id"] == first.token_id
     assert broker.ops("revoke") == [{"token_id": first.token_id}]
     # The swap came first: at revoke time the store already held the new token.
     assert seen == [second.token]
