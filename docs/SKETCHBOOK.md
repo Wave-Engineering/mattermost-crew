@@ -259,8 +259,9 @@ ephemeral tokens, minted on demand and re-minted daily.
 - The broker is **non-admin**. A one-time patch adds `create_bot`, `read_bots` and
   `manage_bots` to the `system_user_access_token` role, which is assigned to the broker account
   only. Any account holding that role can create bots, so keep it to the broker.
-- On a server without native token expiry (before 11.10), revocation by the broker is the
-  only expiry. 11.10 or later adds native expiry and rotation.
+- On a server without native token expiry (before 11.9), revocation by the broker is the
+  only expiry. 11.9 adds native `expires_at`; 11.10 adds a maximum lifetime and rotation.
+  *(Corrected 2026-10-23: this said 11.10 for expiry; the research digest's §5 has 11.9.)*
 
 ### D-20: Agents read and write through OUR MCP server; the token is never agent-readable
 **together; BJ agreed 2026-10-23** (call 3: "yes"). It revises the 10-19 shape after BJ's 10-20
@@ -301,7 +302,8 @@ Discord kill switch.
   - **social** admits anyone, expires on its own, and marks outsiders' messages "from outside the
     crew", as data.
 - **Only BJ flips it, and the broker holds it.** An agent-flippable switch is defeated by the first
-  successful coaxing.
+  successful coaxing. *(Generalized 2026-10-23 in the `/devspec` walk, Plan #3 D-018: only the
+  crew's human partner flips that crew's switch, which for crews partnered with BJ is still BJ.)*
 - **It fails closed:** if crew can't be resolved, nothing is delivered.
 - **Membership is by Mattermost user ID, never display name.** The broker is the source of truth for
   the bots it minted, plus named humans.
