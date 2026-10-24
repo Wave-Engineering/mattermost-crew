@@ -76,6 +76,9 @@ class Registration:
     needs_list: str
     registered_at: datetime
     unavailable: list[str] = field(default_factory=list)
+    # The agent's Dev-Team (BJ's direction scope, S-11), for `@<dev-team>` addressing (R-17).
+    # `register` doesn't carry it (§5.3); empty until the shim pushes it.
+    dev_team: str = ""
 
     def result(self) -> dict[str, Any]:
         """What `register` answers. Never a token (R-08)."""

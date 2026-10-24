@@ -6,9 +6,9 @@ Mattermost, the token the store holds for (dev_name, server_id).
 
 `InboundMessage` is what every backend hands the daemon, from a pull (`read`, `thread`) or the
 push stream (`stream`). Its `proto` is the sender's protocol marker, 0 when the message has
-none (R-14). `is_bot` and `kiosk` feed §5.9's membership rule. Ownership is not here: a bot
-token can't read another bot's owner, so ownership comes from the brokers'
-`crew_info.minted_bot_ids` (D-100).
+none (R-14). `dm` feeds addressing (R-19, Story 2.3). `is_bot` and `kiosk` feed §5.9's
+membership rule. Ownership is not here: a bot token can't read another bot's owner, so
+ownership comes from the brokers' `crew_info.minted_bot_ids` (D-100).
 """
 
 from __future__ import annotations
@@ -32,6 +32,9 @@ class InboundMessage:
     ts: float = 0.0  # creation time, seconds since the epoch
     is_bot: bool = False  # the author's user object `is_bot`, never a post prop
     kiosk: bool = False  # the post carries `props.crew_kiosk == 1` (§5.9)
+    # A direct message to the receiving agent: a DM channel whose members are the author and
+    # that agent (R-19). Set on the push path, the only one addressing reads (R-21).
+    dm: bool = False
 
 
 class ChatBackend(Protocol):

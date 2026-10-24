@@ -11,7 +11,8 @@ two distinct authors (R-01).
   lost connection is retried with exponential backoff, capped at 60 s (CT-07). A `posted`
   event becomes an `InboundMessage` whose `mentions` are the event's own `mentions` field,
   never parsed from the text (R-29). The agent's own posts are dropped by user ID, whatever
-  their text says (R-04).
+  their text says (R-04). Its `dm` is true when the event's channel is a direct-message
+  channel (`channel_type` `D`) whose two members are the author and the agent (R-19).
 - `on_token_rotated(dev_name)` closes the agent's websocket when its token changed, and the
   stream reopens it at once with the new token: revoking a token doesn't close an open
   websocket, it only stops its events (§4.8). The reconnect asks the server to resume the
@@ -139,6 +140,17 @@ def event_mentions(data: Mapping[str, Any]) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [m for m in raw if isinstance(m, str)]
+
+
+def event_dm(data: Mapping[str, Any], author_id: str, me: str | None) -> bool:
+    """A `posted` event in a DM channel whose members are `author_id` and the agent `me` (R-19).
+
+    A DM channel's name is its two members' user IDs joined by `__`.
+    """
+    if me is None or not author_id or data.get("channel_type") != "D":
+        return False
+    members = str(data.get("channel_name", "")).split("__")
+    return len(members) == 2 and sorted(members) == sorted([author_id, me])
 
 
 @dataclass
@@ -269,7 +281,12 @@ class MattermostBackend:
         return user
 
     async def message(
-        self, client: MattermostClient, post: Mapping[str, Any], mentions: list[str] | None = None
+        self,
+        client: MattermostClient,
+        post: Mapping[str, Any],
+        mentions: list[str] | None = None,
+        *,
+        dm: bool = False,
     ) -> InboundMessage:
         """Map a Mattermost post object to an `InboundMessage`."""
         author_id = str(post.get("user_id", ""))
@@ -289,6 +306,7 @@ class MattermostBackend:
             ts=create_at / 1000.0 if isinstance(create_at, int | float) else 0.0,
             is_bot=user.get("is_bot") is True,
             kiosk=post_kiosk(props),
+            dm=dm,
         )
 
     async def _messages(
@@ -423,9 +441,10 @@ class MattermostBackend:
         if agent.user_id is not None and post.get("user_id") == agent.user_id:
             return None  # echo, by user ID only (R-04)
         mentions = event_mentions(data)
+        dm = event_dm(data, str(post.get("user_id", "")), agent.user_id)
 
         async def request(client: MattermostClient) -> InboundMessage:
-            return await self.message(client, post, mentions)
+            return await self.message(client, post, mentions, dm=dm)
 
         try:
             return await self._call(dev_name, request)
