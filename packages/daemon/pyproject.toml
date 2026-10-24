@@ -11,6 +11,9 @@ dependencies = [
     "httpx>=0.28",
 ]
 
+[project.scripts]
+crewchat = "crewchat.__main__:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

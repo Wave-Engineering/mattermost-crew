@@ -47,8 +47,12 @@ jobs:
         run: ./scripts/ci/ci.sh
       - name: Start broker
         run: ./scripts/ci/broker-up.sh
+      - name: Start daemon
+        run: ./scripts/ci/daemon-up.sh
       - name: make verify-install
         run: make verify-install
+      - name: Installed tests (IT-01)
+        run: ./scripts/ci/installed-test.sh
       - name: Mattermost logs
         if: failure()
         run: ./scripts/ci/mattermost-logs.sh
