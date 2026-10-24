@@ -292,7 +292,7 @@ Project-specific rules. `/ccfold` preserves this section on re-fold.
 - **Ledgers.** `docs/SKETCHBOOK.md` is cited as **S-NN**, and Plan #3's `[ledger]` comments as **D-NNN**. Older text may still say "sketchbook D-xx", which means S-xx. New decisions go on Plan #3 as `[ledger D-NNN]` comments, and a changed decision carries `**Supersedes:**`.
 - **Plans.** Plan #3 is the program Plan and holds the ledger. Each phase is its own Plan and campaign (D-065): Phase 1 is #26, Phase 2 is #27 and Phase 3 is #28.
 - **Wave plan files.** The per-phase plans are committed in `.claude/phases/phase-N.json`. `.claude/status/phases-waves.json` is the active phase only. Start a phase with `wave-status init --force .claude/phases/phase-N.json`, after the previous phase's release PR has merged, then commit the result. Never use `--extend` here: it keeps the old `plan_id`.
-- **Production.** Development runs against a throwaway Mattermost container or the OaW dev space, and neither needs a yes-prod (CP-06). Wiping the dev space needs BJ. On any partner organization's production server, deploys, server settings and the broker's role patch need the human partner's yes-prod (D-25, CP-03).
+- **Production.** Development runs against a throwaway Mattermost container or the OaW dev space, and neither needs a yes-prod (CP-06). Wiping the dev space needs BJ. On any partner organization's production server, deploys, server settings and the broker's role patch need the human partner's yes-prod (S-25, CP-03).
 
 ## Agent Identity
 
