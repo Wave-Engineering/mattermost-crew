@@ -317,9 +317,8 @@ def test_broker_client_per_crew_and_server(
     register(daemon, dev="lutra", crew="otter")
     for crew, dev in (("oaw", "babel"), ("otter", "lutra")):
         for sid in ("dev", "prod"):
-            assert daemon.broker(crew, sid).ops("mint") == [
-                {"dev_name": dev, "crew": crew, "current_token_id": None}
-            ]
+            (args,) = daemon.broker(crew, sid).ops("mint")
+            assert (args["dev_name"], args["crew"]) == (dev, crew)
     # token_for keys by server: each server's broker minted its own token.
     tokens = {
         (dev, sid): daemon.store.token_for(dev, sid)

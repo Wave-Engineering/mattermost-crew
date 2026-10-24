@@ -120,6 +120,23 @@ class Broker:
             raise OpError("bad_request", "current_token_id is a token id or null")
         return held
 
+    def _deadline(self, args: dict[str, Any]) -> float | None:
+        deadline = args.get("deadline")
+        if deadline is not None and (
+            isinstance(deadline, bool) or not isinstance(deadline, int | float)
+        ):
+            raise OpError("bad_request", "deadline is epoch seconds")
+        return float(deadline) if deadline is not None else None
+
+    def _check_deadline(self, deadline: float | None) -> None:
+        """Called once the lock is held: the caller has given up on a request past its deadline.
+
+        Minting for it anyway would leave an orphan, and its supersede could revoke the token
+        a newer call has since swapped in (#41).
+        """
+        if deadline is not None and self.clock().timestamp() > deadline:
+            raise OpError("expired", "the caller's deadline passed before the broker got to it")
+
     def _supersede(self, bot_id: str, held: str | EllipsisType | None, new_id: str) -> None:
         """Revoke the account's tokens other than `held` and `new_id` (#41).
 
@@ -140,7 +157,9 @@ class Broker:
         """Only the daemon's `register` causes a mint; it is the one op that records it."""
         name = self._name(args)
         held = self._held(args)
+        deadline = self._deadline(args)
         with self._lock:
+            self._check_deadline(deadline)
             try:
                 bot_id = ensure_bot(self.client, name, self.accounts, self.config.broker_user_id)
             except SquattedAccount as exc:
@@ -159,7 +178,9 @@ class Broker:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""
         name = self._name(args)
         held = self._held(args)
+        deadline = self._deadline(args)
         with self._lock:
+            self._check_deadline(deadline)
             acct = self.accounts.get(name)
             if acct is None:
                 raise OpError("not_found", f"{name} has never registered")

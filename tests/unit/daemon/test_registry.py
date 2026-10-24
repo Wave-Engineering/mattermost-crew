@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -19,9 +20,10 @@ def test_register_returns_account_name(daemon: Any) -> None:
     reg = register(daemon)
     assert reg.account == "babel.oaw"
     assert reg.result()["account"] == "babel.oaw"
-    assert daemon.broker().ops("mint") == [
-        {"dev_name": "babel", "crew": "oaw", "current_token_id": None}
-    ]
+    (args,) = daemon.broker().ops("mint")
+    # The broker refuses the mint once this call's 2 s timeout has passed (#41).
+    assert args.pop("deadline") == pytest.approx(time.time() + 2.0, abs=1.0)
+    assert args == {"dev_name": "babel", "crew": "oaw", "current_token_id": None}
     # One registration per Dev-Name, taken at its word (D-055).
     assert daemon.registry.get("babel") is reg
     assert reg.session_id == "s1"

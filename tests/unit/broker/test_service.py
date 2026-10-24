@@ -9,6 +9,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,41 @@ def test_current_token_id_must_be_an_id_or_null(broker: Broker) -> None:
     for bad in ("", 7, ["x"]):
         with pytest.raises(OpError, match="bad_request"):
             broker.remint(_args(bad))  # type: ignore[arg-type]
+
+
+def test_late_request_past_its_deadline_is_refused(
+    broker: Broker, fake: Any, clock: Any
+) -> None:
+    """#41: a call the daemon gave up on, served after a newer one, mints and revokes nothing."""
+    held = broker.mint(_args(None))
+    sent = clock.now.timestamp()
+    clock.now += timedelta(seconds=3)  # the broker was stalled past the 2 s timeout
+    newer = broker.mint({**_args(held["token_id"]), "deadline": clock.now.timestamp() + 2})
+    tokens_before = fake.count("create_token")
+
+    with pytest.raises(OpError, match="expired"):
+        broker.mint({**_args(held["token_id"]), "deadline": sent + 2})
+    with pytest.raises(OpError, match="expired"):
+        broker.remint({**_args(held["token_id"]), "deadline": sent + 2})
+    assert fake.count("create_token") == tokens_before
+    assert fake.token_works(newer["token"])
+
+
+def test_deadline_must_be_epoch_seconds(broker: Broker) -> None:
+    for bad in ("soon", True, [1]):
+        with pytest.raises(OpError, match="bad_request"):
+            broker.mint({**_args(None), "deadline": bad})
+
+
+def test_supersede_is_capped_per_call(broker: Broker, fake: Any) -> None:
+    held = broker.mint(_args(None))
+    orphans = [broker.remint({"dev_name": "babel", "crew": "oaw"}) for _ in range(7)]
+    broker.remint(_args(held["token_id"]))
+    left = [o for o in orphans if fake.token_works(o["token"])]
+    assert len(left) == 2  # 5 revoked on this call; the rest wait for the next
+    broker.remint(_args(held["token_id"]))
+    assert not any(fake.token_works(o["token"]) for o in orphans)
+    assert fake.token_works(held["token"])
 
 
 def test_revoke_notfound_upstream_is_success(broker: Broker, fake: Any) -> None:

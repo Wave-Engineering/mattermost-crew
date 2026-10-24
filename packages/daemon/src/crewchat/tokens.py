@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -109,12 +110,20 @@ class BrokerClient:
         None. The broker revokes the account's other tokens, so one minted by a call whose
         reply timed out here is not left live (#41).
         """
-        args = {"dev_name": dev_name, "crew": crew, "current_token_id": current_token_id}
-        return await self.call("mint", args)
+        return await self.call("mint", self._minting(dev_name, crew, current_token_id))
 
     async def remint(self, dev_name: str, crew: str, current_token_id: str) -> dict[str, Any]:
-        args = {"dev_name": dev_name, "crew": crew, "current_token_id": current_token_id}
-        return await self.call("remint", args)
+        return await self.call("remint", self._minting(dev_name, crew, current_token_id))
+
+    def _minting(self, dev_name: str, crew: str, current_token_id: str | None) -> dict[str, Any]:
+        # `deadline`: once this call has timed out here, the broker refuses it rather than
+        # mint late, after a newer call, and supersede the token that call swapped in (#41).
+        return {
+            "dev_name": dev_name,
+            "crew": crew,
+            "current_token_id": current_token_id,
+            "deadline": time.time() + self.timeout_s,
+        }
 
     async def revoke(self, token_id: str) -> dict[str, Any]:
         return await self.call("revoke", {"token_id": token_id})

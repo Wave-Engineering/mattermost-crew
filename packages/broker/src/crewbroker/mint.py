@@ -20,6 +20,7 @@ DEFAULT_TTL_HOURS = 26
 BOT_DESCRIPTION = "mattermost-crew participant"
 PROBE_DESCRIPTION = "crewbroker native-expiry probe"
 PROBE_TTL_MS = 3_600_000
+SUPERSEDE_PER_CALL = 5
 
 
 class SquattedAccount(Exception):
@@ -147,19 +148,23 @@ def mint_token(
 
 
 def revoke_superseded(
-    client: MattermostAPI, bot_user_id: str, tokens: TokenStore, keep: set[str]
+    client: MattermostAPI,
+    bot_user_id: str,
+    tokens: TokenStore,
+    keep: set[str],
+    limit: int = SUPERSEDE_PER_CALL,
 ) -> list[str]:
-    """Revoke every recorded token of `bot_user_id` not in `keep`; return the ids revoked.
+    """Revoke recorded tokens of `bot_user_id` not in `keep`, at most `limit`; return their ids.
 
     `mint` and `remint` call this with the token the daemon says it holds and the one just
     minted, so a token the daemon never learned of (its call timed out, #41) is revoked on
-    its next successful call. An upstream 404 means already gone and clears the entry; any
-    other error keeps it for the next call.
+    its next successful call. `limit` keeps a backlog from holding the reply past the
+    daemon's timeout; the rest go on later calls. An upstream 404 means already gone and
+    clears the entry; any other error keeps it for the next call.
     """
     revoked: list[str] = []
-    for rec in tokens.all():
-        if rec.user_id != bot_user_id or rec.token_id in keep:
-            continue
+    stale = [r for r in tokens.all() if r.user_id == bot_user_id and r.token_id not in keep]
+    for rec in stale[:limit]:
         try:
             client.revoke_token(rec.token_id)
         except NotFound:
