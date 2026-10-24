@@ -1,23 +1,33 @@
-"""Fakes for the daemon's unit tests: brokers, adapters and a clock.
+"""Fakes for the daemon's unit tests: brokers, adapters, a clock and a Mattermost server.
 
 `FakeBroker` stands in for one broker socket. Every broker call and adapter hook appends to
 one shared `events` list, so a test can assert the order of a rotation across both.
+
+`FakeMattermost` answers the REST calls the Mattermost adapter makes, through an
+`httpx.MockTransport`, and serves fake websockets through its `connect`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import itertools
+import json
 import tempfile
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from crewchat.config import ServersConfig, parse_config
 from crewchat.registry import Registry
 from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, SwitchCache, TokenStore
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedOK, InvalidStatus
+from websockets.http11 import Response
 
 Event = tuple[Any, ...]
 
@@ -161,3 +171,182 @@ def short_dir() -> Iterator[Path]:
     # A unix socket path is limited to 108 bytes; pytest's tmp_path can be longer.
     with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as d:
         yield Path(d)
+
+
+# -- a fake Mattermost server ------------------------------------------------------------------
+_CLOSE = object()
+
+
+class FakeWebSocket:
+    """One open websocket: `recv` returns queued frames; a close raises `ConnectionClosedOK`."""
+
+    def __init__(self, server: FakeMattermost, user_id: str, token: str, uri: str) -> None:
+        self.server = server
+        self.user_id = user_id
+        self.token = token
+        self.uri = uri
+        self.queue: asyncio.Queue[Any] = asyncio.Queue()
+        self.closed = False
+        self.seq = 0
+
+    def push(self, event: str, data: Mapping[str, Any]) -> None:
+        if not self.closed:
+            self.queue.put_nowait(json.dumps({"event": event, "data": dict(data), "seq": self.seq}))
+            self.seq += 1
+
+    async def recv(self) -> str:
+        item = await self.queue.get()
+        if item is _CLOSE:
+            self.queue.put_nowait(_CLOSE)
+            raise ConnectionClosedOK(None, None)
+        assert isinstance(item, str)
+        return item
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.queue.put_nowait(_CLOSE)
+
+
+class FakeMattermost:
+    """Users, tokens, posts and websockets, in process. IDs are 26 lowercase characters."""
+
+    URL = "http://mm.invalid"
+
+    def __init__(self) -> None:
+        self.users: dict[str, dict[str, Any]] = {}
+        self.tokens: dict[str, str] = {}  # token -> user_id
+        self.posts: dict[str, dict[str, Any]] = {}
+        self.reactions: list[dict[str, Any]] = []
+        self.requests: list[tuple[str, str, str]] = []  # (method, path, token)
+        self.sockets: list[FakeWebSocket] = []
+        self.connects: list[dict[str, Any]] = []
+        self.fail_connects = 0
+        self._n = itertools.count(1)
+
+    def _id(self, prefix: str) -> str:
+        return f"{prefix}{next(self._n):0>{26 - len(prefix)}}"
+
+    def add_user(self, username: str, *, is_bot: bool = False) -> str:
+        user_id = self._id("u")
+        self.users[user_id] = {"id": user_id, "username": username, "is_bot": is_bot}
+        return user_id
+
+    def add_token(self, user_id: str) -> str:
+        token = self._id("t")
+        self.tokens[token] = user_id
+        return token
+
+    def add_post(
+        self, user_id: str, channel: str, message: str, props: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        post = {
+            "id": self._id("p"),
+            "channel_id": channel,
+            "root_id": "",
+            "user_id": user_id,
+            "message": message,
+            "create_at": int(time.time() * 1000) + len(self.posts),
+            "props": props or {},
+        }
+        self.posts[post["id"]] = post
+        return post
+
+    def broadcast_posted(self, post: Mapping[str, Any], mentions: list[str] | None = None) -> None:
+        """Push a `posted` event to every open websocket, the author's own included."""
+        data: dict[str, Any] = {"post": json.dumps(post), "channel_type": "O"}
+        if mentions is not None:
+            data["mentions"] = json.dumps(mentions)
+        for ws in self.sockets:
+            ws.push("posted", data)
+
+    def open_sockets(self, user_id: str) -> list[FakeWebSocket]:
+        return [ws for ws in self.sockets if ws.user_id == user_id and not ws.closed]
+
+    # -- websockets ------------------------------------------------------------------------
+    async def connect(
+        self, uri: str, *, headers: Mapping[str, str], ping_interval: float
+    ) -> FakeWebSocket:
+        token = headers.get("Authorization", "").removeprefix("Bearer ")
+        self.connects.append({"uri": uri, "token": token, "ping_interval": ping_interval})
+        if self.fail_connects:
+            self.fail_connects -= 1
+            raise OSError("connection refused")
+        user_id = self.tokens.get(token)
+        if user_id is None:
+            raise InvalidStatus(Response(401, "Unauthorized", Headers()))
+        ws = FakeWebSocket(self, user_id, token, uri)
+        self.sockets.append(ws)
+        ws.push("hello", {"connection_id": f"conn-{len(self.sockets)}"})
+        return ws
+
+    # -- REST ------------------------------------------------------------------------------
+    def http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=f"{self.URL}/api/v4", transport=httpx.MockTransport(self.handle)
+        )
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        path = request.url.path.removeprefix("/api/v4")
+        self.requests.append((request.method, path, token))
+        me = self.tokens.get(token)
+        if me is None:
+            return httpx.Response(401, json={"id": "api.context.session_expired.app_error"})
+        parts = path.strip("/").split("/")
+        body = json.loads(request.content) if request.content else None
+        if request.method == "GET" and path == "/users/me":
+            return httpx.Response(200, json=self.users[me])
+        if request.method == "GET" and parts[:2] == ["users", "username"]:
+            found = [u for u in self.users.values() if u["username"] == parts[2]]
+            return httpx.Response(200, json=found[0]) if found else httpx.Response(404, json={})
+        if request.method == "GET" and parts[0] == "users" and len(parts) == 2:
+            user = self.users.get(parts[1])
+            return httpx.Response(200, json=user) if user else httpx.Response(404, json={})
+        if request.method == "POST" and path == "/posts":
+            post = self.add_post(me, body["channel_id"], body["message"], body.get("props"))
+            post["root_id"] = body.get("root_id", "")
+            return httpx.Response(201, json=post)
+        if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
+            posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
+            order = sorted(posts, key=lambda k: -posts[k]["create_at"])
+            return httpx.Response(200, json={"posts": posts, "order": order})
+        if request.method == "GET" and parts[0] == "posts" and parts[2:] == ["thread"]:
+            root = parts[1]
+            posts = {k: p for k, p in self.posts.items() if root in (k, p["root_id"])}
+            return httpx.Response(200, json={"posts": posts, "order": list(posts)})
+        if request.method == "POST" and path == "/channels/direct":
+            return httpx.Response(201, json={"id": "dm-" + "-".join(sorted(body)), "type": "D"})
+        if request.method == "POST" and path == "/reactions":
+            self.reactions.append(body)
+            return httpx.Response(200, json=body)
+        return httpx.Response(404, json={"message": f"no route {request.method} {path}"})
+
+
+class RecordingSleep:
+    """An injected sleep: records each wait and yields once, without waiting."""
+
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
+def mm() -> FakeMattermost:
+    return FakeMattermost()
+
+
+@pytest.fixture
+def run() -> Iterator[Callable[[Any], Any]]:
+    """`asyncio.run`, but every call in one test shares one event loop, as the daemon does:
+    an adapter's clients and websockets live across calls."""
+    with asyncio.Runner() as runner:
+        yield runner.run
+
+
+@pytest.fixture
+def recording_sleep() -> RecordingSleep:
+    return RecordingSleep()
