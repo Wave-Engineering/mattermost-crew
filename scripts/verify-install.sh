@@ -11,11 +11,24 @@
 #   - the agent's user cannot read its credential or token ledger. Each KNOWN file name is
 #     checked with `test -e <file> && ! sudo -u agent test -r <file>`, never a glob (R-08).
 #
-# CREWBROKER_BIN is the installed broker CLI (default /opt/mattermost-crew/.venv/bin/crewbroker).
+# The daemon (Story 1.4):
+#   - its socket /run/crewchat/crewchat.sock exists, mode 0660, group crewchat-clients;
+#   - `health` answers, asked as the agent's user (who reaches the socket through that group);
+#   - a `register` for verify-canary, as the agent's user, succeeds and its reply holds no token;
+#   - the daemon's token file for the canary, the KNOWN name
+#     /var/lib/crewchat/tokens/verify-canary.json, exists and the agent's user cannot read it.
+#     Never a glob: a shell that can't list the directory would pass vacuously (R-08).
+#
+# CREWBROKER_BIN is the installed broker CLI (default /opt/mattermost-crew/.venv/bin/crewbroker),
+# CREWCHAT_BIN the daemon's (default /opt/mattermost-crew/.venv/bin/crewchat).
 # AGENT_USER is the agents' OS user (default agent). It needs sudo.
 set -euo pipefail
 
 CREWBROKER_BIN="${CREWBROKER_BIN:-/opt/mattermost-crew/.venv/bin/crewbroker}"
+CREWCHAT_BIN="${CREWCHAT_BIN:-/opt/mattermost-crew/.venv/bin/crewchat}"
+CREWCHAT_SOCKET=/run/crewchat/crewchat.sock
+CREWCHAT_TOKENS=/var/lib/crewchat/tokens
+CLIENTS_GROUP=crewchat-clients
 AGENT_USER="${AGENT_USER:-agent}"
 DAEMON_USER=crewchat
 RUN_DIR=/run/crewbroker
@@ -90,6 +103,39 @@ for entry in $CREWBROKER_INSTANCES; do
   no_agent_read "${CONFIG_DIR}/${instance}.credential"
   no_agent_read "${STATE_ROOT}/${instance}/tokens.json"
 done
+
+# The daemon: one socket per host.
+if ! $SUDO test -S "$CREWCHAT_SOCKET"; then
+  fail "$CREWCHAT_SOCKET is not a socket"
+else
+  read -r mode group < <($SUDO stat -c '%a %G' "$CREWCHAT_SOCKET")
+  if [[ "$mode" == 660 && "$group" == "$CLIENTS_GROUP" ]]; then
+    pass "$CREWCHAT_SOCKET is mode 0660, group $CLIENTS_GROUP"
+  else
+    fail "$CREWCHAT_SOCKET is mode $mode, group $group (want 660, $CLIENTS_GROUP)"
+  fi
+fi
+
+health="$(sudo -u "$AGENT_USER" "$CREWCHAT_BIN" call "$CREWCHAT_SOCKET" health 2>/dev/null || true)"
+if jq -e '.ok and (.result.backends | type == "object")' <<<"$health" >/dev/null 2>&1; then
+  pass "daemon health answers $AGENT_USER: $(jq -c '.result.backends | keys' <<<"$health")"
+else
+  fail "daemon health: $(jq -c '.error // .' <<<"$health" 2>/dev/null || echo "no reply")"
+fi
+
+# The canary registers with the host's default crew. Only ok and the account leave this pipe.
+reply="$(sudo -u "$AGENT_USER" "$CREWCHAT_BIN" call "$CREWCHAT_SOCKET" register \
+  '{"dev_name": "verify-canary", "session_id": "verify-install"}' 2>/dev/null || true)"
+if jq -e '.ok and (.result.account | startswith("verify-canary."))' <<<"$reply" >/dev/null 2>&1; then
+  if grep -q '"token' <<<"$reply"; then
+    fail "the daemon's register reply carries a token field (R-08)"
+  else
+    pass "register for $(jq -r .result.account <<<"$reply") through the daemon, no token returned"
+  fi
+else
+  fail "register for verify-canary: $(jq -c '.error // .' <<<"$reply" 2>/dev/null || echo "no reply")"
+fi
+no_agent_read "${CREWCHAT_TOKENS}/verify-canary.json"
 
 if ((failures > 0)); then
   echo "verify-install: $failures check(s) failed" >&2

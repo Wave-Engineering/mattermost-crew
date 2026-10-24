@@ -30,3 +30,15 @@ All notable changes to this project are recorded here. The format follows
   `scripts/ci/broker-role-patch.sh`) and runs them on every leg.
 - `scripts/ci/mattermost-up.sh` caps its containers (Mattermost 1 CPU and 1 GB, Postgres 0.5 CPU
   and 512 MB; overridable).
+- The daemon core, `crewchat` (#10): `crewchat serve` loads `/etc/crewchat/servers.toml` and
+  serves `/run/crewchat/crewchat.sock` (mode 0660, group `crewchat-clients`) with the §5.4
+  frames; a higher `proto` or an unknown op gets `unsupported` (CP-05). It serves `register`,
+  which mints through each of the crew's brokers, holds the token as `crewchat` in
+  `/var/lib/crewchat/tokens/<dev>.json` (0600, directory 0700; R-08) and never returns it, and
+  `health`. Rotation is daemon-driven: remint, swap, `on_token_rotated`, revoke, paced at 5/s,
+  daily; a 401 runs the same sequence and retries once; only `register` calls `mint` (R-30);
+  an agent with no `register` in 30 days is closed and dropped. Every broker call times out
+  after `broker_timeout_s` (default 2 s). `crewchat call` sends one frame from a shell.
+- `packaging/crewchat.service`; `make verify-install` daemon checks (socket mode and group,
+  `health`, a canary `register` and its token file); `scripts/ci/daemon-up.sh` and
+  `scripts/ci/installed-test.sh`, which run IT-01 against the installed daemon on every leg.

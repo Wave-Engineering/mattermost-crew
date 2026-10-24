@@ -9,8 +9,9 @@
 # role (scripts/ci/broker-role-patch.sh), writes /etc/crewbroker/<instance>.toml and
 # .credential (0600, crewbroker), creates /run/crewbroker from packaging/crewbroker.tmpfiles.conf
 # and the state directory (0700, crewbroker), and starts `crewbroker serve` as crewbroker.
-# It exports CREWBROKER_INSTANCES and CREWBROKER_BIN for verify-install (into $GITHUB_ENV under
-# Actions, and as export lines on stdout). It needs root or sudo: never run it on a workstation.
+# It exports CREWBROKER_INSTANCES and CREWBROKER_BIN for verify-install, and CREWBROKER_USER_ID
+# (the broker account's user id) for scripts/ci/daemon-up.sh's servers.toml: into $GITHUB_ENV
+# under Actions, and as export lines on stdout. It needs root or sudo: never run it on a workstation.
 set -euo pipefail
 
 : "${MM_URL:?source the env file from scripts/ci/mattermost-up.sh}"
@@ -94,7 +95,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   {
     echo "CREWBROKER_INSTANCES=${CREW}:${SERVER_ID}"
     echo "CREWBROKER_BIN=${BIN}"
+    echo "CREWBROKER_USER_ID=${broker_id}"
   } >>"$GITHUB_ENV"
 fi
 echo "export CREWBROKER_INSTANCES='${CREW}:${SERVER_ID}'"
 echo "export CREWBROKER_BIN='${BIN}'"
+echo "export CREWBROKER_USER_ID='${broker_id}'"
