@@ -220,7 +220,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 ### 4.2 Session Start
 
 1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, crew, session_id}`. `crew` comes from the identity file's `crew` field, or else the host's default crew in `servers.toml`. The shim then pushes the agent's kiosk brief and squawk IDs (`kiosk_brief`, `squawk_ids`), because the daemon never reads agent-home or repo paths.
-2. For each configured Mattermost server, the daemon asks that crew's broker for that server for a token for `<dev-name>.<crew>` (`mint{dev_name, crew}`). Brokers are keyed by (crew, server_id). Only `register` causes a `mint`. The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
+2. For each configured Mattermost server, the daemon asks that crew's broker for that server for a token for `<dev-name>.<crew>` (`mint{dev_name, crew, current_token_id, deadline}`). Brokers are keyed by (crew, server_id). Only `register` causes a `mint`. The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
 3. The daemon opens that agent's Mattermost websocket, pinging every 30 s (CT-07), and attaches the Discord and squawkie adapters.
 
 ### 4.3 Send
@@ -369,11 +369,13 @@ It serves the daemon over its socket, using the same frame shape (D-058). Every 
 
 | op | What it does |
 |---|---|
-| `mint{dev_name, crew}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
-| `remint{dev_name, crew}` | Mints a fresh token for an existing account and returns it, **without** revoking the old one, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
+| `mint{dev_name, crew, current_token_id, deadline}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
+| `remint{dev_name, crew, current_token_id, deadline}` | Mints a fresh token for an existing account and returns it, **without** revoking the token the daemon holds, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
 | `revoke{token_id}` | Revokes a token. The daemon calls it after it has swapped in the new token and reconnected. |
 | `switch_state{}` | Returns the switch setting, its expiry, the setting it reverts to, and the kiosk on/off flag. |
 | `crew_info{}` | Returns **only this broker's own fields**: `{broker_user_id, human_user_ids, trusted: ["<crew>", …], minted_bot_ids}`. `minted_bot_ids` lists the bot account user IDs this broker created. The daemon caches it with the switch state (§5.9), and gets each trusted crew's `broker_user_id`, `human_user_ids` and `minted_bot_ids` **only** from that crew's own broker's `crew_info`. |
+
+On `mint` and `remint`, `current_token_id` names the token the daemon holds for that account on that server (`null` for none). After minting, the broker revokes the account's other recorded tokens, at most 5 per call, so a token minted by a call whose reply timed out is not left live (#41, D-102). `deadline` is the caller's timeout in epoch seconds on the shared host clock. A request the broker reaches after its deadline is refused with `expired` and mints nothing, so a late request can't supersede the token a newer call swapped in. A caller that omits `current_token_id` gets no cleanup, and one that omits `deadline` is never refused as `expired`.
 
 The daemon owns rotation (§4.8). The broker's daily job only deactivates bot accounts whose `last_register` is more than 30 days old (R-30), so an account that is merely re-minted is never counted as active. The broker also listens on its own websocket for DMs from the configured human user IDs, and parses switch commands from them (§4.6).
 
@@ -522,17 +524,26 @@ Deploying onto any production Mattermost needs a yes-prod from the agent's human
 
 ### 5.N Open Questions
 
-Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` entry on Plan #3:
+Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` entry on Plan #3. The evidence is in `docs/spikes/2026-10-spike-1.2.md`.
 
 1. **Enterprise Entry's own limits:** e.g. a cap on message history that would affect the read path (D-007). Answered from the vendor's docs, plus a check against a licensed image where one is available.
+   - **Answer (D-093):** Entry shows only the newest 10,000 posts across all channels; older posts stay stored but aren't returned to reads or search. The read path detects this at runtime from `GET /api/v4/limits/server` (`postHistoryLimit`, `lastAccessiblePostTime`). Nothing in Entry's limits touches bots, tokens or the API we use. On Team Edition, bot accounts don't count toward the 200/250 user limit. No design change.
 2. **One client per token in one process:** does the upstream library support it? If not, §5.2 is revisited (D-054).
+   - **Answer (D-094):** Yes. `mcp-server-mattermost==0.6.1` (the PyPI distribution; import `mcp_server_mattermost`) takes a token per `MattermostClient`. 22 posts from two clients, on their own pools and concurrently on one shared pool, all had the right author. Each client's `lifespan()` must be entered once and held for the token's life, never entered concurrently per call. §5.2 stands.
 3. **The Discord `·p1` suffix:** is it safe for today's parsers (the watcher's echo filter and signature regex)? (D-059)
+   - **Answer (D-095):** Safe. The watcher (`v1.7.0`) matches `— **<name>**` as a substring in both its echo filter and its reply routing, and gives the same verdicts with ` ·p1`. `mcp-server-discord` (`v1.4.3`) has no signature parser.
 4. **The kiosk mechanism:** `claude -p` with tools and MCP disabled, or a direct model API call with no tools. Either way, name the kiosk's **model credential**: its path and owner. If the CLI, prove that nothing loads, including from the managed-settings location (§5.11). (D-071)
+   - **Answer (D-096, resolves D-071):** The CLI runner, as `crewkiosk`. It ran no shell command. Its own transcript and debug log show that no user, project or local settings, hooks, skills or `CLAUDE.md` loaded, against planted ones in every location; a planted managed hook and managed `CLAUDE.md` did load until `/etc/claude-code` was removed. Measured: about 5.4 s and $0.003 per question (Sonnet). Model credential: `/etc/crewkiosk/model.credential`, mode `0600`, owner `crewkiosk:crewkiosk`, a dedicated Anthropic API key that no other user can read. The kiosk host must have no local **or remote (org-pushed)** managed settings.
 5. **An unlicensed Enterprise image as a stand-in for Entry in CI:** is it faithful? (§6.1) Answered from the vendor's docs, plus a licensed-image check where one is available.
+   - **Answer (D-097):** Faithful. By the vendor's definition an unlicensed Enterprise server *is* Entry, and the image reports `SkuShortName: "entry"` and `postHistoryLimit: 10000`. Every bot and token check matches Team Edition 11.11.3.
 6. **Facts carried from the sketchbook:** are bot-to-bot DMs supported? Do bot accounts appear in `@` autocomplete, with their own avatars?
+   - **Answer (D-098):** Bot-to-bot DMs work. Bots appear in `@` autocomplete (`is_bot: true`). Avatars are per bot, but a bot can't set its own (403); its owner, the broker, sets it at mint (`POST /users/{bot_id}/image`). The server marks every bot post `props.from_bot: "true"`.
 7. **Broker transport, and trust, when a broker is on another host:** for this Plan the daemon and every broker it uses (its own and its trusted crews') share one host, using unix sockets, and no broker calls another. **Trust across hosts is deferred:** a trusted crew whose broker is not on this host has no `servers.toml` table and no reachable `crew_info`, so all its senders are treated as outsiders (the kiosk if directly addressed, otherwise dropped under crew and trusted). Spike 1.2 records the remote option (e.g. mutual-TLS TCP from the daemon to a remote broker, carrying `crew_info`) as a design note, for a later Plan.
+   - **Answer (D-099):** Design note recorded for a later Plan. A remote broker serves only `crew_info` (and optionally `switch_state`) over mutual-TLS TCP, with the same frames, pinned per trusted crew by CA and `broker_user_id` in `servers.toml`, with the same timeout and caching rules. Tokens never cross hosts.
 8. **Bot `owner_id`:** verify that a bot account's `owner_id` is the creating broker account, is reported by the API to any user, and cannot be changed by the bot itself. Also confirm that the owner **can** reassign it with `POST /bots/{id}/assign/{user}`, which is why membership also requires `minted_bot_ids` (§5.9).
+   - **Answer (D-100, supersedes D-079 and D-087 in part):** `owner_id` is set to the creating broker; the bot can't change it; the owner can reassign it, and then the former owner can't see the bot. **But `owner_id` is not reported to other users:** `GET /bots/{id}` is 404 without `read_bots` on that bot or `read_others_bots`, and the user object has no owner. So the daemon can't check `owner_id`. Ownership moves into the broker: `crew_info.minted_bot_ids` lists the bots it created **and still owns** (intersected with its own `GET /bots`), and a bot is in X if and only if it is in X's `minted_bot_ids`. On a cache miss, an `is_bot` sender in no cached list triggers one re-fetch of every local broker's `crew_info` (once per bot per 30 s). While any local broker has no cached `crew_info`, an unrecognised bot is `DROP`. §5.9's text is to be brought in line with D-100.
 9. **11.8 compatibility** (owned by spike 1.2, run against a local 11.8 Team Edition container; Story 1.1's 11.8 CI leg then keeps it true): confirm that `owner_id`, `POST /bots/{id}/assign`, the `system_user_access_token` role patch and token create/revoke behave as on 11.11, and that the absence of `expires_at` is detected (R-07). Anything that fails is recorded here with its ledger ID (D-091).
+   - **Answer (D-101):** On Team Edition 11.8.5, the newest 11.8 patch and the one `ci.yml` pins, everything behaves as on 11.11.3, including question 8's `owner_id` visibility. Native expiry is detected as absent by the missing `expires_at` key on the token object; on 11.11 the key is present and honoured on create. CT-11 stands.
 
 **Deferred, decided by usage** (policy for BJ, not facts a spike can settle): private DMs vs. visibility; how `@<dev-team>` behaves across crews; whether crew names need to be unique for `@crew` routing.
 
@@ -826,8 +837,8 @@ Delivers the broker, one per (crew, server), that creates bot accounts and mints
    - `record_register(account, now)` writes `last_register` for the account to `/var/lib/crewbroker/<crew>-<server_id>/accounts.json` (mode `0600`). Only `mint` calls it, and only the daemon's `register` causes a `mint`; `remint` never does.
 3. `crewbroker/prune.py`: `prune_idle(client, now, idle_days=30)` deactivates bot accounts whose `last_register` is more than 30 days old (R-30). Rotation is the daemon's job (Story 1.4), so a re-minted but unregistered account still ages out.
 4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/<crew>-<server_id>.sock` (mode `0660`, group `crewchat`, set by the tmpfiles.d entry `d /run/crewbroker 2770 crewbroker crewchat` so the setgid directory passes the group on; `crewbroker` is not itself in `crewchat`), using the §5.4 frame shape. Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat` (R-08). **No broker ever calls another broker.** The handler never blocks on anything outside its own state and the Mattermost server. The ops are:
-   - `mint{dev_name, crew}` → `{account, token, token_id}`;
-   - `remint{dev_name, crew}` → `{token, token_id}`, without revoking the old token;
+   - `mint{dev_name, crew, current_token_id, deadline}` → `{account, token, token_id}`;
+   - `remint{dev_name, crew, current_token_id, deadline}` → `{token, token_id}`, without revoking the held token. Both revoke the account's other recorded tokens after minting, and refuse with `expired` past `deadline` (§5.6, #41);
    - `revoke{token_id}` → `{}`;
    - `crew_info{}` → `{broker_user_id, human_user_ids, trusted: ["<crew>", …], minted_bot_ids}`: this broker's own fields only, from its config and `accounts.json`. Trusted crews are returned by name; the daemon fetches their membership from their own brokers (§5.6, §5.9).
 
@@ -1667,6 +1678,7 @@ The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[l
 | — | Review round 4: no broker-to-broker calls, broker timeouts, local cache-miss re-fetch, reactivation | D-087 (supersedes D-079 in part) |
 | — | Approval | D-088 |
 | — | Pre-kickoff amendments: one Plan per phase (#26, #27, #28), the spike without CI, the 11.8 floor (CT-11), the S-NN citation rule | D-089 (supersedes D-065 in part), D-090, D-091, D-092 |
+| — | Spike 1.2 answers to §5.N (`docs/spikes/2026-10-spike-1.2.md`) | D-093 to D-101; D-096 resolves D-071 (the kiosk is the CLI runner); D-100 supersedes D-079 and D-087 in part (bot ownership is checked in the broker) |
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 

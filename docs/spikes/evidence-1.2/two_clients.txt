@@ -1,0 +1,30 @@
+upstream: mcp-server-mattermost==0.6.1
+bots: [('one', 'hpazd9msafb97dqjs5e73xecgy'), ('two', 'dtk3adhimbgb9y8mkh961fb9uo')]
+
+# sequential, each client on its own connection pool
+# concurrent, both clients borrowing one shared httpx pool, 10 posts each, interleaved
+ok  own pool    client one      get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  own pool    client two      get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#0    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#0    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#1    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#1    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#2    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#2    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#3    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#3    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#4    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#4    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#5    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#5    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#6    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#6    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#7    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#7    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#8    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#8    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+ok  shared pool client one#9    get_me=hpazd9msafb97dqjs5e73xecgy post.user_id=hpazd9msafb97dqjs5e73xecgy
+ok  shared pool client two#9    get_me=dtk3adhimbgb9y8mkh961fb9uo post.user_id=dtk3adhimbgb9y8mkh961fb9uo
+
+22 posts, 0 with the wrong author
+Answer: PASS, one client per token works in one process

@@ -1,0 +1,9 @@
+[DEBUG] Broken symlink or missing file encountered for settings.json at path: /srv/kiosk/work/.claude/settings.json
+[DEBUG] Broken symlink or missing file encountered for settings.json at path: /srv/kiosk/work/.claude/settings.local.json
+[DEBUG] cc-plugin-sec-default@builtin seated outermost: this machine has managed settings
+[DEBUG] Loaded 1 unique skills (1 unconditional, 0 conditional, managed: 1, user: 0, project: 0, additional: 0, legacy commands: 0)
+[DEBUG] Loading skills from: managed=/etc/claude-code/.claude/skills, user=/home/crewkiosk/.claude/skills, project=[/srv/kiosk/.claude/skills]
+[DEBUG] Remote settings: No settings found (404)
+[DEBUG] Remote settings: Saved empty sentinel (404 response)
+[DEBUG] Remote settings: Saved to /home/crewkiosk/.claude/remote-settings.json
+[DEBUG] [uds-messaging] Skipped: restricted session

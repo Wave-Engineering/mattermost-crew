@@ -1,0 +1,36 @@
+# The mattermost-crew chat daemon: one per host (Dev Spec §4.1, §5.3).
+#
+#   systemctl enable --now crewchat
+#
+# Needs the crewchat user, the crewchat-clients group (crewchat is a member), and
+# /etc/crewchat/servers.toml. systemd creates /run/crewchat (RuntimeDirectory; /run is emptied
+# on every boot) and /var/lib/crewchat (StateDirectory, mode 0700). The daemon creates
+# /var/lib/crewchat/tokens (0700) and every token file in it (0600), and gives its socket,
+# /run/crewchat/crewchat.sock, mode 0660 and group crewchat-clients. It reaches each broker's
+# socket under /run/crewbroker through the crewchat group (packaging/crewbroker.tmpfiles.conf).
+[Unit]
+Description=mattermost-crew chat daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=crewchat
+Group=crewchat
+SupplementaryGroups=crewchat-clients
+ExecStart=/opt/mattermost-crew/.venv/bin/crewchat serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+ProtectSystem=strict
+RuntimeDirectory=crewchat
+# The agents' user must traverse /run/crewchat to reach the socket; the socket itself is 0660.
+RuntimeDirectoryMode=0755
+StateDirectory=crewchat
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/crewchat /run/crewchat
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

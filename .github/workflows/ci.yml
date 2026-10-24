@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci (${{ matrix.leg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: team-11.11.3
+            mm_image: mattermost/mattermost-team-edition:11.11.3
+            native_token_expiry: present
+          - leg: enterprise-11.11.3
+            # Unlicensed: the stand-in for Enterprise Entry (CT-01, Dev Spec 5.N-5).
+            mm_image: mattermost/mattermost-enterprise-edition:11.11.3
+            native_token_expiry: present
+          - leg: team-11.8.5
+            # The oldest supported server, at the newest 11.8 patch (CT-11). Bump the patch
+            # here, and only here, when a newer 11.8 patch ships.
+            mm_image: mattermost/mattermost-team-edition:11.8.5
+            # Tests that need native token expiry assert it is detected as absent (R-07).
+            native_token_expiry: absent
+    env:
+      MM_IMAGE: ${{ matrix.mm_image }}
+      MM_NATIVE_TOKEN_EXPIRY: ${{ matrix.native_token_expiry }}
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Two-user image
+        run: ./scripts/ci/two-user-setup.sh
+      - name: Start Mattermost
+        run: ./scripts/ci/mattermost-up.sh
+      - name: make ci
+        run: ./scripts/ci/ci.sh
+      - name: Start broker
+        run: ./scripts/ci/broker-up.sh
+      - name: Start daemon
+        run: ./scripts/ci/daemon-up.sh
+      - name: make verify-install
+        run: make verify-install
+      - name: Installed tests (IT-01)
+        run: ./scripts/ci/installed-test.sh
+      - name: Mattermost logs
+        if: failure()
+        run: ./scripts/ci/mattermost-logs.sh
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.leg }}
+          path: reports/
+          if-no-files-found: error

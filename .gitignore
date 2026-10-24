@@ -7,3 +7,22 @@
 !.claude/status/
 .claude/status/*
 !.claude/status/phases-waves.json
+
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+dist/
+build/
+*.egg-info/
+
+# Test reports (CI uploads them as artifacts)
+reports/
+
+# Written by scripts/ci/mattermost-up.sh: a throwaway server's URL and admin token
+.mattermost.env
