@@ -1,0 +1,166 @@
+"""The daemon's configuration: `/etc/crewchat/servers.toml` (Dev Spec §5.B, §5.6).
+
+    default_crew = "oaw"
+    broker_timeout_s = 2                 # optional; every daemon->broker call's timeout
+
+    [[mattermost]]
+    id = "oaw-dev"
+    url = "https://mm.example.lan"
+
+    [discord]
+    enabled = true
+
+    [crews.oaw]
+    needs_list = "bj:needs"              # the sqtk list `register` returns (R-11)
+
+    [crews.oaw.oaw-dev]                  # one table per crew and Mattermost server
+    broker_socket = "/run/crewbroker/oaw-oaw-dev.sock"
+    broker_user_id = "<the broker account's user id>"
+
+The `broker_user_id` entries are the configured broker list: the only accounts that may hold
+the patched role (R-06). IT-01 asserts against them.
+"""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path("/etc/crewchat/servers.toml")
+DEFAULT_BROKER_TIMEOUT_S = 2.0
+NAME_RE = re.compile(r"^[a-z0-9._-]+$")
+CREW_KEYS = {"needs_list"}
+
+
+class ConfigError(ValueError):
+    """`servers.toml` is missing, malformed, or inconsistent."""
+
+
+@dataclass(frozen=True)
+class MattermostServer:
+    id: str
+    url: str
+
+
+@dataclass(frozen=True)
+class BrokerEntry:
+    """`[crews.<crew>.<server_id>]`: where that crew's broker for that server listens."""
+
+    crew: str
+    server_id: str
+    broker_socket: Path
+    broker_user_id: str
+
+
+@dataclass(frozen=True)
+class CrewEntry:
+    name: str
+    needs_list: str
+    brokers: dict[str, BrokerEntry] = field(default_factory=dict)  # by server_id
+
+
+@dataclass(frozen=True)
+class ServersConfig:
+    mattermost: list[MattermostServer]
+    discord_enabled: bool
+    default_crew: str
+    crews: dict[str, CrewEntry]
+    broker_timeout_s: float = DEFAULT_BROKER_TIMEOUT_S
+
+    def broker_entries(self) -> list[BrokerEntry]:
+        return [b for crew in self.crews.values() for b in crew.brokers.values()]
+
+    def broker_user_ids(self) -> list[str]:
+        """The configured broker list (R-06)."""
+        return [b.broker_user_id for b in self.broker_entries()]
+
+
+def load_config(path: Path = CONFIG_PATH) -> ServersConfig:
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ConfigError(f"{path}: no such file") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    return parse_config(raw, source=str(path))
+
+
+def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> ServersConfig:
+    servers = _mattermost(raw.get("mattermost", []), source)
+    server_ids = {s.id for s in servers}
+
+    discord = raw.get("discord", {})
+    if not isinstance(discord, dict):
+        raise ConfigError(f"{source}: discord must be a table")
+    enabled = discord.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{source}: discord.enabled must be true or false")
+
+    timeout = raw.get("broker_timeout_s", DEFAULT_BROKER_TIMEOUT_S)
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+        raise ConfigError(f"{source}: broker_timeout_s must be a positive number")
+
+    crews_raw = raw.get("crews", {})
+    if not isinstance(crews_raw, dict):
+        raise ConfigError(f"{source}: crews must be a table")
+    crews = {name: _crew(name, value, server_ids, source) for name, value in crews_raw.items()}
+
+    default_crew = raw.get("default_crew")
+    if not isinstance(default_crew, str) or default_crew not in crews:
+        raise ConfigError(f"{source}: default_crew must name a [crews.<crew>] table")
+
+    return ServersConfig(
+        mattermost=servers,
+        discord_enabled=enabled,
+        default_crew=default_crew,
+        crews=crews,
+        broker_timeout_s=float(timeout),
+    )
+
+
+def _mattermost(value: Any, source: str) -> list[MattermostServer]:
+    if not isinstance(value, list):
+        raise ConfigError(f"{source}: mattermost must be an array of tables")
+    servers: list[MattermostServer] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ConfigError(f"{source}: each [[mattermost]] entry is a table")
+        sid, url = item.get("id"), item.get("url")
+        if not isinstance(sid, str) or not NAME_RE.match(sid):
+            raise ConfigError(f"{source}: mattermost id {sid!r} is not a server id")
+        if not isinstance(url, str) or not url:
+            raise ConfigError(f"{source}: mattermost {sid} needs a url")
+        if any(s.id == sid for s in servers):
+            raise ConfigError(f"{source}: mattermost id {sid} is listed twice")
+        servers.append(MattermostServer(id=sid, url=url))
+    return servers
+
+
+def _crew(name: str, value: Any, server_ids: set[str], source: str) -> CrewEntry:
+    if not NAME_RE.match(name):
+        raise ConfigError(f"{source}: crew {name!r} has characters outside a-z0-9._-")
+    if not isinstance(value, dict):
+        raise ConfigError(f"{source}: crews.{name} must be a table")
+    needs_list = value.get("needs_list")
+    if not isinstance(needs_list, str) or not needs_list:
+        raise ConfigError(f"{source}: crews.{name}.needs_list must be a non-empty string")
+    brokers: dict[str, BrokerEntry] = {}
+    for key, table in value.items():
+        if key in CREW_KEYS:
+            continue
+        if not isinstance(table, dict):
+            raise ConfigError(f"{source}: crews.{name}.{key} is not a known key or a table")
+        if key not in server_ids:
+            raise ConfigError(f"{source}: crews.{name}.{key} names no [[mattermost]] server")
+        sock, broker_id = table.get("broker_socket"), table.get("broker_user_id")
+        if not isinstance(sock, str) or not sock.startswith("/"):
+            raise ConfigError(f"{source}: crews.{name}.{key}.broker_socket must be absolute")
+        if not isinstance(broker_id, str) or not broker_id:
+            raise ConfigError(f"{source}: crews.{name}.{key}.broker_user_id is required")
+        brokers[key] = BrokerEntry(
+            crew=name, server_id=key, broker_socket=Path(sock), broker_user_id=broker_id
+        )
+    return CrewEntry(name=name, needs_list=needs_list, brokers=brokers)

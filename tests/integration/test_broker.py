@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import secrets
 import subprocess
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,10 @@ from typing import Any
 import httpx
 import pytest
 from crewbroker import mint
-from crewbroker.config import CrewConfig
+from crewbroker.config import CrewConfig, parse_config
 from crewbroker.mattermost import MattermostClient
 from crewbroker.service import Broker, OpError
+from crewchat.registry import account_name as daemon_account_name
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE_PATCH = ROOT / "scripts" / "ci" / "broker-role-patch.sh"
@@ -61,7 +63,7 @@ def mkuser(mattermost: Any, username: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def setup(mattermost: Any) -> dict[str, str]:
+def setup(mattermost: Any) -> Iterator[dict[str, str]]:
     run = secrets.token_hex(3)
     crew = f"it{run}"
     broker_id = mkuser(mattermost, f"crewbroker-{run}")
@@ -70,12 +72,54 @@ def setup(mattermost: Any) -> dict[str, str]:
     subprocess.run([str(ROLE_PATCH), broker_id], env=env, check=True)
     resp = admin(mattermost, "POST", f"/users/{broker_id}/tokens", json={"description": "it"})
     assert resp.status_code == 200, resp.text
-    return {
+    yield {
         "crew": crew,
         "broker_id": broker_id,
         "partner_id": partner_id,
         "broker_token": resp.json()["token"],
     }
+    # This module's broker account is not in servers.toml, so it gives the patched role back:
+    # IT-01 asserts that only the configured brokers hold it (R-06).
+    resp = admin(mattermost, "PUT", f"/users/{broker_id}/roles", json={"roles": "system_user"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_it17_crew_defaults_to_partner_username_and_can_be_overridden(
+    mattermost: Any, setup: dict[str, str]
+) -> None:
+    """IT-17, R-02: no `crew` in the config → the partner's username; a `crew` overrides it."""
+    client = MattermostClient(mattermost.url, setup["broker_token"])
+    raw: dict[str, Any] = {
+        "server_id": "ci",
+        "server_url": mattermost.url,
+        "human_user_ids": [setup["partner_id"]],
+    }
+    try:
+        defaulted = parse_config(dict(raw), client=client)
+        assert defaulted.crew == user(mattermost, setup["partner_id"])["username"]
+        assert defaulted.broker_user_id == setup["broker_id"]
+        assert parse_config({**raw, "crew": "override"}, client=client).crew == "override"
+    finally:
+        client.close()
+
+
+def test_it17_account_naming_fits_ct05(mattermost: Any, broker: Broker) -> None:
+    """IT-17, R-01: `<dev>.<crew>` up to 64 characters is created; 65 is refused before the
+    server is asked. The daemon names the account exactly as the broker does."""
+    crew = broker.config.crew
+    dev = "n" * (64 - len(crew) - 1)
+    minted = broker.mint(args(broker, dev))
+    assert minted["account"] == f"{dev}.{crew}" == daemon_account_name(dev, crew)
+    assert len(minted["account"]) == 64
+    found = admin(mattermost, "GET", f"/users/username/{minted['account']}").json()
+    assert found["is_bot"] is True
+    with pytest.raises(OpError, match="bad_request"):
+        broker.mint(args(broker, dev + "n"))
+    with pytest.raises(ValueError):
+        daemon_account_name(dev + "n", crew)
+    for bad in ("Upper", "sp ace", "slash/x"):
+        with pytest.raises(OpError, match="bad_request"):
+            broker.mint(args(broker, bad))
 
 
 @pytest.fixture
