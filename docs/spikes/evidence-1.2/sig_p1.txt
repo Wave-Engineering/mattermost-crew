@@ -1,0 +1,4 @@
+PASS  today (no suffix)      self-echo dropped=true  isReplyToOurSignature=true  reply delivered=true
+PASS  with ·p1               self-echo dropped=true  isReplyToOurSignature=true  reply delivered=true
+PASS  with ·p1, no avatar    self-echo dropped=true  isReplyToOurSignature=true  reply delivered=true
+Answer: PASS, the ·p1 suffix does not change either parser's verdict

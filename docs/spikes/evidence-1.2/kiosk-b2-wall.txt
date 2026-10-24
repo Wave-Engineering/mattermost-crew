@@ -1,0 +1,8 @@
+with-managed wall_ms=7512
+with-managed marker: managed-SessionStart
+with-managed marker: managed-Stop
+with-managed marker: managed-UserPromptSubmit
+managed settings location now: ls: cannot access '/etc/claude-code': No such file or directory
+no-managed-1 wall_ms=5561
+no-managed-2 wall_ms=4477
+no-managed-3 wall_ms=5862
