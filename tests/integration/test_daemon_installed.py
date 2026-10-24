@@ -123,6 +123,8 @@ def test_credential_files_not_readable_by_agent(
         files.append(f"/var/lib/crewbroker/{crew}-{server_id}/tokens.json")
     if installed["servers"].get("discord", {}).get("enabled"):
         files.append("/etc/crewchat/discord.credential")
+    # A refused sudo also exits non-zero, which would read as "cannot read": prove it works.
+    assert as_agent("true").returncode == 0, f"cannot run commands as {AGENT_USER}"
     for path in files:
         assert as_root("test", "-e", path).returncode == 0, f"{path} does not exist"
         assert as_agent("test", "-r", path).returncode != 0, f"{AGENT_USER} can read {path}"

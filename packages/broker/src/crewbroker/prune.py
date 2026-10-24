@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from crewbroker.mattermost import MattermostAPI, NotFound
+from crewbroker.mattermost import MattermostAPI, MattermostError, NotFound
 from crewbroker.state import AccountStore
 
 DEFAULT_IDLE_DAYS = 30
@@ -42,6 +42,11 @@ def prune_idle(
             # Reassigned away, or deleted: no longer ours to disable. Record it as pruned so
             # the daily job doesn't retry it forever; ensure_bot treats it as squatted.
             log.warning("prune: %s (%s) is no longer this broker's", acct.name, acct.bot_user_id)
+        except MattermostError as exc:
+            # Left unmarked, so the next daily run retries it; one bad account must not stop
+            # the accounts after it from being pruned (R-30).
+            log.error("prune: disabling %s failed: %s; will retry", acct.name, exc)
+            continue
         accounts.mark_pruned(acct.name, now)
         pruned.append(acct.name)
         log.info("prune: deactivated %s, last registered %s", acct.name, acct.last_register)

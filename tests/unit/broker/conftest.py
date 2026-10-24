@@ -30,6 +30,7 @@ class FakeMattermost:
         self.read_others_bots = False
         self.list_bots_fails = False
         self.revoke_fails: set[str] = set()
+        self.disable_fails: set[str] = set()
         self.users: dict[str, dict[str, Any]] = {
             BROKER_ID: {"id": BROKER_ID, "username": "crewbroker", "is_bot": False, "delete_at": 0},
             HUMAN_ID: {"id": HUMAN_ID, "username": "bj", "is_bot": False, "delete_at": 0},
@@ -112,6 +113,8 @@ class FakeMattermost:
 
     def disable_bot(self, bot_user_id: str) -> None:
         self.calls.append(("disable_bot", bot_user_id))
+        if bot_user_id in self.disable_fails:
+            raise MattermostError("PUT", f"/bots/{bot_user_id}/disable", 500, "boom")
         self._visible(bot_user_id)["delete_at"] = 1
         self.users[bot_user_id]["delete_at"] = 1
 

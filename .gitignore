@@ -26,3 +26,6 @@ reports/
 
 # Written by scripts/ci/mattermost-up.sh: a throwaway server's URL and admin token
 .mattermost.env
+
+# Written by wave-status: its status panel, at the repo root because there is no .sdlc/
+/.status-panel.html
