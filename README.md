@@ -42,6 +42,67 @@ share. Fleet broadcasts are `@agents` (S-24).
   backlog is upshifted: Stories #7 to #23.
 - **Next:** hailing-frequencies runs `/wavemachine` on #26 first.
 
-No code yet. Development runs on a throwaway Mattermost container. Every agent talks to every
+- **2026-10-24:** Story 1.1 (#7) lays down the workspace, the build and CI. The packages are
+  skeletons so far.
+
+Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
 server need the yes-prod S-25 requires; ordinary account activity doesn't.
+
+## Code layout
+
+One uv workspace (D-064), Python 3.12, with three packages:
+
+| Package | Import name | What it is | Runs as |
+|---------|-------------|------------|---------|
+| `packages/daemon` | `crewchat` | the per-host chat daemon; holds every agent's connection | `crewchat` |
+| `packages/broker` | `crewbroker` | the per-crew broker; creates bot accounts, mints and revokes tokens | `crewbroker` |
+| `packages/clients` | `crewchat_clients` | thin clients: the MCP shim and the doorbell | the agent's user |
+
+The upstream Mattermost library, `mcp-server-mattermost` (`cloud-ru-tech/mcp-server-mattermost`),
+is pinned to an exact reviewed version in `packages/daemon/pyproject.toml`, and `uv.lock` carries a
+hash for every package (CT-03). Install with `uv sync --frozen`; never let it re-resolve.
+
+```
+pyproject.toml   uv.lock   Makefile
+packages/        daemon/  broker/  clients/      each src/<import name>/
+tests/           unit/  integration/              integration tests need a Mattermost server
+scripts/ci/      the CI logic; the workflow only calls these
+scripts/verify-install.sh                         post-install checks (Stories 1.3 and 1.4 fill it)
+.github/workflows/ci.yml                          three Mattermost legs
+docs/            the sketchbook, the Dev Spec, briefs
+```
+
+## Make targets
+
+| Target | What it runs |
+|--------|--------------|
+| `make lint` | `ruff check .` and `mypy packages` |
+| `make test` | `pytest tests`, writing `reports/junit.xml` and `reports/coverage.xml` |
+| `make ci` | `lint`, then `test` |
+| `make verify-install` | `scripts/verify-install.sh`, on an installed host |
+
+## Testing against Mattermost
+
+Integration tests use the `mattermost` fixture in `tests/integration/conftest.py`. It reads
+`MM_URL` and `MM_ADMIN_TOKEN`, and skips with a reason when they are unset, so `make test` passes
+on a laptop with no server. To run them, start a throwaway server (needs Docker, `curl` and `jq`):
+
+```bash
+MM_IMAGE=mattermost/mattermost-team-edition:11.11.3 scripts/ci/mattermost-up.sh
+source .mattermost.env
+make ci
+scripts/ci/mattermost-down.sh
+```
+
+`mattermost-up.sh` starts Postgres and the server on `localhost:8065`, creates an admin, enables
+bot accounts and personal access tokens, and applies the dev space's rate limits (per user, 10/s,
+burst 50; CT-06).
+
+CI runs `make ci` on three legs (CT-01, CT-11): Team Edition 11.11.3, an unlicensed Enterprise
+11.11.3 standing in for Entry, and Team Edition 11.8.x at the newest 11.8 patch, pinned in
+`ci.yml`. Each leg sets `MM_NATIVE_TOKEN_EXPIRY` (`present` on 11.11, `absent` on 11.8), and tests
+that need native token expiry assert the server's capability against it rather than skipping
+(R-07). Each leg uploads `reports/` as an artifact. `scripts/ci/two-user-setup.sh` creates the
+`crewchat`, `crewbroker`, `crewkiosk` and `agent` users and the `crewchat-clients` group on the
+runner; run it only on a runner or a throwaway container.
