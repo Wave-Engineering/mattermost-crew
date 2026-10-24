@@ -29,6 +29,7 @@ class FakeMattermost:
         self.supports_expiry = supports_expiry
         self.read_others_bots = False
         self.list_bots_fails = False
+        self.revoke_fails: set[str] = set()
         self.users: dict[str, dict[str, Any]] = {
             BROKER_ID: {"id": BROKER_ID, "username": "crewbroker", "is_bot": False, "delete_at": 0},
             HUMAN_ID: {"id": HUMAN_ID, "username": "bj", "is_bot": False, "delete_at": 0},
@@ -132,6 +133,10 @@ class FakeMattermost:
 
     def revoke_token(self, token_id: str) -> None:
         self.calls.append(("revoke_token", token_id))
+        if token_id in self.revoke_fails:
+            raise MattermostError("POST", "/users/tokens/revoke", 500, "boom")
+        if token_id not in self.tokens:
+            raise NotFound("POST", "/users/tokens/revoke", 404, "not found")
         self.tokens[token_id]["revoked"] = True
 
 

@@ -42,7 +42,7 @@ from crewbroker.mint import (
     native_expiry_supported,
     record_register,
 )
-from crewbroker.prune import prune_idle
+from crewbroker.prune import prune_idle, reconcile_tokens
 from crewbroker.state import AccountStore, TokenStore
 
 PROTO = 1
@@ -155,7 +155,11 @@ class Broker:
         with self._lock:
             if self.tokens.get(token_id) is None:
                 raise OpError("not_found", "no token with that id was minted by this broker")
-            self.client.revoke_token(token_id)
+            try:
+                self.client.revoke_token(token_id)
+            except NotFound:
+                # Already gone on the server: done, or the daemon would retry it every day.
+                log.warning("revoke: token %s is already gone upstream", token_id)
             self.tokens.remove(token_id)
         log.info("revoke: token %s", token_id)
         return {}
@@ -186,8 +190,12 @@ class Broker:
         }
 
     def prune(self) -> list[str]:
+        """The daily job: deactivate idle accounts, then revoke orphaned tokens."""
         with self._lock:
-            return prune_idle(self.client, self.accounts, self.clock())
+            now = self.clock()
+            pruned = prune_idle(self.client, self.accounts, now)
+            reconcile_tokens(self.client, self.tokens, now)
+            return pruned
 
     def ops(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
         return {
@@ -280,7 +288,7 @@ class BrokerServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def start_prune_scheduler(
     broker: Broker, stop: threading.Event, interval_s: float = PRUNE_INTERVAL_S
 ) -> threading.Thread:
-    """Run `prune_idle` now and then daily, until `stop` is set."""
+    """Run the daily job (`Broker.prune`) now and then daily, until `stop` is set."""
 
     def loop() -> None:
         while not stop.is_set():

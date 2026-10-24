@@ -55,6 +55,13 @@ def test_remint_keeps_old_token_until_revoke(broker: Broker, fake: Any) -> None:
         broker.remint({"dev_name": "never", "crew": "oaw"})
 
 
+def test_revoke_notfound_upstream_is_success(broker: Broker, fake: Any) -> None:
+    minted = broker.mint({"dev_name": "babel", "crew": "oaw"})
+    del fake.tokens[minted["token_id"]]  # already revoked on the server
+    assert broker.revoke({"token_id": minted["token_id"]}) == {}
+    assert broker.tokens.get(minted["token_id"]) is None
+
+
 def test_every_op_refused_to_non_daemon_peer(broker: Broker, fake: Any, short_dir: Path) -> None:
     path = short_dir / "oaw-dev.sock"
     server, _ = serving(broker, path, allowed_uid=os.getuid() + 1)

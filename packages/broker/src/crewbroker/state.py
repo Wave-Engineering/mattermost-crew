@@ -128,6 +128,15 @@ class TokenRecord:
     expires_at: int | None  # epoch milliseconds, when native expiry was set
 
 
+def _token_record(token_id: str, entry: dict[str, Any]) -> TokenRecord:
+    return TokenRecord(
+        token_id=token_id,
+        user_id=entry["user_id"],
+        created_at=datetime.fromisoformat(entry["created_at"]),
+        expires_at=entry.get("expires_at"),
+    )
+
+
 class TokenStore:
     """`tokens.json`: the id and creation time of every live token this broker minted."""
 
@@ -152,12 +161,10 @@ class TokenStore:
         entry = self._load()["tokens"].get(token_id)
         if entry is None:
             return None
-        return TokenRecord(
-            token_id=token_id,
-            user_id=entry["user_id"],
-            created_at=datetime.fromisoformat(entry["created_at"]),
-            expires_at=entry.get("expires_at"),
-        )
+        return _token_record(token_id, entry)
+
+    def all(self) -> list[TokenRecord]:
+        return [_token_record(tid, entry) for tid, entry in sorted(self._load()["tokens"].items())]
 
     def remove(self, token_id: str) -> None:
         data = self._load()

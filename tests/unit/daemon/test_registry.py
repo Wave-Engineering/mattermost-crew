@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from crewchat.registry import RegisterError, account_name
-from crewchat.tokens import BrokerUnavailable
+from crewchat.tokens import BrokerError, BrokerUnavailable
 
 
 def register(daemon: Any, dev: str = "babel", crew: str | None = "oaw", session: str = "s1") -> Any:
@@ -88,6 +88,32 @@ def test_register_fails_loudly_when_no_broker_answers(daemon: Any) -> None:
     with pytest.raises(RegisterError, match="broker_unavailable"):
         register(daemon)
     assert daemon.store.agent("babel") is None
+
+
+def _two_servers(raw: dict[str, Any]) -> dict[str, Any]:
+    raw["mattermost"].append({"id": "prod", "url": "http://mm2.invalid"})
+    raw["crews"]["oaw"]["prod"] = {
+        "broker_socket": "/run/crewbroker/oaw-prod.sock",
+        "broker_user_id": "b-oaw-prod",
+    }
+    return raw
+
+
+def test_register_all_squatted_returns_squatted(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    daemon = make_daemon(_two_servers(servers_toml))
+    for sid in ("dev", "prod"):
+        daemon.broker("oaw", sid).fail["mint"] = BrokerError("mint", "squatted: held by x")
+    with pytest.raises(RegisterError) as exc:
+        register(daemon)
+    assert exc.value.code == "squatted"
+
+    # A squatted name on one server and a timeout on the other: a retry may still work.
+    daemon.broker("oaw", "prod").fail["mint"] = BrokerUnavailable("timeout")
+    with pytest.raises(RegisterError) as exc:
+        register(daemon)
+    assert exc.value.code == "broker_unavailable"
 
 
 def test_register_keeps_the_servers_that_answered(
