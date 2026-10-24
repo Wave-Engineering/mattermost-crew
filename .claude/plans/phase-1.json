@@ -1,0 +1,58 @@
+{
+  "project": "Wave-Engineering/mattermost-crew",
+  "repo": "Wave-Engineering/mattermost-crew",
+  "base_branch": "main",
+  "plan_id": 26,
+  "slug": "mattermost-p1",
+  "phases": [
+    {
+      "name": "Phase 1: Foundation, Broker, Identity",
+      "waves": [
+        {
+          "id": "P1W1",
+          "issues": [
+            {
+              "number": 7,
+              "title": "Workspace scaffold with CI against Mattermost",
+              "story": "1.1",
+              "depends_on": []
+            },
+            {
+              "number": 8,
+              "title": "Verification spike \u2014 \u00a75.N and the kiosk mechanism",
+              "story": "1.2",
+              "depends_on": []
+            }
+          ]
+        },
+        {
+          "id": "P1W2",
+          "issues": [
+            {
+              "number": 9,
+              "title": "Broker \u2014 accounts, tokens, expiry, re-mint, prune",
+              "story": "1.3",
+              "depends_on": [
+                "1.1",
+                "1.2"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "P1W3",
+          "issues": [
+            {
+              "number": 10,
+              "title": "Daemon core \u2014 socket, protocol, register, token store",
+              "story": "1.4",
+              "depends_on": [
+                "1.3"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

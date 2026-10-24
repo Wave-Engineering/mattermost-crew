@@ -9,10 +9,12 @@ finalization_score: 8/8
 
 **Version:** 1.0
 **Date:** 2026-10-23
-**Status:** Draft
+**Status:** Approved (2026-10-24, D-088); amended pre-kickoff by D-089 to D-092
 **Authors:** bakerb, babelfish (oaw)
 **Plan:** Wave-Engineering/mattermost-crew#3
-**Ledger of record:** `docs/SKETCHBOOK.md` (sketchbook D-01 to D-26) and the `[ledger D-NNN]` comments on Plan #3 (D-001 to D-087, including the PR #5 precheck-review entries D-073 to D-087)
+**Phase Plans:** #26 (Phase 1), #27 (Phase 2), #28 (Phase 3); Plan #3 is the program Plan and ledger of record (D-089).
+**Ledger of record:** `docs/SKETCHBOOK.md` (sketchbook S-01 to S-26) and the `[ledger D-NNN]` comments on Plan #3 (D-001 to D-092, including the PR #5 precheck-review entries D-073 to D-087 and the pre-kickoff amendments D-089 to D-092)
+**Citation rule:** Sketchbook decisions are cited S-NN (sketchbook D-NN); Plan #3's ledger entries D-NNN (D-092).
 
 ---
 
@@ -103,6 +105,7 @@ A self-hosted Mattermost runs alongside Discord, behind one chat tool contract.
 | CT-08 | An agent is woken by a background task's **exit** (the one-shot doorbell pattern), and every adapter feeds that pattern. | There is no Monitor primitive on Bedrock. D-014. |
 | CT-09 | The `discord-watcher` binary name is kept or aliased. | About 27 kit files invoke it. D-015. |
 | CT-10 | Development uses the LAN-only dev space. The implementation carries **no network assumption**: server URLs are configuration, and it runs anywhere that can reach a configured server. | BJ: it must be able to run on other LANs. D-016. |
+| CT-11 | The program supports Mattermost 11.8 and later; CI runs a third leg at the newest 11.8 patch. | The oldest server the program must join predates 11.9; the design relies there on bot `owner_id`, bot reassignment, the role patch and token create/revoke. Native expiry stays a runtime capability (R-07). D-091. |
 
 ### 2.2 Product Constraints
 
@@ -297,7 +300,7 @@ mattermost-crew/
             partner-guide.md  mattermost-crew-devspec.md
 ```
 
-The broker remains a separate package, a separate service and a separate OS user; its trust boundary is a deploy boundary, not a repo boundary. claudecode-workflow changes are made outside the Plan, at phase-boundary integration points, pinned to a tagged `mattermost-crew` release (D-064, D-065). mcp-server-discord and the watcher get maintenance only, and leave agent sessions once `chat_*` covers Discord.
+The broker remains a separate package, a separate service and a separate OS user; its trust boundary is a deploy boundary, not a repo boundary. claudecode-workflow changes are made outside the phase Plans, at phase-boundary integration points (IP-2 after Plan #27 lands, IP-3 after Plan #28), pinned to a tagged `mattermost-crew` release (D-064, D-065, D-089). mcp-server-discord and the watcher get maintenance only, and leave agent sessions once `chat_*` covers Discord.
 
 ### 5.2 Technology Choices
 
@@ -509,7 +512,7 @@ Tier 2 triggers, recorded:
 | Stage | Trigger | Steps | Artifacts Produced | Gate |
 |-------|---------|-------|-------------------|------|
 | Validate | every push and PR | `make lint` (ruff, mypy) | none | must pass to merge |
-| Test | every push and PR | `make test` against Mattermost Team Edition and Enterprise containers, in a two-user image | DM-05, DM-06 | must pass to merge |
+| Test | every push and PR | `make test` against three Mattermost legs (Team Edition 11.11.3, Enterprise 11.11.3, Team Edition 11.8.x), in a two-user image | DM-05, DM-06 | must pass to merge |
 | Install verify | every push and PR | IT-20: the runbook's install and verify, run in a fresh container | none | must pass to merge |
 | Release | version tag | build sdists and wheels; publish to the GitHub release | wheels | tag cut by babelfish (lead grant) at the integration points |
 
@@ -529,6 +532,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 6. **Facts carried from the sketchbook:** are bot-to-bot DMs supported? Do bot accounts appear in `@` autocomplete, with their own avatars?
 7. **Broker transport, and trust, when a broker is on another host:** for this Plan the daemon and every broker it uses (its own and its trusted crews') share one host, using unix sockets, and no broker calls another. **Trust across hosts is deferred:** a trusted crew whose broker is not on this host has no `servers.toml` table and no reachable `crew_info`, so all its senders are treated as outsiders (the kiosk if directly addressed, otherwise dropped under crew and trusted). Spike 1.2 records the remote option (e.g. mutual-TLS TCP from the daemon to a remote broker, carrying `crew_info`) as a design note, for a later Plan.
 8. **Bot `owner_id`:** verify that a bot account's `owner_id` is the creating broker account, is reported by the API to any user, and cannot be changed by the bot itself. Also confirm that the owner **can** reassign it with `POST /bots/{id}/assign/{user}`, which is why membership also requires `minted_bot_ids` (§5.9).
+9. **11.8 compatibility** (owned by spike 1.2, run against a local 11.8 Team Edition container; Story 1.1's 11.8 CI leg then keeps it true): confirm that `owner_id`, `POST /bots/{id}/assign`, the `system_user_access_token` role patch and token create/revoke behave as on 11.11, and that the absence of `expires_at` is detected (R-07). Anything that fails is recorded here with its ledger ID (D-091).
 
 **Deferred, decided by usage** (policy for BJ, not facts a spike can settle): private DMs vs. visibility; how `@<dev-team>` behaves across crews; whether crew names need to be unique for `@crew` routing.
 
@@ -539,7 +543,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 ### 6.1 Test Strategy
 
 - **Unit tests** are pytest, per package, specified per story in §8.
-- **Integration and E2E tests** run in CI against real Mattermost containers: Team Edition 11.11.3, and an unlicensed Enterprise image standing in for Entry (CT-01; to verify, §5.N-5). The rate limits match the dev space.
+- **Integration and E2E tests** run in CI against real Mattermost containers, on three legs: Team Edition 11.11.3, an unlicensed Enterprise 11.11.3 image standing in for Entry (CT-01; to verify, §5.N-5), and Team Edition 11.8.x, the oldest supported server (CT-11; latest patch, pinned in the workflow). The rate limits match the dev space.
 - The CI image has **two users**, so the daemon runs apart from the test "agent" user. That makes R-08 actually testable (IT-01).
 - Discord is exercised through a scream-hole fake. squawkie is exercised through a local SSE fake.
 - The final phase ends with a smoke run on the OaW dev space, run by an agent and posted to Plan #3.
@@ -590,7 +594,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 
 - [ ] All Phase DoD checklists are satisfied.
 - [ ] Every requirement R-01 to R-34 traces to at least one IT or E2E item in the VRTM, and that item passes. [R-01 to R-34]
-- [ ] All IT-01 to IT-23 and E2E-01 to E2E-03 pass in CI, against both the Team Edition and the Enterprise images. [CT-01]
+- [ ] All IT-01 to IT-23 and E2E-01 to E2E-03 pass in CI on all three legs: Team Edition and Enterprise at 11.11.3, and Team Edition 11.8.x. [CT-01, CT-11]
 - [ ] IT-01 runs the daemon under a separate user in CI. [R-08]
 - [ ] Every Deliverables Manifest row (5.A) is delivered at its path.
 - [ ] The §5.N questions each have a recorded answer, and any answer that changes a decision has a superseding `[ledger]` entry.
@@ -615,12 +619,12 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 
 Phases are sequential milestones, each with its own Definition of Done. Each story becomes one issue, and is implemented as one PR in `Wave-Engineering/mattermost-crew`. Stories in the same wave have no dependencies on each other and can run in parallel. Each AC item is tagged with the requirements it verifies.
 
-A dedicated dev-agent in `mattermost-crew` runs `/wavemachine` for this Plan (D-065). babelfish owns the kit integration points, IP-2 and IP-3, which sit outside the Plan's stories, and is that agent's escalation point. Each phase lands on `main` on its own. The agent's first check is whether `/wavemachine` can scope a campaign to one phase; if it can't, each phase becomes its own Plan.
+A dedicated dev-agent in `mattermost-crew` (hailing-frequencies) runs `/wavemachine` (D-065). **Each phase is its own Plan and its own `/wavemachine` campaign, landing on `main` independently (D-089):** Phase 1 is #26, Phase 2 is #27 and Phase 3 is #28. `/wavemachine` cuts one campaign branch per Plan and writes `main` once, at the end, so a per-phase Plan is what lets each phase land. Plan #3 stays the program Plan and the ledger of record. babelfish owns the kit integration points, which sit outside the phase Plans' stories: IP-2 follows #27 landing, and IP-3 follows #28. babelfish is also that agent's escalation point.
 
 ### Wave Map
 
 ```
-PHASE 1 — Foundation, broker, identity
+PHASE 1 — Foundation, broker, identity                    (Plan #26, its own campaign)
 P1W1 ─┬─ 1.1 Workspace scaffold (foundation)
       └─ 1.2 Verification spike (§5.N, kiosk mechanism)
            │
@@ -628,17 +632,19 @@ P1W2 ─── 1.3 Broker: accounts, tokens, expiry, re-mint, prune
            │
 P1W3 ─── 1.4 Daemon core: socket, protocol, register, token store
            │
-PHASE 2 — Chat contract and adapters
+   ⇒ #26 lands on main
+           │
+PHASE 2 — Chat contract and adapters                      (Plan #27, its own campaign)
 P2W1 ─┬─ 2.1 Mattermost adapter
       ├─ 2.2 Discord adapter
       └─ 2.3 Addressing
            │
 P2W2 ─── 2.4 Thin MCP: chat_*, default resolution, disc_* aliases
            │
-   ⇒ IP-2: tag release → K-1 (babelfish, claudecode-workflow): skills → chat_*, /name registers,
+   ⇒ #27 lands on main ⇒ IP-2: tag release → K-1 (babelfish, claudecode-workflow): skills → chat_*, /name registers,
            install thin MCP, chat-defaults ask-once, chat_* tool reference (DM-09b)
            │
-PHASE 3 — Inbound defense, doorbell, kiosk
+PHASE 3 — Inbound defense, doorbell, kiosk                (Plan #28, its own campaign)
 P3W1 ─┬─ 3.1 Broker: switch and kiosk control
       └─ 3.2 Doorbell core
            │
@@ -654,14 +660,14 @@ P3W5 ─── 3.8 E2E suite and remaining API tests
            │
 P3W6 ─── 3.9 Closing: VRTM, manifest, partner-name grep, dev-space smoke
            │
-   ⇒ IP-3: tag release → K-2 (babelfish, claudecode-workflow): doorbell wiring to the chat
+   ⇒ #28 lands on main ⇒ IP-3: tag release → K-2 (babelfish, claudecode-workflow): doorbell wiring to the chat
            one-shot (old one-shots kept as fallback), /reseed writes the `## Kiosk` section,
            the kiosk-review step in the doorbell skill
 ```
 
 | Wave | Stories | Master Issue | Parallel? |
 |------|---------|-------------|-----------|
-| P1W1 | 1.1, 1.2 | P1W1 master | Yes — 2 independent stories |
+| P1W1 | 1.1, 1.2 | P1W1 master | Yes — 2 independent stories (1.2 is docs and spike scripts only, D-090) |
 | P1W2 | 1.3 | Story 1.3 | Single story |
 | P1W3 | 1.4 | Story 1.4 | Single story |
 | P2W1 | 2.1, 2.2, 2.3 | P2W1 master | Yes — 3 independent stories |
@@ -683,9 +689,11 @@ Each story that delivers a deployable service (1.3 broker, 1.4 daemon) adds its 
 
 **Goal:** A workspace with CI against real Mattermost, a broker that creates bot accounts and mints tokens, and a daemon that holds those tokens where agents cannot read them.
 
+**Plan:** #26 (its own `/wavemachine` campaign, landing on `main` independently; D-089)
+
 #### Phase 1 Definition of Done
 
-- [ ] `make ci` passes locally and in CI against both Mattermost images. [CT-01]
+- [ ] `make ci` passes locally and in CI on all three CI legs. [CT-01, CT-11]
 - [ ] Every §5.N question has a recorded answer on Plan #3.
 - [ ] IT-01, IT-03 and IT-17 pass. [R-01, R-02, R-03, R-05, R-06, R-08, R-30]
 - [ ] `make verify-install` checks the broker and the daemon on a fresh host. [R-06, R-08]
@@ -719,9 +727,9 @@ Creates the uv workspace, the build system and the CI that every later story rel
    - `ci`: `lint test`
    - `verify-install`: runs `scripts/verify-install.sh`, which starts empty and gains checks in 1.3 and 1.4.
 5. Create `tests/integration/conftest.py` with a `mattermost` fixture. It reads `MM_URL` and `MM_ADMIN_TOKEN` from the environment, and skips with a clear reason when they are absent.
-6. Create `scripts/ci/mattermost-up.sh`. It starts the image named by `MM_IMAGE` (`mattermost/mattermost-team-edition:11.11.3` or `mattermost/mattermost-enterprise-edition:11.11.3`), waits for `/api/v4/system/ping`, creates an admin, sets `EnableBotAccountCreation` and `EnableUserAccessTokens` and the dev-space rate limits, and exports `MM_URL` and `MM_ADMIN_TOKEN`.
+6. Create `scripts/ci/mattermost-up.sh`. It starts the image named by `MM_IMAGE` (`mattermost/mattermost-team-edition:11.11.3`, `mattermost/mattermost-enterprise-edition:11.11.3`, or `mattermost/mattermost-team-edition:11.8.x` with the latest 11.8 patch pinned in the workflow; CT-11), waits for `/api/v4/system/ping`, creates an admin, sets `EnableBotAccountCreation` and `EnableUserAccessTokens` and the dev-space rate limits, and exports `MM_URL` and `MM_ADMIN_TOKEN`.
 7. Create `scripts/ci/two-user-setup.sh`. It creates the `crewchat`, `crewbroker`, `crewkiosk` (empty HOME) and `agent` users and the `crewchat-clients` group in the CI image, so tests can run as `agent` while services run as their own users.
-8. Create `.github/workflows/ci.yml`, with each step one line calling `scripts/ci/*.sh`: a matrix over the two `MM_IMAGE` values, running `make ci`, then uploading `reports/`.
+8. Create `.github/workflows/ci.yml`, with each step one line calling `scripts/ci/*.sh`: a matrix over three `MM_IMAGE` legs (`mattermost-team-edition:11.11.3`, `mattermost-enterprise-edition:11.11.3`, and `mattermost-team-edition:11.8.x`, latest patch, pinned in the workflow), running `make ci`, then uploading `reports/`. On the 11.8 leg, tests that need native token expiry assert it is detected as absent rather than skipping silently (R-07, CT-11).
 9. Write `README.md` (overview, layout, `make` targets) and `CHANGELOG.md` with an "Unreleased" section.
 
 **Test Procedures:**
@@ -741,7 +749,7 @@ Creates the uv workspace, the build system and the CI that every later story rel
 
 - [ ] `uv sync --frozen` succeeds, and `uv.lock` contains `--hash` entries for every package. [CT-03]
 - [ ] `make ci` passes locally with the Team Edition container. [CT-01]
-- [ ] CI runs the matrix over both images, and both legs are green on the PR. [CT-01]
+- [ ] CI runs the matrix over all three legs (Team Edition 11.11.3, Enterprise 11.11.3, Team Edition 11.8.x), and all three are green on the PR. [CT-01, CT-11]
 - [ ] `reports/junit.xml` and `reports/coverage.xml` are uploaded as CI artifacts.
 - [ ] `.github/workflows/ci.yml` has no `run:` step longer than one line; the logic is in `scripts/ci/`.
 - [ ] `README.md` and `CHANGELOG.md` exist.
@@ -760,7 +768,8 @@ Answers the open questions that could overturn a locked decision, before any cod
 
 1. Against the OaW dev space, or a local Team Edition container, answer §5.N questions 6 and 8 by experiment. Answer questions 1 and 5 from the vendor's docs, plus a check against a licensed image where one is available. For each question, record the command or source and its output in `docs/spikes/2026-10-spike-1.2.md`.
    - **Question 8 (bot `owner_id`):** create a bot account as the broker account, then read it as a second user. Assert `owner_id` is the broker's user ID. Attempt to change `owner_id` with the bot's own token, and record that it is refused. Then, as the owner (the broker account), reassign the bot with `POST /bots/{id}/assign/{user}` and record that it succeeds, which is why membership also requires `minted_bot_ids` (§5.9).
-2. **Question 2 (one client per token):** write `spikes/two_clients.py`. It imports the upstream library, creates two client objects with two different bot tokens in one process, and posts as each. Record which author IDs the server reports.
+2. **Question 2 (one client per token):** write `spikes/two_clients.py`. It imports the upstream library, creates two client objects with two different bot tokens in one process, and posts as each. Record which author IDs the server reports. Run it against the pinned upstream, not whatever resolves: `uv run --with <upstream-dist>==<pin> spikes/two_clients.py` (D-090). `<pin>` is the version Story 1.1 locks in `uv.lock`; choose it here and record it in the spike doc, and if 1.1's PR is still open, use the version that PR pins, so that the two agree.
+   - **Record the upstream's PyPI distribution name and the pinned version** in the spike doc (the Dev Spec names the repo, `cloud-ru-tech/mcp-server-mattermost`, but not its PyPI distribution name).
 3. **Question 3 (`·p1`):** run the signature-parsing code from mcp-server-discord and the watcher, as of their current release tags, against a signature line ending in ` ·p1`, and record whether the name still parses.
 4. **Question 4 (the kiosk mechanism):** time and test both options with a fixture brief.
    - (a) As the `crewkiosk` user, with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`, with the brief in the prompt. Ask it to run a shell command and record whether it ran. Then prove, **from the CLI's own transcript or debug output and not from our argv**, that no user, project or local settings, no hooks and no `CLAUDE.md` loaded. Plant a hook and a `CLAUDE.md` in the usual locations first, **and a hook in the managed-settings location**, so the proof is against something present; then confirm the kiosk host has no managed settings configured.
@@ -772,11 +781,7 @@ Answers the open questions that could overturn a locked decision, before any cod
 
 **Test Procedures:**
 
-*Unit Tests:*
-
-| Test Name | Purpose | File Location |
-|-----------|---------|---------------|
-| `test_spike_doc_answers_every_question` | Every §5.N item has an "Answer:" line in the spike doc | `tests/unit/test_spike_doc.py` |
+*Unit Tests:* none. This story is docs and spike scripts only, so its CI gate is honest when empty (it runs in parallel with 1.1, before CI exists). The check that every §5.N item is answered, `test_spike_doc_answers_every_question`, lands in Story 1.3 (D-090).
 
 *Integration/E2E Coverage:*
 
@@ -851,6 +856,7 @@ Delivers the broker, one per (crew, server), that creates bot accounts and mints
 | `test_ensure_bot_rejects_squatted_name` | An existing `<dev>.<crew>` not owned by this broker (or not in `minted_bot_ids`) → `SquattedAccount`, no token minted | `tests/unit/broker/test_mint.py` |
 | `test_remint_does_not_record_register` | `remint` leaves `last_register` unchanged; `mint` updates it | `tests/unit/broker/test_mint.py` |
 | `test_crew_defaults_to_partner_username` | `crew` is absent from the config → the partner's username | `tests/unit/broker/test_config.py` |
+| `test_spike_doc_answers_every_question` | Every §5.N item has an "Answer:" line in `docs/spikes/2026-10-spike-1.2.md` (moved from Story 1.2, D-090) | `tests/unit/test_spike_doc.py` |
 
 *Integration/E2E Coverage:*
 
@@ -867,10 +873,11 @@ Delivers the broker, one per (crew, server), that creates bot accounts and mints
 - [ ] `crew_info` returns only this broker's own fields: `minted_bot_ids` that match the bot accounts it created, and the trusted crews by name; it never calls another broker. [R-22]
 - [ ] A pruned agent's account is reactivated on its next `register`, and `mint` then succeeds, against the CI Mattermost. [R-03, R-30]
 - [ ] `mint` for a squatted `<dev>.<crew>` (an existing account not owned by this broker) fails loudly and mints nothing. [R-01, R-03]
-- [ ] IT-03 passes on both images. [R-30]
+- [ ] IT-03 passes on all three CI legs. [R-30]
 - [ ] `remint` and `revoke` work as separate steps, so the old token stays valid until the daemon revokes it. [R-05]
 - [ ] Every broker op from a peer that isn't `crewchat` is refused. [R-08]
 - [ ] `make verify-install` includes the broker checks, and they pass in CI. [R-06]
+- [ ] `test_spike_doc_answers_every_question` passes against the merged spike doc from Story 1.2: every §5.N item, including the 11.8 compatibility item, has an "Answer:" line. [CT-01, CT-11]
 
 ---
 
@@ -938,7 +945,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 
 **Acceptance Criteria:**
 
-- [ ] IT-01 passes on both images [R-01, R-03, R-05, R-06, R-08]:
+- [ ] IT-01 passes on all three CI legs [R-01, R-03, R-05, R-06, R-08]:
   - the daemon runs as `crewchat`;
   - for every known credential file, `test -e` succeeds and `sudo -u agent test -r` fails;
   - no socket op returns a token to a non-daemon peer;
@@ -956,9 +963,11 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 
 **Goal:** One chat contract that sends, reads and replies across N Mattermost servers and Discord, with the agreed addressing rules, exposed to agents as `chat_*` tools.
 
+**Plan:** #27 (its own `/wavemachine` campaign; IP-2 follows its landing; D-089)
+
 #### Phase 2 Definition of Done
 
-- [ ] IT-02, IT-04 to IT-07, and IT-14 to IT-16, pass on both images. [R-04, R-05, R-07, R-09 to R-19, R-29]
+- [ ] IT-02, IT-04 to IT-07, and IT-14 to IT-16, pass on all three CI legs. [R-04, R-05, R-07, R-09 to R-19, R-29]
 - [ ] Every `disc_*` alias is covered by IT-15. [R-15]
 - [ ] A `mattermost-crew` release is tagged, ready for IP-2 (K-1).
 - [ ] All Phase 2 unit tests pass.
@@ -1005,11 +1014,11 @@ Implements send, read, thread, DM and react against Mattermost through the upstr
 
 **Acceptance Criteria:**
 
-- [ ] IT-14 passes on both images. [R-04, R-29]
+- [ ] IT-14 passes on all three CI legs. [R-04, R-29]
 - [ ] Posts made through the adapter carry `props.crew_proto = 1`, and older posts parse with `proto` 0. [R-14]
 - [ ] Two agents post from one daemon process as two distinct authors (two client objects). [R-01]
 - [ ] Websocket reconnect after a forced close is covered by a unit test. [CT-07]
-- [ ] IT-02 passes on both images: across a daemon-driven rotation, the agent's websocket reconnects with the new token and no event is lost. [R-05, R-07]
+- [ ] IT-02 passes on all three CI legs: across a daemon-driven rotation, the agent's websocket reconnects with the new token and no event is lost. [R-05, R-07]
 
 ---
 
@@ -1097,7 +1106,7 @@ Implements the addressing rules every adapter inherits: `@agents`, `@all` during
 
 **Acceptance Criteria:**
 
-- [ ] IT-07 passes on both images. [R-16, R-17, R-18, R-19]
+- [ ] IT-07 passes on all three CI legs. [R-16, R-17, R-18, R-19]
 - [ ] No code path calls the Mattermost user-groups API (checked by grep in CI). [R-17, CT-01]
 
 ---
@@ -1155,7 +1164,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 
 **Acceptance Criteria:**
 
-- [ ] IT-04, IT-05, IT-15 and IT-16 pass on both images. [R-09, R-10, R-11, R-12, R-13, R-15]
+- [ ] IT-04, IT-05, IT-15 and IT-16 pass on all three CI legs. [R-09, R-10, R-11, R-12, R-13, R-15]
 - [ ] A headless send with no default fails, and leaves a squawk on the crew's configured needs list; there is no Discord fallback. [R-11]
 - [ ] `grep -rn "token" packages/clients/` finds no credential handling. [R-08]
 - [ ] Every `disc_*` alias forwards and warns. [R-15]
@@ -1167,9 +1176,11 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 
 **Goal:** One merged doorbell over three backends, gated by the crew's social switch and the loop guard, with outsiders answered by a tool-less kiosk, and the operator and partner docs that make it runnable.
 
+**Plan:** #28 (its own `/wavemachine` campaign; IP-3 follows its landing; D-089)
+
 #### Phase 3 Definition of Done
 
-- [ ] IT-08 to IT-13 and IT-18 to IT-23 pass on both images. [R-20 to R-28, R-31 to R-34]
+- [ ] IT-08 to IT-13 and IT-18 to IT-23 pass on all three CI legs. [R-20 to R-28, R-31 to R-34]
 - [ ] E2E-01 to E2E-03 pass in CI. [R-01, R-09, R-12, R-16, R-20, R-21, R-23, R-25, R-26, R-31, R-33]
 - [ ] DM-09a, DM-09c and DM-10 are delivered.
 - [ ] The dev-space smoke run is posted to Plan #3.
@@ -1262,7 +1273,7 @@ Merges the Mattermost, Discord and squawkie streams into one queue per agent, wi
 
 **Acceptance Criteria:**
 
-- [ ] IT-11, IT-12 and IT-13 pass on both images. [R-26, R-27, R-28]
+- [ ] IT-11, IT-12 and IT-13 pass on all three CI legs. [R-26, R-27, R-28]
 - [ ] squawkie events reproduce `sqtk-doorbell.sh`'s predicate, which a shared fixture verifies. [R-26]
 - [ ] Killing one adapter's connection enqueues exactly one `backend.down`. [R-27]
 
@@ -1349,7 +1360,7 @@ Applies the social switch and the loop guard on both the push path and the pull 
 
 **Acceptance Criteria:**
 
-- [ ] IT-08, IT-09, IT-10 and IT-23 pass on both images. [R-20, R-21, R-22, R-23, R-24, R-25, R-34]
+- [ ] IT-08, IT-09, IT-10 and IT-23 pass on all three CI legs. [R-20, R-21, R-22, R-23, R-24, R-25, R-34]
 - [ ] With the broker stopped and the cached social past its expiry, deliveries use the reverted mode. [R-23]
 - [ ] Membership and the switch apply to both `subscribe` and `read`; addressing and the loop guard apply to `subscribe` only, so `read` returns unaddressed crewmate posts. A test asserts both paths. [R-21]
 - [ ] A newly registered crewmate or trusted-crew agent is never routed to the kiosk (cache-miss re-fetch of the owning local broker, capped per bot), and an outsider's broadcast never reaches a kiosk. [R-22, R-31]
@@ -1483,7 +1494,7 @@ When the human partner engages social, the working agent reviews what the kiosk 
 
 **Acceptance Criteria:**
 
-- [ ] IT-22 passes on both images. [R-33]
+- [ ] IT-22 passes on all three CI legs. [R-33]
 - [ ] No kiosk content reaches the working agent while social is off: a test asserts its queue stays empty during kiosk traffic. [R-31, R-33]
 
 ---
@@ -1565,7 +1576,7 @@ Runs the three end-to-end flows and the remaining API tests in CI.
 
 **Acceptance Criteria:**
 
-- [ ] E2E-01, E2E-02 and E2E-03 pass in CI on both images. [R-01, R-09, R-12, R-16, R-20, R-21, R-23, R-25, R-26, R-31, R-33]
+- [ ] E2E-01, E2E-02 and E2E-03 pass in CI on all three CI legs. [R-01, R-09, R-12, R-16, R-20, R-21, R-23, R-25, R-26, R-31, R-33]
 - [ ] IT-19 passes. [R-01]
 
 ---
@@ -1611,45 +1622,49 @@ Closes the Plan. It completes the trace and confirms every deliverable, checks f
 
 ### Appendix L: Ledger Index
 
-The sketchbook (`docs/SKETCHBOOK.md`, D-01 to D-26) holds the shaping decisions. Plan #3's `[ledger D-NNN]` comments hold the Dev Spec decisions.
+The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[ledger D-NNN]` comments hold the Dev Spec decisions.
+
+**Citation rule (D-092):** sketchbook decisions are cited **S-NN** (the sketchbook's own headings read D-NN, so S-18 is sketchbook D-18); Plan #3's ledger entries are cited **D-NNN**, three digits. D-18 and D-018 are different decisions, so never normalize the zero-padding. Older text that says "sketchbook D-NN" means S-NN; nothing is renumbered.
 
 | Sketchbook | Subject | Plan #3 entries |
 |-----------|---------|-----------------|
-| D-01 | Cross-crew collaboration goal | §1.2; D-017 |
-| D-02 | Control of data | D-002 |
-| D-03 | Configured server instances | D-002, D-032 (R-10), D-016 |
-| D-04 | Backend is a default | D-003, D-033 (R-11) |
-| D-05 | Replies follow the thread | D-034 (R-12) |
-| D-06 | Explicit backend parameter | D-035 (R-13) |
-| D-07 | Forge-less home backend | D-033 (R-11 step 1) |
-| D-08 | Abstract in the server | D-010 (CT-04), D-031 (R-09) |
-| D-09 | Partnered, not bots | D-017 (CP-01) |
-| D-10 | Partner direction is authority | D-004, D-019 (CP-03) |
-| D-11 | Crew namespace | D-011 (CT-05), D-023, D-024 (R-01, R-02) |
-| D-12 | Real accounts | D-023, D-026, D-051 (R-01, R-04, R-29) |
-| D-13 | scream-hole stays for Discord | D-001, D-060 |
-| D-14 | Upstream library | D-009 (CT-03) |
-| D-15 | Discord parity | D-001, D-037 (R-15) |
-| D-16 | Backend down is loud | D-049 (R-27) |
-| D-17 | Wave order | §8 (superseded by D-064, D-065) |
-| D-18 | Its own program | D-064 |
-| D-19 | Per-crew broker (now one per crew, server: D-082) | D-008, D-027 to D-029 (R-05 to R-07) |
-| D-20 | Read and write through our server | D-008 (CT-02), D-030 (R-08), D-043 |
-| D-21 | Loop guard | D-047 (R-25) |
-| D-22 | One doorbell core | D-015 (CT-09), D-048 (R-26), D-060 |
-| D-23 | Social switch | D-005, D-018 (CP-02), D-042 to D-046 |
-| D-24 | Addressing | D-020 (CP-04), D-038 to D-041 |
-| D-25 | Prod scope | D-019 (CP-03) |
-| D-26 | Order of work, dev space | D-006, D-022, D-066 |
+| S-01 | Cross-crew collaboration goal | §1.2; D-017 |
+| S-02 | Control of data | D-002 |
+| S-03 | Configured server instances | D-002, D-032 (R-10), D-016 |
+| S-04 | Backend is a default | D-003, D-033 (R-11) |
+| S-05 | Replies follow the thread | D-034 (R-12) |
+| S-06 | Explicit backend parameter | D-035 (R-13) |
+| S-07 | Forge-less home backend | D-033 (R-11 step 1) |
+| S-08 | Abstract in the server | D-010 (CT-04), D-031 (R-09) |
+| S-09 | Partnered, not bots | D-017 (CP-01) |
+| S-10 | Partner direction is authority | D-004, D-019 (CP-03) |
+| S-11 | Crew namespace | D-011 (CT-05), D-023, D-024 (R-01, R-02) |
+| S-12 | Real accounts | D-023, D-026, D-051 (R-01, R-04, R-29) |
+| S-13 | scream-hole stays for Discord | D-001, D-060 |
+| S-14 | Upstream library | D-009 (CT-03) |
+| S-15 | Discord parity | D-001, D-037 (R-15) |
+| S-16 | Backend down is loud | D-049 (R-27) |
+| S-17 | Wave order | §8 (superseded by D-064, D-065, D-089) |
+| S-18 | Its own program | D-064 |
+| S-19 | Per-crew broker (now one per crew, server: D-082) | D-008, D-027 to D-029 (R-05 to R-07) |
+| S-20 | Read and write through our server | D-008 (CT-02), D-030 (R-08), D-043 |
+| S-21 | Loop guard | D-047 (R-25) |
+| S-22 | One doorbell core | D-015 (CT-09), D-048 (R-26), D-060 |
+| S-23 | Social switch | D-005, D-018 (CP-02), D-042 to D-046 |
+| S-24 | Addressing | D-020 (CP-04), D-038 to D-041 |
+| S-25 | Prod scope | D-019 (CP-03) |
+| S-26 | Order of work, dev space | D-006, D-022, D-066 |
 | — | Constraints | D-007 to D-016 |
 | — | Design | D-053 (superseded by D-064), D-054 to D-062, D-071 |
 | — | Test policy (no MV) | D-063 |
-| — | Agent and integration points | D-065 |
+| — | Agent and integration points | D-065 (phase landing amended by D-089) |
 | — | Kiosk | D-067, D-068 (superseded by D-072), D-069, D-070, D-072 |
 | — | PR #5 precheck review: membership, per-backend rule, loop guard, rotation, kiosk isolation, agent paths | D-073, D-074, D-075 (supersedes D-047), D-076, D-077, D-078 |
 | — | Review round 2: `crew_info`, DMs addressed, R-30 by register, (crew, server) keying, no kiosk-to-kiosk | D-079 (supersedes D-073 in part), D-080 (supersedes D-041), D-081 (supersedes D-052), D-082, D-083 |
 | — | Review round 3: same-host trust, pull filters, 401 reconnect, cache miss, per-server switch | D-084, D-085, D-086 |
 | — | Review round 4: no broker-to-broker calls, broker timeouts, local cache-miss re-fetch, reactivation | D-087 (supersedes D-079 in part) |
+| — | Approval | D-088 |
+| — | Pre-kickoff amendments: one Plan per phase (#26, #27, #28), the spike without CI, the 11.8 floor (CT-11), the S-NN citation rule | D-089 (supersedes D-065 in part), D-090, D-091, D-092 |
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 
