@@ -1,0 +1,9 @@
+# Session-local Claude Code state (identity, WTF recorder, scratch)
+.claude/*
+# Per-phase wave plans, committed (one v3 plan per phase Plan)
+!.claude/phases/
+# wave-status writes phases-waves.json AND runtime state.json/flights.json here;
+# only the plan is committed
+!.claude/status/
+.claude/status/*
+!.claude/status/phases-waves.json
