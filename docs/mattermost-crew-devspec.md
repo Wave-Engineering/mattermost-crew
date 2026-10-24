@@ -55,7 +55,7 @@ A self-hosted Mattermost runs alongside Discord, behind one chat tool contract.
 - **Backends are configured server instances:** one or more Mattermost servers, plus Discord.
 - **Every agent monitors every backend** through one merged doorbell. The doorbell has three adapters: Discord, Mattermost and squawkie.
 - **The send backend is a default, never enforced.**
-- **On Mattermost, every agent is a real account** (`<dev-name>.<crew>`). Its ephemeral token is minted by a per-crew broker, and the agent itself can never read it.
+- **On Mattermost, every agent is a real account** (`<dev-name>.<crew>`). Its ephemeral token is minted by a broker per (crew, server), and the agent itself can never read it.
 - **Inbound messages pass a social switch** that only the crew's human partner can flip.
 - **Outsiders who write while social is off are answered by a tool-less kiosk.** The kiosk is seeded only from the expert agent's curated brief.
 
@@ -164,11 +164,11 @@ Requirements follow the **EARS** notation:
 
 | ID | Type | Requirement |
 |----|------|-------------|
-| R-20 | Ubiquitous | Each crew shall have a social switch with three settings: **crew only** (the default), **trusted crews**, and **social**. [D-042] |
-| R-21 | Ubiquitous | The switch shall gate both the doorbell (push) and the read path (pull). [D-043] |
+| R-20 | Ubiquitous | Each crew's switch on each server shall have three settings: **crew only** (the default), **trusted crews**, and **social**. [D-042; per server since the PR #5 review] |
+| R-21 | Ubiquitous | The switch shall gate both the doorbell (push) and the read path (pull). On pull, membership and the switch apply; addressing and the loop guard apply to push only. [D-043] |
 | R-22 | Unwanted | If a sender's crew cannot be resolved, the message shall not be delivered. [D-044] |
 | R-23 | State-driven | While a crew is in social, messages from outside the crew shall be marked as such. Social shall lapse at its expiry, which is checked on every delivery and never by a timer. When it lapses it shall revert to the setting it was flipped from (or to crew only if that can't be read), and the human partner shall be notified. [D-045] |
-| R-24 | Ubiquitous | Only the crew's human partner shall be able to change the switch, and the broker shall hold its state. [D-046] |
+| R-24 | Ubiquitous | Only the crew's human partner shall be able to change each crew's switch on each server, and that server's broker shall hold its state. [D-046] |
 | R-25 | Ubiquitous | An agent shall respond to a message from a bot account only in a conversation it has opted into, and only to an inline mention. It shall drop anything past about 20 messages from bot accounts per conversation in a sliding window. Human messages shall be admitted when addressed per R-16 to R-19, which includes any direct message to the agent. A conversation is opted into when the agent started it, posted in it, or was mentioned into it, and every DM is opted into. A mention is `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token. [D-047; amended in the PR #5 review] |
 | R-31 | Event-driven | When social is off and a message arrives from outside the crew, the daemon shall route it to the expert agent's kiosk session, started on the first such message, and never to the working agent. The kiosk shall have no tools. One kiosk session per expert shall serve every outsider, and its transcript shall be kept. [D-067] |
 | R-32 | Ubiquitous | The kiosk shall be seeded only from the `## Kiosk` section of the expert's reseed seed (`.claude/reseed-revive.md`), which code extracts mechanically (the shim, running as the agent's user, extracts it and pushes only that section to the daemon); the kiosk shall never see the rest of the file. If the section is missing or empty, the kiosk shall say it has nothing to offer yet. The kiosk shall refresh on each reseed. [D-072, superseding D-068] |
@@ -200,7 +200,7 @@ Requirements follow the **EARS** notation:
 └──────────────────────────────┘   │  ├ kiosk sessions (tool-less)           │──► squawkie SSE
    /run/crewchat/crewchat.sock     │  └ per-agent tokens ◄── broker ─────────┼──► Mattermost (patched role)
    (one socket per host, mounted   └─────────────────────────────────────────┘
-    into every container on it)          crewbroker OS user: broker (one per crew)
+    into every container on it)          crewbroker OS user: broker (one per crew, server)
 ```
 
 R-08 forces this shape. Any MCP server that Claude Code spawns runs as the agent's user, and so does the doorbell, so neither of them can hold the token. Both are therefore **thin clients** that talk over a local unix socket to a **chat daemon**. The daemon runs as its own user and holds the tokens, the websockets, the switch, the loop guard and the kiosk sessions.
@@ -223,10 +223,10 @@ Agents on one host, including containers on a common host, are inside one trust 
 ### 4.4 Inbound (Crew or Trusted)
 
 1. An event arrives from any backend.
-2. The sender's crew is resolved by user ID. On Mattermost, a bot account belongs to a crew when its `owner_id` is that crew's broker **and** it appears in that broker's `minted_bot_ids`; a human belongs when listed by ID. Discord is crew-equivalent, and squawkie is exempt (§5.9). If it can't be resolved, the event is dropped (R-22).
-3. The social switch applies (R-20, R-21), then the loop guard (R-25).
-4. The daemon checks whether the event is addressed to this agent (R-16 to R-19, R-29).
-5. The one-shot doorbell exits (R-26). The agent wakes, reads through the MCP (filtered again, R-21) and re-arms.
+2. **Membership:** the sender's crew is resolved by user ID. On Mattermost, a bot account belongs to a crew when its `owner_id` is that crew's broker **and** it appears in that broker's `minted_bot_ids`; a human belongs when listed by ID. Discord is crew-equivalent, and squawkie is exempt (§5.9). If it can't be resolved, the event is dropped (R-22).
+3. **Addressing:** the daemon checks whether the event is addressed to this agent (R-16 to R-19, R-29).
+4. **Loop guard** (R-25), then **the switch** (R-20, R-21). This is the push order, the same as §5.9.
+5. The one-shot doorbell exits (R-26). The agent wakes, reads through the MCP (on pull only membership and the switch apply, R-21) and re-arms.
 
 ### 4.5 Inbound (Outsider)
 
@@ -351,7 +351,9 @@ The configuration names:
 - the crew;
 - the one server it serves (`server_id` and URL);
 - the crew's human partner user IDs;
-- the trusted crews, as one `[trusted.<crew>]` table each, with `broker_user_id` and `human_user_ids`.
+- the trusted crews, as one `[trusted.<crew>]` table each, with `broker_user_id`, `human_user_ids` and `broker_socket` (the trusted crew's broker for this server, which must be on this host).
+
+**Trusted crews in this Plan are crews whose broker for this server is reachable on this host.** The broker gets each trusted crew's `minted_bot_ids` by calling that crew's broker's `crew_info` over its socket; there is no hand-copied list. Trust across hosts is deferred (§5.N, item 7).
 
 It serves the daemon over its socket, using the same frame shape (D-058). Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat`.
 
@@ -361,7 +363,7 @@ It serves the daemon over its socket, using the same frame shape (D-058). Every 
 | `remint{dev_name, crew}` | Mints a fresh token for an existing account and returns it, **without** revoking the old one, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
 | `revoke{token_id}` | Revokes a token. The daemon calls it after it has swapped in the new token and reconnected. |
 | `switch_state{}` | Returns the switch setting, its expiry, the setting it reverts to, and the kiosk on/off flag. |
-| `crew_info{}` | Returns `{broker_user_id, human_user_ids, trusted:[{crew, broker_user_id, human_user_ids}], minted_bot_ids}`. `minted_bot_ids` lists the bot account user IDs this broker created. The daemon caches it with the switch state (§5.9). |
+| `crew_info{}` | Returns `{broker_user_id, human_user_ids, trusted:[{crew, broker_user_id, human_user_ids, minted_bot_ids}], minted_bot_ids}`. `minted_bot_ids` lists the bot account user IDs this broker created; each trusted entry's `minted_bot_ids` is fetched live from that crew's broker. The daemon caches it with the switch state (§5.9), and gets trusted crews' `minted_bot_ids` **only** from here. |
 
 The daemon owns rotation (§4.8). The broker's daily job only deactivates bot accounts whose `last_register` is more than 30 days old (R-30), so an account that is merely re-minted is never counted as active. The broker also listens on its own websocket for DMs from the configured human user IDs, and parses switch commands from them (§4.6).
 
@@ -391,13 +393,15 @@ One-shot exit codes:
 ### 5.9 Switch and Loop Guard Placement
 
 - Both run inside the daemon, before an event is queued and before a `read` result is returned (D-061).
-- The daemon caches `switch_state` and `crew_info` from each crew's broker, and checks expiry against the cached timestamp on every delivery.
+- The daemon caches `switch_state` and `crew_info` from each broker per (crew, server), and checks expiry against the cached timestamp on every delivery.
 - With no cached switch state or `crew_info`, nothing from **Mattermost** is delivered (R-22). Discord and squawkie keep flowing, because neither depends on the broker (per-backend table below, R-27).
-- A trusted crew's `crew_info` is fetched from that crew's broker when it shares this host. Otherwise the trusted crew's `minted_bot_ids` come from its `[trusted.<crew>]` table, and with neither source its bot accounts are outsiders.
+- Trusted crews' membership data comes **only** from `crew_info.trusted[]`, which the broker fills from each trusted crew's broker on this host (§5.6). A trusted crew whose broker isn't reachable has no `minted_bot_ids`, so its bot accounts are outsiders.
+- **Cache miss:** when a bot account's `owner_id` is our own broker but its user ID isn't in the cached `minted_bot_ids`, the daemon re-fetches `crew_info` once before giving any verdict. It also refreshes `crew_info` right after its own `mint`. A newly registered crewmate is therefore never treated as an outsider or routed to the kiosk.
 
 **Crew membership on Mattermost:**
 - A bot account is in crew X **if and only if** its Mattermost `owner_id` equals X's broker account user ID **and** its user ID is in X's `minted_bot_ids`. That holds for X = the agent's own crew, and for each trusted crew against that crew's info. Both conditions are needed, because a bot's owner can reassign it to another user (`POST /bots/{id}/assign/{user}`).
-- A human is in X if and only if their user ID is listed: in `human_user_ids` for the agent's own crew, or for a trusted crew in its `[trusted.<crew>]` table.
+- A human is in X if and only if their user ID is listed: in `human_user_ids` for the agent's own crew, or for a trusted crew in its `crew_info.trusted[]` entry.
+- **A trusted crew's sender under crew only** is treated as an outsider: kiosk if directly addressed, otherwise dropped.
 - **Username suffixes are never used for membership.** Anyone can register a username like `x.oaw`.
 - Anything else is an outsider. A user the server can't resolve is unresolvable, and is dropped (R-22).
 
@@ -410,9 +414,9 @@ One-shot exit codes:
 | squawkie | **Exempt.** The adapter delivers only the agent's own squawks (R-26). |
 
 **Verdicts by path:**
-- **Order:** crew resolution, then addressing (R-16 to R-19), then the loop guard (R-25), then the switch. A `KIOSK` verdict is only possible for an outsider post that is addressed to the agent and passes the loop guard.
-- **Push:** `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK` (the event goes to the kiosk's holding queue), or `DROP`.
-- **Pull** (`read`, `thread`): a `KIOSK` verdict means **omit and never enqueue**, so reading a channel never re-sends old outsider posts to the kiosk, and never returns them to the working agent.
+- **Push order:** crew resolution, then addressing (R-16 to R-19), then the loop guard (R-25), then the switch. Push verdicts are `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK` (the event goes to the kiosk's holding queue), or `DROP`.
+- **Kiosk routing needs direct address.** Only `@<dev>`, `@<dev>.<crew>`, a DM, or a reply in the agent's own thread can earn a `KIOSK` verdict. An outsider's broadcast (`@agents`) or crew/team token is `DROP` under crew only and trusted. Each outsider is also rate-limited to 10 kiosk routings per hour (`kiosk_rate_per_hour`, configurable); excess is `DROP`.
+- **Pull** (`read`, `thread`): **membership and the switch only**; addressing and the loop guard do not apply, so a channel read returns crewmates' posts whether or not they address the agent. An outsider's post is omitted under crew only and trusted, and returned marked under social. A kiosk-verdict post is **omitted and never enqueued**, so a read never re-sends old outsider posts to the kiosk. Kiosk posts (`crew_kiosk=1`) are omitted under crew only and trusted.
 - **Kiosk posts:** a post carrying `props.crew_kiosk=1` is treated as outsider content whoever authored it, and is **never** given a `KIOSK` verdict: it is `DROP` under crew only and trusted, and `DELIVER_MARKED_OUTSIDER` under social. A crewmate never receives outsider-steered kiosk text as crewmate traffic, and two kiosks can't answer each other.
 
 **Loop guard (R-25):**
@@ -439,11 +443,11 @@ Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. 
   - the brief;
   - **only the asker's own posts in the thread, and the kiosk's own earlier answers to that asker.** Crewmates' posts in the same thread are never included, so an outsider can't pull crew conversation into the kiosk.
 
-  The transcript is appended to `/var/lib/crewchat/kiosk/<dev-name>.jsonl`.
+  The transcript is appended to `/var/lib/crewchat/kiosk/<dev-name>-<server_id>.jsonl`.
 - **Output:** @mentions are stripped from the kiosk's answer before posting. The post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
 - **Mechanism:** open. Spike 1.2 decides between `claude -p` with tools and MCP disabled, and a direct model API call with no tool definitions (D-071). A 2026-10-23 test of `claude -p --resume --fork-session --tools ""` hung to its timeout.
 - **If the CLI runner is chosen,** it runs as its own unprivileged OS user, `crewkiosk`, not as `crewchat`, which holds every token. It has an empty HOME and an empty working directory, and runs `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. `--restricted` ignores user, project and local settings, so no user, project or local settings, hooks or `CLAUDE.md` load; the empty working directory also means no project `CLAUDE.md`. **Managed settings and `--settings` still apply** under `--restricted`, so the kiosk host must have no managed settings configured, and spike 1.2 plants a hook in the managed-settings location too. The spike must prove, from the CLI's own transcript or debug output and not from our argv, that none of them loaded. `crewkiosk` holds **no chat or broker credential**. It does need a model credential to run at all; its path and owner are a named output of spike 1.2.
-- **Review:** when the switch moves to social, the daemon enqueues a `kiosk.review` event for the working agent. It carries the transcript lines since `/var/lib/crewchat/kiosk/<dev-name>.cursor`, marked as outsider content, and the cursor then advances (R-33).
+- **Review:** when the switch moves to social on a server, the daemon enqueues a `kiosk.review` event for the working agent. It carries **only that server's** transcript lines since that server's cursor (`/var/lib/crewchat/kiosk/<dev-name>-<server_id>.cursor`), marked as outsider content, and that cursor then advances (R-33). The transcript is kept per server: `/var/lib/crewchat/kiosk/<dev-name>-<server_id>.jsonl`.
 - **Off:** with the kiosk off, outsider messages are dropped (R-34).
 
 ### 5.A Deliverables Manifest
@@ -476,7 +480,7 @@ Tier 2 triggers, recorded:
 2. **Daemon:** create the `crewchat` user and the `crewchat-clients` group.
    - `uv sync --frozen --package crewchat`
    - Install `packaging/crewchat.service` as a systemd system service.
-   - `/etc/crewchat/servers.toml` lists the configured servers (D-032), the host's `default_crew`, a `[crews.<crew>] needs_list` per crew, and a `[crews.<crew>.<server_id>] broker_socket` entry per crew and Mattermost server on the host.
+   - `/etc/crewchat/servers.toml` lists the configured servers (D-032), the host's `default_crew`, a `[crews.<crew>] needs_list` per crew, and a `[crews.<crew>.<server_id>]` table per crew and Mattermost server on the host with `broker_socket` and `broker_user_id`. The `broker_user_id` entries are **the configured broker list**: the only accounts that may hold the patched role (R-06).
    - The socket is `/run/crewchat/crewchat.sock`. The agents' user, and each container's mount, must be in `crewchat-clients`.
 3. **Kiosk user** (only if spike 1.2 picks the CLI runner): create the unprivileged `crewkiosk` user with an empty HOME. It holds no chat or broker credential. Its model credential is installed at the path and with the owner that spike 1.2 names. Configure no managed Claude Code settings on the kiosk host (§5.11).
 4. **Broker:** create the `crewbroker` user.
@@ -515,7 +519,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 4. **The kiosk mechanism:** `claude -p` with tools and MCP disabled, or a direct model API call with no tools. Either way, name the kiosk's **model credential**: its path and owner. If the CLI, prove that nothing loads, including from the managed-settings location (§5.11). (D-071)
 5. **An unlicensed Enterprise image as a stand-in for Entry in CI:** is it faithful? (§6.1) Answered from the vendor's docs, plus a licensed-image check where one is available.
 6. **Facts carried from the sketchbook:** are bot-to-bot DMs supported? Do bot accounts appear in `@` autocomplete, with their own avatars?
-7. **Broker transport when the broker is on another host:** for the dev phase the daemon and broker share one host, using the unix socket. Spike 1.2 records the remote option (e.g. mutual-TLS TCP) as a design note, for a later Plan.
+7. **Broker transport, and trust, when a broker is on another host:** for this Plan the daemon and every broker it uses (its own and its trusted crews') share one host, using unix sockets. **Trust across hosts is deferred:** a trusted crew whose broker is on another host has no `minted_bot_ids`, so its bot accounts are outsiders. Spike 1.2 records the remote option (e.g. mutual-TLS TCP between brokers, carrying `crew_info`) as a design note, for a later Plan.
 8. **Bot `owner_id`:** verify that a bot account's `owner_id` is the creating broker account, is reported by the API to any user, and cannot be changed by the bot itself. Also confirm that the owner **can** reassign it with `POST /bots/{id}/assign/{user}`, which is why membership also requires `minted_bot_ids` (§5.9).
 
 **Deferred, decided by usage** (policy for BJ, not facts a spike can settle): private DMs vs. visibility; how `@<dev-team>` behaves across crews; whether crew names need to be unique for `@crew` routing.
@@ -543,7 +547,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-05 | daemon ↔ adapters | A reply follows its thread and backend; an explicit backend is used and logged | R-12, R-13 |
 | IT-06 | adapters | The protocol marker is written on both backends; a proto-0 message (no marker) still parses | R-14 |
 | IT-07 | daemon addressing | `@agents` and `@all` (Discord, during the transition), `@name.crew` kept, "reply to me" semantics, and a plain DM to the agent counts as addressed | R-16, R-17, R-18, R-19 |
-| IT-08 | daemon filters | The three switch modes; push and pull both gated; an unresolvable crew is dropped. A spoofed username (`x.<crew>` owned by another account) is **not** admitted as crew, and neither is a bot reassigned to the crew's broker that isn't in its `minted_bot_ids`; membership needs both `owner_id` and `minted_bot_ids`. With no cached `crew_info`, Mattermost traffic is dropped while Discord keeps flowing. Discord messages are crew-equivalent and squawkie events are exempt | R-20, R-21, R-22 |
+| IT-08 | daemon filters | The three switch modes; push and pull both gated; an unresolvable crew is dropped. A spoofed username (`x.<crew>` owned by another account) is **not** admitted as crew, and neither is a bot reassigned to the crew's broker that isn't in its `minted_bot_ids`; membership needs both `owner_id` and `minted_bot_ids`. With no cached `crew_info`, Mattermost traffic is dropped while Discord keeps flowing. Discord messages are crew-equivalent and squawkie events are exempt. A trusted crew's bot account is recognised only through `crew_info.trusted[].minted_bot_ids` fetched from its broker on this host; with that broker unreachable, it is an outsider. A newly registered crewmate (cache miss) is re-checked and never routed to the kiosk. On pull, an unaddressed crewmate post is returned. A trusted crew's sender under crew only is an outsider | R-20, R-21, R-22 |
 | IT-09 | daemon ↔ broker | Social lapses on delivery after expiry and reverts, the partner is notified, a dead broker can't hold social open, and only the partner's user ID can flip | R-23, R-24 |
 | IT-10 | daemon filters | Loop guard on messages from bot accounts: opt-in (started, posted in, mentioned into, or a DM), mention required (`@<dev>`, `@<dev>.<crew>`, `@agents`, crew or team token), sliding-window drop; an addressed human message is admitted without a mention | R-25 |
 | IT-11 | doorbell | Events from all three adapters merge, one exit per event | R-26 |
@@ -556,7 +560,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-18 | broker ↔ Mattermost | A test user standing in for the human partner DMs `social 2h`, `crew` and `kiosk off`; the state, expiry and lapse notice change | R-23, R-24, R-34 |
 | IT-19 | Mattermost API | Each bot account's avatar is set (`GET /users/{id}/image`) and the bot account is listed by `GET /users/autocomplete` | R-01 |
 | IT-20 | runbook | The install and verify commands, **extracted from `docs/runbook.md`**, run in a fresh container | R-06, R-08 |
-| IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply. A crewmate's post in the same thread never reaches the kiosk's prompt. The kiosk's answer carries `props.crew_kiosk=1` and no @mentions, and is treated as outsider content by `admit`. Two crewmates' kiosks in one thread produce no second kiosk answer | R-31, R-32 |
+| IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply. A crewmate's post in the same thread never reaches the kiosk's prompt. The kiosk's answer carries `props.crew_kiosk=1` and no @mentions, and is treated as outsider content by `admit`. Two crewmates' kiosks in one thread produce no second kiosk answer. An outsider's `@agents` broadcast reaches no kiosk, and an outsider past the per-hour kiosk rate limit is dropped | R-31, R-32 |
 | IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances | R-33 |
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
 
@@ -788,7 +792,7 @@ Answers the open questions that could overturn a locked decision, before any cod
 **Repository:** Wave-Engineering/mattermost-crew
 **Dependencies:** 1.1, 1.2
 
-Delivers the per-crew broker that creates bot accounts and mints, rotates and prunes their tokens, with no admin rights.
+Delivers the broker, one per (crew, server), that creates bot accounts and mints, rotates and prunes their tokens, with no admin rights.
 
 **Implementation Steps:**
 
@@ -797,20 +801,20 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
    - `server_id` and `server_url` (one Mattermost server per instance);
    - `broker_user_id`, filled at startup from `/users/me`;
    - `human_user_ids: list[str]`;
-   - `trusted: list[TrustedCrew]`, where `TrustedCrew` holds `crew`, `broker_user_id`, `human_user_ids` and an optional `minted_bot_ids` list, used when that crew's broker isn't on this host (§5.9).
+   - `trusted: list[TrustedCrew]`, where `TrustedCrew` holds `crew`, `broker_user_id`, `human_user_ids` and `broker_socket` (that crew's broker for this server, on this host). There is no hand-copied `minted_bot_ids`; trust across hosts is deferred (§5.N, item 7).
 
    If `crew` is absent from the file, it defaults to the username of the first human user ID, fetched from the server (R-02). Paths are per (crew, server) (§5.6), so several crews' brokers, and several servers per crew, can share a host.
 2. `crewbroker/mint.py`:
    - `account_name(dev_name, crew) -> str` returns `f"{dev_name}.{crew}"`. It raises `ValueError` past 64 characters, or on characters outside `a-z0-9._-` (CT-05).
-   - `ensure_bot(client, name) -> bot_user_id` looks up a bot account by username and creates it if absent (R-03). Every bot account it creates is added to `minted_bot_ids` in `/var/lib/crewbroker/<crew>-<server_id>/accounts.json`.
+   - `ensure_bot(client, name) -> bot_user_id` looks up a bot account by username and creates it if absent (R-03). Every bot account it creates is added to `minted_bot_ids` in `/var/lib/crewbroker/<crew>-<server_id>/accounts.json`. If an account with that username already exists and its `owner_id` is **not** this broker, or it is not in `minted_bot_ids`, `ensure_bot` raises `SquattedAccount` and `mint` fails loudly; it never mints for a squatted name.
    - `mint_token(client, bot_user_id, ttl_hours=26) -> Token` creates a user access token. Where the server supports expiry, it sets the expiry, detected by a capability probe cached per server (R-07). It records the token's id and creation time in `/var/lib/crewbroker/<crew>-<server_id>/tokens.json`.
    - `record_register(account, now)` writes `last_register` for the account to `/var/lib/crewbroker/<crew>-<server_id>/accounts.json`. Only `mint` calls it, and only the daemon's `register` causes a `mint`; `remint` never does.
 3. `crewbroker/prune.py`: `prune_idle(client, now, idle_days=30)` deactivates bot accounts whose `last_register` is more than 30 days old (R-30). Rotation is the daemon's job (Story 1.4), so a re-minted but unregistered account still ages out.
-4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/<crew>-<server_id>.sock` (mode `0660`, group `crewchat`), using the §5.4 frame shape. Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat` (R-08). The ops are:
+4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/<crew>-<server_id>.sock` (mode `0660`, group `crewchat`; the `crewbroker` user is also a member so brokers can reach each other), using the §5.4 frame shape. Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat` (R-08), except `crew_info`, which carries no token and is also answered for `crewbroker` peers (other brokers on this host). The ops are:
    - `mint{dev_name, crew}` → `{account, token, token_id}`;
    - `remint{dev_name, crew}` → `{token, token_id}`, without revoking the old token;
    - `revoke{token_id}` → `{}`;
-   - `crew_info{}` → `{broker_user_id, human_user_ids, trusted:[{crew, broker_user_id, human_user_ids}], minted_bot_ids}`, read from the config and `accounts.json` (§5.6, §5.9).
+   - `crew_info{}` → `{broker_user_id, human_user_ids, trusted:[{crew, broker_user_id, human_user_ids, minted_bot_ids}], minted_bot_ids}`. Its own fields come from the config and `accounts.json`. Each trusted entry's `minted_bot_ids` is fetched live from that crew's broker (`crew_info` on its `broker_socket`, own fields only, no recursion); if that broker can't be reached, the entry's `minted_bot_ids` is empty, so its bot accounts are outsiders (§5.6, §5.9).
 
    A daily scheduler thread runs `prune_idle`.
 5. `packaging/crewbroker@.service`: a systemd template unit, one instance per (crew, Mattermost server) (`%i` is `<crew>-<server_id>`), with `User=crewbroker`, `ProtectSystem=strict` and `ReadWritePaths=/var/lib/crewbroker/%i /run/crewbroker`.
@@ -832,8 +836,11 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
 | `test_remint_keeps_old_token_until_revoke` | `remint` returns a new token and the old one still works until `revoke` | `tests/unit/broker/test_service.py` |
 | `test_prune_idle_30_days_since_register` | With an injected clock: re-minted daily but no `register` for 31 days → deactivated; registered 29 days ago → kept | `tests/unit/broker/test_prune.py` |
 | `test_every_op_refused_to_non_daemon_peer` | `SO_PEERCRED` ≠ the crewchat UID → every op errors, and no token is returned | `tests/unit/broker/test_service.py` |
-| `test_trusted_config_parses` | `[trusted.<crew>]` tables load with `broker_user_id`, `human_user_ids` and optional `minted_bot_ids` | `tests/unit/broker/test_config.py` |
+| `test_trusted_config_parses` | `[trusted.<crew>]` tables load with `broker_user_id`, `human_user_ids` and `broker_socket`; a `minted_bot_ids` key is rejected | `tests/unit/broker/test_config.py` |
 | `test_crew_info_lists_minted_bots` | `crew_info` returns the broker's user ID, the humans, the trusted crews, and exactly the bot accounts `ensure_bot` created | `tests/unit/broker/test_service.py` |
+| `test_crew_info_fetches_trusted_minted_ids` | Each trusted entry's `minted_bot_ids` is fetched from that crew's broker socket; an unreachable broker gives an empty list | `tests/unit/broker/test_service.py` |
+| `test_crew_info_answered_for_broker_peer` | `crew_info` is answered for a `crewbroker` peer; `mint`/`remint`/`revoke` are refused for it | `tests/unit/broker/test_service.py` |
+| `test_ensure_bot_rejects_squatted_name` | An existing `<dev>.<crew>` not owned by this broker (or not in `minted_bot_ids`) → `SquattedAccount`, no token minted | `tests/unit/broker/test_mint.py` |
 | `test_remint_does_not_record_register` | `remint` leaves `last_register` unchanged; `mint` updates it | `tests/unit/broker/test_mint.py` |
 | `test_crew_defaults_to_partner_username` | `crew` is absent from the config → the partner's username | `tests/unit/broker/test_config.py` |
 
@@ -849,7 +856,8 @@ Delivers the per-crew broker that creates bot accounts and mints, rotates and pr
 - [ ] `ensure_bot` creates `<dev>.<crew>` on the first call only, against the CI Mattermost. [R-01, R-03]
 - [ ] `mint_token` returns a working token, and sets native expiry when the server supports it. [R-05, R-07]
 - [ ] The broker account holds the patched role and no system-admin role; a test asserts this through the API. [R-06]
-- [ ] `crew_info` returns `minted_bot_ids` that match the bot accounts the broker created. [R-22]
+- [ ] `crew_info` returns `minted_bot_ids` that match the bot accounts the broker created, and each trusted crew's `minted_bot_ids` fetched from that crew's broker on this host. [R-22]
+- [ ] `mint` for a squatted `<dev>.<crew>` (an existing account not owned by this broker) fails loudly and mints nothing. [R-01, R-03]
 - [ ] IT-03 passes on both images. [R-30]
 - [ ] `remint` and `revoke` work as separate steps, so the old token stays valid until the daemon revokes it. [R-05]
 - [ ] Every broker op from a peer that isn't `crewchat` is refused. [R-08]
@@ -872,11 +880,12 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
    - `parse_frame(line: bytes) -> Request` validates `proto`, `id`, `op` and `args`. It accepts `proto <= PROTO` and rejects a higher `proto` with `unsupported` (CP-05);
    - `ok(id, result)` and `err(id, msg)`.
 2. `crewchat/server.py`: an asyncio unix server on `/run/crewchat/crewchat.sock` (mode `0660`, group `crewchat-clients`) that dispatches ops to handlers. Unknown ops return `unsupported`.
-3. `crewchat/registry.py`: `register(dev_name, crew, session_id) -> Registration`. It keeps a registration per Dev-Name and accepts the declared name (D-055). It never reads a path from the agent's side (§5.3).
+3. `crewchat/registry.py`: `register(dev_name, crew, session_id) -> Registration`. It keeps a registration per Dev-Name and accepts the declared name (D-055). It never reads a path from the agent's side (§5.3). A `register` for an agent that already holds tokens (the shim's daily re-register) runs the rotation sequence with `mint` in place of `remint`: `mint` (which records `last_register`), swap, `on_token_rotated`, `revoke` the previous token. No token is left live.
 4. `crewchat/tokens.py`:
    - `BrokerClient(socket_path)`, one per (crew, server_id), from `[crews.<crew>.<server_id>] broker_socket`, with `mint(dev_name, crew)`, `remint(dev_name, crew)`, `revoke(token_id)` and `crew_info()`;
    - `TokenStore` keeps tokens keyed by (dev_name, server_id) in memory, plus `/var/lib/crewchat/tokens/<dev>.json` (mode `0600`; directory `0700`; owner `crewchat`). It exposes `token_for(dev_name, server_id)`.
-   - **Only `register` calls `mint`.** On a 401, `TokenStore` calls `remint`, swaps the new token in, retries once, then calls `revoke` on the old `token_id`. A 401 never calls `mint`, so it never refreshes `last_register` (R-30).
+   - **Only `register` calls `mint`.** On a 401, `TokenStore` runs **the same four steps as rotation** for that agent and server: `remint`, swap the token in, call each adapter's `on_token_rotated(dev_name)` (the websocket reconnect, Story 2.1), then `revoke` the old `token_id`; it then retries the failed request once. A 401 never calls `mint`, so it never refreshes `last_register` (R-30), and never leaves the websocket on a dead token (§4.8).
+   - After each `register`-driven `mint`, the daemon refreshes that broker's cached `crew_info`, so the new bot account is in `minted_bot_ids` before its first post (§5.9).
    - `Rotator.run_daily(now)`: an agent with no `register` in 30 days has its websockets closed and is dropped from rotation. For each agent registered in the last 30 days, on each of its servers, it does four steps, paced at 5/s or less (R-05, CT-06):
      1. call `remint`;
      2. swap the token in the store;
@@ -887,7 +896,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
    - a `discord` table with `enabled`;
    - `default_crew`;
    - a `[crews.<crew>] needs_list` per crew (the sqtk list `register` returns for R-11's headless squawk);
-   - a `[crews.<crew>.<server_id>] broker_socket` entry per crew and Mattermost server.
+   - a `[crews.<crew>.<server_id>]` table per crew and Mattermost server, with `broker_socket` and `broker_user_id`. The `broker_user_id` entries are the configured broker list that IT-01 asserts R-06 against.
 6. `packaging/crewchat.service`: a systemd unit with `User=crewchat`, `ReadWritePaths=/var/lib/crewchat /run/crewchat`.
 7. `scripts/verify-install.sh`: add checks that the daemon socket exists with mode `0660` and group `crewchat-clients`, and that `health` answers. For a canary agent's known token file `/var/lib/crewchat/tokens/verify-canary.json`, check `test -e <file> && ! sudo -u agent test -r <file>`. Never use a glob, because a shell that can't list the directory would make the check pass vacuously (R-08).
 
@@ -901,7 +910,9 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 | `test_unknown_op_unsupported` | An unknown op returns `ok:false` | `tests/unit/daemon/test_server.py` |
 | `test_register_returns_account_name` | `register` → `<dev>.<crew>` | `tests/unit/daemon/test_registry.py` |
 | `test_token_store_mode_0700` | The store directory and files are not readable by others | `tests/unit/daemon/test_tokens.py` |
-| `test_token_refresh_on_401` | A 401 calls `remint` (never `mint`), swaps, retries once, then revokes the old token | `tests/unit/daemon/test_tokens.py` |
+| `test_token_refresh_on_401` | A 401 calls `remint` (never `mint`), swaps, calls `on_token_rotated` (asserted: the reconnect hook fires for that agent), revokes the old token, then retries once | `tests/unit/daemon/test_tokens.py` |
+| `test_crew_info_refreshed_after_mint` | A `register`-driven `mint` triggers a `crew_info` refresh for that broker | `tests/unit/daemon/test_tokens.py` |
+| `test_reregister_revokes_previous_token` | A second `register` for the same agent mints, swaps, reconnects and revokes the previous token | `tests/unit/daemon/test_registry.py` |
 | `test_only_register_calls_mint` | No code path other than `register` calls `BrokerClient.mint` | `tests/unit/daemon/test_tokens.py` |
 | `test_unregistered_30_days_closes_websocket` | An agent with no `register` in 30 days has its websockets closed and is dropped from rotation | `tests/unit/daemon/test_tokens.py` |
 | `test_register_returns_needs_list` | `register` returns the crew's `needs_list` from `servers.toml` | `tests/unit/daemon/test_registry.py` |
@@ -921,11 +932,11 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
   - for every known credential file, `test -e` succeeds and `sudo -u agent test -r` fails;
   - no socket op returns a token to a non-daemon peer;
   - the minted token works;
-  - the patched role is held only by the configured broker accounts, asserted against the configured list.
+  - the patched role is held only by the configured broker accounts, asserted against the `broker_user_id` entries in `servers.toml`.
 - [ ] IT-17 passes. [R-01, R-02]
 - [ ] A frame with `proto: 2` gets `unsupported`; a frame with `proto: 0` is handled. [CP-05, D-056]
 - [ ] Rotation calls remint, swap, the reconnect hook and revoke in that order. [R-05]
-- [ ] A 401 refresh uses `remint` then `revoke`, never `mint`; an agent unregistered for 30 days is closed and not rotated. [R-05, R-30]
+- [ ] A 401 refresh runs remint, swap, the reconnect hook and revoke, never `mint`, and the test asserts the reconnect hook fires; an agent unregistered for 30 days is closed and not rotated. [R-05, R-30]
 - [ ] `make verify-install` includes the daemon checks, and they pass in CI. [R-08]
 
 ---
@@ -1051,6 +1062,8 @@ Implements the addressing rules every adapter inherits: `@agents`, `@all` during
    - `@<crew>` or `@<dev-team>`, matched by our filter and never by Mattermost user groups (R-17);
    - `msg.root_id` is in `my_threads`, the threads the agent started or posted in (R-19);
    - the message is a direct message to the agent (a DM channel whose members are the sender and the agent) (R-19).
+
+   `is_direct_address(msg, reg, my_threads) -> bool` is the narrower test used for kiosk routing (§5.9): true only for `@<dev-name>`, `@<dev-name>.<crew>`, a DM to the agent, or a reply in one of the agent's own threads. Broadcasts and crew or team tokens are never direct address.
 3. `crewchat/threads.py`: a `MyThreads` store that records the root ID of every post the agent makes, and that is consulted by `addressed_to`.
 
 **Test Procedures:**
@@ -1065,6 +1078,7 @@ Implements the addressing rules every adapter inherits: `@agents`, `@all` during
 | `test_crew_and_team_tokens` | Matched by our filter | `tests/unit/daemon/test_addressing.py` |
 | `test_reply_to_me_by_thread_root` | A post in my thread is addressed to me | `tests/unit/daemon/test_addressing.py` |
 | `test_dm_is_addressed` | A plain DM to the agent, with no mention and outside any thread of mine, is addressed to me | `tests/unit/daemon/test_addressing.py` |
+| `test_direct_address_excludes_broadcast_and_crew_tokens` | `is_direct_address` is true for `@<dev>`, `@<dev>.<crew>`, a DM and a reply in my thread; false for `@agents`, `@all`, `@<crew>` and `@<dev-team>` | `tests/unit/daemon/test_addressing.py` |
 
 *Integration/E2E Coverage:*
 
@@ -1090,6 +1104,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 1. `packages/clients/src/crewchat_clients/mcp_shim.py`: a stdio MCP server built with the `mcp` SDK. It holds no credentials.
    - It defines the §5.5 tools. `chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react` and `chat_health` each forward one frame to `/run/crewchat/crewchat.sock`. `chat_set_default(key, backend)` is the one local-only tool: it writes `~/.claude/chat-defaults.json` and sends nothing to the daemon.
    - On start it sends `register` with the Dev-Name and `crew` from `<repo_root>/.claude/agent-identity.json`; `crew` is omitted when the file has none. The result includes the crew's `needs_list` (§5.4), which the daemon takes from `[crews.<crew>] needs_list` in `servers.toml`.
+   - It **re-registers** every 24 hours on a timer, and before any call if its last `register` is older than 24 h. The shim lives as long as the session, so a session that stays up for weeks never ages out under R-30.
    - It runs as the agent's user, so it reads the agent's files; the daemon never does (§5.3).
      - It pushes `kiosk_brief{dev_name, text}`, where `text` is `crewchat_clients.brief.extract_brief` of `<repo_root>/.claude/reseed-revive.md`, at start and whenever that file's mtime changes.
      - It pushes `squawk_ids{dev_name, ids}` from `<repo_root>/.claude/sqtk-mine.json` at start and on change.
@@ -1120,6 +1135,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 | `test_reply_follows_thread_backend` | A reply goes to the thread's backend | `tests/unit/clients/test_mcp_shim.py` |
 | `test_disc_alias_maps_and_warns` | The alias forwards with `backend=discord` and warns once | `tests/unit/clients/test_mcp_shim.py` |
 | `test_shim_holds_no_credentials` | The shim's environment and files contain no token | `tests/unit/clients/test_mcp_shim.py` |
+| `test_shim_reregisters_daily` | With an injected clock, the shim sends `register` again after 24 h, and before a call when its last `register` is older than 24 h | `tests/unit/clients/test_mcp_shim.py` |
 
 *Integration/E2E Coverage:*
 
@@ -1252,7 +1268,8 @@ Applies the social switch and the loop guard on both the push path and the pull 
 **Implementation Steps:**
 
 1. `crewchat/filters.py`:
-   - `SwitchCache` fetches `switch_state` **and `crew_info`** from each crew's broker every 30 s, and on demand. It stores the switch state with its expiry, and the membership data (`broker_user_id`, `human_user_ids`, `trusted`, `minted_bot_ids`). A trusted crew's `crew_info` comes from its broker when that broker is on this host, otherwise from its `[trusted.<crew>]` table.
+   - `SwitchCache` fetches `switch_state` **and `crew_info`** from each broker per (crew, server) every 30 s, on demand, and right after this daemon's own `mint`. It stores the switch state with its expiry, and the membership data (`broker_user_id`, `human_user_ids`, `trusted` with each entry's `minted_bot_ids`, and `minted_bot_ids`). Trusted crews' membership data comes **only** from `crew_info.trusted[]` (§5.6); there is no other source.
+   - **Cache miss:** if a bot account's `owner_id` equals our own `broker_user_id` but its user ID isn't in the cached `minted_bot_ids`, `admit` re-fetches `crew_info` once and re-checks before giving any verdict. Only if it is still absent is the account an outsider.
    - `admit(msg, reg, now, path) -> Verdict` returns one of `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK`, or `DROP(reason)`. `path` is `push` or `pull`.
 2. **Per backend first (§5.9):**
    - Discord messages are crew-equivalent → `DELIVER` (the loop guard still applies; R-15).
@@ -1264,21 +1281,23 @@ Applies the social switch and the loop guard on both the push path and the pull 
      - **username suffixes are never used for membership.**
 
      If the author can't be resolved by the server, or no switch state or `crew_info` is cached, it returns `DROP` (R-22).
-   - **Order on Mattermost:** membership, then addressing (`addressed_to`, Story 2.3), then the loop guard (step 3), then the switch. An outsider post that isn't addressed to the agent, or fails the loop guard, is `DROP`, never `KIOSK`.
-   - A post with `msg.kiosk` true (`props.crew_kiosk=1`) is classed as an outsider whoever authored it, and is never `KIOSK`: `DROP` under `crew` or `trusted`, `DELIVER_MARKED_OUTSIDER` under `social` (§5.9).
+   - **Push order on Mattermost:** membership, then addressing (`addressed_to`, Story 2.3), then the loop guard (step 3), then the switch. An outsider post that isn't addressed to the agent, or fails the loop guard, is `DROP`, never `KIOSK`.
+   - **Pull order on Mattermost:** membership, then the switch, **only**. Addressing and the loop guard do not apply on pull, so `chat_read` and `chat_thread` return crewmates' posts whether or not they address the agent.
+   - A post with `msg.kiosk` true (`props.crew_kiosk=1`) is classed as an outsider whoever authored it, and is never `KIOSK`: `DROP` (omitted on pull) under `crew` or `trusted`, `DELIVER_MARKED_OUTSIDER` under `social` (§5.9).
    - A crewmate → `DELIVER`.
-   - A trusted crew under `trusted` or `social` → `DELIVER`.
+   - A trusted crew under `trusted` or `social` → `DELIVER`. **A trusted crew under `crew`** is treated as an outsider (next two rules).
    - An outsider under `social` (per `effective_mode`, checked now) → `DELIVER_MARKED_OUTSIDER` (R-23).
-   - An outsider under `crew` or `trusted`, with the kiosk on → `KIOSK`; with the kiosk off → `DROP` (R-31, R-34).
+   - An outsider under `crew` or `trusted`, on push: with the kiosk on **and** `is_direct_address` true (Story 2.3: `@<dev>`, `@<dev>.<crew>`, a DM, or a reply in the agent's thread) **and** within that outsider's kiosk rate limit (`kiosk_rate_per_hour`, default 10, configurable in `servers.toml`) → `KIOSK`; otherwise `DROP`. An outsider's broadcast or crew/team token is always `DROP` here. With the kiosk off → `DROP` (R-31, R-34).
+   - An outsider under `crew` or `trusted`, on pull → omitted.
 3. Loop guard, `LoopGuard.admit(msg, reg)` (R-25):
    - **Messages from bot accounts:**
      - require an opted-in conversation: the agent started it, posted in it, or was mentioned into it; every DM counts as opted in;
      - require an inline mention: `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token;
      - drop once there are more than 20 messages from bot accounts in the conversation's sliding window, which is configurable.
    - **Human messages** are admitted when addressed per R-16 to R-19, with no mention required. A direct message to the agent is addressed (R-19, Story 2.3), so the human partner's first DM, or a reply in the agent's thread, always gets through.
-4. Wire `admit` into `Doorbell` before the queue (push), and into the `read` and `thread` handlers before results are returned (pull) (R-21).
+4. Wire `admit(path="push")` into `Doorbell` before the queue, and `admit(path="pull")` into the `read` and `thread` handlers before results are returned (R-21).
    - On **push**, `KIOSK` verdicts go into a holding queue, which 3.5 consumes.
-   - On **pull**, a `KIOSK` verdict means **omit, and never enqueue**. Reading a channel never re-sends old outsider posts to the kiosk, and never returns them to the working agent.
+   - On **pull**, `KIOSK` is never produced: an outsider post under crew or trusted is **omitted, and never enqueued**. Reading a channel never re-sends old outsider posts to the kiosk, and never returns them to the working agent.
 5. Mark outsider content: `DELIVER_MARKED_OUTSIDER` adds `{"outsider": true}` to the event, and the shim prefixes its text with `[from outside the crew]`.
 
 **Test Procedures:**
@@ -1294,9 +1313,13 @@ Applies the social switch and the loop guard on both the push path and the pull 
 | `test_unaddressed_outsider_never_kiosk` | An outsider post not addressed to the agent → DROP, never KIOSK | `tests/unit/daemon/test_filters.py` |
 | `test_kiosk_post_never_kiosk_verdict` | A `crew_kiosk=1` post → DROP under crew and trusted, DELIVER_MARKED_OUTSIDER under social, never KIOSK | `tests/unit/daemon/test_filters.py` |
 | `test_two_kiosks_no_second_answer` | Two crewmates' kiosks in one thread: the first kiosk answer does not trigger a second kiosk answer | `tests/unit/daemon/test_filters.py` |
-| `test_modes_matrix` | Every mode × sender class → the expected verdict | `tests/unit/daemon/test_filters.py` |
+| `test_modes_matrix` | Every mode × sender class → the expected verdict, including a trusted crew's sender under `crew` (outsider: KIOSK if directly addressed, else DROP) | `tests/unit/daemon/test_filters.py` |
 | `test_expiry_checked_per_delivery` | A stale cached social past its expiry → reverted verdict | `tests/unit/daemon/test_filters.py` |
-| `test_read_path_filtered` | `read` omits dropped posts, marks outsiders, and omits `KIOSK`-verdict posts **without** enqueuing them to the kiosk | `tests/unit/daemon/test_filters.py` |
+| `test_read_path_filtered` | `read` returns an **unaddressed** crewmate post; omits outsider posts under crew and trusted **without** enqueuing them to the kiosk; marks outsiders under social; omits kiosk posts under crew and trusted | `tests/unit/daemon/test_filters.py` |
+| `test_new_crewmate_cache_miss_never_kiosk` | A bot account owned by our broker but missing from the cached `minted_bot_ids` triggers one `crew_info` re-fetch; once it appears, the post is DELIVER, and it is never KIOSK | `tests/unit/daemon/test_filters.py` |
+| `test_trusted_membership_only_from_crew_info` | A trusted crew's bot account is crew only via `crew_info.trusted[].minted_bot_ids`; with that crew's broker unreachable (empty list), it is an outsider | `tests/unit/daemon/test_filters.py` |
+| `test_outsider_broadcast_never_kiosk` | An outsider's `@agents`, `@<crew>` or `@<dev-team>` post under crew or trusted → DROP, never KIOSK | `tests/unit/daemon/test_filters.py` |
+| `test_kiosk_rate_limit_per_outsider` | The 11th directly addressed post from one outsider within an hour → DROP; another outsider is unaffected; the limit is configurable | `tests/unit/daemon/test_filters.py` |
 | `test_membership_by_owner_id_not_suffix` | A bot account named `x.<crew>` but owned by another account → outsider; a bot owned by the crew's broker → crew | `tests/unit/daemon/test_filters.py` |
 | `test_trusted_membership_by_broker_user_id` | A trusted crew's bot account is recognised by its broker's `owner_id` plus that crew's `minted_bot_ids`, and its humans by listed IDs | `tests/unit/daemon/test_filters.py` |
 | `test_discord_crew_equivalent_squawkie_exempt` | Discord → DELIVER (subject to the loop guard); squawkie → DELIVER | `tests/unit/daemon/test_filters.py` |
@@ -1314,7 +1337,8 @@ Applies the social switch and the loop guard on both the push path and the pull 
 
 - [ ] IT-08, IT-09, IT-10 and IT-23 pass on both images. [R-20, R-21, R-22, R-23, R-24, R-25, R-34]
 - [ ] With the broker stopped and the cached social past its expiry, deliveries use the reverted mode. [R-23]
-- [ ] The same filter applies to `subscribe` and to `read`, and a test asserts both. [R-21]
+- [ ] Membership and the switch apply to both `subscribe` and `read`; addressing and the loop guard apply to `subscribe` only, so `read` returns unaddressed crewmate posts. A test asserts both paths. [R-21]
+- [ ] A newly registered crewmate is never routed to the kiosk (cache-miss re-fetch), and an outsider's broadcast never reaches a kiosk. [R-22, R-31]
 - [ ] Membership never uses username suffixes: IT-08's spoofed-username case is not admitted, and neither is a reassigned bot missing from `minted_bot_ids`. [R-22]
 - [ ] On the pull path, `KIOSK` posts are omitted and never enqueued. [R-21, R-31]
 - [ ] Kiosk-tagged posts never get a `KIOSK` verdict, and two kiosks in one thread don't answer each other. [R-31]
@@ -1377,7 +1401,7 @@ Answers outsiders while social is off, through a tool-less session seeded only f
    - `ApiRunner` makes a direct model API call with no tool definitions, using the credential decided in 1.2.
 
    Both expose `answer(prompt) -> str`.
-4. One session per expert serves every outsider, so their contexts mingle (D-067). Each Q&A is appended to `/var/lib/crewchat/kiosk/<dev>.jsonl` as `{ts, thread, asker_id, question, answer}`.
+4. One session per expert serves every outsider, so their contexts mingle (D-067). Each Q&A is appended to that server's transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, asker_id, question, answer}`.
 5. Consume the `KIOSK` holding queue from 3.3. Answer in the outsider's thread on the originating backend (Mattermost only; §5.9):
    - `strip_mentions(answer)` removes every `@token` before posting;
    - the post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
@@ -1422,8 +1446,8 @@ When the human partner engages social, the working agent reviews what the kiosk 
 
 **Implementation Steps:**
 
-1. In `crewchat/filters.py`, detect a mode transition to `social` in `SwitchCache`, comparing successive `effective_mode` values.
-2. On that transition, `kiosk.review_since_cursor(dev)` reads `/var/lib/crewchat/kiosk/<dev>.jsonl` from the offset in `<dev>.cursor`. It enqueues one `{"type":"kiosk.review","outsider":true,"entries":[...]}` event for the working agent, then advances the cursor (R-33).
+1. In `crewchat/filters.py`, detect a mode transition to `social` in `SwitchCache`, comparing successive `effective_mode` values per (crew, server).
+2. On that transition on a server, `kiosk.review_since_cursor(dev, server_id)` reads **only that server's** transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, from the offset in `<dev>-<server_id>.cursor`. It enqueues one `{"type":"kiosk.review","outsider":true,"server":...,"entries":[...]}` event for the working agent, then advances that cursor (R-33). Other servers' transcripts and cursors are untouched.
 3. The event's text, as rendered by the shim, opens with `[from outside the crew] Kiosk review: review these exchanges and raise anything notable to your human partner.`
 
 **Test Procedures:**
@@ -1434,6 +1458,7 @@ When the human partner engages social, the working agent reviews what the kiosk 
 |-----------|---------|---------------|
 | `test_review_on_social_transition_only` | Fires on crew/trusted→social, not on other changes | `tests/unit/daemon/test_kiosk_review.py` |
 | `test_review_since_cursor_and_advance` | Only the new entries; the cursor advances | `tests/unit/daemon/test_kiosk_review.py` |
+| `test_review_only_that_servers_transcript` | Social engaged on server A delivers only A's transcript; server B's cursor is unchanged | `tests/unit/daemon/test_kiosk_review.py` |
 | `test_review_marked_outsider` | The event carries `outsider: true` | `tests/unit/daemon/test_kiosk_review.py` |
 
 *Integration/E2E Coverage:*
@@ -1466,7 +1491,7 @@ Delivers the operator runbook (with its prerequisites and install verification f
    - "Rollback".
 2. `tests/integration/test_runbook.py` (IT-20) extracts every fenced `bash` block under "Install …" and "Verify the install" from `docs/runbook.md` and runs them in order, in a fresh container in CI. Every block must exit 0.
 3. `docs/partner-guide.md`: the broker DM commands (`social <dur>`, `trusted`, `crew`, `kiosk off`, `kiosk on`); what each mode delivers; expiry and lapse notices; the kiosk and its review on social engage; and how to write a `## Kiosk` section.
-4. `docs/architecture.md`: the §4.1 diagram, the components, the data paths for push, pull and kiosk, and the trust boundaries (the per-host socket, the `crewchat`, `crewbroker` and `crewkiosk` users), the membership rule (bot account `owner_id`, never username suffixes), and the per-backend rule (Discord crew-equivalent, squawkie exempt).
+4. `docs/architecture.md`: the §4.1 diagram, the components, the data paths for push, pull and kiosk, and the trust boundaries (the per-host socket, the `crewchat`, `crewbroker` and `crewkiosk` users), the membership rule (bot account `owner_id` **plus** the broker's `minted_bot_ids`, never username suffixes; trusted crews only through `crew_info` from their broker on this host), the push and pull filter orders, and the per-backend rule (Discord crew-equivalent, squawkie exempt).
 
 **Test Procedures:**
 
@@ -1499,7 +1524,7 @@ Runs the three end-to-end flows and the remaining API tests in CI.
 
 **Implementation Steps:**
 
-1. `tests/e2e/conftest.py`: two crews (`oaw` and `synth`), each with its own human test user, its own `crewbroker@<crew>-<server_id>` instance and two registered agents. Each crew lists the other as `[trusted.<crew>]` by the other broker's `broker_user_id` and human IDs. There is also one unlisted outsider user, plus one outsider bot account named `x.oaw` but **not** owned by the `oaw` broker, to prove membership ignores username suffixes.
+1. `tests/e2e/conftest.py`: two crews (`oaw` and `synth`), each with its own human test user, its own `crewbroker@<crew>-<server_id>` instance and two registered agents. Both brokers run on the CI host, and each crew lists the other as `[trusted.<crew>]` by the other broker's `broker_user_id`, human IDs and `broker_socket`, so each broker's `crew_info.trusted[]` carries the other crew's live `minted_bot_ids`. There is also one unlisted outsider user, plus one outsider bot account named `x.oaw` but **not** owned by the `oaw` broker, to prove membership ignores username suffixes.
 2. `tests/e2e/test_cross_crew.py` (E2E-01): under `trusted`, an agent from each crew converses in a shared channel; replies follow the thread, and each doorbell exits once per addressed message.
 3. `tests/e2e/test_outsider_switch.py` (E2E-02):
    - The outsider asks a crew-only agent a question → the kiosk answers.
@@ -1591,7 +1616,7 @@ The sketchbook (`docs/SKETCHBOOK.md`, D-01 to D-26) holds the shaping decisions.
 | D-16 | Backend down is loud | D-049 (R-27) |
 | D-17 | Wave order | §8 (superseded by D-064, D-065) |
 | D-18 | Its own program | D-064 |
-| D-19 | Per-crew broker | D-008, D-027 to D-029 (R-05 to R-07) |
+| D-19 | Per-crew broker (now one per crew, server: D-082) | D-008, D-027 to D-029 (R-05 to R-07) |
 | D-20 | Read and write through our server | D-008 (CT-02), D-030 (R-08), D-043 |
 | D-21 | Loop guard | D-047 (R-25) |
 | D-22 | One doorbell core | D-015 (CT-09), D-048 (R-26), D-060 |
