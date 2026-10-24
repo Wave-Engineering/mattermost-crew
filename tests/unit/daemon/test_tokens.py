@@ -1,9 +1,11 @@
-"""Story 1.4: broker clients, the token store, 401 refresh and rotation (§4.8; R-05, R-08, R-30)."""
+"""Stories 1.4 and 2.1: broker clients, the token store, 401 refresh and rotation (§4.8; R-05,
+R-07, R-08, R-30)."""
 
 from __future__ import annotations
 
 import ast
 import asyncio
+import itertools
 import json
 import stat
 import time
@@ -14,13 +16,17 @@ from typing import Any
 
 import crewchat
 import pytest
+from crewchat.__main__ import rotation_loop
 from crewchat.tokens import (
+    RETRY_FIRST_S,
+    RETRY_MAX_S,
     BrokerClient,
     BrokerUnavailable,
     Rotator,
     TokenStore,
     Unauthorized,
     broker_clients,
+    retry_delays,
 )
 
 PACKAGE = Path(crewchat.__file__).parent
@@ -370,3 +376,146 @@ def test_broker_call_timeout(short_dir: Path) -> None:
                 srv.close()
 
     asyncio.run(main())
+
+
+def test_rotation_does_not_drop_a_concurrent_register(daemon: Any, clock: Any) -> None:
+    """#40 review minor 1 (R-05, R-30): a `register` that lands between the rotation's idle
+    check and its drop keeps the agent, its fresh token and its file."""
+    start = clock.now
+    register(daemon)
+    broker = daemon.broker()
+    now = start + timedelta(days=31)
+    store = daemon.store
+
+    async def scenario() -> Any:
+        lock = store.lock("babel")
+        await lock.acquire()  # the register is inside its critical section
+        rotation = asyncio.create_task(Rotator(store, sleep=NoSleep()).run_daily(now))
+        for _ in range(10):
+            await asyncio.sleep(0)  # the rotation has seen a stale last_register, and waits
+        assert not rotation.done()
+        # The register's body, under the lock it already holds (Registry.register).
+        held = store.held_token_id("babel", "oaw", "dev")
+        minted = await broker.mint("babel", "oaw", held)
+        await store.install_minted("babel", "oaw", "dev", minted, now)
+        lock.release()
+        return await rotation, minted
+
+    report, minted = asyncio.run(scenario())
+    assert report.dropped == []
+    assert ("close", "babel") not in daemon.events
+    agent = store.agent("babel")
+    assert agent is not None and agent.last_register == now
+    assert store.token_for("babel", "dev") == minted["token"]
+    assert minted["token_id"] in broker.live  # its fresh token was not revoked
+    assert (store.root / "babel.json").exists()
+
+
+def test_idle_agent_dropped_then_closed(daemon: Any, clock: Any) -> None:
+    """`close_agent` follows a drop that `drop_if_idle` confirmed, and only then."""
+    register(daemon)
+    daemon.events.clear()
+    now = clock.now + timedelta(days=31)
+    report = asyncio.run(Rotator(daemon.store, sleep=NoSleep()).run_daily(now))
+    assert report.dropped == ["babel"]
+    assert steps(daemon.events) == [("broker", "revoke"), ("close", "babel")]
+    assert asyncio.run(daemon.store.drop_if_idle("babel", now)) is False  # already gone
+
+
+def test_retry_delays_double_to_an_hour() -> None:
+    assert RETRY_FIRST_S == 300 and RETRY_MAX_S == 3600
+    assert list(itertools.islice(retry_delays(), 6)) == [300, 600, 1200, 2400, 3600, 3600]
+
+
+class FakeTime:
+    """`rotation_loop`'s clock and wait: each wait advances monotonic time, without sleeping."""
+
+    def __init__(self, stop_after: int, on_wait: Callable[[int], None] = lambda _n: None):
+        self.t = 0.0
+        self.waits: list[float] = []
+        self.stop_after = stop_after
+        self.on_wait = on_wait
+
+    def monotonic(self) -> float:
+        return self.t
+
+    async def wait(self, stop: asyncio.Event, seconds: float) -> bool:
+        self.waits.append(seconds)
+        self.t += seconds
+        self.on_wait(len(self.waits))
+        if len(self.waits) >= self.stop_after:
+            stop.set()
+        return stop.is_set()
+
+
+def test_failed_rotation_retried_on_backoff(daemon: Any, clock: Any) -> None:
+    """#40 review minor 3 (R-05, R-07): a rotation that failed on a broker timeout is retried
+    at 5 min, then 10 min, and succeeds once the broker answers, long before the next
+    daily run and the 26 h native expiry."""
+    register(daemon)
+    old = daemon.store.agent("babel").servers["dev"]
+    broker = daemon.broker()
+    broker.fail["remint"] = BrokerUnavailable("babel: no answer to remint in 2.0s")
+    clock.now += timedelta(days=1)
+
+    def broker_back(n: int) -> None:
+        if n == 2:
+            del broker.fail["remint"]
+
+    fake = FakeTime(stop_after=3, on_wait=broker_back)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        rotator = Rotator(daemon.store, sleep=NoSleep())
+        await rotation_loop(
+            rotator,
+            stop,
+            interval_s=24 * 3600,
+            wait=fake.wait,
+            monotonic=fake.monotonic,
+            now=clock,
+        )
+
+    asyncio.run(scenario())
+    assert fake.waits == [300, 600, 24 * 3600 - 900]
+    assert len(broker.ops("remint")) == 3  # the daily run, a failed retry, a good one
+    rotated = daemon.store.agent("babel").servers["dev"]
+    assert rotated.token_id != old.token_id
+    assert old.token_id not in broker.live  # the old token was revoked after the swap
+
+
+def test_failing_rotation_retries_stop_at_the_next_daily_run(daemon: Any, clock: Any) -> None:
+    register(daemon)
+    daemon.broker().fail["remint"] = BrokerUnavailable("down")
+    clock.now += timedelta(days=1)
+    fake = FakeTime(stop_after=1000)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        rotator = Rotator(daemon.store, sleep=NoSleep())
+        original = rotator.run_daily
+        runs = 0
+
+        async def run_daily(now: Any) -> Any:
+            nonlocal runs
+            runs += 1
+            if runs == 2:
+                stop.set()
+            return await original(now)
+
+        rotator.run_daily = run_daily  # type: ignore[method-assign]
+        await rotation_loop(
+            rotator, stop, interval_s=24 * 3600, wait=fake.wait, monotonic=fake.monotonic
+        )
+
+    asyncio.run(scenario())
+    first_day = []
+    total = 0.0
+    for w in fake.waits:
+        first_day.append(w)
+        total += w
+        if total >= 24 * 3600:
+            break
+    assert total == 24 * 3600  # the retries and the final wait fill exactly one day
+    assert first_day[:5] == [300, 600, 1200, 2400, 3600]
+    assert all(w <= 3600 for w in first_day[:-1])
