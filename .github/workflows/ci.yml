@@ -45,6 +45,10 @@ jobs:
         run: ./scripts/ci/mattermost-up.sh
       - name: make ci
         run: ./scripts/ci/ci.sh
+      - name: Start broker
+        run: ./scripts/ci/broker-up.sh
+      - name: make verify-install
+        run: make verify-install
       - name: Mattermost logs
         if: failure()
         run: ./scripts/ci/mattermost-logs.sh
