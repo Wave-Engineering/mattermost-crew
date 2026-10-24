@@ -1,3 +1,10 @@
+<!-- DEV-SPEC-APPROVAL
+approved: true
+approved_by: BJ
+approved_at: 2026-10-24T01:27:12Z
+finalization_score: 8/8
+-->
+
 # Mattermost Program — Development Specification
 
 **Version:** 1.0
@@ -686,7 +693,7 @@ Each story that delivers a deployable service (1.3 broker, 1.4 daemon) adds its 
 
 ---
 
-#### Story 1.1: Workspace scaffold with CI against Mattermost
+#### Story 1.1: Workspace scaffold with CI against Mattermost (#7)
 
 **Wave:** P1W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -741,7 +748,7 @@ Creates the uv workspace, the build system and the CI that every later story rel
 
 ---
 
-#### Story 1.2: Verification spike — §5.N and the kiosk mechanism
+#### Story 1.2: Verification spike — §5.N and the kiosk mechanism (#8)
 
 **Wave:** P1W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -787,7 +794,7 @@ Answers the open questions that could overturn a locked decision, before any cod
 
 ---
 
-#### Story 1.3: Broker — accounts, tokens, expiry, re-mint, prune
+#### Story 1.3: Broker — accounts, tokens, expiry, re-mint, prune (#9)
 
 **Wave:** P1W2
 **Repository:** Wave-Engineering/mattermost-crew
@@ -867,7 +874,7 @@ Delivers the broker, one per (crew, server), that creates bot accounts and mints
 
 ---
 
-#### Story 1.4: Daemon core — socket, protocol, register, token store
+#### Story 1.4: Daemon core — socket, protocol, register, token store (#10)
 
 **Wave:** P1W3
 **Repository:** Wave-Engineering/mattermost-crew
@@ -958,7 +965,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 
 ---
 
-#### Story 2.1: Mattermost adapter
+#### Story 2.1: Mattermost adapter (#11)
 
 **Wave:** P2W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1006,7 +1013,7 @@ Implements send, read, thread, DM and react against Mattermost through the upstr
 
 ---
 
-#### Story 2.2: Discord adapter
+#### Story 2.2: Discord adapter (#12)
 
 **Wave:** P2W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1047,7 +1054,7 @@ Gives the daemon Discord parity: reads go through scream-hole, sends go through 
 
 ---
 
-#### Story 2.3: Addressing
+#### Story 2.3: Addressing (#13)
 
 **Wave:** P2W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1095,7 +1102,7 @@ Implements the addressing rules every adapter inherits: `@agents`, `@all` during
 
 ---
 
-#### Story 2.4: Thin MCP — chat_*, default resolution, disc_* aliases
+#### Story 2.4: Thin MCP — chat_*, default resolution, disc_* aliases (#14)
 
 **Wave:** P2W2
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1171,7 +1178,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 
 ---
 
-#### Story 3.1: Broker — social switch and kiosk control
+#### Story 3.1: Broker — social switch and kiosk control (#15)
 
 **Wave:** P3W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1219,7 +1226,7 @@ The broker holds each crew's social switch and kiosk flag, and changes them only
 
 ---
 
-#### Story 3.2: Doorbell core
+#### Story 3.2: Doorbell core (#16)
 
 **Wave:** P3W1
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1261,7 +1268,7 @@ Merges the Mattermost, Discord and squawkie streams into one queue per agent, wi
 
 ---
 
-#### Story 3.3: Daemon filters — switch cache, fail-closed, loop guard
+#### Story 3.3: Daemon filters — switch cache, fail-closed, loop guard (#17)
 
 **Wave:** P3W2
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1354,7 +1361,7 @@ Applies the social switch and the loop guard on both the push path and the pull 
 
 ---
 
-#### Story 3.4: Thin doorbell one-shot
+#### Story 3.4: Thin doorbell one-shot (#18)
 
 **Wave:** P3W2
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1389,7 +1396,7 @@ Gives agents a one-shot doorbell client that exits once per event, so an idle ag
 
 ---
 
-#### Story 3.5: Kiosk
+#### Story 3.5: Kiosk (#19)
 
 **Wave:** P3W3
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1444,7 +1451,7 @@ Answers outsiders while social is off, through a tool-less session seeded only f
 
 ---
 
-#### Story 3.6: Social-engage kiosk review
+#### Story 3.6: Social-engage kiosk review (#20)
 
 **Wave:** P3W4
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1481,7 +1488,7 @@ When the human partner engages social, the working agent reviews what the kiosk 
 
 ---
 
-#### Story 3.7: Docs — runbook, partner guide, architecture
+#### Story 3.7: Docs — runbook, partner guide, architecture (#21)
 
 **Wave:** P3W4
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1524,7 +1531,7 @@ Delivers the operator runbook (with its prerequisites and install verification f
 
 ---
 
-#### Story 3.8: E2E suite and remaining API tests
+#### Story 3.8: E2E suite and remaining API tests (#22)
 
 **Wave:** P3W5
 **Repository:** Wave-Engineering/mattermost-crew
@@ -1563,7 +1570,7 @@ Runs the three end-to-end flows and the remaining API tests in CI.
 
 ---
 
-#### Story 3.9: Closing — VRTM, manifest, partner-name grep, dev-space smoke
+#### Story 3.9: Closing — VRTM, manifest, partner-name grep, dev-space smoke (#23)
 
 **Wave:** P3W6
 **Repository:** Wave-Engineering/mattermost-crew
