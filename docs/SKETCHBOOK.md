@@ -12,11 +12,15 @@ pointer. D-01 to D-17 are as they were there, except for ruling notes appended u
 BJ has since ruled on.
 
 **Roadmap slot:** after mcp-server-nerf#32 (BJ). That slot arrived on 2026-10-23: nerf, the
-precheck gate split, sqtk and `/onboard` have all shipped. **Next step (2026-10-23):** finish the
-doorbell cleanup that BJ put first (D-26), then `/devspec` this program. BJ ruled all 8 calls of
-the decision brief on 2026-10-23: call 1 is D-03's note, 2 is D-19, 3 is D-20 (which revises D-14),
+precheck gate split, sqtk and `/onboard` have all shipped. **Status (2026-10-24):** the Dev Spec is
+approved (Plan #3 D-088) and amended pre-kickoff (D-089 to D-092); phases run as Plans #26, #27, #28.
+BJ ruled all 8 calls of the decision brief on 2026-10-23: call 1 is D-03's note, 2 is D-19, 3 is D-20 (which revises D-14),
 4 is D-22, 5 is D-21, 6 is D-13's note, 7 is D-24 and 8 is D-23. D-25 (the prod scope) and D-26 (the
 order of work) were ruled the same day. D-18 dates from 2026-10-18.
+
+**Citing these entries:** cite them as S-NN (S-01 to S-26) to keep them apart from Plan #3's ledger
+(D-NNN, three digits); D-092. The headings below keep their original D-NN numbers, so S-18 is the
+heading "D-18". Never normalize the zero-padding: D-18 and D-018 are different decisions.
 
 ---
 
@@ -229,11 +233,17 @@ semantics are ours to define either way.
 Mattermost path and the merged doorbell stream. Follows from D-02: Discord is likely the
 waypoint, not the destination.
 
+> **Ruled 2026-10-24 by the Dev Spec's approval (Plan #3 D-088):** absorbed as R-15, Discord
+> parity (Plan #3 D-037).
+
 ### D-16: "One backend is down" is a first-class, loudly reported state *(proposed)*
 **babelfish.** Every Discord deafness mode we've hit has a Mattermost twin waiting: a global auth
 breaker, an identity that is null at boot, a session launched without channels. With two
 planes, a silent partial outage is the default failure unless the watcher reports per-backend
 health explicitly.
+
+> **Ruled 2026-10-24 by the Dev Spec's approval (Plan #3 D-088):** absorbed as R-27, a backend
+> outage is loud and the others keep flowing (Plan #3 D-049).
 
 ### D-17: Order of the devspec waves *(proposed)*
 **babelfish.**
@@ -242,6 +252,10 @@ health explicitly.
 3. The watcher merge (D-12, D-13, D-16).
 
 Everything else depends on who may say what to whom.
+
+> **Ruled 2026-10-24 by the Dev Spec's approval (Plan #3 D-088):** absorbed as the Dev Spec's §8
+> phase order, now run as one Plan per phase, #26, #27 and #28, which supersede this ordering
+> (Plan #3 D-089).
 
 ### D-18: Mattermost is its own program
 **BJ, 2026-10-18.** "mattermost is probably a devspec, new githup repos, new dev-agents, a whole
@@ -308,7 +322,7 @@ Discord kill switch.
 - **Membership is by Mattermost user ID, never display name.** The broker is the source of truth for
   the bots it minted, plus named humans.
 - **It gates both push** (the doorbell) **and pull** (D-20's read path).
-- **Expiry** *(proposed by babelfish, 2026-10-23, in answer to BJ's question; awaiting his ack)*:
+- **Expiry** *(proposed by babelfish, 2026-10-23, in answer to BJ's question; ruled: Plan #3 D-045)*:
   - expiry is checked on every delivery, not by a timer, so a dead broker can't leave social stuck
     on;
   - social reverts to the setting it was flipped from, which was BJ's last deliberate choice;

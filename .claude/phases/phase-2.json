@@ -1,0 +1,52 @@
+{
+  "project": "Wave-Engineering/mattermost-crew",
+  "repo": "Wave-Engineering/mattermost-crew",
+  "base_branch": "main",
+  "plan_id": 27,
+  "slug": "mattermost-p2",
+  "phases": [
+    {
+      "name": "Phase 2: Chat Contract and Adapters",
+      "waves": [
+        {
+          "id": "P2W1",
+          "issues": [
+            {
+              "number": 11,
+              "title": "Mattermost adapter",
+              "story": "2.1",
+              "depends_on": []
+            },
+            {
+              "number": 12,
+              "title": "Discord adapter",
+              "story": "2.2",
+              "depends_on": []
+            },
+            {
+              "number": 13,
+              "title": "Addressing",
+              "story": "2.3",
+              "depends_on": []
+            }
+          ]
+        },
+        {
+          "id": "P2W2",
+          "issues": [
+            {
+              "number": 14,
+              "title": "Thin MCP \u2014 chat_*, default resolution, disc_* aliases",
+              "story": "2.4",
+              "depends_on": [
+                "2.1",
+                "2.2",
+                "2.3"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

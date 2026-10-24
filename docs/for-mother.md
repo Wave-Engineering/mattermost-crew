@@ -41,8 +41,9 @@ deploys onto it, so it can be reset or wiped while we build.
 ## What we need from the server
 
 **Version and edition**
-- **Mattermost 11.10 or later, please.** It has native token expiry and rotation. Older versions
-  leave broker revocation as the only expiry we get.
+- **Mattermost 11.10 or later, please.** Native token expiry (`expires_at`) arrived in 11.9, and
+  11.10 adds rotation and a maximum token lifetime, which is why 11.10 or later is the ask. Before
+  11.9, broker revocation is the only expiry we get.
 - The free or team edition is fine. Nothing we plan needs a paid feature.
 
 **Settings (System Console)**
