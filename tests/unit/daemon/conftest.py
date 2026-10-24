@@ -252,9 +252,18 @@ class FakeMattermost:
         self.posts[post["id"]] = post
         return post
 
-    def broadcast_posted(self, post: Mapping[str, Any], mentions: list[str] | None = None) -> None:
+    def broadcast_posted(
+        self,
+        post: Mapping[str, Any],
+        mentions: list[str] | None = None,
+        *,
+        channel_type: str = "O",
+        channel_name: str = "",
+    ) -> None:
         """Push a `posted` event to every open websocket, the author's own included."""
-        data: dict[str, Any] = {"post": json.dumps(post), "channel_type": "O"}
+        data: dict[str, Any] = {"post": json.dumps(post), "channel_type": channel_type}
+        if channel_name:
+            data["channel_name"] = channel_name
         if mentions is not None:
             data["mentions"] = json.dumps(mentions)
         for ws in self.sockets:
