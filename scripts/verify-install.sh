@@ -47,12 +47,18 @@ if [[ -z "${CREWBROKER_INSTANCES:-}" ]]; then
   exit 1
 fi
 
+# The R-08 checks below read a refused sudo as "cannot read", so prove sudo works first.
+if ! sudo -n -u "$AGENT_USER" true; then
+  echo "verify-install: FAIL cannot run commands as $AGENT_USER (sudo -n -u $AGENT_USER)" >&2
+  exit 1
+fi
+
 # no_agent_read FILE: the file exists, and the agent's user cannot read it.
 no_agent_read() {
   local file="$1"
   if ! $SUDO test -e "$file"; then
     fail "$file does not exist"
-  elif sudo -u "$AGENT_USER" test -r "$file"; then
+  elif sudo -n -u "$AGENT_USER" test -r "$file"; then
     fail "$file is readable by $AGENT_USER"
   else
     pass "$file exists and $AGENT_USER cannot read it"
