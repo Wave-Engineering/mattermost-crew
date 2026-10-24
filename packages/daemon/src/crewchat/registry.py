@@ -116,6 +116,7 @@ class Registry:
 
         backends: list[str] = []
         unavailable: list[str] = []
+        squatted: list[str] = []
         async with self.store.lock(dev_name):
             now = self.clock()
             for server in self.config.mattermost:
@@ -123,10 +124,13 @@ class Registry:
                     continue
                 client = self.brokers[(crew, server.id)]
                 try:
-                    minted = await client.mint(dev_name, crew)
+                    held = self.store.held_token_id(dev_name, crew, server.id)
+                    minted = await client.mint(dev_name, crew, held)
                 except (BrokerError, BrokerUnavailable) as exc:
                     log.error("register %s on %s: %s", account, server.id, exc)
                     unavailable.append(server.id)
+                    if isinstance(exc, BrokerError) and exc.code == "squatted":
+                        squatted.append(server.id)
                     continue
                 if minted.get("account") != account:
                     log.error(
@@ -142,6 +146,11 @@ class Registry:
                 backends.append(server.id)
 
         if unavailable and not backends:
+            if squatted == unavailable:
+                # Every broker refused the name itself: a retry won't help, so say why.
+                raise RegisterError(
+                    "squatted", f"{account} is held by another owner on {', '.join(squatted)}"
+                )
             raise RegisterError(
                 "broker_unavailable", f"no broker minted for {account}: {', '.join(unavailable)}"
             )

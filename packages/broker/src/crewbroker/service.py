@@ -29,6 +29,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from types import EllipsisType
 from typing import Any
 
 from crewbroker import config as cfg
@@ -41,6 +42,7 @@ from crewbroker.mint import (
     mint_token,
     native_expiry_supported,
     record_register,
+    revoke_superseded,
 )
 from crewbroker.prune import prune_idle
 from crewbroker.state import AccountStore, TokenStore
@@ -106,10 +108,58 @@ class Broker:
     def _expiry(self) -> bool:
         return native_expiry_supported(self.client, self.server_key, self.config.broker_user_id)
 
+    def _held(self, args: dict[str, Any]) -> str | EllipsisType | None:
+        """`current_token_id`: the token the daemon holds for this account, or null for none.
+
+        Absent (an older daemon) returns `...`, and nothing is revoked.
+        """
+        if "current_token_id" not in args:
+            return ...
+        held = args["current_token_id"]
+        if held is not None and (not isinstance(held, str) or not held):
+            raise OpError("bad_request", "current_token_id is a token id or null")
+        return held
+
+    def _deadline(self, args: dict[str, Any]) -> float | None:
+        deadline = args.get("deadline")
+        if deadline is not None and (
+            isinstance(deadline, bool) or not isinstance(deadline, int | float)
+        ):
+            raise OpError("bad_request", "deadline is epoch seconds")
+        return float(deadline) if deadline is not None else None
+
+    def _check_deadline(self, deadline: float | None) -> None:
+        """Called once the lock is held: the caller has given up on a request past its deadline.
+
+        Minting for it anyway would leave an orphan, and its supersede could revoke the token
+        a newer call has since swapped in (#41).
+        """
+        if deadline is not None and self.clock().timestamp() > deadline:
+            raise OpError("expired", "the caller's deadline passed before the broker got to it")
+
+    def _supersede(self, bot_id: str, held: str | EllipsisType | None, new_id: str) -> None:
+        """Revoke the account's tokens other than `held` and `new_id` (#41).
+
+        A best-effort cleanup after the mint: its errors are logged and never fail the op.
+        """
+        if held is ...:
+            return
+        keep = {new_id} | ({held} if held else set())
+        try:
+            gone = revoke_superseded(self.client, bot_id, self.tokens, keep)
+        except Exception:
+            log.exception("revoking superseded tokens of %s failed", bot_id)
+            return
+        if gone:
+            log.info("revoked superseded tokens of %s: %s", bot_id, ", ".join(gone))
+
     def mint(self, args: dict[str, Any]) -> dict[str, Any]:
         """Only the daemon's `register` causes a mint; it is the one op that records it."""
         name = self._name(args)
+        held = self._held(args)
+        deadline = self._deadline(args)
         with self._lock:
+            self._check_deadline(deadline)
             try:
                 bot_id = ensure_bot(self.client, name, self.accounts, self.config.broker_user_id)
             except SquattedAccount as exc:
@@ -120,13 +170,17 @@ class Broker:
             token = mint_token(
                 self.client, bot_id, self.tokens, expiry_supported=self._expiry(), now=now
             )
+            self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
         return {"account": name, "token": token.token, "token_id": token.token_id}
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
-        """A fresh token for an existing account; the old one stays valid until `revoke`."""
+        """A fresh token for an existing account; the held one stays valid until `revoke`."""
         name = self._name(args)
+        held = self._held(args)
+        deadline = self._deadline(args)
         with self._lock:
+            self._check_deadline(deadline)
             acct = self.accounts.get(name)
             if acct is None:
                 raise OpError("not_found", f"{name} has never registered")
@@ -145,6 +199,7 @@ class Broker:
                 expiry_supported=self._expiry(),
                 now=self.clock(),
             )
+            self._supersede(acct.bot_user_id, held, token.token_id)
         log.info("remint: %s token %s", name, token.token_id)
         return {"token": token.token, "token_id": token.token_id}
 
@@ -155,7 +210,11 @@ class Broker:
         with self._lock:
             if self.tokens.get(token_id) is None:
                 raise OpError("not_found", "no token with that id was minted by this broker")
-            self.client.revoke_token(token_id)
+            try:
+                self.client.revoke_token(token_id)
+            except NotFound:
+                # Already gone on the server: done, or the daemon would retry it every day.
+                log.warning("revoke: token %s is already gone upstream", token_id)
             self.tokens.remove(token_id)
         log.info("revoke: token %s", token_id)
         return {}

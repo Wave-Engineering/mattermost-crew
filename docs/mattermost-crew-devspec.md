@@ -220,7 +220,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 ### 4.2 Session Start
 
 1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, crew, session_id}`. `crew` comes from the identity file's `crew` field, or else the host's default crew in `servers.toml`. The shim then pushes the agent's kiosk brief and squawk IDs (`kiosk_brief`, `squawk_ids`), because the daemon never reads agent-home or repo paths.
-2. For each configured Mattermost server, the daemon asks that crew's broker for that server for a token for `<dev-name>.<crew>` (`mint{dev_name, crew}`). Brokers are keyed by (crew, server_id). Only `register` causes a `mint`. The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
+2. For each configured Mattermost server, the daemon asks that crew's broker for that server for a token for `<dev-name>.<crew>` (`mint{dev_name, crew, current_token_id, deadline}`). Brokers are keyed by (crew, server_id). Only `register` causes a `mint`. The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
 3. The daemon opens that agent's Mattermost websocket, pinging every 30 s (CT-07), and attaches the Discord and squawkie adapters.
 
 ### 4.3 Send
@@ -369,11 +369,13 @@ It serves the daemon over its socket, using the same frame shape (D-058). Every 
 
 | op | What it does |
 |---|---|
-| `mint{dev_name, crew}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
-| `remint{dev_name, crew}` | Mints a fresh token for an existing account and returns it, **without** revoking the old one, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
+| `mint{dev_name, crew, current_token_id, deadline}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
+| `remint{dev_name, crew, current_token_id, deadline}` | Mints a fresh token for an existing account and returns it, **without** revoking the token the daemon holds, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
 | `revoke{token_id}` | Revokes a token. The daemon calls it after it has swapped in the new token and reconnected. |
 | `switch_state{}` | Returns the switch setting, its expiry, the setting it reverts to, and the kiosk on/off flag. |
 | `crew_info{}` | Returns **only this broker's own fields**: `{broker_user_id, human_user_ids, trusted: ["<crew>", …], minted_bot_ids}`. `minted_bot_ids` lists the bot account user IDs this broker created. The daemon caches it with the switch state (§5.9), and gets each trusted crew's `broker_user_id`, `human_user_ids` and `minted_bot_ids` **only** from that crew's own broker's `crew_info`. |
+
+On `mint` and `remint`, `current_token_id` names the token the daemon holds for that account on that server (`null` for none). After minting, the broker revokes the account's other recorded tokens, at most 5 per call, so a token minted by a call whose reply timed out is not left live (#41, D-102). `deadline` is the caller's timeout in epoch seconds on the shared host clock. A request the broker reaches after its deadline is refused with `expired` and mints nothing, so a late request can't supersede the token a newer call swapped in. A caller that omits `current_token_id` gets no cleanup, and one that omits `deadline` is never refused as `expired`.
 
 The daemon owns rotation (§4.8). The broker's daily job only deactivates bot accounts whose `last_register` is more than 30 days old (R-30), so an account that is merely re-minted is never counted as active. The broker also listens on its own websocket for DMs from the configured human user IDs, and parses switch commands from them (§4.6).
 
@@ -835,8 +837,8 @@ Delivers the broker, one per (crew, server), that creates bot accounts and mints
    - `record_register(account, now)` writes `last_register` for the account to `/var/lib/crewbroker/<crew>-<server_id>/accounts.json` (mode `0600`). Only `mint` calls it, and only the daemon's `register` causes a `mint`; `remint` never does.
 3. `crewbroker/prune.py`: `prune_idle(client, now, idle_days=30)` deactivates bot accounts whose `last_register` is more than 30 days old (R-30). Rotation is the daemon's job (Story 1.4), so a re-minted but unregistered account still ages out.
 4. `crewbroker/service.py`: a unix-socket server on `/run/crewbroker/<crew>-<server_id>.sock` (mode `0660`, group `crewchat`, set by the tmpfiles.d entry `d /run/crewbroker 2770 crewbroker crewchat` so the setgid directory passes the group on; `crewbroker` is not itself in `crewchat`), using the §5.4 frame shape. Every op is refused unless the peer's `SO_PEERCRED` UID is `crewchat` (R-08). **No broker ever calls another broker.** The handler never blocks on anything outside its own state and the Mattermost server. The ops are:
-   - `mint{dev_name, crew}` → `{account, token, token_id}`;
-   - `remint{dev_name, crew}` → `{token, token_id}`, without revoking the old token;
+   - `mint{dev_name, crew, current_token_id, deadline}` → `{account, token, token_id}`;
+   - `remint{dev_name, crew, current_token_id, deadline}` → `{token, token_id}`, without revoking the held token. Both revoke the account's other recorded tokens after minting, and refuse with `expired` past `deadline` (§5.6, #41);
    - `revoke{token_id}` → `{}`;
    - `crew_info{}` → `{broker_user_id, human_user_ids, trusted: ["<crew>", …], minted_bot_ids}`: this broker's own fields only, from its config and `accounts.json`. Trusted crews are returned by name; the daemon fetches their membership from their own brokers (§5.6, §5.9).
 

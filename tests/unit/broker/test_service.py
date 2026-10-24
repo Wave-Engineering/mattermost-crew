@@ -9,6 +9,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,100 @@ def test_remint_keeps_old_token_until_revoke(broker: Broker, fake: Any) -> None:
         broker.revoke({"token_id": first["token_id"]})
     with pytest.raises(OpError, match="not_found"):
         broker.remint({"dev_name": "never", "crew": "oaw"})
+
+
+def _args(held: str | None) -> dict[str, Any]:
+    return {"dev_name": "babel", "crew": "oaw", "current_token_id": held}
+
+
+def test_timed_out_remint_token_revoked_on_next_call(broker: Broker, fake: Any) -> None:
+    """#41: the daemon keeps its token after a remint it timed out on; the orphan is revoked."""
+    held = broker.mint(_args(None))
+    orphan = broker.remint(_args(held["token_id"]))  # its reply never reached the daemon
+    fresh = broker.remint(_args(held["token_id"]))  # the next rotation, still on `held`
+
+    assert not fake.token_works(orphan["token"])
+    assert broker.tokens.get(orphan["token_id"]) is None
+    # The token the daemon is using is never touched; it revokes it itself after the swap.
+    assert fake.token_works(held["token"]) and fake.token_works(fresh["token"])
+
+
+def test_mint_with_nothing_held_revokes_every_other_token(broker: Broker, fake: Any) -> None:
+    orphan = broker.mint(_args(None))  # a register whose reply timed out
+    fresh = broker.mint(_args(None))  # the agent registers again, holding nothing
+    assert not fake.token_works(orphan["token"])
+    assert {r.token_id for r in broker.tokens.all()} == {fresh["token_id"]}
+
+
+def test_supersede_without_current_token_id_revokes_nothing(broker: Broker, fake: Any) -> None:
+    # An older daemon sends no current_token_id: the broker cannot tell what it holds.
+    first = broker.mint({"dev_name": "babel", "crew": "oaw"})
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    assert fake.token_works(first["token"])
+
+
+def test_supersede_errors_never_fail_the_op(broker: Broker, fake: Any) -> None:
+    held = broker.mint(_args(None))
+    gone = broker.remint(_args(held["token_id"]))
+    stuck = broker.remint(_args(held["token_id"]))
+    del fake.tokens[gone["token_id"]]  # 404 upstream: cleared
+    fake.revoke_fails.add(stuck["token_id"])  # 500 upstream: kept for the next call
+
+    fresh = broker.remint(_args(held["token_id"]))
+    assert fake.token_works(fresh["token"])
+    assert broker.tokens.get(gone["token_id"]) is None
+    assert broker.tokens.get(stuck["token_id"]) is not None
+    fake.revoke_fails.clear()
+    broker.remint(_args(held["token_id"]))
+    assert broker.tokens.get(stuck["token_id"]) is None
+
+
+def test_current_token_id_must_be_an_id_or_null(broker: Broker) -> None:
+    for bad in ("", 7, ["x"]):
+        with pytest.raises(OpError, match="bad_request"):
+            broker.remint(_args(bad))  # type: ignore[arg-type]
+
+
+def test_late_request_past_its_deadline_is_refused(
+    broker: Broker, fake: Any, clock: Any
+) -> None:
+    """#41: a call the daemon gave up on, served after a newer one, mints and revokes nothing."""
+    held = broker.mint(_args(None))
+    sent = clock.now.timestamp()
+    clock.now += timedelta(seconds=3)  # the broker was stalled past the 2 s timeout
+    newer = broker.mint({**_args(held["token_id"]), "deadline": clock.now.timestamp() + 2})
+    tokens_before = fake.count("create_token")
+
+    with pytest.raises(OpError, match="expired"):
+        broker.mint({**_args(held["token_id"]), "deadline": sent + 2})
+    with pytest.raises(OpError, match="expired"):
+        broker.remint({**_args(held["token_id"]), "deadline": sent + 2})
+    assert fake.count("create_token") == tokens_before
+    assert fake.token_works(newer["token"])
+
+
+def test_deadline_must_be_epoch_seconds(broker: Broker) -> None:
+    for bad in ("soon", True, [1]):
+        with pytest.raises(OpError, match="bad_request"):
+            broker.mint({**_args(None), "deadline": bad})
+
+
+def test_supersede_is_capped_per_call(broker: Broker, fake: Any) -> None:
+    held = broker.mint(_args(None))
+    orphans = [broker.remint({"dev_name": "babel", "crew": "oaw"}) for _ in range(7)]
+    broker.remint(_args(held["token_id"]))
+    left = [o for o in orphans if fake.token_works(o["token"])]
+    assert len(left) == 2  # 5 revoked on this call; the rest wait for the next
+    broker.remint(_args(held["token_id"]))
+    assert not any(fake.token_works(o["token"]) for o in orphans)
+    assert fake.token_works(held["token"])
+
+
+def test_revoke_notfound_upstream_is_success(broker: Broker, fake: Any) -> None:
+    minted = broker.mint({"dev_name": "babel", "crew": "oaw"})
+    del fake.tokens[minted["token_id"]]  # already revoked on the server
+    assert broker.revoke({"token_id": minted["token_id"]}) == {}
+    assert broker.tokens.get(minted["token_id"]) is None
 
 
 def test_every_op_refused_to_non_daemon_peer(broker: Broker, fake: Any, short_dir: Path) -> None:

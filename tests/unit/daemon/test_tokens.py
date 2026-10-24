@@ -244,6 +244,11 @@ def test_rotation_order(daemon: Any, clock: Any) -> None:
         ("hook", "kessel"),
         ("broker", "revoke"),
     ]
+    # Each remint names the token held, which the broker keeps live (#41).
+    assert [a["current_token_id"] for a in broker.ops("remint")] == [
+        before["babel"].token_id,
+        before["kessel"].token_id,
+    ]
     # Revoke is never called before the swap: at each revoke the store holds the new token.
     for tid, current in at_revoke:
         assert current is not None and current != before[owner[tid]].token
@@ -312,7 +317,8 @@ def test_broker_client_per_crew_and_server(
     register(daemon, dev="lutra", crew="otter")
     for crew, dev in (("oaw", "babel"), ("otter", "lutra")):
         for sid in ("dev", "prod"):
-            assert daemon.broker(crew, sid).ops("mint") == [{"dev_name": dev, "crew": crew}]
+            (args,) = daemon.broker(crew, sid).ops("mint")
+            assert (args["dev_name"], args["crew"]) == (dev, crew)
     # token_for keys by server: each server's broker minted its own token.
     tokens = {
         (dev, sid): daemon.store.token_for(dev, sid)

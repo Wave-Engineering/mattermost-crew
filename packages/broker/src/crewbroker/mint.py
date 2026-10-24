@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 
-from crewbroker.mattermost import MattermostAPI, NotFound
+from crewbroker.mattermost import MattermostAPI, MattermostError, NotFound
 from crewbroker.state import AccountStore, TokenRecord, TokenStore
+
+log = logging.getLogger(__name__)
 
 ACCOUNT_NAME_MAX = 64  # Mattermost's UserNameMaxLength (CT-05)
 ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9._-]+$")
@@ -17,6 +20,7 @@ DEFAULT_TTL_HOURS = 26
 BOT_DESCRIPTION = "mattermost-crew participant"
 PROBE_DESCRIPTION = "crewbroker native-expiry probe"
 PROBE_TTL_MS = 3_600_000
+SUPERSEDE_PER_CALL = 5
 
 
 class SquattedAccount(Exception):
@@ -141,6 +145,36 @@ def mint_token(
         )
     )
     return token
+
+
+def revoke_superseded(
+    client: MattermostAPI,
+    bot_user_id: str,
+    tokens: TokenStore,
+    keep: set[str],
+    limit: int = SUPERSEDE_PER_CALL,
+) -> list[str]:
+    """Revoke recorded tokens of `bot_user_id` not in `keep`, at most `limit`; return their ids.
+
+    `mint` and `remint` call this with the token the daemon says it holds and the one just
+    minted, so a token the daemon never learned of (its call timed out, #41) is revoked on
+    its next successful call. `limit` keeps a backlog from holding the reply past the
+    daemon's timeout; the rest go on later calls. An upstream 404 means already gone and
+    clears the entry; any other error keeps it for the next call.
+    """
+    revoked: list[str] = []
+    stale = [r for r in tokens.all() if r.user_id == bot_user_id and r.token_id not in keep]
+    for rec in stale[:limit]:
+        try:
+            client.revoke_token(rec.token_id)
+        except NotFound:
+            log.warning("token %s of %s is already gone upstream", rec.token_id, bot_user_id)
+        except MattermostError as exc:
+            log.error("revoke superseded %s of %s: %s", rec.token_id, bot_user_id, exc)
+            continue
+        tokens.remove(rec.token_id)
+        revoked.append(rec.token_id)
+    return revoked
 
 
 def record_register(accounts: AccountStore, account: str, now: datetime) -> None:

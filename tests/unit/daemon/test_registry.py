@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 from crewchat.registry import RegisterError, account_name
-from crewchat.tokens import BrokerUnavailable
+from crewchat.tokens import BrokerError, BrokerUnavailable
 
 
 def register(daemon: Any, dev: str = "babel", crew: str | None = "oaw", session: str = "s1") -> Any:
@@ -19,7 +20,10 @@ def test_register_returns_account_name(daemon: Any) -> None:
     reg = register(daemon)
     assert reg.account == "babel.oaw"
     assert reg.result()["account"] == "babel.oaw"
-    assert daemon.broker().ops("mint") == [{"dev_name": "babel", "crew": "oaw"}]
+    (args,) = daemon.broker().ops("mint")
+    # The broker refuses the mint once this call's 2 s timeout has passed (#41).
+    assert args.pop("deadline") == pytest.approx(time.time() + 2.0, abs=1.0)
+    assert args == {"dev_name": "babel", "crew": "oaw", "current_token_id": None}
     # One registration per Dev-Name, taken at its word (D-055).
     assert daemon.registry.get("babel") is reg
     assert reg.session_id == "s1"
@@ -56,6 +60,8 @@ def test_reregister_revokes_previous_token(daemon: Any) -> None:
         ("broker", "revoke"),
         ("broker", "crew_info"),
     ]
+    # The mint names the token held, so the broker keeps it live until the swap (#41).
+    assert broker.ops("mint")[-1]["current_token_id"] == first.token_id
     assert broker.ops("revoke") == [{"token_id": first.token_id}]
     # The swap came first: at revoke time the store already held the new token.
     assert seen == [second.token]
@@ -88,6 +94,32 @@ def test_register_fails_loudly_when_no_broker_answers(daemon: Any) -> None:
     with pytest.raises(RegisterError, match="broker_unavailable"):
         register(daemon)
     assert daemon.store.agent("babel") is None
+
+
+def _two_servers(raw: dict[str, Any]) -> dict[str, Any]:
+    raw["mattermost"].append({"id": "prod", "url": "http://mm2.invalid"})
+    raw["crews"]["oaw"]["prod"] = {
+        "broker_socket": "/run/crewbroker/oaw-prod.sock",
+        "broker_user_id": "b-oaw-prod",
+    }
+    return raw
+
+
+def test_register_all_squatted_returns_squatted(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    daemon = make_daemon(_two_servers(servers_toml))
+    for sid in ("dev", "prod"):
+        daemon.broker("oaw", sid).fail["mint"] = BrokerError("mint", "squatted: held by x")
+    with pytest.raises(RegisterError) as exc:
+        register(daemon)
+    assert exc.value.code == "squatted"
+
+    # A squatted name on one server and a timeout on the other: a retry may still work.
+    daemon.broker("oaw", "prod").fail["mint"] = BrokerUnavailable("timeout")
+    with pytest.raises(RegisterError) as exc:
+        register(daemon)
+    assert exc.value.code == "broker_unavailable"
 
 
 def test_register_keeps_the_servers_that_answered(
