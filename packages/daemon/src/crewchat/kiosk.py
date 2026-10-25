@@ -27,6 +27,19 @@
 
 `Kiosk` consumes the `KioskQueue` from Story 3.3: one worker per expert, started when that
 expert's first event arrives, answering its events in order.
+
+**The review** (Story 3.6, R-33). When the switch cache sees social engaged for (crew, server),
+`on_social` runs `review_since_cursor(dev, server_id)` for each of that crew's agents
+registered on that server. It reads **only that server's** transcript, from the byte offset in
+`<dev>-<server_id>.cursor` (`{"offset": N}`, mode 0600, written atomically), and puts one
+`{"type": "kiosk.review", "outsider": true, "server": ..., "entries": [...]}` event on the
+working agent's doorbell queue, then advances that cursor. Only complete lines are read, so a
+record still being appended waits for the next review. A transcript shorter than its cursor
+(replaced) is read from the start. With no new entries nothing is enqueued. A backlog past
+`REVIEW_MAX_BYTES` is split across several such events, so each fits the shim's frame; a
+full queue stops the review and leaves the cursor at the last entry delivered. Other
+servers' transcripts and cursors are never touched. The shim renders the event's `text` with
+the outsider prefix.
 """
 
 from __future__ import annotations
@@ -38,17 +51,17 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from crewchat.adapters.base import InboundMessage
+from crewchat.doorbell import DoorbellEvent
 from crewchat.threads import STATE_DIR
-from crewchat.tokens import DIR_MODE, FILE_MODE
+from crewchat.tokens import DIR_MODE, FILE_MODE, write_private_json
 
 if TYPE_CHECKING:
-    from crewchat.doorbell import DoorbellEvent
     from crewchat.filters import KioskQueue
 
 KIOSK_HEADER = (
@@ -77,6 +90,17 @@ MATTERMOST_PREFIX = "mattermost:"
 # `@name`, `@name.crew`, `@channel`: dots inside a token, never a trailing full stop.
 MENTION_RE = re.compile(r"@[\w\-]+(?:\.[\w\-]+)*")
 SAFE_PART_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+REVIEW_TYPE = "kiosk.review"
+# The review's text; the shim prefixes it `[from outside the crew]` (outsider content).
+REVIEW_TEXT = (
+    "Kiosk review: review these exchanges and raise anything notable to your human partner."
+)
+REVIEW_FIELDS = ("ts", "thread", "asker_id", "question", "answer")
+# One review event's entries, encoded: well inside the shim's 1 MiB reply frame.
+REVIEW_MAX_BYTES = 256 * 1024
+Deliver = Callable[[str, DoorbellEvent], bool]
+# A transcript line read for review: its entry (None when malformed), and the offset past it.
+ReviewLine = tuple[dict[str, Any] | None, int]
 
 log = logging.getLogger("crewchat.kiosk")
 
@@ -298,6 +322,7 @@ class Kiosk:
         *,
         state_dir: Path = STATE_DIR,
         clock: Callable[[], float] = time.time,
+        deliver: Deliver | None = None,
     ) -> None:
         self.queue = queue
         self.briefs = briefs
@@ -305,6 +330,8 @@ class Kiosk:
         self.runner = runner
         self.kiosk_dir = state_dir / KIOSK_SUBDIR
         self.clock = clock
+        # Puts a review on the working agent's doorbell queue (`Doorbell.deliver`, R-33).
+        self.deliver = deliver
         self.sessions: dict[tuple[str, str], KioskSession] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._started = False
@@ -385,3 +412,116 @@ class Kiosk:
         posted: InboundMessage = await backend.send_kiosk(dev_name, msg.channel, answer, thread)
         sess.record(msg, answer, posted.ts)
         return posted
+
+    # -- the review on social engage (R-33) -------------------------------------------------
+    def review_paths(self, dev_name: str, server_id: str) -> tuple[Path, Path]:
+        """That server's transcript and its review cursor."""
+        if not SAFE_PART_RE.fullmatch(dev_name) or not SAFE_PART_RE.fullmatch(server_id):
+            raise ValueError(f"unsafe kiosk review key ({dev_name!r}, {server_id!r})")
+        base = f"{dev_name}-{server_id}"
+        return self.kiosk_dir / f"{base}.jsonl", self.kiosk_dir / f"{base}.cursor"
+
+    def read_cursor(self, dev_name: str, server_id: str) -> int:
+        """The byte offset reviewed up to: 0 when there is no cursor, or it is unreadable."""
+        _, path = self.review_paths(dev_name, server_id)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return 0
+        except (OSError, ValueError) as exc:
+            log.error("kiosk review cursor %s unreadable, reviewing from the start: %s", path, exc)
+            return 0
+        offset = raw.get("offset") if isinstance(raw, dict) else None
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            log.error("kiosk review cursor %s holds no offset, reviewing from the start", path)
+            return 0
+        return offset
+
+    def _write_cursor(self, path: Path, offset: int) -> None:
+        path.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+        write_private_json(path, {"offset": offset})
+
+    @staticmethod
+    def _new_lines(transcript: Path, offset: int) -> tuple[list[ReviewLine], int]:
+        """Each complete transcript line past `offset`, parsed (None when malformed), with the
+        offset just past it; and the offset reading started from (0 for a replaced file)."""
+        try:
+            with transcript.open("rb") as fh:
+                if os.fstat(fh.fileno()).st_size < offset:
+                    log.warning("kiosk transcript %s is shorter than its cursor", transcript)
+                    offset = 0
+                fh.seek(offset)
+                data = fh.read()
+        except FileNotFoundError:
+            return [], offset
+        complete = data[: data.rfind(b"\n") + 1]  # a record mid-append waits for next time
+        lines: list[ReviewLine] = []
+        pos = offset
+        for line in complete.splitlines(keepends=True):
+            pos += len(line)
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                rec = None
+            if not isinstance(rec, dict):
+                log.warning("kiosk transcript %s: skipped a malformed line", transcript)
+                lines.append((None, pos))
+                continue
+            lines.append(({k: rec[k] for k in REVIEW_FIELDS if k in rec}, pos))
+        return lines, offset
+
+    def review_since_cursor(self, dev_name: str, server_id: str) -> int:
+        """Enqueue `dev_name`'s kiosk exchanges on `server_id` since that server's cursor for
+        the working agent, as `kiosk.review` outsider events, and advance the cursor past
+        each one delivered. The number of entries delivered."""
+        if self.deliver is None:
+            log.error("kiosk review: no doorbell to deliver to; %s's cursor kept", dev_name)
+            return 0
+        transcript, cursor = self.review_paths(dev_name, server_id)
+        offset = self.read_cursor(dev_name, server_id)
+        lines, start = self._new_lines(transcript, offset)
+        batches: list[tuple[list[dict[str, Any]], int]] = []
+        chunk: list[dict[str, Any]] = []
+        size, end = 0, start
+        for entry, pos in lines:
+            if entry is not None:
+                n = len(json.dumps(entry))
+                if chunk and size + n > REVIEW_MAX_BYTES:
+                    batches.append((chunk, end))
+                    chunk, size = [], 0
+                chunk.append(entry)
+                size += n
+            end = pos
+        batches.append((chunk, end))
+        backend = f"{MATTERMOST_PREFIX}{server_id}"
+        delivered = 0
+        for entries, upto in batches:
+            if entries:
+                payload = {
+                    "type": REVIEW_TYPE,
+                    "backend": backend,
+                    "outsider": True,
+                    "server": server_id,
+                    "text": REVIEW_TEXT,
+                    "entries": entries,
+                }
+                if not self.deliver(dev_name, DoorbellEvent(backend, payload, ts=self.clock())):
+                    log.error("kiosk review for %s on %s not delivered", dev_name, server_id)
+                    return delivered
+                delivered += len(entries)
+            if upto != offset:
+                self._write_cursor(cursor, upto)
+                offset = upto
+        if delivered:
+            log.info("kiosk review: %d exchanges for %s on %s", delivered, dev_name, server_id)
+        return delivered
+
+    def on_social(self, server_id: str, dev_names: Iterable[str]) -> int:
+        """Social engaged on `server_id`: review each agent's kiosk there (R-33)."""
+        total = 0
+        for dev_name in dev_names:
+            try:
+                total += self.review_since_cursor(dev_name, server_id)
+            except Exception:
+                log.exception("kiosk review for %s on %s failed", dev_name, server_id)
+        return total

@@ -129,6 +129,16 @@ def mark_outsiders(result: dict[str, Any]) -> dict[str, Any]:
     return {**result, "messages": marked}
 
 
+def render_event(event: dict[str, Any]) -> dict[str, Any]:
+    """A doorbell event as the agent reads it: an event the daemon marked `"outsider": true`
+    (the kiosk review, Story 3.6, R-33) has its `text` prefixed with `OUTSIDER_PREFIX`."""
+    text = event.get("text")
+    marked = event.get("outsider") is True and isinstance(text, str)
+    if marked and not str(text).startswith(OUTSIDER_PREFIX):
+        return {**event, "text": f"{OUTSIDER_PREFIX} {text}"}
+    return event
+
+
 class ShimError(Exception):
     """A tool call that failed; the message goes to the agent as the tool's error."""
 
