@@ -235,6 +235,8 @@ class FakeMattermost:
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
         self.fail_connects = 0
+        # path fragment -> how many more requests whose path holds it get a 503
+        self.errors: dict[str, int] = {}
         # team id -> the channels every user is in there (`GET /users/me/teams/{id}/channels`)
         self.teams: dict[str, list[dict[str, Any]]] = {}
         self._n = itertools.count(1)
@@ -314,6 +316,10 @@ class FakeMattermost:
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
         path = request.url.path.removeprefix("/api/v4")
         self.requests.append((request.method, path, token))
+        for fragment, left in self.errors.items():
+            if left > 0 and fragment in path:
+                self.errors[fragment] = left - 1
+                return httpx.Response(503, json={"id": "fake.unavailable"})
         me = self.tokens.get(token)
         if me is None:
             return httpx.Response(401, json={"id": "api.context.session_expired.app_error"})

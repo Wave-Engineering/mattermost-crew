@@ -27,10 +27,12 @@ two distinct authors (R-01).
   the stream remembers the IDs it yielded (seeded from `cursor.seen`). A replayed post has no
   `mentions` (a REST post carries none, and the text is never parsed, R-29). With no cursor,
   the first connect starts at now, less `REPLAY_MARGIN_S` for clock skew.
-- **Status** (R-27). `on_status(True, "")` when a connection delivers its first frame;
-  `on_status(False, reason)` when a connect is refused (`unauthorized` on a 401), when the
-  agent's own user can't be read, or when a connection is lost. A rotation's reconnect is not
-  an outage and reports nothing.
+- **Status** (R-27). `on_status(True, "")` when a connection delivers its first frame and its
+  replay has succeeded; `on_status(False, reason)` when a connect is refused (`unauthorized`
+  on a 401), when the agent's own user can't be read, when a connection is lost, or when a
+  replay fails (`replay failed: <the call>: <error>`). A failed replay yields nothing from that
+  connection, which is closed and retried after the backoff with the position unmoved, so a
+  gap is never skipped (#99). A rotation's reconnect is not an outage and reports nothing.
 - A 401 on a request is refreshed through the token store's `call_with_refresh` (`remint`,
   never `mint`; R-30), and a 401 on the websocket handshake through its `refresh`.
 - `is_bot` comes from the author's user object (`GET /users/{id}`, cached per author ID, as a
@@ -110,6 +112,10 @@ log = logging.getLogger("crewchat.adapters.mattermost")
 
 T = TypeVar("T")
 TokenFor = Callable[[str, str], str | None]
+
+
+class ReplayFailed(Exception):
+    """A reconnect's replay failed; the message names the call (#99)."""
 
 
 class TokenRefresher(Protocol):
@@ -620,18 +626,23 @@ class MattermostBackend:
 
     async def _replay(self, dev_name: str, agent: _Agent) -> list[InboundMessage]:
         """The posts created since the agent's position in each of its channels, oldest
-        first, that the stream hasn't yielded (R-28). A failure is logged and replays none."""
+        first, that the stream hasn't yielded (R-28). A failure raises `ReplayFailed`, naming
+        the call that failed, and the position is left where it was (#99)."""
         since = agent.position_ms
         if since is None:
             return []
         me = agent.user_id
+        step = "GET /users/me/teams"
 
         async def request(client: MattermostClient) -> list[InboundMessage]:
+            nonlocal step
+            step = "GET /users/me/teams"
             channels: dict[str, dict[str, Any]] = {}
             for team in await client.get_teams():
                 team_id = str(team.get("id", ""))
                 if not is_mm_id(team_id):
                     continue
+                step = f"GET /users/me/teams/{team_id}/channels"
                 for channel in await client.get_my_channels(team_id):
                     channel_id = str(channel.get("id", ""))
                     if is_mm_id(channel_id):
@@ -640,6 +651,7 @@ class MattermostBackend:
             for channel_id, chan in channels.items():
                 # `since` is `update_at > since`, so one millisecond back keeps a post made
                 # at the position itself; the IDs already yielded are left out below.
+                step = f"GET /channels/{channel_id}/posts?since="
                 result = await client.get_posts_since(channel_id, since - 1)
                 posts = result.get("posts") or {}
                 if not isinstance(posts, dict):
@@ -660,6 +672,7 @@ class MattermostBackend:
                         "channel_name": chan.get("name", ""),
                     }
                     dm = event_dm(data, author, me)
+                    step = f"GET /users/{author}"
                     found.append(await self.message(client, post, [], dm=dm))
             found.sort(key=lambda m: (m.ts, m.post_id))
             return found
@@ -667,8 +680,8 @@ class MattermostBackend:
         try:
             return await self._call(dev_name, request)
         except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
-            log.error("replay for %s on %s: %s", dev_name, self.server_id, exc)
-            return []
+            log.error("replay for %s on %s: %s: %s", dev_name, self.server_id, step, exc)
+            raise ReplayFailed(f"{step}: {exc}") from exc
 
     async def stream(
         self,
@@ -686,6 +699,7 @@ class MattermostBackend:
             agent.position_ms = int(cursor.ts * 1000) if cursor.ts > 0 else None
         delays = backoff_delays()
         while not agent.closed:
+            replay_failed = False
             if agent.user_id is None:
                 try:
                     await self.user_id(dev_name)
@@ -705,18 +719,27 @@ class MattermostBackend:
                     # A dead connection is the library's to notice: its pings time out.
                     raw = await ws.recv()
                     first = not agent.hello
-                    if first:
-                        delays = backoff_delays()  # connected: the next loss starts at 1 s
                     msg = await self._event(dev_name, agent, raw)
                     agent.hello = True
                     if first:
-                        on_status(True, "")
                         if agent.position_ms is None:
                             agent.position_ms = int((time.time() - REPLAY_MARGIN_S) * 1000)
+                            missed_posts: list[InboundMessage] = []
                         else:
-                            for missed in await self._replay(dev_name, agent):
-                                if self._fresh(agent, missed):
-                                    yield missed
+                            # Caught up before it counts as up, as squawkie's catch-up is. A
+                            # failed replay yields nothing from this connection, not even
+                            # `msg`, so the position stays before the gap (R-27, R-28, #99).
+                            try:
+                                missed_posts = await self._replay(dev_name, agent)
+                            except ReplayFailed as exc:
+                                on_status(False, f"replay failed: {exc}")
+                                replay_failed = True
+                                break
+                        delays = backoff_delays()  # connected: the next loss starts at 1 s
+                        on_status(True, "")
+                        for missed in missed_posts:
+                            if self._fresh(agent, missed):
+                                yield missed
                     if msg is not None and self._fresh(agent, msg):
                         yield msg
             except (ConnectionClosed, TimeoutError, OSError) as exc:
@@ -731,7 +754,8 @@ class MattermostBackend:
                 break
             if agent.rotated:
                 agent.rotated = False  # a new token: reconnect at once
-                continue
+                if not replay_failed:  # a replay that failed waits out its backoff
+                    continue
             await self._sleep(next(delays))
 
     # -- token hooks (crewchat.tokens.Adapter) ----------------------------------------------

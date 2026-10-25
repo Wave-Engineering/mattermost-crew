@@ -140,7 +140,8 @@ the kiosk; under social it is returned marked. Pull never gives a `KIOSK` verdic
    `KIOSK` verdict, so two kiosks can't answer each other.
 6. When the partner engages social on that server, the daemon enqueues a `kiosk.review` event for
    the working agent with that server's transcript since its cursor, marked as outsider content,
-   and advances the cursor (R-33).
+   and advances the cursor once the review is handed over (R-33). An agent that registers while
+   social is already on gets the review then.
 
 ## Per backend
 
@@ -151,7 +152,10 @@ the kiosk; under social it is returned marked. Pull never gives a `KIOSK` verdic
 | squawkie | **Exempt**: the adapter delivers only the agent's own squawks (R-26). |
 
 A backend that goes down is reported as `backend.down` and the others keep flowing (R-27); on
-reconnect each replays from its saved cursor, exactly once (R-28).
+reconnect each replays from its saved cursor, queuing each missed event exactly once (R-28). A
+replay that fails is an outage too, and loses nothing. Handing an event to the agent is at least
+once: the cursor moves only after `subscribe`'s reply is written, and each reply carries an
+`event_id` to drop a repeat by (#99).
 
 ## Tokens
 

@@ -10,7 +10,7 @@
 #
 # Usage:
 #
-#   MM_URL=https://<the OaW dev space> MM_ADMIN_TOKEN=<a dev-space admin access token> \
+#   MM_URL=https://chat.apps.oakai.waveeng.com MM_ADMIN_TOKEN=<a dev-space admin access token> \
 #   SMOKE_TARGET=oaw-devspace scripts/smoke-devspace.sh
 #
 # It prints a markdown report on stdout, ready to post to Plan #3 as a comment, and writes the
@@ -24,10 +24,12 @@
 # OaW dev space needs no yes-prod for that (CP-06). It never cleans up after itself: wiping the
 # dev space needs BJ. On any partner organization's production server the role patch is the
 # human partner's yes-prod (CP-03, S-25), so this script runs only with
-# SMOKE_TARGET=oaw-devspace, a statement that MM_URL is the OaW dev space, or with
-# SMOKE_TARGET=local against a localhost throwaway from scripts/ci/mattermost-up.sh.
+# SMOKE_TARGET=oaw-devspace and MM_URL exactly the OaW dev space ($DEVSPACE_URL below), or
+# with SMOKE_TARGET=local against a localhost throwaway from scripts/ci/mattermost-up.sh.
+# Only the dev space lets the role patch reach a non-local server (#99).
 set -euo pipefail
 
+DEVSPACE_URL="https://chat.apps.oakai.waveeng.com"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORTS="${SMOKE_REPORTS:-${ROOT}/reports}"
 FLOWS=(tests/e2e/test_cross_crew.py tests/e2e/test_outsider_switch.py tests/e2e/test_broadcast.py)
@@ -39,8 +41,15 @@ die() { log "ERROR: $*"; exit 2; }
 : "${MM_ADMIN_TOKEN:?set MM_ADMIN_TOKEN to a dev-space admin access token}"
 MM_URL="${MM_URL%/}"
 
+allow_remote=0
 case "${SMOKE_TARGET:-}" in
-  oaw-devspace) ;;
+  oaw-devspace)
+    # The statement alone is not enough: the broker role patch below reaches the server, and
+    # on a partner's production server that needs its human partner's yes-prod (CP-03).
+    [[ "$MM_URL" == "$DEVSPACE_URL" ]] \
+      || die "SMOKE_TARGET=oaw-devspace needs MM_URL=$DEVSPACE_URL, not $MM_URL"
+    allow_remote=1
+    ;;
   local)
     case "$MM_URL" in
       http://localhost:* | http://127.0.0.1:*) ;;
@@ -70,8 +79,12 @@ log "running ${#FLOWS[@]} flows against ${MM_URL} (Mattermost ${version})"
 uv sync --frozen >&2
 export MM_URL MM_ADMIN_TOKEN
 # The e2e world's broker accounts get the patched role through broker-role-patch.sh, which
-# refuses a non-local server unless told; the SMOKE_TARGET check above is that decision.
-export BROKER_ROLE_PATCH_ALLOW_REMOTE=1
+# refuses a non-local server unless told. Only the pinned dev space is told (#99).
+if [[ "$allow_remote" == 1 ]]; then
+  export BROKER_ROLE_PATCH_ALLOW_REMOTE=1
+else
+  unset BROKER_ROLE_PATCH_ALLOW_REMOTE
+fi
 set +e
 uv run pytest "${FLOWS[@]}" -v -rA -p no:cacheprovider --junitxml="$junit" >&2
 pytest_rc=$?

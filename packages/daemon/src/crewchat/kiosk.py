@@ -37,13 +37,17 @@ expert's first event arrives, answering its events in order.
 registered on that server. It reads **only that server's** transcript, from the byte offset in
 `<dev>-<server_id>.cursor` (`{"offset": N}`, mode 0600, written atomically), and puts one
 `{"type": "kiosk.review", "outsider": true, "server": ..., "entries": [...]}` event on the
-working agent's doorbell queue, then advances that cursor. Only complete lines are read, so a
-record still being appended waits for the next review. A transcript shorter than its cursor
-(replaced) is read from the start. With no new entries nothing is enqueued. A backlog past
-`REVIEW_MAX_BYTES` is split across several such events, so each fits the shim's frame; a
-full queue stops the review and leaves the cursor at the last entry delivered. Other
-servers' transcripts and cursors are never touched. The shim renders the event's `text` with
-the outsider prefix.
+working agent's doorbell queue. The cursor moves past an event only when the doorbell hands
+it to the agent (its `on_handover`, #99), so a review still queued when the daemon stops is
+read again after it starts. `on_registered` reviews an agent that registers while its crew's
+switch is social, since the cache reports social engaging only once.
+The offset already queued is kept in memory, so a review while one is still waiting adds
+only what came after it. Only complete lines are read, so a record still being appended
+waits for the next review. A transcript shorter than its cursor (replaced) is read from the
+start. With no new entries nothing is enqueued. A backlog past `REVIEW_MAX_BYTES` is split
+across several such events, so each fits the shim's frame; a full queue stops the review,
+and the entries it didn't queue are read again next time. Other servers' transcripts and
+cursors are never touched. The shim renders the event's `text` with the outsider prefix.
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -66,7 +71,7 @@ from crewchat.threads import STATE_DIR
 from crewchat.tokens import DIR_MODE, FILE_MODE, write_private_json
 
 if TYPE_CHECKING:
-    from crewchat.filters import KioskQueue
+    from crewchat.filters import KioskQueue, SwitchCache
 
 KIOSK_HEADER = (
     "You are this agent's kiosk. Answer questions using only the brief below. "
@@ -345,6 +350,9 @@ class Kiosk:
         self.sessions: dict[tuple[str, str], KioskSession] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._started = False
+        # (dev, server) -> the transcript offset already queued for review but maybe not
+        # yet handed over (#99). In memory only: after a restart the cursor on disk rules.
+        self._queued: dict[tuple[str, str], int] = {}
 
     # -- lifecycle --------------------------------------------------------------------------
     def start(self) -> None:
@@ -484,14 +492,17 @@ class Kiosk:
         return lines, offset
 
     def review_since_cursor(self, dev_name: str, server_id: str) -> int:
-        """Enqueue `dev_name`'s kiosk exchanges on `server_id` since that server's cursor for
-        the working agent, as `kiosk.review` outsider events, and advance the cursor past
-        each one delivered. The number of entries delivered."""
+        """Enqueue `dev_name`'s kiosk exchanges on `server_id` since that server's cursor (or
+        since what is already queued) for the working agent, as `kiosk.review` outsider
+        events. Each event moves the cursor past its entries when it is handed over (#99).
+        The number of entries enqueued."""
         if self.deliver is None:
             log.error("kiosk review: no doorbell to deliver to; %s's cursor kept", dev_name)
             return 0
         transcript, cursor = self.review_paths(dev_name, server_id)
-        offset = self.read_cursor(dev_name, server_id)
+        key = (dev_name, server_id)
+        on_disk = self.read_cursor(dev_name, server_id)
+        offset = max(on_disk, self._queued.get(key, on_disk))
         lines, start = self._new_lines(transcript, offset)
         batches: list[tuple[list[dict[str, Any]], int]] = []
         chunk: list[dict[str, Any]] = []
@@ -509,25 +520,60 @@ class Kiosk:
         backend = f"{MATTERMOST_PREFIX}{server_id}"
         delivered = 0
         for entries, upto in batches:
-            if entries:
-                payload = {
-                    "type": REVIEW_TYPE,
-                    "backend": backend,
-                    "outsider": True,
-                    "server": server_id,
-                    "text": REVIEW_TEXT,
-                    "entries": entries,
-                }
-                if not self.deliver(dev_name, DoorbellEvent(backend, payload, ts=self.clock())):
-                    log.error("kiosk review for %s on %s not delivered", dev_name, server_id)
-                    return delivered
-                delivered += len(entries)
-            if upto != offset:
-                self._write_cursor(cursor, upto)
-                offset = upto
+            if not entries:
+                # Nothing but malformed lines: move past them now, unless a review is still
+                # waiting, whose handover must not be overtaken.
+                if upto != offset and key not in self._queued:
+                    self._write_cursor(cursor, upto)
+                continue
+            payload = {
+                "type": REVIEW_TYPE,
+                "backend": backend,
+                "outsider": True,
+                "server": server_id,
+                "text": REVIEW_TEXT,
+                "entries": entries,
+            }
+            event = DoorbellEvent(
+                backend,
+                payload,
+                ts=self.clock(),
+                on_handover=partial(self._handed_over, key, cursor, upto),
+                nonce=f"{REVIEW_TYPE}:{upto}",
+            )
+            before = self._queued.get(key)
+            self._queued[key] = upto  # before `deliver`: a handover may run from inside it
+            if not self.deliver(dev_name, event):
+                if before is None:
+                    self._queued.pop(key, None)
+                else:
+                    self._queued[key] = before
+                log.error("kiosk review for %s on %s not delivered", dev_name, server_id)
+                break
+            delivered += len(entries)
         if delivered:
             log.info("kiosk review: %d exchanges for %s on %s", delivered, dev_name, server_id)
         return delivered
+
+    def _handed_over(self, key: tuple[str, str], cursor: Path, upto: int) -> None:
+        """A review event reached the agent: its cursor moves past the event's entries."""
+        self._write_cursor(cursor, upto)
+        if self._queued.get(key) == upto:
+            del self._queued[key]  # nothing queued beyond it
+
+    def on_registered(self, reg: Any, cache: SwitchCache) -> int:
+        """An agent registered (#99): on each of its Mattermost servers where its crew's
+        switch is social now, review its kiosk there. The switch cache reports social
+        engaging only once, often before any agent has registered after a daemon start, so
+        this is what reaches an agent registering while social is on (R-33)."""
+        total = 0
+        for backend in reg.backends:
+            if not backend.startswith(MATTERMOST_PREFIX):
+                continue
+            server_id = backend[len(MATTERMOST_PREFIX) :]
+            if cache.mode(reg.crew, server_id) == "social":
+                total += self.on_social(server_id, [reg.dev_name])
+        return total
 
     def on_social(self, server_id: str, dev_names: Iterable[str]) -> int:
         """Social engaged on `server_id`: review each agent's kiosk there (R-33)."""
