@@ -72,8 +72,11 @@ lapsed, it DMs you, `social lapsed → crew` (or `→ trusted`). So the notice c
 message or state check arrives after the expiry, not to the second. The switch itself is never
 late: nothing is delivered under social after it expires.
 
-If the broker can't be reached, nothing from Mattermost is delivered at all: a dead broker can't
-hold social open.
+Each daemon re-reads the switch from the broker every 30 seconds. If the broker can't be reached,
+the daemon keeps using the last state it read, for up to five minutes. After that nothing from
+Mattermost is delivered until the broker answers again. A dead broker still can't hold social
+open: social ends at its expiry either way. But a change you send, such as `crew`, can be missed
+for that long if the broker stops before a daemon has re-read the switch.
 
 ## The kiosk
 

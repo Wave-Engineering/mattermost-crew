@@ -214,6 +214,39 @@ def test_history_survives_a_restart(mm: Any, run: Any, tmp_path: Path) -> None:
     assert "ANSWER-ONE" in w.runner.prompts[-1]
 
 
+def test_replay_after_a_restart_is_not_answered_again(mm: Any, run: Any, tmp_path: Path) -> None:
+    """#97: a `KIOSK` hand-off never moves the doorbell's cursor, so a restarted daemon replays
+    the question. The transcript's `post_id` stops a second answer."""
+    w = World(mm, tmp_path, FakeRunner("ANSWER-ONE"))
+    w.briefs[DEV] = BRIEF
+    ask = w.post(w.outsider, "@babel QUESTION-ONE")
+    assert run(w.kiosk.handle(DEV, w.event(ask))) is not None
+    assert run(w.kiosk.handle(DEV, w.event(ask))) is None  # a replay in the same process
+    again = Kiosk(
+        w.queue, w.briefs, {MM: w.backend}, w.runner, state_dir=w.state_dir, clock=Clock()
+    )
+    assert run(again.handle(DEV, w.event(ask))) is None  # the replay after a restart
+    assert len(w.kiosk_posts()) == 1 and len(w.runner.prompts) == 1
+    assert len(w.transcript.read_text().splitlines()) == 1
+    # A new question in the same thread is still answered.
+    follow = w.post(w.outsider, "@babel QUESTION-TWO", ask.post_id)
+    assert run(again.handle(DEV, w.event(follow))) is not None
+    assert len(w.kiosk_posts()) == 2
+
+
+def test_record_without_post_id_still_loads(mm: Any, run: Any, tmp_path: Path) -> None:
+    """A transcript written before `post_id` was kept still gives its history."""
+    w = World(mm, tmp_path, FakeRunner("ANSWER-TWO"))
+    w.briefs[DEV] = BRIEF
+    root = w.post(w.outsider, "@babel QUESTION-ONE")
+    w.transcript.parent.mkdir(parents=True)
+    old = {"ts": 1.0, "thread": root.post_id, "asker_id": w.outsider, "question": "q"}
+    w.transcript.write_text(json.dumps({**old, "answer": "OLD-ANSWER"}) + "\n")
+    follow = w.post(w.outsider, "@babel QUESTION-TWO", root.post_id)
+    assert run(w.kiosk.handle(DEV, w.event(follow))) is not None
+    assert "OLD-ANSWER" in w.runner.prompts[-1]
+
+
 def test_answer_mentions_stripped_and_tagged(mm: Any, run: Any, tmp_path: Path) -> None:
     w = World(mm, tmp_path, FakeRunner("Ask @kessel or @channel, or @all.  Thanks @babel.oaw!"))
     w.briefs[DEV] = BRIEF
@@ -299,7 +332,9 @@ def test_transcript_appended(mm: Any, run: Any, tmp_path: Path) -> None:
     run(w.kiosk.handle(DEV, w.event(third)))
 
     records = [json.loads(line) for line in w.transcript.read_text().splitlines()]
-    assert [set(r) for r in records] == [{"ts", "thread", "asker_id", "question", "answer"}] * 3
+    fields = {"ts", "thread", "post_id", "asker_id", "question", "answer"}
+    assert [set(r) for r in records] == [fields] * 3
+    assert [r["post_id"] for r in records] == [first.post_id, second.post_id, third.post_id]
     assert [(r["thread"], r["asker_id"], r["question"], r["answer"]) for r in records] == [
         (first.post_id, w.outsider, "@babel Q1", "ANSWER"),
         (first.post_id, w.other, "@babel Q2", "ANSWER"),

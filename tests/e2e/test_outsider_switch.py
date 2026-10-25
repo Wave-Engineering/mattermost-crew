@@ -71,6 +71,8 @@ def test_e2e02_outsider_and_switch(e2e: World) -> None:
             got = await d.delivered(babel, again)
             assert got["backend"] == MM
             assert got["outsider"] is True and got["message"]["outsider"] is True
+            # As the one-shot prints it, the text says where it came from (R-23, #97).
+            assert got["message"]["text"] == f"{OUTSIDER_PREFIX} @{babel} and who runs it?"
             await d.silent(babel)
             await asyncio.sleep(1)
             assert await asyncio.to_thread(_kiosk_answers, e2e, again) == []

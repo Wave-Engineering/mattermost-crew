@@ -22,8 +22,12 @@
 - **The answer** goes in the outsider's thread on the originating Mattermost server (§5.9),
   with every `@token` stripped (`strip_mentions`) and `props.crew_kiosk=1`, so `admit` treats
   it as outsider content. Each Q&A is appended to that server's transcript,
-  `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, asker_id, question,
-  answer}` (mode 0600, directory 0700).
+  `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, post_id, asker_id,
+  question, answer}` (mode 0600, directory 0700).
+- **Answered once.** A question whose `post_id` is already in the transcript is not answered
+  again (#97). A `KIOSK` hand-off never moves the doorbell's cursor, so a restarted daemon's
+  stream replays every outsider question since the agent's last event. Records written
+  before `post_id` was kept still load; they just can't stop a replay.
 
 `Kiosk` consumes the `KioskQueue` from Story 3.3: one worker per expert, started when that
 expert's first event arrives, answering its events in order.
@@ -229,6 +233,8 @@ class KioskSession:
         self.transcript = kiosk_dir / f"{dev_name}-{server_id}.jsonl"
         # (thread, asker_id) -> the kiosk's earlier answers to that asker in that thread.
         self._answers: dict[tuple[str, str], list[Turn]] = {}
+        # The post IDs of the questions already answered here, so a replay isn't (#97).
+        self.answered: set[str] = set()
         self._load()
 
     def _load(self) -> None:
@@ -247,6 +253,8 @@ class KioskSession:
             except (ValueError, KeyError, TypeError):
                 continue
             self._answers.setdefault(key, []).append(turn)
+            if isinstance(rec.get("post_id"), str):
+                self.answered.add(rec["post_id"])
 
     def history(self, msg: InboundMessage, thread_posts: Sequence[InboundMessage]) -> list[Turn]:
         """The asker's own posts in the thread and the kiosk's answers to that asker; nothing
@@ -298,6 +306,7 @@ class KioskSession:
         rec = {
             "ts": ts,
             "thread": thread,
+            "post_id": msg.post_id,
             "asker_id": msg.author_id,
             "question": msg.text,
             "answer": answer,
@@ -307,6 +316,7 @@ class KioskSession:
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
         self._answers.setdefault((thread, msg.author_id), []).append(Turn(ts, "kiosk", answer))
+        self.answered.add(msg.post_id)
 
 
 # -- the consumer ---------------------------------------------------------------------------
@@ -401,6 +411,9 @@ class Kiosk:
             return None
         server_id = msg.backend[len(MATTERMOST_PREFIX) :]
         sess = self.session(dev_name, server_id)
+        if msg.post_id in sess.answered:
+            log.info("kiosk: %s already answered %s on %s", dev_name, msg.post_id, server_id)
+            return None
         thread = msg.root_id or msg.post_id
         posts: list[InboundMessage] = []
         if self.briefs.brief(dev_name):

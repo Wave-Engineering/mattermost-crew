@@ -51,6 +51,10 @@ K-2 (the kit's doorbell wiring to the chat daemon).
 ### Fixed
 
 - Discord channel names resolve while scream-hole is degraded.
+- The kiosk no longer answers an outsider's question a second time after a daemon restart: each
+  transcript record keeps the question's `post_id` (#97).
+- An outsider message delivered under social now reaches the agent's doorbell with its text
+  prefixed `[from outside the crew]`, as it already did on the pull path (#97).
 
 ## [0.1.0] — 2026-10-24
 
