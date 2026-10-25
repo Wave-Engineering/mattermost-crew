@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# The kiosk's CLI runner (Dev Spec §5.11; Story 3.5; D-096). Install root-owned, mode 0755, at
+# /usr/local/libexec/crewkiosk-run. The daemon (crewchat) runs it as crewkiosk through the one
+# rule in packaging/crewkiosk.sudoers, which allows this command with NO arguments:
+#
+#   sudo -n -u crewkiosk -- /usr/local/libexec/crewkiosk-run    < prompt
+#
+# It reads the prompt on stdin and prints the answer on stdout. It:
+#   - refuses to run as anyone but crewkiosk;
+#   - drops every inherited environment variable;
+#   - gives the CLI an empty HOME and an empty working directory, fresh for every question and
+#     removed afterwards, so no user, project or local settings, hooks, skills, CLAUDE.md or
+#     earlier session can load;
+#   - hands the CLI only the kiosk's model credential, /etc/crewkiosk/model.credential
+#     (0600, crewkiosk:crewkiosk; spike 1.2), never any chat or broker credential;
+#   - runs `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`,
+#     so the model has no tool and no MCP server to call.
+# The kiosk host must have no local or remote (org-pushed) managed Claude Code settings: they
+# still apply under --restricted (§5.11, spike 1.2).
+set -euo pipefail
+
+KIOSK_USER=crewkiosk
+CREDENTIAL=/etc/crewkiosk/model.credential
+CLAUDE=/usr/local/bin/claude
+KIOSK_PATH=/usr/local/bin:/usr/bin:/bin
+
+if [[ "$(id -un)" != "$KIOSK_USER" ]]; then
+  echo "crewkiosk-run: must run as $KIOSK_USER" >&2
+  exit 64
+fi
+
+# Nothing inherited reaches the CLI.
+while IFS= read -r name; do
+  unset "$name" 2>/dev/null || true
+done < <(compgen -e)
+export PATH="$KIOSK_PATH"
+umask 077
+
+IFS= read -r ANTHROPIC_API_KEY <"$CREDENTIAL" || [[ -n "${ANTHROPIC_API_KEY:-}" ]]
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "crewkiosk-run: $CREDENTIAL is empty" >&2
+  exit 65
+fi
+export ANTHROPIC_API_KEY
+
+scratch="$(mktemp -d -t crewkiosk.XXXXXXXX)"
+trap 'rm -rf "$scratch"' EXIT
+mkdir -m 0700 "$scratch/home" "$scratch/work"
+export HOME="$scratch/home"
+cd "$scratch/work"
+
+"$CLAUDE" -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"

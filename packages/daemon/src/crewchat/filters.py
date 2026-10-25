@@ -403,6 +403,12 @@ class KioskQueue:
     def __init__(self, maxsize: int = KIOSK_QUEUE_MAX) -> None:
         self.maxsize = maxsize
         self._queues: dict[str, asyncio.Queue[DoorbellEvent]] = {}
+        # Called with the expert's Dev-Name after each event is queued (the kiosk's wake-up).
+        self.listeners: list[Callable[[str], None]] = []
+
+    def pending(self) -> list[str]:
+        """The experts with events waiting."""
+        return [dev for dev, q in self._queues.items() if not q.empty()]
 
     def queue(self, dev_name: str) -> asyncio.Queue[DoorbellEvent]:
         q = self._queues.get(dev_name)
@@ -417,6 +423,8 @@ class KioskQueue:
         except asyncio.QueueFull:
             log.error("kiosk queue for %s is full (%d): dropped an event", dev_name, self.maxsize)
             return False
+        for listener in list(self.listeners):
+            listener(dev_name)
         return True
 
     async def get(self, dev_name: str) -> DoorbellEvent:
