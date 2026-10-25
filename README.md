@@ -45,10 +45,14 @@ share. Fleet broadcasts are `@agents` (S-24).
 - **2026-10-23:** the doorbell cleanup BJ put first (S-26) is in the codebase.
 - **2026-10-24:** the Dev Spec is approved (D-088) and amended pre-kickoff (D-089 to D-092). The
   backlog is upshifted: Stories #7 to #23.
-- **Next:** hailing-frequencies runs `/wavemachine` on #26 first.
-
-- **2026-10-24:** Story 1.1 (#7) lays down the workspace, the build and CI. The packages are
-  skeletons so far.
+- **2026-10-24:** Phases 1 and 2 land on `main` (#26, #27) and are tagged `v0.1.0`, the base for
+  the kit's IP-2 (K-1, `chat_*` in the kit).
+- **2026-10-25:** Phase 3 (#28) is complete: the social switch and kiosk control in the broker,
+  the merged doorbell (Discord, Mattermost and squawkie), the daemon's inbound filters and loop
+  guard, the tool-less kiosk with its review on social engage, the runbook, partner guide and
+  architecture document, and the E2E suite. Every requirement R-01 to R-34 traces to a passing
+  IT or E2E item (Dev Spec Appendix V). The release IP-3 tags is the base for K-2, the kit's
+  doorbell wiring to the chat daemon.
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
@@ -71,11 +75,13 @@ hash for every package (CT-03). Install with `uv sync --frozen`; never let it re
 ```
 pyproject.toml   uv.lock   Makefile
 packages/        daemon/  broker/  clients/      each src/<import name>/
-tests/           unit/  integration/              integration tests need a Mattermost server
+tests/           unit/  integration/  e2e/        integration and E2E tests need a Mattermost server
 scripts/ci/      the CI logic; the workflow only calls these
-scripts/verify-install.sh                         post-install checks (Stories 1.3 and 1.4 fill it)
-.github/workflows/ci.yml                          three Mattermost legs
-docs/            the sketchbook, the Dev Spec, briefs
+scripts/verify-install.sh                         post-install checks (`make verify-install`)
+scripts/smoke-devspace.sh                         the E2E flows against the OaW dev space
+packaging/       systemd units for the daemon, the broker and the kiosk
+.github/workflows/ci.yml                          three Mattermost legs and the runbook install
+docs/            the sketchbook, the Dev Spec, the runbook, the partner guide, the architecture
 ```
 
 ## Make targets
@@ -111,3 +117,19 @@ that need native token expiry assert the server's capability against it rather t
 (R-07). Each leg uploads `reports/` as an artifact. `scripts/ci/two-user-setup.sh` creates the
 `crewchat`, `crewbroker`, `crewkiosk` and `agent` users and the `crewchat-clients` group on the
 runner; run it only on a runner or a throwaway container.
+
+## The dev-space smoke
+
+`scripts/smoke-devspace.sh` runs the three E2E flows (a cross-crew exchange, kiosk Q&A with a
+social flip and its review, and an `@agents` broadcast) against the OaW dev space, and prints a
+markdown report for Plan #3:
+
+```bash
+MM_URL=https://<the OaW dev space> MM_ADMIN_TOKEN=<dev-space admin token> \
+  SMOKE_TARGET=oaw-devspace scripts/smoke-devspace.sh
+```
+
+It creates users, broker accounts and bot accounts with a per-run suffix and patches the broker
+accounts' role, which the dev space allows (CP-06). It refuses to run without
+`SMOKE_TARGET=oaw-devspace`, and is never pointed at a partner organization's production server
+(CP-03).
