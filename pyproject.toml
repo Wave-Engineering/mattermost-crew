@@ -57,8 +57,9 @@ testpaths = ["tests"]
 # the slowest test, E2E-03's broadcast to about 30 agents, takes well under a minute.
 timeout = 120
 timeout_method = "thread"
-# The backstop, just under the job's 30 minutes, if the timeout itself can't fire.
-faulthandler_timeout = 1500
+# The backstop, if the timeout itself can't fire. It restarts for every test, so it has to be
+# well under the job's 30 minutes to dump a hang that starts partway through the run.
+faulthandler_timeout = 600
 
 [tool.coverage.run]
 branch = true
