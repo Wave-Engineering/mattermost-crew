@@ -27,10 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from crewchat.adapters.base import ChatBackend
-from crewchat.adapters.discord import DiscordBackend
+from crewchat.adapters.discord import DiscordBackend, read_credential
 from crewchat.adapters.mattermost import MattermostBackend
+from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
+from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import (
@@ -141,11 +143,39 @@ async def serve(
     # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
     uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
     health_sources: dict[str, HealthSource] = {discord.name: discord} if discord else {}
+    # What the shims push (the kiosk brief, the squawk ids): squawkie filters by the ids.
+    context = AgentContext()
+    squawkie: SquawkieBackend | None = None
+    if config.squawkie_url is not None:
+        token = (
+            read_credential(config.squawkie_credential)
+            if config.squawkie_credential is not None
+            else None
+        )
+        squawkie = SquawkieBackend(
+            config.squawkie_url,
+            token,
+            ids_for=lambda dev: context.squawk_ids.get(dev, ()),
+        )
+    # The doorbell (Story 3.2): one task per (agent, backend), one queue per agent. It goes
+    # first among the store's adapters, so an agent leaving rotation has its doorbell tasks
+    # stopped before its streams close.
+    sources: dict[str, Source] = dict(chat_backends)
+    if squawkie is not None:
+        sources[SQUAWKIE] = squawkie
+    doorbell = Doorbell(sources, CursorStore(state_dir))
+    store.adapters.insert(0, doorbell)
     handlers = build_handlers(config, registry, health_sources)
+    handlers.update(build_chat_handlers(registry, chat_backends, threads, context, uploads))
     handlers.update(
-        build_chat_handlers(registry, chat_backends, threads, AgentContext(), uploads)
+        build_doorbell_handlers(
+            registry,
+            doorbell,
+            handlers["register"],
+            extra_backends=[SQUAWKIE] if squawkie is not None else [],
+        )
     )
-    server = DaemonServer(handlers)
+    server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
     listener = await server.start(socket_path, group)
 
     stop = asyncio.Event()
@@ -165,6 +195,9 @@ async def serve(
         listener.close()
         await listener.wait_closed()
         await rotation
+        await doorbell.aclose()
+        if squawkie is not None:
+            await squawkie.aclose()
         for backend in backends:
             await backend.aclose()
         if discord is not None:

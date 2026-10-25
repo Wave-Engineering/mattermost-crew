@@ -14,6 +14,10 @@
     credential = "/etc/crewchat/discord.credential"  # optional; this is the default
     guild_id = "<the guild's id>"               # optional: the channels the stream polls
 
+    [squawkie]                           # optional: the doorbell's squawk feed (Story 3.2)
+    url = "http://squawkie.lan:3000"
+    credential = "/etc/crewchat/squawkie.credential"  # optional: its API token, mode 0600
+
     [crews.oaw]
     needs_list = "bj:needs"              # the sqtk list `register` returns (R-11)
 
@@ -81,6 +85,8 @@ class ServersConfig:
     discord_screamhole_url: str | None = None
     discord_credential: Path = DISCORD_CREDENTIAL_PATH
     discord_guild_id: str | None = None
+    squawkie_url: str | None = None
+    squawkie_credential: Path | None = None
 
     def broker_entries(self) -> list[BrokerEntry]:
         return [b for crew in self.crews.values() for b in crew.brokers.values()]
@@ -120,6 +126,20 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
     if guild_id is not None and (not isinstance(guild_id, str) or not guild_id.isdigit()):
         raise ConfigError(f"{source}: discord.guild_id must be a snowflake string")
 
+    squawkie = raw.get("squawkie", {})
+    if not isinstance(squawkie, dict):
+        raise ConfigError(f"{source}: squawkie must be a table")
+    squawkie_url = squawkie.get("url")
+    if squawkie_url is not None and (not isinstance(squawkie_url, str) or not squawkie_url):
+        raise ConfigError(f"{source}: squawkie.url must be a non-empty string")
+    squawkie_credential = squawkie.get("credential")
+    if squawkie_credential is not None and (
+        not isinstance(squawkie_credential, str) or not squawkie_credential.startswith("/")
+    ):
+        raise ConfigError(f"{source}: squawkie.credential must be an absolute path")
+    if squawkie_credential is not None and squawkie_url is None:
+        raise ConfigError(f"{source}: squawkie.credential needs squawkie.url")
+
     timeout = raw.get("broker_timeout_s", DEFAULT_BROKER_TIMEOUT_S)
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
         raise ConfigError(f"{source}: broker_timeout_s must be a positive number")
@@ -147,6 +167,8 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
         discord_screamhole_url=screamhole_url,
         discord_credential=Path(credential),
         discord_guild_id=guild_id,
+        squawkie_url=squawkie_url,
+        squawkie_credential=Path(squawkie_credential) if squawkie_credential else None,
     )
 
 

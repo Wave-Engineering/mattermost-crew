@@ -18,6 +18,19 @@ two distinct authors (R-01).
   websocket, it only stops its events (§4.8). The reconnect asks the server to resume the
   connection (`connection_id`, `sequence_number`), so events in the gap are still delivered
   while the server holds them; the doorbell's cursor replay covers the rest (R-28).
+- **Cursor replay** (R-28, Story 3.2). `stream(dev_name, cursor=...)` keeps the agent's position:
+  the cursor's time at start, then the newest post it yielded. On every connect after the
+  first, and on the first when a cursor was given, it reads the posts created since that
+  position in each of the agent's channels (`GET /users/me/teams`, then
+  `/users/me/teams/{team}/channels` and `/channels/{id}/posts?since=`), oldest first, and
+  yields those it hasn't yielded yet, before the live events. A post is never yielded twice:
+  the stream remembers the IDs it yielded (seeded from `cursor.seen`). A replayed post has no
+  `mentions` (a REST post carries none, and the text is never parsed, R-29). With no cursor,
+  the first connect starts at now, less `REPLAY_MARGIN_S` for clock skew.
+- **Status** (R-27). `on_status(True, "")` when a connection delivers its first frame;
+  `on_status(False, reason)` when a connect is refused (`unauthorized` on a 401), when the
+  agent's own user can't be read, or when a connection is lost. A rotation's reconnect is not
+  an outage and reports nothing.
 - A 401 on a request is refreshed through the token store's `call_with_refresh` (`remint`,
   never `mint`; R-30), and a 401 on the websocket handshake through its `refresh`.
 - `is_bot` comes from the author's user object (`GET /users/{id}`, cached per author ID, as a
@@ -32,9 +45,11 @@ import asyncio
 import json
 import logging
 import re
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar, cast
 from urllib.parse import urlencode
 
@@ -49,7 +64,15 @@ from mcp_server_mattermost.exceptions import (
 )
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
-from crewchat.adapters.base import Attachment, Embed, InboundMessage, NotFound
+from crewchat.adapters.base import (
+    NO_STATUS,
+    Attachment,
+    Embed,
+    InboundMessage,
+    NotFound,
+    StatusSink,
+    StreamCursor,
+)
 from crewchat.protocol import PROTO
 from crewchat.tokens import Unauthorized
 
@@ -58,6 +81,8 @@ PING_TIMEOUT_S = 30.0
 BACKOFF_FIRST_S = 1.0
 BACKOFF_MAX_S = 60.0  # CT-07
 DEFAULT_READ_LIMIT = 60
+REPLAY_MARGIN_S = 60.0  # a first connect's replay position: now, less this, for clock skew
+RECENT_IDS = 1000  # the post IDs a stream remembers yielding, so a replay never repeats one
 # Mattermost IDs and usernames, used with `fullmatch`. The client library interpolates its
 # arguments into REST paths unchecked, and each path carries the agent's bot token, which the
 # agent never holds (R-08). So every caller-supplied ID is shape-checked first (#62).
@@ -204,6 +229,9 @@ class _Agent:
     next_seq: int = 0
     hello: bool = False  # the current connection has delivered a frame
     connects: int = 0
+    last_error: str = ""  # why the last connect failed, for `on_status`
+    position_ms: int | None = None  # replay from here on a reconnect (R-28)
+    recent: OrderedDict[str, None] = field(default_factory=OrderedDict)  # IDs yielded
 
 
 class MattermostBackend:
@@ -494,6 +522,7 @@ class MattermostBackend:
             token = self.token(dev_name)
         except KeyError as exc:
             log.warning("stream %s: %s", dev_name, exc)
+            agent.last_error = "no token"
             return None
         try:
             ws = await self._connect(
@@ -502,15 +531,19 @@ class MattermostBackend:
                 ping_interval=self.ping_interval_s,
             )
         except InvalidStatus as exc:
-            if exc.response.status_code == 401 and self.refresher is not None:
-                log.info("websocket 401 for %s on %s: refreshing", dev_name, self.server_id)
-                with suppress(Exception):
-                    await self.refresher.refresh(dev_name, self.server_id, token)
+            if exc.response.status_code == 401:
+                agent.last_error = "unauthorized"
+                if self.refresher is not None:
+                    log.info("websocket 401 for %s on %s: refreshing", dev_name, self.server_id)
+                    with suppress(Exception):
+                        await self.refresher.refresh(dev_name, self.server_id, token)
             else:
+                agent.last_error = f"connect refused: HTTP {exc.response.status_code}"
                 log.warning("websocket %s on %s: %s", dev_name, self.server_id, exc)
             return None
         except (OSError, TimeoutError, WebSocketException) as exc:
             log.warning("websocket %s on %s: %s", dev_name, self.server_id, exc)
+            agent.last_error = f"connect failed: {exc}"
             return None
         agent.ws, agent.ws_token = ws, token
         agent.connects += 1
@@ -558,10 +591,84 @@ class MattermostBackend:
             log.warning("posted event for %s: %s", dev_name, exc)
             return None
 
-    async def stream(self, dev_name: str) -> AsyncIterator[InboundMessage]:
-        """`dev_name`'s inbound posts, reconnecting until `close_agent` (CT-07)."""
+    def _fresh(self, agent: _Agent, msg: InboundMessage) -> bool:
+        """True the first time the stream sees `msg` (and remember it); False for a repeat."""
+        if msg.post_id in agent.recent:
+            return False
+        agent.recent[msg.post_id] = None
+        while len(agent.recent) > RECENT_IDS:
+            agent.recent.popitem(last=False)
+        ts_ms = int(msg.ts * 1000)
+        if agent.position_ms is None or ts_ms > agent.position_ms:
+            agent.position_ms = ts_ms
+        return True
+
+    async def _replay(self, dev_name: str, agent: _Agent) -> list[InboundMessage]:
+        """The posts created since the agent's position in each of its channels, oldest
+        first, that the stream hasn't yielded (R-28). A failure is logged and replays none."""
+        since = agent.position_ms
+        if since is None:
+            return []
+        me = agent.user_id
+
+        async def request(client: MattermostClient) -> list[InboundMessage]:
+            channels: dict[str, dict[str, Any]] = {}
+            for team in await client.get_teams():
+                team_id = str(team.get("id", ""))
+                if not is_mm_id(team_id):
+                    continue
+                for channel in await client.get_my_channels(team_id):
+                    channel_id = str(channel.get("id", ""))
+                    if is_mm_id(channel_id):
+                        channels[channel_id] = channel
+            found: list[InboundMessage] = []
+            for channel_id, chan in channels.items():
+                # `since` is `update_at > since`, so one millisecond back keeps a post made
+                # at the position itself; the IDs already yielded are left out below.
+                result = await client.get_posts_since(channel_id, since - 1)
+                posts = result.get("posts") or {}
+                if not isinstance(posts, dict):
+                    continue
+                for post in posts.values():
+                    if not isinstance(post, dict):
+                        continue
+                    create_at = post.get("create_at")
+                    if not isinstance(create_at, int | float) or create_at < since:
+                        continue  # an older post, edited or replied to since
+                    if post.get("delete_at") or str(post.get("id", "")) in agent.recent:
+                        continue
+                    author = str(post.get("user_id", ""))
+                    if me is not None and author == me:
+                        continue  # echo, by user ID only (R-04)
+                    data = {
+                        "channel_type": chan.get("type"),
+                        "channel_name": chan.get("name", ""),
+                    }
+                    dm = event_dm(data, author, me)
+                    found.append(await self.message(client, post, [], dm=dm))
+            found.sort(key=lambda m: (m.ts, m.post_id))
+            return found
+
+        try:
+            return await self._call(dev_name, request)
+        except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
+            log.error("replay for %s on %s: %s", dev_name, self.server_id, exc)
+            return []
+
+    async def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        """`dev_name`'s inbound posts, reconnecting until `close_agent` (CT-07), replayed
+        from `cursor` on each reconnect (R-28), its connection state sent to `on_status`."""
         agent = self._agent(dev_name)
         agent.closed = False
+        if cursor is not None:
+            agent.recent = OrderedDict.fromkeys(sorted(cursor.seen | {cursor.id} - {""}))
+            agent.position_ms = int(cursor.ts * 1000) if cursor.ts > 0 else None
         delays = backoff_delays()
         while not agent.closed:
             if agent.user_id is None:
@@ -569,25 +676,38 @@ class MattermostBackend:
                     await self.user_id(dev_name)
                 except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
                     log.warning("stream %s: who am I: %s", dev_name, exc)
+                    reason = "unauthorized" if isinstance(exc, Unauthorized) else str(exc)
+                    on_status(False, f"cannot read the agent's user: {reason}")
                     await self._sleep(next(delays))
                     continue
             ws = await self._open(dev_name, agent)
             if ws is None:
+                on_status(False, agent.last_error or "connect failed")
                 await self._sleep(next(delays))
                 continue
             try:
                 while True:
                     # A dead connection is the library's to notice: its pings time out.
                     raw = await ws.recv()
-                    if not agent.hello:
+                    first = not agent.hello
+                    if first:
                         delays = backoff_delays()  # connected: the next loss starts at 1 s
                     msg = await self._event(dev_name, agent, raw)
                     agent.hello = True
-                    if msg is not None:
+                    if first:
+                        on_status(True, "")
+                        if agent.position_ms is None:
+                            agent.position_ms = int((time.time() - REPLAY_MARGIN_S) * 1000)
+                        else:
+                            for missed in await self._replay(dev_name, agent):
+                                if self._fresh(agent, missed):
+                                    yield missed
+                    if msg is not None and self._fresh(agent, msg):
                         yield msg
             except (ConnectionClosed, TimeoutError, OSError) as exc:
                 if not agent.rotated and not agent.closed:
                     log.warning("websocket %s on %s lost: %s", dev_name, self.server_id, exc)
+                    on_status(False, f"connection lost: {exc}")
             finally:
                 agent.ws = None
                 with suppress(Exception):

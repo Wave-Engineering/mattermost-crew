@@ -59,6 +59,12 @@ class MattermostAPI(Protocol):
 
     def revoke_token(self, token_id: str) -> None: ...
 
+    def direct_channel(self, user_id: str, other_id: str) -> str: ...
+
+    def create_post(
+        self, channel_id: str, message: str, props: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
 
 class MattermostClient:
     """`MattermostAPI` over httpx, authenticated with the broker account's access token."""
@@ -171,6 +177,20 @@ class MattermostClient:
 
     def revoke_token(self, token_id: str) -> None:
         self._call("POST", "/users/tokens/revoke", json={"token_id": token_id})
+
+    def direct_channel(self, user_id: str, other_id: str) -> str:
+        """The DM channel between two users, created if missing; its ID."""
+        result: dict[str, Any] = self._call("POST", "/channels/direct", json=[user_id, other_id])
+        return str(result["id"])
+
+    def create_post(
+        self, channel_id: str, message: str, props: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"channel_id": channel_id, "message": message}
+        if props:
+            body["props"] = props
+        result: dict[str, Any] = self._call("POST", "/posts", json=body)
+        return result
 
 
 def _retry_after(resp: httpx.Response) -> float:
