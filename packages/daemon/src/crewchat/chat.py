@@ -27,8 +27,11 @@ The daemon never reads a file on the agent's side (§5.3). What it knows about t
 brief and its squawks is what the shim pushed: `AgentContext` keeps it for the doorbell and the
 kiosk (Phase 3).
 
-The pull path's switch filter (R-21) arrives with Story 3.3; until then `read` and `thread`
-return what the adapter returned.
+**The pull path's filter** (R-21, Story 3.3). Given `filters` (`crewchat serve` always gives
+it), `read` and `thread` pass what the adapter returned through `Filters.pull`: membership and
+the switch, only. A crewmate's post is returned whether or not it addresses the agent; an
+outsider's, or a kiosk post, is omitted under crew only and trusted (never sent to the kiosk),
+and returned with `"outsider": true` under social. Without `filters`, nothing is filtered.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from crewchat.adapters.base import (
     PostProbe,
     parse_embed,
 )
+from crewchat.filters import Filters
 from crewchat.registry import Registration, Registry
 from crewchat.server import Handler, OpError
 from crewchat.threads import MyThreads
@@ -138,9 +142,22 @@ def build_chat_handlers(
     threads: MyThreads,
     context: AgentContext,
     uploads: UploadStore | None = None,
+    filters: Filters | None = None,
 ) -> dict[str, Handler]:
     """The chat ops over `backends`, keyed by backend name. Without `uploads`, `upload` and
-    `attachments` are refused (`unsupported`), never dropped."""
+    `attachments` are refused (`unsupported`), never dropped. With `filters`, `read` and
+    `thread` return only what membership and the switch admit (R-21)."""
+
+    async def pulled(reg: Registration, msgs: list[InboundMessage]) -> list[dict[str, Any]]:
+        if filters is None:
+            return [message_json(m) for m in msgs]
+        out: list[dict[str, Any]] = []
+        for msg, outsider in await filters.pull(reg, msgs):
+            item = message_json(msg)
+            if outsider:
+                item["outsider"] = True
+            out.append(item)
+        return out
 
     def registered(args: Mapping[str, Any]) -> tuple[str, Registration]:
         dev_name = _str(args, "dev_name")
@@ -239,7 +256,7 @@ def build_chat_handlers(
         return {"backend": backend_name, "post_id": msg.post_id, "channel": msg.channel}
 
     async def read(args: dict[str, Any]) -> dict[str, Any]:
-        dev_name, _reg, backend_name, backend = agent(args)
+        dev_name, reg, backend_name, backend = agent(args)
         channel = _str(args, "channel")
         post_id = _str(args, "post_id", required=False)
         assert channel is not None
@@ -259,17 +276,17 @@ def build_chat_handlers(
                 )
         except Exception as exc:
             raise backend_error(backend_name, "read", exc) from exc
-        return {"backend": backend_name, "messages": [message_json(m) for m in msgs]}
+        return {"backend": backend_name, "messages": await pulled(reg, msgs)}
 
     async def thread(args: dict[str, Any]) -> dict[str, Any]:
-        dev_name, _reg, backend_name, backend = agent(args)
+        dev_name, reg, backend_name, backend = agent(args)
         post_id = _str(args, "post_id")
         assert post_id is not None
         try:
             msgs = await backend.thread(dev_name, post_id)
         except Exception as exc:
             raise backend_error(backend_name, "thread", exc) from exc
-        return {"backend": backend_name, "messages": [message_json(m) for m in msgs]}
+        return {"backend": backend_name, "messages": await pulled(reg, msgs)}
 
     async def react(args: dict[str, Any]) -> dict[str, Any]:
         dev_name, _reg, backend_name, backend = agent(args)

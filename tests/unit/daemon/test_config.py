@@ -106,3 +106,32 @@ def test_config_retention_default() -> None:
         parse_config({**raw, "daemon": {"my_threads_retention_days": 5}}).my_threads_retention_days
         == 90
     )
+
+
+def test_config_filter_settings() -> None:
+    """Story 3.3: the filters' settings are top-level, with the Dev Spec's defaults."""
+    raw = tomllib.loads(TOML)
+    cfg = parse_config(raw)
+    assert (cfg.crew_info_max_age_s, cfg.refetch_min_interval_s) == (300.0, 2.0)
+    assert (cfg.kiosk_rate_per_hour, cfg.loop_guard_window) == (10, 20)
+    cfg = parse_config(
+        {
+            **raw,
+            "crew_info_max_age_s": 60,
+            "refetch_min_interval_s": 0.5,
+            "kiosk_rate_per_hour": 3,
+            "loop_guard_window": 5,
+        }
+    )
+    assert (cfg.crew_info_max_age_s, cfg.refetch_min_interval_s) == (60.0, 0.5)
+    assert (cfg.kiosk_rate_per_hour, cfg.loop_guard_window) == (3, 5)
+    for key, bad in (
+        ("crew_info_max_age_s", 0),
+        ("refetch_min_interval_s", -1),
+        ("crew_info_max_age_s", True),
+        ("kiosk_rate_per_hour", 0),
+        ("kiosk_rate_per_hour", 2.5),
+        ("loop_guard_window", "20"),
+    ):
+        with pytest.raises(ConfigError, match=key):
+            parse_config({**raw, key: bad})

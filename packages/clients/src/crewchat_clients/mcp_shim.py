@@ -102,6 +102,7 @@ SEED_FILE = Path(".claude/reseed-revive.md")
 SQUAWKS_FILE = Path(".claude/sqtk-mine.json")
 # CLAUDE_CODE_ENTRYPOINT values of a session with a human at the keyboard.
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli", "claude-vscode", "claude-desktop", "claude-jetbrains"})
+OUTSIDER_PREFIX = "[from outside the crew]"
 
 log = logging.getLogger("crewchat_clients.mcp_shim")
 
@@ -112,6 +113,20 @@ Squawker = Callable[[Sequence[str], Path], Awaitable[int]]
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def mark_outsiders(result: dict[str, Any]) -> dict[str, Any]:
+    """Prefix the text of each message the daemon marked `"outsider": true` (Story 3.3, R-23)
+    with `OUTSIDER_PREFIX`, so the agent never reads outsider content as its crew's."""
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return result
+    marked: list[Any] = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("outsider") is True:
+            msg = {**msg, "text": f"{OUTSIDER_PREFIX} {msg.get('text', '')}"}
+        marked.append(msg)
+    return {**result, "messages": marked}
 
 
 class ShimError(Exception):
@@ -663,7 +678,7 @@ class Shim:
             args["post_id"] = post_id
         if off:
             args["off_default"] = True
-        return await self._forward("read", args)
+        return mark_outsiders(await self._forward("read", args))
 
     async def chat_thread(self, post_id: str, backend: str | None = None) -> dict[str, Any]:
         route = await self._route(backend, post_id)
@@ -677,7 +692,7 @@ class Shim:
         }
         if off:
             args["off_default"] = True
-        return await self._forward("thread", args)
+        return mark_outsiders(await self._forward("thread", args))
 
     async def chat_react(
         self, post_id: str, emoji: str, backend: str | None = None

@@ -9,6 +9,7 @@ dependencies = [
 
 [project.scripts]
 crewchat-mcp = "crewchat_clients.mcp_shim:main"
+crewchat-doorbell = "crewchat_clients.doorbell:main"
 
 [build-system]
 requires = ["hatchling"]
