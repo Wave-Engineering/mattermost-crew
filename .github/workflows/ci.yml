@@ -32,11 +32,12 @@ jobs:
           path: reports/
           if-no-files-found: error
 
-  # Stays on GitHub-hosted, throwaway VMs until there is an ephemeral self-hosted pool: these
-  # legs useradd as root, start Mattermost, the broker and the daemon (babelfish, #79).
+  # These legs useradd as root and start Mattermost, the broker and the daemon, so they run only
+  # on the ephemeral pool: a fresh VM per job, destroyed after it (#83). Never `oaw` alone:
+  # the persistent barry-org-1 carries that label too.
   ci:
     name: ci (${{ matrix.leg }})
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, ephemeral]
     timeout-minutes: 30
     strategy:
       fail-fast: false
