@@ -118,6 +118,25 @@ class ReplayFailed(Exception):
     """A reconnect's replay failed; the message names the call (#99)."""
 
 
+class AllUnreadable(ReplayFailed):
+    """Every team, or every channel, in a replay was unreadable (#103)."""
+
+
+UNREADABLE = (403, 404)  # a replay scope this account can't read yet: skipped, not an outage
+UNREADABLE_RETRY_S = 2.0  # the wait before retrying a replay that could read nothing
+
+
+def unreadable(exc: Exception) -> bool:
+    """Whether `exc` is Mattermost saying the account can't read that scope (#103), so the
+    replay skips it rather than going down. Mattermost's own errors always carry an `id`; a
+    proxy's 403 or 404 (an HTML page, `error_id` None) is an outage, not a scope."""
+    return (
+        isinstance(exc, MattermostAPIError)
+        and exc.status_code in UNREADABLE
+        and exc.error_id is not None
+    )
+
+
 class TokenRefresher(Protocol):
     """The token store's 401 path (`crewchat.tokens.TokenStore` provides it)."""
 
@@ -627,32 +646,57 @@ class MattermostBackend:
     async def _replay(self, dev_name: str, agent: _Agent) -> list[InboundMessage]:
         """The posts created since the agent's position in each of its channels, oldest
         first, that the stream hasn't yielded (R-28). A failure raises `ReplayFailed`, naming
-        the call that failed, and the position is left where it was (#99)."""
+        the call that failed, and the position is left where it was (#99). A team or channel
+        that Mattermost says is unreadable (403 or 404) is skipped with a warning instead. When
+        every team, or every channel, is skipped, the replay is retried once and then raises
+        `AllUnreadable` (#103)."""
         since = agent.position_ms
         if since is None:
             return []
         me = agent.user_id
         step = "GET /users/me/teams"
 
+        async def scoped(call: Awaitable[T], skipped: list[str]) -> T | None:
+            try:
+                return await call
+            except MattermostAPIError as exc:
+                if not unreadable(exc):
+                    raise
+                log.warning("replay for %s skips %s: %s", dev_name, step, exc)
+                skipped.append(f"{step} {exc}")
+                return None
+
+        def all_skipped(tried: int, skipped: list[str]) -> None:
+            if tried and len(skipped) == tried:
+                raise AllUnreadable(f"every replay scope unreadable: {'; '.join(skipped)}")
+
         async def request(client: MattermostClient) -> list[InboundMessage]:
             nonlocal step
             step = "GET /users/me/teams"
             channels: dict[str, dict[str, Any]] = {}
+            teams_tried = 0
+            teams_skipped: list[str] = []
             for team in await client.get_teams():
                 team_id = str(team.get("id", ""))
                 if not is_mm_id(team_id):
                     continue
                 step = f"GET /users/me/teams/{team_id}/channels"
-                for channel in await client.get_my_channels(team_id):
+                teams_tried += 1
+                team_channels = await scoped(client.get_my_channels(team_id), teams_skipped)
+                for channel in team_channels or []:
                     channel_id = str(channel.get("id", ""))
                     if is_mm_id(channel_id):
                         channels[channel_id] = channel
+            all_skipped(teams_tried, teams_skipped)
             found: list[InboundMessage] = []
+            chans_skipped: list[str] = []
             for channel_id, chan in channels.items():
                 # `since` is `update_at > since`, so one millisecond back keeps a post made
                 # at the position itself; the IDs already yielded are left out below.
                 step = f"GET /channels/{channel_id}/posts?since="
-                result = await client.get_posts_since(channel_id, since - 1)
+                result = await scoped(client.get_posts_since(channel_id, since - 1), chans_skipped)
+                if result is None:
+                    continue
                 posts = result.get("posts") or {}
                 if not isinstance(posts, dict):
                     continue
@@ -674,14 +718,29 @@ class MattermostBackend:
                     dm = event_dm(data, author, me)
                     step = f"GET /users/{author}"
                     found.append(await self.message(client, post, [], dm=dm))
+            all_skipped(len(channels), chans_skipped)
             found.sort(key=lambda m: (m.ts, m.post_id))
             return found
 
+        async def attempt() -> list[InboundMessage]:
+            try:
+                return await self._call(dev_name, request)
+            except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
+                log.error("replay for %s on %s: %s: %s", dev_name, self.server_id, step, exc)
+                raise ReplayFailed(f"{step}: {exc}") from exc
+
+        # Every scope unreadable is an account problem, or a new account whose membership
+        # hasn't reached the server yet: one retry tells the two apart.
         try:
-            return await self._call(dev_name, request)
-        except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
-            log.error("replay for %s on %s: %s: %s", dev_name, self.server_id, step, exc)
-            raise ReplayFailed(f"{step}: {exc}") from exc
+            return await attempt()
+        except AllUnreadable as exc:
+            log.warning("replay for %s on %s: %s; retrying", dev_name, self.server_id, exc)
+        await self._sleep(UNREADABLE_RETRY_S)
+        try:
+            return await attempt()
+        except AllUnreadable as exc:
+            log.error("replay for %s on %s: %s", dev_name, self.server_id, exc)
+            raise
 
     async def stream(
         self,
