@@ -765,6 +765,9 @@ class DiscordBackend:
         name = emoji.strip()
         if len(name) > 2 and name.startswith(":") and name.endswith(":"):
             name = name[1:-1]
+        if not name.strip("."):
+            # Quoting leaves `.` and `..` alone, and httpx resolves them as dot segments (#62).
+            raise ValueError(f"emoji {emoji!r} is not an emoji")
         await self._discord_write(
             "PUT", f"/channels/{channel}/messages/{message}/reactions/{quote(name, safe='')}/@me"
         )

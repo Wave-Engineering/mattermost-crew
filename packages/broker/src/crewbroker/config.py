@@ -118,7 +118,7 @@ def parse_config(
             crew = str(client.get_user(humans[0])["username"])
     if crew is None:
         raise ConfigError(f"{source}: crew is absent and there is no server to default it from")
-    if not NAME_RE.match(crew):
+    if not NAME_RE.fullmatch(crew):
         raise ConfigError(f"{source}: crew {crew!r} has characters outside a-z0-9._-")
 
     return CrewConfig(
@@ -155,7 +155,7 @@ def _trusted(value: Any, source: str) -> list[str]:
                 f"{source}: trusted entries are crew names only, not {what}; each trusted "
                 "crew's membership comes from its own broker"
             )
-        if not isinstance(item, str) or not NAME_RE.match(item):
+        if not isinstance(item, str) or not NAME_RE.fullmatch(item):
             raise ConfigError(f"{source}: trusted entry {item!r} is not a crew name")
         names.append(item)
     return names

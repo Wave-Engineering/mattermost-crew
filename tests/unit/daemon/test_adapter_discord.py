@@ -337,6 +337,9 @@ def test_discord_hostile_ids_send_nothing(credential: Path, run: Any) -> None:
         for call in calls:
             with pytest.raises(ValueError):
                 run(call())
+    for emoji in (".", "..", "...", " .. "):  # a dot segment would walk the reactions path
+        with pytest.raises(ValueError):
+            run(b.react(ME, f"{ops}/{good}", emoji))
     assert discord.requests == before  # not one request, not even a health check
 
 

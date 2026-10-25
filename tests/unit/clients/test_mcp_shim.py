@@ -510,10 +510,13 @@ def test_shim_thread_form(tmp_path: Path) -> None:
         assert daemon.of("send")[-1]["thread"] == chan
         await shim.chat_thread(f"{chan}/{msg}")
         assert daemon.of("thread")[-1]["post_id"] == chan
+        report = tmp_path / "report.txt"
+        report.write_text("attached")
         start = len(daemon.frames)
         for bad in ("a/b/c", "../x", f"{chan}/../x", f"{chan}/x", f"{chan}/", f"/{msg}"):
             for call in (
                 lambda bad=bad: shim.chat_send("town", "x", thread=bad),
+                lambda bad=bad: shim.chat_send("town", "x", thread=bad, attach_path=str(report)),
                 lambda bad=bad: shim.chat_send("town", "x", thread=bad, backend="discord"),
                 lambda bad=bad: shim.chat_thread(bad, backend="discord"),
                 lambda bad=bad: shim.chat_react(bad, "👍"),

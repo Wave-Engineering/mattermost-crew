@@ -604,14 +604,16 @@ class Shim:
         attach_path: str | None = None,
         embed: str | None = None,
     ) -> dict[str, Any]:
+        # The thread is checked first: `_post_args` sends `upload` frames (#62).
+        tid = thread_id(thread) if thread else None
         route = await self._route(backend, thread)
         if isinstance(route, dict):
             return route
         name, off = route
         args = await self._post_args(name, off, attach_path, embed)
         args.update({"to": to, "text": text})
-        if thread:
-            args["thread"] = thread_id(thread)
+        if tid:
+            args["thread"] = tid
         return await self._forward("send", args)
 
     async def chat_dm(
