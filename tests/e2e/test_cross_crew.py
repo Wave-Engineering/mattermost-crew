@@ -70,6 +70,8 @@ def test_e2e01_cross_crew_under_trusted(e2e: World) -> None:
             got = await d.delivered(babel, human)
             assert got["message"]["root_id"] == root
             assert got["message"]["author_id"] == synth.partner_id
+            # zed posted in this thread, so the in-thread human reply rings zed too (R-12).
+            await d.delivered(zed, human)
 
             # babel answers zed in the thread; zed rings once.
             answer = await d.send(babel, channel, f"@{zed} the reconnect path", thread=root)

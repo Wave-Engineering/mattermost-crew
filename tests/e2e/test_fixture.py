@@ -85,5 +85,5 @@ def test_e2e_fixture_builds_two_crews(e2e: World) -> None:
     bot: dict[str, Any] = mm_request(e2e.mattermost, "GET", f"/bots/{e2e.spoof_id}").json()
     assert bot["owner_id"] not in (oaw.broker_id, synth.broker_id)
     outsider = mm_request(e2e.mattermost, "GET", f"/users/{e2e.outsider_id}").json()
-    assert outsider["is_bot"] is not True
+    assert outsider.get("is_bot") is not True
     assert e2e.outsider_id not in (oaw.partner_id, synth.partner_id)
