@@ -47,11 +47,11 @@ share. Fleet broadcasts are `@agents` (S-24).
   backlog is upshifted: Stories #7 to #23.
 - **2026-10-24:** Phases 1 and 2 land on `main` (#26, #27) and are tagged `v0.1.0`, the base for
   the kit's IP-2 (K-1, `chat_*` in the kit).
-- **2026-10-25:** Phase 3 (#28) is complete: the social switch and kiosk control in the broker,
+- **2026-10-25:** Phase 3 (#28) lands on `main` and is tagged `v0.2.0`: the social switch and kiosk control in the broker,
   the merged doorbell (Discord, Mattermost and squawkie), the daemon's inbound filters and loop
   guard, the tool-less kiosk with its review on social engage, the runbook, partner guide and
   architecture document, and the E2E suite. Every requirement R-01 to R-34 traces to a passing
-  IT or E2E item (Dev Spec Appendix V). The release IP-3 tags is the base for K-2, the kit's
+  IT or E2E item (Dev Spec Appendix V). `v0.2.0` is IP-3, the base for K-2, the kit's
   doorbell wiring to the chat daemon.
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
