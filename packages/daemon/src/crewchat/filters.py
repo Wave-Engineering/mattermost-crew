@@ -19,6 +19,10 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
   `refetch_min_interval_s` (default 2 s) apart: a miss while a round is in flight waits for
   it, and a round that fails or times out gives `DROP` (R-22). The daemon never reads
   `owner_id`: a bot token can't see it (D-100).
+- **Social engaged** (Story 3.6, R-33). Each `switch_state` fetch compares the broker's
+  `effective_mode` with the one its previous fetch gave. A move to `social` from `crew` or
+  `trusted` (or a first fetch that finds social) calls each `social_listeners(crew,
+  server_id)` once; no other change calls them. `crewchat serve` wires the kiosk review.
 
 **`admit(msg, reg, now, path)`** gives one `Verdict`: `DELIVER`, `DELIVER_MARKED_OUTSIDER`,
 `KIOSK` or `DROP(reason)`. `path` is `push` (the doorbell) or `pull` (`read`, `thread`).
@@ -178,6 +182,10 @@ def effective_mode(state: SwitchState, now: datetime) -> Mode:
     return "trusted" if state.mode == "trusted" else "crew"
 
 
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 # -- the switch cache -----------------------------------------------------------------------
 MissResult = Literal["ok", "capped", "failed"]
 
@@ -194,8 +202,14 @@ class SwitchCache:
         refetch_per_bot_s: float = REFETCH_PER_BOT_S,
         round_wait_s: float | None = None,
         monotonic: Monotonic = time.monotonic,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._brokers = brokers
+        # The wall clock `effective_mode` is read against, for the social transition (R-33).
+        self.clock = clock
+        # Called with (crew, server_id) when that broker's effective mode becomes `social`.
+        self.social_listeners: list[Callable[[str, str], object]] = []
+        self._modes: dict[BrokerKey, Mode] = {}
         self.crew_info_max_age_s = crew_info_max_age_s
         self.refetch_min_interval_s = refetch_min_interval_s
         self.refetch_per_bot_s = refetch_per_bot_s
@@ -265,7 +279,27 @@ class SwitchCache:
             log.warning("switch_state %s-%s: %s; keeping the last good", key[0], key[1], exc)
             return False
         self._switch[key] = SwitchState.from_reply(state)
+        self._observe(key)
         return True
+
+    def _observe(self, key: BrokerKey) -> None:
+        """Compare this broker's effective mode with the one its last fetch gave: a move to
+        `social` (from crew or trusted, or the first fetch finding social) tells each
+        listener, once per engagement (R-33). Any other change tells nobody."""
+        state = self._switch.get(key)
+        if state is None:
+            return
+        mode = effective_mode(state, self.clock())
+        before = self._modes.get(key)
+        self._modes[key] = mode
+        if mode != "social" or before == "social":
+            return
+        log.info("social engaged for %s on %s", key[0], key[1])
+        for listener in list(self.social_listeners):
+            try:
+                listener(key[0], key[1])
+            except Exception:
+                log.exception("social listener for %s-%s failed", key[0], key[1])
 
     async def refresh(self, crew: str, server_id: str) -> dict[str, Any] | None:
         """Re-fetch one broker's `crew_info` and `switch_state` (after its `mint`). On failure
@@ -437,10 +471,6 @@ Class = Literal["crew", "trusted", "outsider"]
 
 def server_of(backend: str) -> str | None:
     return backend[len(MATTERMOST_PREFIX) :] if backend.startswith(MATTERMOST_PREFIX) else None
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC)
 
 
 def _ids(info: Mapping[str, Any], key: str) -> set[str]:
