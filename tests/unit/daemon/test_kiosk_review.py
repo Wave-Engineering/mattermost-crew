@@ -8,6 +8,7 @@ working agent's queue is the real `Doorbell`'s.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import stat
 from datetime import UTC, datetime, timedelta
@@ -110,6 +111,12 @@ def cursor_of(kiosk: Kiosk, server_id: str) -> Path:
     return kiosk.review_paths(DEV, server_id)[1]
 
 
+def head_of(transcript: Path) -> str:
+    """The head the kiosk derives for `transcript` (#110), recomputed here."""
+    with transcript.open("rb") as fh:
+        return hashlib.sha256(fh.readline()).hexdigest()[:16]
+
+
 # -- the transition -------------------------------------------------------------------------
 def test_review_on_social_transition_only() -> None:
     async def scenario() -> None:
@@ -190,7 +197,10 @@ def test_review_since_cursor_and_advance(tmp_path: Path) -> None:
     assert dev == DEV
     assert event.payload["entries"] == first
     transcript, cursor = kiosk.review_paths(DEV, A)
-    assert json.loads(cursor.read_text()) == {"offset": transcript.stat().st_size}
+    assert json.loads(cursor.read_text()) == {
+        "offset": transcript.stat().st_size,
+        "head": head_of(transcript),
+    }
     assert stat.S_IMODE(cursor.stat().st_mode) == 0o600
 
     # Nothing new: nothing enqueued, the cursor where it was.
@@ -207,7 +217,10 @@ def test_review_since_cursor_and_advance(tmp_path: Path) -> None:
         fh.write(', "asker_id": "o", "question": "q4", "answer": "a4"}\n')
     assert kiosk.review_since_cursor(DEV, A) == 1
     assert delivered[-1][1].payload["entries"][0]["question"] == "q4"
-    assert json.loads(cursor.read_text()) == {"offset": transcript.stat().st_size}
+    assert json.loads(cursor.read_text()) == {
+        "offset": transcript.stat().st_size,
+        "head": head_of(transcript),
+    }
 
 
 def test_review_skips_malformed_lines_and_restarts_a_replaced_transcript(tmp_path: Path) -> None:
@@ -231,6 +244,113 @@ def test_review_skips_malformed_lines_and_restarts_a_replaced_transcript(tmp_pat
     # An unreadable cursor reviews from the start rather than losing entries.
     cursor.write_text("garbage")
     assert kiosk.review_since_cursor(DEV, A) == 1
+
+
+def test_replaced_longer_transcript_is_reviewed_from_the_start(tmp_path: Path) -> None:
+    """#110: a transcript replaced by one that has grown past the old cursor is reviewed from
+    its start, not from the old offset, which would skip its head without a word."""
+    delivered: list[tuple[str, DoorbellEvent]] = []
+    kiosk = make_kiosk(tmp_path, delivered)
+    record(kiosk, A, 1)
+    record(kiosk, A, 2)
+    assert kiosk.review_since_cursor(DEV, A) == 2
+    transcript, _ = kiosk.review_paths(DEV, A)
+    old_size = transcript.stat().st_size
+    transcript.unlink()
+    fresh = [record(kiosk, A, n) for n in (7, 8, 9)]
+    assert transcript.stat().st_size > old_size
+    assert kiosk.review_since_cursor(DEV, A) == 3
+    assert delivered[-1][1].payload["entries"] == fresh
+
+
+def test_replaced_transcript_review_id_is_new(tmp_path: Path) -> None:
+    """#110: no two transcripts' reviews share an `event_id`, though their offsets do. The
+    one-shot drops an ID it has seen (#109), so a shared one would lose a real review."""
+    delivered: list[tuple[str, DoorbellEvent]] = []
+    kiosk = make_kiosk(tmp_path, delivered)
+    transcript, _ = kiosk.review_paths(DEV, A)
+    record(kiosk, A, 1)
+    kiosk.review_since_cursor(DEV, A)
+    for numbers in ((5,), (6, 7, 8), (4,)):  # shorter, longer, then shorter again
+        transcript.unlink()
+        for n in numbers:
+            record(kiosk, A, n)
+        assert kiosk.review_since_cursor(DEV, A) == len(numbers)
+    ids = [event.reply()["event_id"] for _, event in delivered]
+    assert len(ids) == 4 and len(set(ids)) == 4
+    # The first, second and last reviews end at one offset: the head is what tells them apart.
+    assert len({event_id.rsplit(":", 1)[1] for event_id in (ids[0], ids[1], ids[3])}) == 1
+
+
+def test_cursor_carries_head(tmp_path: Path) -> None:
+    """#110: a handover writes the transcript's head beside the offset."""
+    kiosk = make_kiosk(tmp_path)
+    record(kiosk, A, 1)
+    kiosk.review_since_cursor(DEV, A)
+    transcript, cursor = kiosk.review_paths(DEV, A)
+    assert json.loads(cursor.read_text()) == {
+        "offset": transcript.stat().st_size,
+        "head": head_of(transcript),
+    }
+
+
+def test_v020_cursor_without_head_is_accepted(tmp_path: Path) -> None:
+    """#110: a cursor written before the head existed resumes at its offset, and gains the
+    head on its next write."""
+    delivered: list[tuple[str, DoorbellEvent]] = []
+    kiosk = make_kiosk(tmp_path, delivered)
+    record(kiosk, A, 1)
+    transcript, cursor = kiosk.review_paths(DEV, A)
+    cursor.write_text(json.dumps({"offset": transcript.stat().st_size}))
+    second = record(kiosk, A, 2)
+    assert kiosk.review_since_cursor(DEV, A) == 1
+    assert delivered[-1][1].payload["entries"] == [second]
+    assert json.loads(cursor.read_text())["head"] == head_of(transcript)
+
+
+def test_partial_first_line_has_no_head(tmp_path: Path) -> None:
+    """#110: a first record still being appended gives no head, so none is written. Once it is
+    complete, the head it gets matches every later review: no spurious reset to 0."""
+    assert Kiosk._head(b'{"ts": 1001.0, "thread"') is None
+    delivered: list[tuple[str, DoorbellEvent]] = []
+    kiosk = make_kiosk(tmp_path, delivered)
+    transcript, cursor = kiosk.review_paths(DEV, A)
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    whole = json.dumps({"ts": 1001.0, "thread": "root-1", "question": "q1"}) + "\n"
+    transcript.write_text(whole[:20])
+    assert kiosk.review_since_cursor(DEV, A) == 0
+    assert not cursor.exists()
+    with transcript.open("a", encoding="utf-8") as fh:
+        fh.write(whole[20:])
+    assert kiosk.review_since_cursor(DEV, A) == 1
+    assert json.loads(cursor.read_text())["head"] == head_of(transcript)
+    second = record(kiosk, A, 2)
+    assert kiosk.review_since_cursor(DEV, A) == 1
+    assert delivered[-1][1].payload["entries"] == [second]  # not re-reviewed from 0
+
+
+def test_handover_of_a_replaced_transcripts_review_keeps_the_cursor(tmp_path: Path) -> None:
+    """#110: a review still queued when its transcript is replaced is handed over later. Its
+    offset means nothing in the new transcript, so its handover leaves the cursor alone; the
+    new transcript's review moves it."""
+    delivered: list[tuple[str, DoorbellEvent]] = []
+    kiosk = make_kiosk(tmp_path, delivered, handover=False)
+    transcript, cursor = kiosk.review_paths(DEV, A)
+    record(kiosk, A, 1)
+    assert kiosk.review_since_cursor(DEV, A) == 1
+    transcript.unlink()
+    record(kiosk, A, 7)
+    record(kiosk, A, 8)
+    assert kiosk.review_since_cursor(DEV, A) == 2  # reviewed from 0, not after the old one
+    (_, stale), (_, current) = delivered
+    assert stale.on_handover is not None and current.on_handover is not None
+    stale.on_handover()
+    assert not cursor.exists()
+    current.on_handover()
+    assert json.loads(cursor.read_text()) == {
+        "offset": transcript.stat().st_size,
+        "head": head_of(transcript),
+    }
 
 
 def test_review_only_that_servers_transcript(tmp_path: Path) -> None:
@@ -329,7 +449,8 @@ def test_doorbell_one_shot_prints_rendered_outsider_text(
             pass
 
     out, err = Out(), Out()
-    assert doorbell_run(repo, tmp_path / "sock", {}, out, err) == 0  # type: ignore[arg-type]
+    environ = {"XDG_STATE_HOME": str(tmp_path / "state")}  # its seen set, not the real home's
+    assert doorbell_run(repo, tmp_path / "sock", environ, out, err) == 0  # type: ignore[arg-type]
     assert text_of(json.loads(out.text)).startswith(OUTSIDER_PREFIX)
 
 
@@ -524,10 +645,16 @@ def test_review_cursor_moves_on_handover_only(tmp_path: Path) -> None:
         await rig.register()
         held = await rig.doorbell.take(DEV)
         assert [e["question"] for e in held.payload["entries"]] == ["question 1 on srv-a"]
-        assert held.reply()["event_id"] == f"mattermost:{A}:kiosk.review:{cursor_size(rig, A)}"
+        transcript = rig.kiosk.review_paths(DEV, A)[0]
+        assert held.reply()["event_id"] == (
+            f"mattermost:{A}:kiosk.review:{head_of(transcript)}:{cursor_size(rig, A)}"
+        )
         assert not cursor.exists()  # taken, still not sent
         rig.doorbell.ack(DEV, held)
-        assert json.loads(cursor.read_text()) == {"offset": cursor_size(rig, A)}
+        assert json.loads(cursor.read_text()) == {
+            "offset": cursor_size(rig, A),
+            "head": head_of(transcript),
+        }
 
         # Handed over: a restart and a re-register review nothing; a new entry only itself.
         rig = Rig(tmp_path, broker)

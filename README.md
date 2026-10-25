@@ -53,6 +53,8 @@ share. Fleet broadcasts are `@agents` (S-24).
   architecture document, and the E2E suite. Every requirement R-01 to R-34 traces to a passing
   IT or E2E item (Dev Spec Appendix V). `v0.2.0` is IP-3, the base for K-2, the kit's
   doorbell wiring to the chat daemon.
+- **2026-10-25:** `v0.2.1`, what K-2 pins: `crewchat-doorbell` drops a repeat event (#109),
+  and a replaced kiosk transcript restarts its review under a new `event_id` (#110).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
