@@ -49,6 +49,8 @@ mypy_path = [
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib", "-p", "pytester"]
+# The repo root, so tests can import the shared fakes as `tests.fakes.*`.
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.coverage.run]

@@ -1,6 +1,7 @@
 """The crewchat daemon's entry point.
 
     crewchat serve [--config /etc/crewchat/servers.toml] [--socket /run/crewchat/crewchat.sock]
+                   [--state-dir /var/lib/crewchat]
     crewchat call <socket> <op> ['<args json>']
 
 `serve` loads `servers.toml`, reads the token store, and serves the socket; the daily rotation
@@ -18,46 +19,133 @@ import logging
 import signal
 import socket
 import sys
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from crewchat.config import CONFIG_PATH, load_config
+from crewchat.adapters.base import ChatBackend
+from crewchat.adapters.discord import DiscordBackend
+from crewchat.adapters.mattermost import MattermostBackend
+from crewchat.chat import AgentContext, build_chat_handlers
+from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
-from crewchat.server import CLIENTS_GROUP, SOCKET_PATH, DaemonServer, build_handlers
-from crewchat.tokens import TOKENS_DIR, Rotator, SwitchCache, TokenStore, broker_clients
+from crewchat.server import (
+    CLIENTS_GROUP,
+    SOCKET_PATH,
+    DaemonServer,
+    HealthSource,
+    build_handlers,
+)
+from crewchat.threads import STATE_DIR, MyThreads
+from crewchat.tokens import (
+    TOKENS_DIR,
+    Rotator,
+    SwitchCache,
+    TokenStore,
+    broker_clients,
+    retry_delays,
+)
+from crewchat.uploads import UploadStore
 
 ROTATION_INTERVAL_S = 24 * 3600
+UPLOADS_SUBDIR = "uploads"  # /run/crewchat/uploads, beside the socket
 
 log = logging.getLogger("crewchat")
 
 
-async def rotation_loop(rotator: Rotator, stop: asyncio.Event) -> None:
+async def wait_or_stop(stop: asyncio.Event, seconds: float) -> bool:
+    """Wait `seconds`, or until `stop` is set. True when stopping."""
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(stop.wait(), max(seconds, 0.0))
+    return stop.is_set()
+
+
+async def rotation_loop(
+    rotator: Rotator,
+    stop: asyncio.Event,
+    *,
+    interval_s: float = ROTATION_INTERVAL_S,
+    wait: Callable[[asyncio.Event, float], Awaitable[bool]] = wait_or_stop,
+    monotonic: Callable[[], float] = time.monotonic,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    """The daily rotation. A rotation that fails is retried on a backoff (5 min, doubling,
+    capped at 1 h) until it succeeds or the next daily run, well inside the 26 h native
+    expiry (R-05, R-07)."""
     while not stop.is_set():
+        started = monotonic()
+        failed: list[tuple[str, str, str]] = []
         try:
-            report = await rotator.run_daily(datetime.now(UTC))
+            report = await rotator.run_daily(now())
+            failed = report.failed
             log.info(
                 "rotation: %d rotated, %d dropped, %d failed",
                 len(report.rotated),
                 len(report.dropped),
-                len(report.failed),
+                len(failed),
             )
         except Exception:
             log.exception("rotation failed; retrying at the next interval")
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), ROTATION_INTERVAL_S)
+        delays = retry_delays()
+        while failed:
+            delay = next(delays)
+            if monotonic() - started + delay >= interval_s:
+                break  # the next daily run picks them up
+            if await wait(stop, delay):
+                return
+            try:
+                failed = await rotator.retry(failed)
+            except Exception:
+                log.exception("rotation retry failed")
+        if await wait(stop, interval_s - (monotonic() - started)):
+            return
 
 
-async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: str | None) -> int:
+async def serve(
+    config_path: Path,
+    socket_path: Path,
+    tokens_dir: Path,
+    group: str | None,
+    state_dir: Path = STATE_DIR,
+) -> int:
     config = load_config(config_path)
     brokers = broker_clients(config)
     store = TokenStore(tokens_dir, brokers)
     store.load()
+    # One adapter per configured Mattermost server (R-10). They hold websockets only for
+    # agents whose stream is open; rotation reconnects those (§4.8).
+    backends = [
+        MattermostBackend(s.id, s.url, store.token_for, refresher=store) for s in config.mattermost
+    ]
+    store.adapters.extend(backends)
+    chat_backends: dict[str, ChatBackend] = {b.name: b for b in backends}
+    discord: DiscordBackend | None = None
+    if config.discord_enabled:
+        if config.discord_screamhole_url is None:
+            raise ConfigError(f"{config_path}: discord is enabled but has no screamhole_url")
+        discord = DiscordBackend(
+            config.discord_screamhole_url,
+            config.discord_credential,
+            guild_id=config.discord_guild_id,
+        )
+        chat_backends[discord.name] = discord
     cache = SwitchCache(brokers)
-    registry = Registry(config, brokers, store, cache)
-    server = DaemonServer(build_handlers(config, registry))
+    registry = Registry(config, brokers, store, cache, identity_sink=discord)
+    # The one persisted "my threads" set (D-104): every send and dm records into it, and
+    # Phase 3's addressing reads the same instance, so replies survive a restart.
+    threads = MyThreads.load(state_dir, config.my_threads_retention_days)
+    # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
+    uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
+    health_sources: dict[str, HealthSource] = {discord.name: discord} if discord else {}
+    handlers = build_handlers(config, registry, health_sources)
+    handlers.update(
+        build_chat_handlers(registry, chat_backends, threads, AgentContext(), uploads)
+    )
+    server = DaemonServer(handlers)
     listener = await server.start(socket_path, group)
 
     stop = asyncio.Event()
@@ -77,6 +165,10 @@ async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: s
         listener.close()
         await listener.wait_closed()
         await rotation
+        for backend in backends:
+            await backend.aclose()
+        if discord is not None:
+            await discord.aclose()
         socket_path.unlink(missing_ok=True)
     return 0
 
@@ -105,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--config", type=Path, default=CONFIG_PATH)
     p_serve.add_argument("--socket", type=Path, default=SOCKET_PATH)
     p_serve.add_argument("--tokens-dir", type=Path, default=TOKENS_DIR)
+    p_serve.add_argument("--state-dir", type=Path, default=STATE_DIR)
     p_serve.add_argument(
         "--group", default=CLIENTS_GROUP, help="the socket's group ('' leaves it unchanged)"
     )
@@ -120,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     if ns.cmd == "serve":
-        return asyncio.run(serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None))
+        return asyncio.run(
+            serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None, ns.state_dir)
+        )
     reply = call(ns.socket, ns.op, json.loads(ns.args))
     print(json.dumps(reply))
     return 0 if reply.get("ok") else 1

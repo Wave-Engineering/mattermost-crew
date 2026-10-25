@@ -1,0 +1,175 @@
+"""Stories 2.4b and 2.4c: the persisted `MyThreads` store, each root with its backend (Dev Spec
+§5.9; R-12, R-19; D-104)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import stat
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from crewchat.threads import MyThreads
+
+START = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+MM = "mattermost:dev"
+
+
+class Clock:
+    def __init__(self, start: datetime = START) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def entry(seen: datetime, backend: str = MM) -> dict[str, str]:
+    return {"backend": backend, "last_seen": seen.isoformat()}
+
+
+def test_threads_persist_roundtrip(tmp_path: Path) -> None:
+    clock = Clock()
+    threads = MyThreads.load(tmp_path, 90, clock)
+    threads.add("kessel", "root-a", MM)
+    clock.now += timedelta(minutes=1)
+    threads.add("kessel", "root-b", "discord")
+    threads.add("babel", "root-c", MM)
+
+    path = tmp_path / "threads" / "kessel.json"
+    assert mode(tmp_path / "threads") == 0o700
+    assert mode(path) == 0o600
+    # 2.4c: each entry is {"backend", "last_seen"}, the backend in the one name form.
+    assert json.loads(path.read_text()) == {
+        "roots": {
+            "root-a": entry(START),
+            "root-b": entry(START + timedelta(minutes=1), "discord"),
+        }
+    }
+    # No temp file is left behind by the atomic write.
+    assert sorted(p.name for p in (tmp_path / "threads").iterdir()) == ["babel.json", "kessel.json"]
+
+    again = MyThreads.load(tmp_path, 90, clock)
+    assert again.roots("kessel") == {"root-a", "root-b"}
+    assert again.roots("babel") == {"root-c"}
+    assert again.backend_of("kessel", "root-a") == MM
+    assert again.backend_of("kessel", "root-b") == "discord"
+    assert again.backend_of("kessel", "root-c") is None
+    assert again.backend_of("nobody", "root-a") is None
+
+
+def test_threads_last_seen_refreshed_on_add(tmp_path: Path) -> None:
+    clock = Clock()
+    threads = MyThreads.load(tmp_path, 90, clock)
+    threads.add("kessel", "root-a", MM)
+    clock.now += timedelta(days=10)
+    threads.add("kessel", "root-a", MM)
+    data = json.loads((tmp_path / "threads" / "kessel.json").read_text())
+    assert data["roots"]["root-a"] == entry(clock.now)
+
+
+def test_threads_refuse_a_bare_backend_name(tmp_path: Path) -> None:
+    """2.4c: the one backend-name form; a bare server id is never written."""
+    threads = MyThreads.load(tmp_path, 90, Clock())
+    for bad in ("dev", "discord:900000000000000001", ""):
+        with pytest.raises(ValueError):
+            threads.add("kessel", "root-a", bad)
+    assert threads.roots("kessel") == set()
+
+
+def test_threads_prune_by_retention(tmp_path: Path) -> None:
+    clock = Clock()
+    threads = MyThreads.load(tmp_path, 30, clock)
+    threads.add("kessel", "old", MM)
+    clock.now += timedelta(days=20)
+    threads.add("kessel", "mid", MM)
+
+    # On load: 31 days on, "old" is past retention and "mid" is not.
+    clock.now = START + timedelta(days=31)
+    loaded = MyThreads.load(tmp_path, 30, clock)
+    assert loaded.roots("kessel") == {"mid"}
+
+    # On save: another 20 days on, an add drops "mid" from memory and the file.
+    clock.now += timedelta(days=20)
+    loaded.add("kessel", "new", MM)
+    assert loaded.roots("kessel") == {"new"}
+    data = json.loads((tmp_path / "threads" / "kessel.json").read_text())
+    assert set(data["roots"]) == {"new"}
+
+
+def test_threads_limit_applies_after_pruning(tmp_path: Path) -> None:
+    clock = Clock()
+    threads = MyThreads.load(tmp_path, 90, clock, limit=2)
+    for root in ("a", "b", "c"):
+        clock.now += timedelta(seconds=1)
+        threads.add("kessel", root, MM)
+    assert threads.roots("kessel") == {"b", "c"}
+    assert MyThreads.load(tmp_path, 90, clock, limit=2).roots("kessel") == {"b", "c"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        "[]",
+        '{"roots": []}',
+        '{"roots": {"r": 5}}',
+        '{"roots": {"r": "2026-10-01T12:00:00+00:00"}}',  # #49's shape, before 2.4c
+        '{"roots": {"r": {"backend": "dev", "last_seen": "2026-10-01T12:00:00+00:00"}}}',
+        '{"roots": {"r": {"backend": "mattermost:dev"}}}',
+        '{"roots": {"r": {"backend": "mattermost:dev", "last_seen": "yesterday"}}}',
+        "",
+    ],
+)
+def test_threads_corrupt_file_is_empty(
+    tmp_path: Path, content: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="crewchat.threads")
+    directory = tmp_path / "threads"
+    directory.mkdir(mode=0o700)
+    (directory / "kessel.json").write_text(content)
+    (directory / "babel.json").write_text(json.dumps({"roots": {"ok": entry(START)}}))
+    threads = MyThreads.load(tmp_path, 90, Clock())
+    assert threads.roots("kessel") == set()
+    assert threads.roots("babel") == {"ok"}
+    errors = [r for r in caplog.records if "kessel.json" in r.getMessage()]
+    assert len(errors) == 1
+    # It is still usable, and the next add replaces the bad file.
+    threads.add("kessel", "fresh", MM)
+    assert MyThreads.load(tmp_path, 90, Clock()).roots("kessel") == {"fresh"}
+
+
+def test_threads_forget_deletes_file(tmp_path: Path) -> None:
+    threads = MyThreads.load(tmp_path, 90, Clock())
+    threads.add("kessel", "root-a", MM)
+    path = tmp_path / "threads" / "kessel.json"
+    assert path.exists()
+    threads.forget("kessel")
+    assert not path.exists()
+    assert threads.roots("kessel") == set()
+    threads.forget("kessel")  # forgetting twice is fine
+    assert MyThreads.load(tmp_path, 90, Clock()).roots("kessel") == set()
+
+
+def test_threads_load_tightens_directory_mode(tmp_path: Path) -> None:
+    directory = tmp_path / "threads"
+    directory.mkdir(mode=0o755)
+    directory.chmod(0o755)
+    MyThreads.load(tmp_path, 90, Clock())
+    assert mode(directory) == 0o700
+
+
+def test_threads_in_memory_writes_nothing(tmp_path: Path) -> None:
+    threads = MyThreads()
+    threads.add("kessel", "root-a", MM)
+    assert threads.roots("kessel") == {"root-a"}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_threads_rejects_bad_retention(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        MyThreads.load(tmp_path, 0)

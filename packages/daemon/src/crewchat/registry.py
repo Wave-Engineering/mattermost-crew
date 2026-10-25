@@ -1,8 +1,11 @@
 """Agent registration (Dev Spec §4.2, §5.3; D-055).
 
-`register{dev_name, crew, session_id}` keeps one registration per Dev-Name and takes the
-declared name at its word: agents on one host are one trust boundary (D-055). The daemon never
-reads a path on the agent's side (§5.3); everything it knows came over the socket.
+`register{dev_name, dev_team, dev_avatar, crew, session_id}` keeps one registration per
+Dev-Name and takes the declared name at its word: agents on one host are one trust boundary
+(D-055). `dev_team` and `dev_avatar` are self-declared too; a re-register overwrites both, and
+with Discord enabled they go to the Discord adapter's `set_identity` for the signature (D-103).
+The daemon never reads a path on the agent's side (§5.3); everything it knows came over the
+socket.
 
 For each Mattermost server the crew has a broker for, `register` asks that broker to `mint`.
 It is the **only** caller of `BrokerClient.mint` (R-30). For an agent that already holds a
@@ -19,7 +22,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from crewchat.config import ServersConfig
 from crewchat.tokens import (
@@ -41,6 +44,12 @@ log = logging.getLogger("crewchat.registry")
 Clock = Callable[[], datetime]
 
 
+class IdentitySink(Protocol):
+    """What `register` tells about an agent's signature: `DiscordBackend.set_identity`."""
+
+    def set_identity(self, dev_name: str, *, avatar: str = "", team: str = "") -> None: ...
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -54,11 +63,16 @@ class RegisterError(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
+def mattermost_backend(server_id: str) -> str:
+    """A Mattermost server's backend name, the one form on the socket and in files (§5.4)."""
+    return f"mattermost:{server_id}"
+
+
 def account_name(dev_name: str, crew: str) -> str:
     """`<dev_name>.<crew>`, as the broker names it: at most 64 of a-z 0-9 . _ - (CT-05)."""
-    if not isinstance(dev_name, str) or not DEV_NAME_RE.match(dev_name):
+    if not isinstance(dev_name, str) or not DEV_NAME_RE.fullmatch(dev_name):
         raise ValueError(f"dev_name {dev_name!r} must be a-z0-9._- and not start with a dot")
-    if not isinstance(crew, str) or not CREW_RE.match(crew):
+    if not isinstance(crew, str) or not CREW_RE.fullmatch(crew):
         raise ValueError(f"crew {crew!r} has characters outside a-z0-9._-")
     name = f"{dev_name}.{crew}"
     if len(name) > ACCOUNT_NAME_MAX:
@@ -72,10 +86,17 @@ class Registration:
     crew: str
     session_id: str
     account: str
+    # Backend names in the one form (§5.4): `mattermost:<server_id>` per server, `discord`.
     backends: list[str]
     needs_list: str
     registered_at: datetime
     unavailable: list[str] = field(default_factory=list)
+    # The agent's Dev-Team (BJ's direction scope, S-11), for `@<dev-team>` addressing (R-17).
+    # `register` carries it, self-declared from the shim's identity file (D-103).
+    dev_team: str = ""
+    # The agent's avatar: display only, for its Discord signature (D-103). Never read by
+    # addressing, membership or any trust decision.
+    dev_avatar: str = ""
 
     def result(self) -> dict[str, Any]:
         """What `register` answers. Never a token (R-08)."""
@@ -91,18 +112,29 @@ class Registry:
         cache: SwitchCache,
         *,
         clock: Clock = utc_now,
+        identity_sink: IdentitySink | None = None,
     ) -> None:
         self.config = config
         self.brokers = brokers
         self.store = store
         self.cache = cache
         self.clock = clock
+        # The Discord adapter, when Discord is enabled: `set_identity` after each register.
+        self.identity_sink = identity_sink
         self._registrations: dict[str, Registration] = {}
 
     def get(self, dev_name: str) -> Registration | None:
         return self._registrations.get(dev_name)
 
-    async def register(self, dev_name: str, crew: str | None, session_id: str) -> Registration:
+    async def register(
+        self,
+        dev_name: str,
+        crew: str | None,
+        session_id: str,
+        *,
+        dev_team: str = "",
+        dev_avatar: str = "",
+    ) -> Registration:
         crew = crew or self.config.default_crew
         try:
             account = account_name(dev_name, crew)
@@ -143,7 +175,7 @@ class Registry:
                     continue
                 await self.store.install_minted(dev_name, crew, server.id, minted, now)
                 await self.cache.refresh(crew, server.id)
-                backends.append(server.id)
+                backends.append(mattermost_backend(server.id))
 
         if unavailable and not backends:
             if squatted == unavailable:
@@ -165,7 +197,12 @@ class Registry:
             needs_list=entry.needs_list,
             registered_at=now,
             unavailable=unavailable,
+            dev_team=dev_team,
+            dev_avatar=dev_avatar,
         )
         self._registrations[dev_name] = reg
+        if self.config.discord_enabled and self.identity_sink is not None:
+            # So the agent's Discord signature carries its avatar and team (D-103).
+            self.identity_sink.set_identity(dev_name, avatar=dev_avatar, team=dev_team)
         log.info("registered %s (session %s): %s", account, session_id, ", ".join(backends))
         return reg

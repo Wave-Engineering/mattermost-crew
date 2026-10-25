@@ -22,7 +22,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +36,9 @@ FILE_MODE = 0o600
 DIR_MODE = 0o700
 IDLE_DAYS = 30
 ROTATIONS_PER_S = 5.0
+# A failed rotation is retried well inside the 26 h native expiry, not 24 h later.
+RETRY_FIRST_S = 5 * 60.0
+RETRY_MAX_S = 3600.0
 MAX_REPLY_BYTES = 1024 * 1024
 
 log = logging.getLogger("crewchat.tokens")
@@ -409,11 +412,29 @@ class TokenStore:
     async def drop(self, dev_name: str) -> None:
         """Take an agent out of the store and rotation, revoking what it held."""
         async with self.lock(dev_name):
-            agent = self._agents.pop(dev_name, None)
+            await self._drop_locked(dev_name)
+
+    async def drop_if_idle(self, dev_name: str, cutoff: datetime) -> bool:
+        """Drop `dev_name` only if, under its lock, it still has no `register` since `cutoff`.
+
+        The rotation's idle check runs outside the lock, so a `register` can land between the
+        check and the drop; re-checking here keeps that agent's fresh token and file (R-30).
+        """
+        async with self.lock(dev_name):
+            agent = self._agents.get(dev_name)
             if agent is None:
-                return
-            await self._retire(agent)
-            self.path_for(dev_name).unlink(missing_ok=True)
+                return False
+            if agent.last_register is not None and agent.last_register >= cutoff:
+                return False
+            await self._drop_locked(dev_name)
+            return True
+
+    async def _drop_locked(self, dev_name: str) -> None:
+        agent = self._agents.pop(dev_name, None)
+        if agent is None:
+            return
+        await self._retire(agent)
+        self.path_for(dev_name).unlink(missing_ok=True)
 
     async def _retire(self, agent: AgentTokens) -> None:
         """Best-effort revoke of every token `agent` holds or still owes a revoke for."""
@@ -474,12 +495,15 @@ class Rotator:
         first = True
         for agent in self.store.agents():
             if agent.last_register is None or agent.last_register < cutoff:
+                if not await self.store.drop_if_idle(agent.dev_name, cutoff):
+                    # A register landed after the check: its token is fresh, so leave it.
+                    log.info("rotation: %s registered meanwhile; kept", agent.dev_name)
+                    continue
                 for adapter in self.store.adapters:
                     try:
                         await adapter.close_agent(agent.dev_name)
                     except Exception:
                         log.exception("close_agent(%s) failed", agent.dev_name)
-                await self.store.drop(agent.dev_name)
                 report.dropped.append(agent.dev_name)
                 log.info(
                     "rotation: dropped %s, last registered %s", agent.dev_name, agent.last_register
@@ -497,3 +521,38 @@ class Rotator:
                     continue
                 report.rotated.append((agent.dev_name, server_id))
         return report
+
+    async def retry(self, failed: Iterable[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+        """Rotate each failed (dev_name, server_id) again; return the ones still failing.
+
+        An agent that has left the store meanwhile is done, not failed.
+        """
+        left: list[tuple[str, str, str]] = []
+        first = True
+        for dev_name, server_id, _ in failed:
+            if not first:
+                await self.sleep(self.interval_s)
+            first = False
+            agent = self.store.agent(dev_name)
+            if agent is None or server_id not in agent.servers:
+                continue
+            try:
+                await self.store.rotate(dev_name, server_id)
+            except (BrokerError, BrokerUnavailable) as exc:
+                log.error("rotation retry: %s on %s: %s", dev_name, server_id, exc)
+                left.append((dev_name, server_id, str(exc)))
+                continue
+            except KeyError:
+                continue
+            log.info("rotation retry: rotated %s on %s", dev_name, server_id)
+        return left
+
+
+def retry_delays(
+    first_s: float = RETRY_FIRST_S, cap_s: float = RETRY_MAX_S
+) -> Iterator[float]:
+    """A failed rotation's retry waits: 5 min, doubling, capped at 1 h."""
+    delay = first_s
+    while True:
+        yield min(delay, cap_s)
+        delay = min(delay * 2, cap_s)

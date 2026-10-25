@@ -70,3 +70,19 @@ def test_servers_toml_rejects(change: Any, message: str) -> None:
 def test_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="no such file"):
         load_config(tmp_path / "nope.toml")
+
+
+def test_config_retention_default() -> None:
+    """D-104: `my_threads_retention_days` is top-level, defaults to 90, and is at least 1."""
+    raw = tomllib.loads(TOML)
+    assert parse_config(raw).my_threads_retention_days == 90
+    assert parse_config({**raw, "my_threads_retention_days": 7}).my_threads_retention_days == 7
+    assert parse_config({**raw, "my_threads_retention_days": 1}).my_threads_retention_days == 1
+    for bad in (0, -3, 1.5, "90", True):
+        with pytest.raises(ConfigError, match="my_threads_retention_days"):
+            parse_config({**raw, "my_threads_retention_days": bad})
+    # A `[daemon]` table is not where it lives: the top-level default still applies.
+    assert (
+        parse_config({**raw, "daemon": {"my_threads_retention_days": 5}}).my_threads_retention_days
+        == 90
+    )

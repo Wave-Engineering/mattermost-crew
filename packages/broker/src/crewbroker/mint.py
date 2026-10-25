@@ -34,7 +34,7 @@ def account_name(dev_name: str, crew: str) -> str:
         raise ValueError("dev_name and crew must both be non-empty")
     if len(name) > ACCOUNT_NAME_MAX:
         raise ValueError(f"account name {name!r} is longer than {ACCOUNT_NAME_MAX} characters")
-    if not ACCOUNT_NAME_RE.match(name):
+    if not ACCOUNT_NAME_RE.fullmatch(name):
         raise ValueError(f"account name {name!r} has characters outside a-z0-9._-")
     return name
 
