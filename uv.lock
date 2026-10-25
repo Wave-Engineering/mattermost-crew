@@ -425,7 +425,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "httpx", specifier = ">=0.28" }]
+requires-dist = [{ name = "httpx", specifier = ">=0.28,<1" }]
 
 [[package]]
 name = "crewchat"
@@ -439,9 +439,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = ">=0.28" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mcp-server-mattermost", specifier = "==0.6.1" },
-    { name = "websockets", specifier = ">=15" },
+    { name = "websockets", specifier = ">=15,<18" },
 ]
 
 [[package]]
@@ -453,7 +453,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=1.20" }]
+requires-dist = [{ name = "mcp", specifier = ">=1.20,<2" }]
 
 [[package]]
 name = "cryptography"
