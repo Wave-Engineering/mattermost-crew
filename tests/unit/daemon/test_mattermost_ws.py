@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import websockets.asyncio.client
 from crewchat.adapters import mattermost as mm_adapter
-from crewchat.adapters.base import InboundMessage
+from crewchat.adapters.base import InboundMessage, StreamCursor
 from crewchat.adapters.mattermost import (
     BACKOFF_MAX_S,
     PING_INTERVAL_S,
@@ -237,3 +237,78 @@ def test_default_connect_pings_every_30s(monkeypatch: pytest.MonkeyPatch, run: A
     run(mm_adapter.ws_connect("ws://x/api/v4/websocket", headers={"A": "b"}, ping_interval=30))
     assert seen["ping_interval"] == 30
     assert seen["additional_headers"] == {"A": "b"}
+
+
+# -- Story 3.2: cursor replay (R-28) and status (R-27) ----------------------------------------
+def test_replay_from_cursor(mm: Any, recording_sleep: Any, run: Any) -> None:
+    """With a cursor, the first connect replays the posts after it in the agent's channels,
+    oldest first: not the older ones, not the cursor's own, not the agent's own, and a DM
+    with the agent comes back marked `dm`."""
+    tokens = Tokens(mm)
+    me = tokens.add(DEV)
+    sender = mm.add_user("bj")
+    chan, dm_chan = mm._id("c"), mm._id("c")
+    mm.teams[mm._id("t")] = [
+        {"id": chan, "type": "O", "name": "crew"},
+        {"id": dm_chan, "type": "D", "name": f"{me}__{sender}"},
+        {"id": "not-an-id", "type": "O", "name": "skipped"},
+    ]
+    mm.add_post(sender, chan, "older")
+    last = mm.add_post(sender, chan, "the cursor's own")
+    mm.add_post(me, chan, "my own")
+    mm.add_post(sender, chan, "missed")
+    mm.add_post(sender, dm_chan, "a missed DM")
+    cursor = StreamCursor(last["id"], last["create_at"] / 1000, frozenset({last["id"]}))
+    b = make(mm, tokens, recording_sleep)
+    status: list[tuple[bool, str]] = []
+
+    async def scenario() -> list[InboundMessage]:
+        gen = b.stream(DEV, cursor=cursor, on_status=lambda up, why: status.append((up, why)))
+        got = [await recv(gen), await recv(gen)]
+        # The live feed repeats the missed post: not yielded again.
+        missed = got[0]
+        mm.broadcast_posted(mm.posts[missed.post_id])
+        mm.broadcast_posted(mm.add_post(sender, chan, "live"))
+        got.append(await recv(gen))
+        await b.close_agent(DEV)
+        return got
+
+    got = run(scenario())
+    assert [m.text for m in got] == ["missed", "a missed DM", "live"]
+    assert [m.dm for m in got] == [False, True, False]
+    assert status == [(True, "")]
+
+
+def test_status_reports_down_and_up(mm: Any, recording_sleep: Any, run: Any) -> None:
+    tokens = Tokens(mm)
+    me = tokens.add(DEV)
+    b = make(mm, tokens, recording_sleep)
+    status: list[tuple[bool, str]] = []
+
+    async def scenario() -> None:
+        gen = b.stream(DEV, on_status=lambda up, why: status.append((up, why)))
+        task = asyncio.ensure_future(recv(gen))
+        await until(lambda: status)
+        mm.fail_connects = 2
+        await mm.open_sockets(me)[0].close()
+        await until(lambda: len(status) >= 5)
+        # A rotation's reconnect is not an outage.
+        tokens.rotate(DEV)
+        await b.on_token_rotated(DEV)
+        await until(lambda: len(mm.connects) >= 5)
+        await until(lambda: mm.open_sockets(me) and b._agents[DEV].hello)
+        mm.tokens.clear()  # every token revoked: 401
+        await mm.open_sockets(me)[0].close()
+        await until(lambda: any(why == "unauthorized" for _, why in status))
+        await b.close_agent(DEV)
+        task.cancel()
+
+    run(scenario())
+    assert status[0] == (True, "")
+    assert status[1][0] is False and status[1][1].startswith("connection lost")
+    assert status[2] == (False, "connect failed: connection refused")
+    assert status[3] == (False, "connect failed: connection refused")
+    assert status[4] == (True, "")
+    assert status[5] == (True, "")  # after the rotation: no down in between
+    assert status[6][1].startswith("connection lost")
+    assert (False, "unauthorized") in status[7:]

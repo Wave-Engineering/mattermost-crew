@@ -41,9 +41,22 @@ class OpError(Exception):
 
 
 class DaemonServer:
-    def __init__(self, handlers: dict[str, Handler]) -> None:
+    """`hangup_cancels` names the ops a client's hangup cancels while they run: `subscribe`,
+    which would otherwise take an event off the agent's queue for a client that has gone."""
+
+    def __init__(
+        self, handlers: dict[str, Handler], *, hangup_cancels: frozenset[str] = frozenset()
+    ) -> None:
         self.handlers = handlers
+        self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
+
+    @staticmethod
+    def _op(line: bytes) -> str | None:
+        try:
+            return parse_frame(line).op
+        except ProtocolError:
+            return None
 
     async def handle_line(self, line: bytes) -> dict[str, Any]:
         """One request frame in, one response frame out. Never raises."""
@@ -63,10 +76,14 @@ class DaemonServer:
             return err(req.id, "internal")
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        next_line: asyncio.Future[bytes] | None = None
         try:
             while True:
                 try:
-                    line = await reader.readline()
+                    if next_line is None:
+                        line = await reader.readline()
+                    else:
+                        line, next_line = await next_line, None
                 except (ValueError, asyncio.LimitOverrunError):
                     writer.write(encode(err(None, "bad_request: frame too large")))
                     await writer.drain()
@@ -75,11 +92,30 @@ class DaemonServer:
                     return
                 if not line.strip():
                     continue
-                writer.write(encode(await self.handle_line(line)))
+                if self._op(line) not in self.hangup_cancels:
+                    writer.write(encode(await self.handle_line(line)))
+                    await writer.drain()
+                    continue
+                # Watch for the client hanging up while the op waits; a line it sends
+                # meanwhile is kept for the next turn of the loop.
+                handling = asyncio.ensure_future(self.handle_line(line))
+                next_line = asyncio.ensure_future(reader.readline())
+                await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                hung_up = (
+                    next_line.done() and next_line.exception() is None and not next_line.result()
+                )
+                if hung_up and not handling.done():
+                    handling.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await handling
+                    return
+                writer.write(encode(await handling))
                 await writer.drain()
         except ConnectionError:
             return
         finally:
+            if next_line is not None and not next_line.done():
+                next_line.cancel()
             writer.close()
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
