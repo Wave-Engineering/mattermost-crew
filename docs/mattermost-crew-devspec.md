@@ -1590,7 +1590,7 @@ Answers outsiders while social is off, through a tool-less session seeded only f
    - It uses the current brief from `BriefStore`. With no brief, it replies "I have nothing to share yet."
    - Its prompt is `KIOSK_HEADER + brief + history`. **`history` holds only the asker's own posts in that thread and the kiosk's own earlier answers to that asker.** Crewmates' posts in the thread are never included (§5.11).
 3. `runner` implements the mechanism chosen in spike 1.2. Either:
-   - `ClaudeCliRunner` runs, as OS user `crewkiosk` (never `crewchat`), with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. It is started through a fixed `sudo -u crewkiosk` rule that allows only this command line. `crewkiosk` can read no chat or broker credential; its only credential is the model credential spike 1.2 names; or
+   - `ClaudeCliRunner` runs, as OS user `crewkiosk` (never `crewchat`), with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. It is started through `crewkiosk.socket` and `crewkiosk@.service` (`Accept=yes`): the daemon, which keeps `NoNewPrivileges=yes`, connects to `/run/crewkiosk/kiosk.sock` (0660, group `crewchat`) and systemd runs this one fixed command line as `crewkiosk` for that connection. No sudo rule ships (D-107, which supersedes the earlier `sudo -u crewkiosk` rule). `crewkiosk` can read no chat or broker credential; its only credential is the model credential spike 1.2 names; or
    - `ApiRunner` makes a direct model API call with no tool definitions, using the credential decided in 1.2.
 
    Both expose `answer(prompt) -> str`.

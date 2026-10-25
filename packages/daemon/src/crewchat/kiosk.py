@@ -11,12 +11,14 @@
   in that thread, and the kiosk's own earlier answers to that asker.** A crewmate's post in the
   thread, or another outsider's, is never included (§5.11).
 - **The runner** is the mechanism spike 1.2 chose (D-096): `ClaudeCliRunner`, the `claude -p`
-  CLI run as the unprivileged `crewkiosk` user through one fixed `sudo` rule
-  (`packaging/crewkiosk.sudoers`) that allows only `packaging/crewkiosk-run`, with no
-  arguments. That wrapper starts `claude -p --restricted --strict-mcp-config --tools ""
-  --disallowedTools "mcp__*"` in an empty HOME and an empty working directory, with the kiosk's
-  own model credential and no other; the prompt goes on stdin. `crewkiosk` can read no chat or
-  broker credential.
+  CLI run as the unprivileged `crewkiosk` user. The daemon keeps `NoNewPrivileges=yes`, so it
+  never changes user itself (D-107): it connects to `/run/crewkiosk/kiosk.sock`
+  (`packaging/crewkiosk.socket`, `Accept=yes`), and systemd starts one `crewkiosk@` instance
+  per connection, as `crewkiosk`, running `packaging/crewkiosk-run`. The daemon writes the
+  prompt and half-closes; the wrapper starts `claude -p --restricted --strict-mcp-config
+  --tools "" --disallowedTools "mcp__*"` in an empty HOME and an empty working directory, with
+  the kiosk's own model credential and no other, and answers `ok` plus the answer, or
+  `error <rc>`. `crewkiosk` can read no chat or broker credential.
 - **The answer** goes in the outsider's thread on the originating Mattermost server (§5.9),
   with every `@token` stripped (`strip_mentions`) and `props.crew_kiosk=1`, so `admit` treats
   it as outsider content. Each Q&A is appended to that server's transcript,
@@ -36,7 +38,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -57,6 +59,7 @@ NO_BRIEF_REPLY = "I have nothing to share yet."
 KIOSK_SUBDIR = "kiosk"  # /var/lib/crewchat/kiosk
 KIOSK_USER = "crewkiosk"
 KIOSK_RUN = "/usr/local/libexec/crewkiosk-run"  # packaging/crewkiosk-run, root-owned
+KIOSK_SOCKET = "/run/crewkiosk/kiosk.sock"  # packaging/crewkiosk.socket (D-107)
 # What packaging/crewkiosk-run runs; test_kiosk_runner holds the wrapper to exactly this.
 CLAUDE_FLAGS = (
     "-p",
@@ -101,65 +104,61 @@ class Runner(Protocol):
     async def answer(self, prompt: str) -> str: ...
 
 
-@dataclass(frozen=True)
-class Completed:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-
-
-async def spawn_process(argv: Sequence[str], stdin: bytes, timeout_s: float) -> Completed:
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={"PATH": "/usr/bin:/bin"},
-        cwd="/",
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout_s)
-    except TimeoutError:
-        proc.terminate()  # sudo relays SIGTERM to the wrapper
-        try:
-            await asyncio.wait_for(proc.wait(), 5.0)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-        raise RunnerError(f"the kiosk runner timed out after {timeout_s:.0f}s") from None
-    return Completed(proc.returncode or 0, out[:MAX_OUTPUT_BYTES], err[-4096:])
+def parse_reply(reply: bytes) -> str:
+    """The wrapper's framed reply: `ok\\n<answer>`, or `error <rc>\\n`. Anything else, an
+    empty reply included (the wrapper refused before running the CLI), is a `RunnerError`;
+    its reason is in the `crewkiosk@` instance's journal, never on the socket."""
+    head, _, body = reply.partition(b"\n")
+    if head == b"ok":
+        return body[:MAX_OUTPUT_BYTES].decode(errors="replace").strip()
+    if head.startswith(b"error "):
+        status = head.removeprefix(b"error ").decode(errors="replace")[:16]
+        raise RunnerError(f"the kiosk runner exited {status} (see journalctl -u 'crewkiosk@*')")
+    raise RunnerError("the kiosk runner gave no answer (see journalctl -u 'crewkiosk@*')")
 
 
 class ClaudeCliRunner:
-    """`claude -p` as `crewkiosk`, through the fixed sudo rule (D-096).
+    """`claude -p` as `crewkiosk`, through the kiosk socket (D-096, D-107).
 
-    The daemon passes no argument through sudo: the command line is fixed, and the prompt
-    goes on stdin. The wrapper, not the daemon, holds the CLI flags, the empty HOME and
-    working directory, and the model credential, so the sudo rule can allow exactly one
-    command line."""
+    The daemon runs with `NoNewPrivileges=yes` and never changes user: it connects to the
+    socket, and systemd starts the wrapper as `crewkiosk` for that one connection. The daemon
+    sends only the prompt; the wrapper, not the daemon, holds the CLI flags, the empty HOME
+    and working directory, and the model credential. A socket that is missing or refuses, or
+    an answer that takes longer than `timeout_s`, is a `RunnerError`: the kiosk logs it and
+    posts nothing."""
 
-    def __init__(
-        self,
-        *,
-        user: str = KIOSK_USER,
-        run: str = KIOSK_RUN,
-        timeout_s: float = RUNNER_TIMEOUT_S,
-        spawn: Callable[[Sequence[str], bytes, float], Awaitable[Completed]] = spawn_process,
-    ) -> None:
-        self.user = user
-        self.run = run
+    def __init__(self, *, socket: str = KIOSK_SOCKET, timeout_s: float = RUNNER_TIMEOUT_S):
+        self.socket = socket
         self.timeout_s = timeout_s
-        self.spawn = spawn
-
-    def argv(self) -> list[str]:
-        return ["sudo", "-n", "-u", self.user, "--", self.run]
 
     async def answer(self, prompt: str) -> str:
-        done: Completed = await self.spawn(self.argv(), prompt.encode(), self.timeout_s)
-        if done.returncode != 0:
-            detail = done.stderr.decode(errors="replace").strip()[-500:]
-            raise RunnerError(f"the kiosk runner exited {done.returncode}: {detail}")
-        return done.stdout.decode(errors="replace").strip()
+        try:
+            return parse_reply(await asyncio.wait_for(self._exchange(prompt), self.timeout_s))
+        except TimeoutError:
+            raise RunnerError(f"the kiosk runner timed out after {self.timeout_s:.0f}s") from None
+
+    async def _exchange(self, prompt: str) -> bytes:
+        try:
+            reader, writer = await asyncio.open_unix_connection(self.socket)
+        except OSError as exc:
+            raise RunnerError(f"the kiosk runner is unavailable at {self.socket}: {exc}") from exc
+        try:
+            writer.write(prompt.encode())
+            await writer.drain()
+            writer.write_eof()  # the prompt ends here; the CLI reads stdin to EOF
+            reply = bytearray()
+            while len(reply) <= MAX_OUTPUT_BYTES:  # the wrapper closes after its reply
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                reply += chunk
+            return bytes(reply)
+        except OSError as exc:
+            raise RunnerError(f"the kiosk runner dropped the connection: {exc}") from exc
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
 
 
 # -- posting --------------------------------------------------------------------------------

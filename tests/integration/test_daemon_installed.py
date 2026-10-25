@@ -150,6 +150,49 @@ def test_credential_files_not_readable_by_crewkiosk(
         assert run(*as_kiosk, "test", "-r", path).returncode != 0, f"{KIOSK_USER} can read {path}"
 
 
+KIOSK_CALL = """
+import asyncio, sys
+from crewchat.kiosk import ClaudeCliRunner
+print(asyncio.run(ClaudeCliRunner(socket=sys.argv[1], timeout_s=30).answer(sys.argv[2])))
+"""
+
+
+def test_kiosk_answers_through_the_socket(installed: dict[str, Any]) -> None:
+    """D-107: the daemon's user, with no new privileges (as crewchat.service runs it), gets
+    an answer from `crewkiosk` through `crewkiosk.socket`. CI's stub `claude`
+    (scripts/ci/kiosk-up.sh) reports what it ran as: `crewkiosk`, an empty HOME and working
+    directory, the kiosk's own key, exactly the fixed flags, and the prompt on stdin. Under
+    the same flag, the old `sudo -u crewkiosk` path cannot work at all."""
+    sock = os.environ.get("CREWKIOSK_SOCKET", "").strip()
+    if not sock:
+        reason = "no kiosk socket: run scripts/ci/kiosk-up.sh"
+        if os.environ.get("CREWCHAT_INSTALLED_REQUIRED") == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
+    python = os.path.join(os.path.dirname(installed["bin"]), "python")
+    as_daemon = ("sudo", "-n", "-u", "crewchat", "--", "setpriv", "--no-new-privs")
+    proc = run(*as_daemon, python, "-c", KIOSK_CALL, sock, "WHAT-DO-YOU-BUILD")
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert "user=crewkiosk" in lines
+    assert "home_entries=0" in lines and "work_entries=0" in lines
+    assert "key_set=yes" in lines
+    args = [line[len("arg=[") : -1] for line in lines if line.startswith("arg=[")]
+    assert args == [
+        "-p",
+        "--restricted",
+        "--strict-mcp-config",
+        "--tools",
+        "",
+        "--disallowedTools",
+        "mcp__*",
+    ]
+    assert "prompt=WHAT-DO-YOU-BUILD" in lines
+    # The superseded path: sudo can't gain privileges once NoNewPrivs is set.
+    dead = run(*as_daemon, "sudo", "-n", "-u", KIOSK_USER, "--", "true")
+    assert dead.returncode != 0
+
+
 def test_no_socket_op_returns_a_token(
     installed: dict[str, Any], registered: dict[str, Any]
 ) -> None:

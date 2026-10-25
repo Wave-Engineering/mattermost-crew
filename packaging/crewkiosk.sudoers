@@ -1,8 +1,0 @@
-# The kiosk's one sudo rule (Dev Spec §5.11; Story 3.5). Install as /etc/sudoers.d/crewkiosk,
-# mode 0440, root:root, and check it with `visudo -cf /etc/sudoers.d/crewkiosk`.
-#
-# The daemon's user (crewchat) may run exactly one command as crewkiosk: the kiosk wrapper,
-# with no arguments (the trailing "" forbids any). The prompt goes on stdin. Nothing else runs
-# as crewkiosk, and crewkiosk can run nothing as anyone.
-Defaults:crewchat !requiretty, env_reset
-crewchat ALL=(crewkiosk) NOPASSWD: /usr/local/libexec/crewkiosk-run ""
