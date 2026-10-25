@@ -62,7 +62,9 @@ K-2 (the kit's doorbell wiring to the chat daemon).
   written, an overlapping `subscribe` gets the same event, and every event carries an
   `event_id` (#99).
 - A Mattermost reconnect whose replay fails is now a `backend.down` naming the failing call,
-  and the gap is delivered by the next replay rather than skipped (#99).
+  and the gap is delivered by the next replay rather than skipped (#99). A team or channel
+  answering 403 or 404, such as a team a new bot's membership hasn't settled in yet, is
+  skipped with a warning instead: the account can't read it, so it holds no gap (#103).
 - `scripts/smoke-devspace.sh` pins `SMOKE_TARGET=oaw-devspace` to the OaW dev space's URL, and
   only that host lets the broker role patch reach a non-local server (#99).
 

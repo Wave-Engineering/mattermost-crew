@@ -139,8 +139,10 @@ class World:
             ):
                 await asyncio.sleep(0.001)
 
-    def mm_post(self, text: str, *, broadcast: bool = True) -> dict[str, Any]:
-        post: dict[str, Any] = self.mm.add_post(self.sender, self.chan, text)
+    def mm_post(
+        self, text: str, *, broadcast: bool = True, chan: str | None = None
+    ) -> dict[str, Any]:
+        post: dict[str, Any] = self.mm.add_post(self.sender, chan or self.chan, text)
         if broadcast:
             self.mm.broadcast_posted(post)
         return post
@@ -454,7 +456,8 @@ def test_cursor_replay_exactly_once(world: World, run: Any) -> None:
     assert after == ["event 7", "event 8"]
 
 
-def test_failed_replay_is_loud_and_loses_nothing(world: World, run: Any) -> None:
+@pytest.mark.parametrize("status", [503, 429])
+def test_failed_replay_is_loud_and_loses_nothing(world: World, run: Any, status: int) -> None:
     """R-27, R-28, #99: a reconnect whose replay fails is a `backend.down` naming the failing
     call, yields nothing, and keeps the position, so the next replay delivers the gap."""
 
@@ -469,6 +472,7 @@ def test_failed_replay_is_loud_and_loses_nothing(world: World, run: Any) -> None
         await world.close()
         world.mm_post("event 2", broadcast=False)
         world.mm.errors[f"/channels/{world.chan}/posts"] = 1
+        world.mm.error_status[f"/channels/{world.chan}/posts"] = status
         world.build()
         world.doorbell.attach(DEV, [MM])
         health = [await world.next(), await world.next()]
@@ -484,8 +488,58 @@ def test_failed_replay_is_loud_and_loses_nothing(world: World, run: Any) -> None
     assert [kind(e) for e in health] == [(MM, "backend.down"), (MM, "backend.up")]
     reason = str(health[0].payload["reason"])
     assert reason.startswith(f"replay failed: GET /channels/{world.chan}/posts")
-    assert "503" in reason
+    assert str(status) in reason
     assert got == ["event 1", "event 2", "event 3"]
+
+
+@pytest.mark.parametrize(("scope", "status"), [("team", 403), ("channel", 404)])
+def test_unreadable_replay_scope_is_skipped(
+    world: World, run: Any, caplog: pytest.LogCaptureFixture, scope: str, status: int
+) -> None:
+    """R-27, R-28, #103: a team or channel that answers 403 or 404 during replay can't be read
+    by this account, so it can't hold a gap: it's skipped with a warning, the rest of the
+    replay is delivered, and no `backend.down` is emitted."""
+    other = world.mm._id("c")
+    if scope == "team":
+        team = world.mm._id("t")
+        world.mm.teams[team] = [{"id": other, "type": "O", "name": "elsewhere"}]
+        fragment = f"/teams/{team}/channels"
+    else:
+        world.mm.teams[world.team].append({"id": other, "type": "O", "name": "elsewhere"})
+        fragment = f"/channels/{other}/posts"
+
+    async def scenario() -> list[DoorbellEvent]:
+        world.doorbell.attach(DEV, [MM])
+        async with asyncio.timeout(3):
+            while not (world.mm.open_sockets(world.me) and world.mattermost._agents[DEV].hello):
+                await asyncio.sleep(0.001)
+        world.mm_post("event 1")
+        got = [await world.next()]
+        await world.close()
+        world.mm_post("event 2", broadcast=False)
+        world.mm_post("unreadable", broadcast=False, chan=other)
+        world.mm.errors[fragment] = 1
+        world.mm.error_status[fragment] = status
+        world.build()
+        world.doorbell.attach(DEV, [MM])
+        got.append(await world.next())
+        async with asyncio.timeout(3):
+            while not world.mm.open_sockets(world.me):
+                await asyncio.sleep(0.001)
+        world.mm_post("event 3")
+        got.append(await world.next())
+        await asyncio.sleep(0.05)
+        assert world.doorbell.queue(DEV).empty()
+        await world.close()
+        return got
+
+    with caplog.at_level("WARNING", logger="crewchat.adapters.mattermost"):
+        got = run(scenario())
+    assert [kind(e) for e in got] == [(MM, "message")] * 3
+    assert [text_of(e) for e in got] == ["event 1", "event 2", "event 3"]
+    assert world.mm.errors[fragment] == 0  # the unreadable scope was asked
+    skips = [r.getMessage() for r in caplog.records if "skips" in r.getMessage()]
+    assert len(skips) == 1 and fragment in skips[0] and str(status) in skips[0]
 
 
 class Scripted:

@@ -118,6 +118,15 @@ class ReplayFailed(Exception):
     """A reconnect's replay failed; the message names the call (#99)."""
 
 
+UNREADABLE = (403, 404)  # a replay scope this account can't read: skipped, not an outage
+
+
+def unreadable(exc: Exception) -> bool:
+    """Whether `exc` says the account can't read that scope (#103): it can't have missed
+    anything there, so the replay skips it rather than going down."""
+    return isinstance(exc, MattermostAPIError) and exc.status_code in UNREADABLE
+
+
 class TokenRefresher(Protocol):
     """The token store's 401 path (`crewchat.tokens.TokenStore` provides it)."""
 
@@ -627,7 +636,8 @@ class MattermostBackend:
     async def _replay(self, dev_name: str, agent: _Agent) -> list[InboundMessage]:
         """The posts created since the agent's position in each of its channels, oldest
         first, that the stream hasn't yielded (R-28). A failure raises `ReplayFailed`, naming
-        the call that failed, and the position is left where it was (#99)."""
+        the call that failed, and the position is left where it was (#99). A team or channel
+        that answers 403 or 404 is skipped with a warning instead (#103)."""
         since = agent.position_ms
         if since is None:
             return []
@@ -643,7 +653,14 @@ class MattermostBackend:
                 if not is_mm_id(team_id):
                     continue
                 step = f"GET /users/me/teams/{team_id}/channels"
-                for channel in await client.get_my_channels(team_id):
+                try:
+                    team_channels = await client.get_my_channels(team_id)
+                except MattermostAPIError as exc:
+                    if not unreadable(exc):
+                        raise
+                    log.warning("replay for %s skips %s: %s", dev_name, step, exc)
+                    continue
+                for channel in team_channels:
                     channel_id = str(channel.get("id", ""))
                     if is_mm_id(channel_id):
                         channels[channel_id] = channel
@@ -652,7 +669,13 @@ class MattermostBackend:
                 # `since` is `update_at > since`, so one millisecond back keeps a post made
                 # at the position itself; the IDs already yielded are left out below.
                 step = f"GET /channels/{channel_id}/posts?since="
-                result = await client.get_posts_since(channel_id, since - 1)
+                try:
+                    result = await client.get_posts_since(channel_id, since - 1)
+                except MattermostAPIError as exc:
+                    if not unreadable(exc):
+                        raise
+                    log.warning("replay for %s skips %s: %s", dev_name, step, exc)
+                    continue
                 posts = result.get("posts") or {}
                 if not isinstance(posts, dict):
                     continue
