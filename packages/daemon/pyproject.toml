@@ -7,8 +7,10 @@ dependencies = [
     # The upstream Mattermost library (cloud-ru-tech/mcp-server-mattermost), at an exact
     # reviewed version and never auto-updated (CT-03, D-009). Bump only with a review.
     "mcp-server-mattermost==0.6.1",
-    "websockets>=15",
-    "httpx>=0.28",
+    # Bounded below the next major: an install without uv.lock must never resolve to an
+    # untested major (#73).
+    "websockets>=15,<18",
+    "httpx>=0.28,<1",
 ]
 
 [project.scripts]
