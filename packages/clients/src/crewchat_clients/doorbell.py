@@ -11,8 +11,9 @@ is no Monitor primitive on Bedrock, so a task's exit is the only wake-up there i
   doesn't know the agent answers `not_registered`.
 - **How long.** `CREWCHAT_DOORBELL_TIMEOUT` is the wait in seconds; the default `0` waits
   forever. On a timeout the one-shot hangs up, which cancels the daemon's `subscribe`.
-- **Outsider events.** An event marked `"outsider": true` (the kiosk review, Story 3.6) is
-  printed with its `text` prefixed `[from outside the crew]` (`mcp_shim.render_event`).
+- **Outsider events.** An event marked `"outsider": true` is printed with its text prefixed
+  `[from outside the crew]` (`mcp_shim.render_event`): the `text` of the kiosk review (Story
+  3.6), and `message.text` of an outsider message delivered under social (Story 3.3, #97).
 
 Exit codes (§5.8). It **never** exits 0 without printing an event:
 
