@@ -2,7 +2,8 @@
 
 Real posts reach a registered agent's websocket through the Story 2.1 adapter, and
 `addressed_to` / `is_direct_address` judge them: `@agents` is a broadcast, `@all` is not on
-Mattermost, `@<dev>.<crew>` stays whole, crew and team tokens match by our own filter, a reply
+Mattermost, `@<dev>.<crew>` stays whole, crew and team tokens match by our own filter (the
+team token only for an author of the agent's own crew, D-103), a reply
 in a thread the agent posted in is addressed to it, and so is a plain DM to it.
 
 The harness (broker, registry, adapter, inbox) is Story 2.1's, from `test_mattermost_adapter`.
@@ -81,13 +82,20 @@ def test_it07_addressing(mattermost: Any, setup: dict[str, str], tmp_path: Path)
             assert judge(m) == (True, True)
             assert m.mentions == [babel_id]  # the server's own marker agrees (R-29)
 
-            # R-17: crew and team tokens, by our filter; never direct address.
+            # R-17: crew and team tokens, by our filter; never direct address. On Mattermost
+            # the team token needs an author of babel's own crew (D-103): Phase 2 has no
+            # membership step, so with `author_crew=None` it fails closed.
             m = await arrives(as_admin_post(mattermost, channel, f"@{crew} crew check")["message"])
             assert judge(m) == (True, False)
             m = await arrives(as_admin_post(mattermost, channel, f"@{TEAM} team check")["message"])
-            assert judge(m) == (True, False)
+            assert judge(m) == (False, False)
+            mine = threads.roots("babel")
+            assert addressed_to(m, reg, mine, author_crew=crew)
+            assert not addressed_to(m, reg, mine, author_crew="othercrew")
+            assert not is_direct_address(m, reg, mine)
             m = await arrives(as_admin_post(mattermost, channel, "@otherteam check")["message"])
             assert judge(m) == (False, False)
+            assert not addressed_to(m, reg, threads.roots("babel"), author_crew=crew)
 
             # R-19: a reply in a thread babel posted in is addressed to it, with no mention.
             root = await d.backend.send("kessel", channel, "kessel starts a thread")

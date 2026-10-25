@@ -2,6 +2,7 @@
 
     default_crew = "oaw"
     broker_timeout_s = 2                 # optional; every daemon->broker call's timeout
+    my_threads_retention_days = 90       # optional; how long a thread stays "mine" (D-104)
 
     [[mattermost]]
     id = "oaw-dev"
@@ -34,6 +35,9 @@ from typing import Any
 
 CONFIG_PATH = Path("/etc/crewchat/servers.toml")
 DEFAULT_BROKER_TIMEOUT_S = 2.0
+# How long a thread the agent posted in keeps counting as "mine" (D-104). Our own setting:
+# it never reads any server's retention policy (CT-01).
+DEFAULT_MY_THREADS_RETENTION_DAYS = 90
 DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 CREW_KEYS = {"needs_list"}
@@ -73,6 +77,7 @@ class ServersConfig:
     default_crew: str
     crews: dict[str, CrewEntry]
     broker_timeout_s: float = DEFAULT_BROKER_TIMEOUT_S
+    my_threads_retention_days: int = DEFAULT_MY_THREADS_RETENTION_DAYS
     discord_screamhole_url: str | None = None
     discord_credential: Path = DISCORD_CREDENTIAL_PATH
     discord_guild_id: str | None = None
@@ -119,6 +124,10 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
         raise ConfigError(f"{source}: broker_timeout_s must be a positive number")
 
+    retention = raw.get("my_threads_retention_days", DEFAULT_MY_THREADS_RETENTION_DAYS)
+    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
+        raise ConfigError(f"{source}: my_threads_retention_days must be an integer of at least 1")
+
     crews_raw = raw.get("crews", {})
     if not isinstance(crews_raw, dict):
         raise ConfigError(f"{source}: crews must be a table")
@@ -134,6 +143,7 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
         default_crew=default_crew,
         crews=crews,
         broker_timeout_s=float(timeout),
+        my_threads_retention_days=retention,
         discord_screamhole_url=screamhole_url,
         discord_credential=Path(credential),
         discord_guild_id=guild_id,

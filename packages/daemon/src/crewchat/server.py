@@ -106,7 +106,12 @@ def build_handlers(config: ServersConfig, registry: Registry) -> dict[str, Handl
             raise OpError("bad_request", "dev_name and session_id are required strings")
         if crew is not None and not isinstance(crew, str):
             raise OpError("bad_request", "crew is a string")
-        reg = await registry.register(dev_name, crew, session_id)
+        dev_team, dev_avatar = args.get("dev_team", ""), args.get("dev_avatar", "")
+        if not isinstance(dev_team, str) or not isinstance(dev_avatar, str):
+            raise OpError("bad_request", "dev_team and dev_avatar are strings")
+        reg = await registry.register(
+            dev_name, crew, session_id, dev_team=dev_team, dev_avatar=dev_avatar
+        )
         return reg.result()
 
     async def health(_args: dict[str, Any]) -> dict[str, Any]:
