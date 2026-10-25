@@ -14,6 +14,15 @@ is no Monitor primitive on Bedrock, so a task's exit is the only wake-up there i
 - **Outsider events.** An event marked `"outsider": true` is printed with its text prefixed
   `[from outside the crew]` (`mcp_shim.render_event`): the `text` of the kiosk review (Story
   3.6), and `message.text` of an outsider message delivered under social (Story 3.3, #97).
+- **Repeats** (#109). Delivery is at least once (§5.8): an overlapping second `subscribe`, a
+  re-arm racing a live one-shot or two sessions with one Dev-Name, gets the held event again.
+  The agent re-arms on every exit, so a repeat that exited 0 would have it react twice. The
+  one-shot keeps the last `SEEN_MAX` `event_id`s it printed for the Dev-Name, in
+  `${XDG_STATE_HOME:-~/.local/state}/crewchat/doorbell-seen/<dev_name>`. On a repeat it prints
+  nothing and subscribes again, within the same timeout. An ID is kept only once its line is
+  flushed, so a crash in between gives a repeat, never a loss. A seen file it can't read is
+  warned about and treated as empty: a repeat is tolerable, a one-shot that stops delivering
+  is not.
 
 Exit codes (§5.8). It **never** exits 0 without printing an event:
 
@@ -29,10 +38,14 @@ Exit codes (§5.8). It **never** exits 0 without printing an event:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
+import re
 import socket
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Mapping
@@ -57,6 +70,15 @@ EXIT_UNREACHABLE = 4
 TIMEOUT_ENV = "CREWCHAT_DOORBELL_TIMEOUT"
 CONNECT_TIMEOUT_S = 10.0
 RECV_CHUNK = 65536
+
+SEEN_MAX = 512  # the `event_id`s kept per Dev-Name (#109)
+SEEN_DIR = Path("crewchat") / "doorbell-seen"
+# A Dev-Name safe as a file name, and an `event_id` safe as one line of the seen file.
+SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+EVENT_ID_RE = re.compile(r"[^\s]{1,512}")
+# How long to pause before subscribing again after the same repeat came back twice running:
+# the daemon acks a repeat as it writes it, so a third in a row is a daemon fault, not a race.
+REPEAT_BACKOFF_S = (0.0, 0.05, 0.2, 1.0)
 
 
 class DoorbellExit(Exception):
@@ -102,6 +124,71 @@ def parse_timeout(environ: Mapping[str, str]) -> float | None:
     if value != value or value < 0 or value == float("inf"):
         raise DoorbellExit(f"{TIMEOUT_ENV}={raw!r} is not a number of seconds >= 0")
     return value or None
+
+
+class SeenSet:
+    """The `event_id`s this Dev-Name's one-shots have printed, newest last, at most `SEEN_MAX`
+    (#109). Shared by every one-shot with that Dev-Name, in any checkout, as the daemon's
+    queue is. Every failure here is a warning: the worst it can cause is a repeat."""
+
+    def __init__(self, path: Path, err: TextIO) -> None:
+        self.path = path
+        self.err = err
+
+    @classmethod
+    def for_dev(cls, environ: Mapping[str, str], dev_name: str, err: TextIO) -> SeenSet | None:
+        """The seen set for `dev_name`, or None (no repeat is dropped) when it has no home."""
+        if not SAFE_NAME_RE.fullmatch(dev_name):
+            print(f"crewchat-doorbell: {dev_name!r} can't name a seen file; repeats pass", file=err)
+            return None
+        state = environ.get("XDG_STATE_HOME", "")
+        if not os.path.isabs(state):  # unset, empty or relative: the XDG default
+            home = environ.get("HOME") or str(Path.home())
+            state = os.path.join(home, ".local", "state")
+        return cls(Path(state) / SEEN_DIR / dev_name, err)
+
+    def _warn(self, what: str, exc: BaseException) -> None:
+        print(f"crewchat-doorbell: seen file {self.path} {what}: {exc}", file=self.err)
+
+    def _read(self) -> list[str]:
+        try:
+            ids = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        except (OSError, UnicodeError) as exc:
+            self._warn("unreadable, treated as empty", exc)
+            return []
+        if not all(EVENT_ID_RE.fullmatch(i) for i in ids):
+            self._warn("corrupt, treated as empty", ValueError("a line is not an event_id"))
+            return []
+        return ids
+
+    def contains(self, event_id: str) -> bool:
+        return event_id in self._read()
+
+    def record(self, event_id: str) -> None:
+        """Keep `event_id`, under an exclusive lock: two one-shots may record at once."""
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock = os.open(
+                self.path.with_name(self.path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600
+            )
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                ids = [*(i for i in self._read() if i != event_id), event_id][-SEEN_MAX:]
+                fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write("".join(i + "\n" for i in ids))
+                    os.replace(tmp, self.path)  # mkstemp made it 0600
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
+            finally:
+                os.close(lock)  # and with it the lock
+        except OSError as exc:
+            self._warn("not written, so this event may come again", exc)
 
 
 def subscribe(sock_path: Path, dev_name: str, timeout_s: float | None) -> dict[str, Any]:
@@ -160,18 +247,51 @@ def run(
     out: TextIO,
     err: TextIO,
 ) -> int:
-    """The one-shot, apart from argv: its exit code. Only an event's path returns 0."""
+    """The one-shot, apart from argv: its exit code. Only an event's path returns 0, and
+    only for an event this Dev-Name hasn't been given before (#109)."""
     try:
         timeout_s = parse_timeout(environ)
         dev_name = read_dev_name(repo_root)
-        event = subscribe(sock_path, dev_name, timeout_s)
+        seen = SeenSet.for_dev(environ, dev_name, err)
+        event, event_id = wait_for_new(sock_path, dev_name, timeout_s, seen)
     except DoorbellExit as exc:
         print(f"crewchat-doorbell: {exc}", file=err)
         return exc.code
     # `json.dumps` without `indent` never emits a newline: the event is exactly one line.
     out.write(json.dumps(render_event(event)) + "\n")
     out.flush()
+    if seen is not None and event_id is not None:
+        seen.record(event_id)  # only now: a crash before this gives a repeat, never a loss
     return EXIT_EVENT
+
+
+def wait_for_new(
+    sock_path: Path, dev_name: str, timeout_s: float | None, seen: SeenSet | None
+) -> tuple[dict[str, Any], str | None]:
+    """The first event whose `event_id` isn't in `seen`, and that ID (None for an event from
+    a daemon that gives none). A repeat's reply was written, so the daemon has acked it, and
+    the next `subscribe`, on a fresh connection, waits for the event after it. One timeout
+    spans them all."""
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    last, again = None, 0
+    while True:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimedOut(f"no new event within {timeout_s:g} s")
+        try:
+            event = subscribe(sock_path, dev_name, remaining)
+        except TimedOut as exc:
+            raise TimedOut(f"no new event within {timeout_s:g} s") from exc
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not EVENT_ID_RE.fullmatch(event_id):
+            return event, None
+        if seen is None or not seen.contains(event_id):
+            return event, event_id
+        again = again + 1 if event_id == last else 0
+        last = event_id
+        pause = REPEAT_BACKOFF_S[min(again, len(REPEAT_BACKOFF_S) - 1)]
+        if pause:
+            time.sleep(pause if remaining is None else min(pause, remaining))
 
 
 def main(argv: list[str] | None = None) -> int:

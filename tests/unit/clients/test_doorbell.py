@@ -9,8 +9,12 @@ from __future__ import annotations
 import io
 import json
 import socket
+import stat
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -102,8 +106,25 @@ def repo(tmp_path: Path) -> Path:
 
 def ring(repo: Path, sock: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
-    code = run(repo, sock, env or {}, out, err)
+    environ = {"XDG_STATE_HOME": str(repo / "state"), **(env or {})}  # never the real home
+    code = run(repo, sock, environ, out, err)
     return code, out.getvalue(), err.getvalue()
+
+
+def in_turn(*events: dict[str, Any]) -> Responder:
+    """Answers each `subscribe` with the next event, then holds the connection open."""
+    pending = list(events)
+    return lambda frame: (
+        {"id": frame["id"], "ok": True, "result": pending.pop(0)} if pending else None
+    )
+
+
+def seen_file(repo: Path, dev: str = DEV) -> Path:
+    return repo / "state" / "crewchat" / "doorbell-seen" / dev
+
+
+def with_id(event_id: str) -> dict[str, Any]:
+    return {**EVENT, "event_id": event_id}
 
 
 def test_exit_0_on_event_prints_json(repo: Path, short_dir: Path) -> None:
@@ -241,3 +262,127 @@ def test_console_script_is_declared() -> None:
     pyproject = Path(__file__).parents[3] / "packages" / "clients" / "pyproject.toml"
     scripts = tomllib.loads(pyproject.read_text())["project"]["scripts"]
     assert scripts["crewchat-doorbell"] == "crewchat_clients.doorbell:main"
+
+
+# -- repeats (#109) -------------------------------------------------------------------------
+def test_repeat_is_dropped_and_next_event_exits_0(repo: Path, short_dir: Path) -> None:
+    """A repeat of a printed event prints nothing: the one-shot subscribes again and exits 0
+    on the next new event."""
+    fake = FakeDaemon(
+        short_dir / "d.sock", in_turn(with_id("mm:A"), with_id("mm:A"), with_id("mm:B"))
+    )
+    try:
+        first = ring(repo, fake.path)
+        second = ring(repo, fake.path)
+    finally:
+        fake.close()
+    assert first[0] == EXIT_EVENT and json.loads(first[1])["event_id"] == "mm:A"
+    assert second[0] == EXIT_EVENT, second[2]
+    assert second[1].count("\n") == 1 and json.loads(second[1])["event_id"] == "mm:B"
+    assert len(fake.frames) == 3  # the second one-shot subscribed twice
+    assert seen_file(repo).read_text().splitlines() == ["mm:A", "mm:B"]
+
+
+def test_seen_set_is_per_dev_name_not_checkout(tmp_path: Path, short_dir: Path) -> None:
+    """Two checkouts with one Dev-Name share the seen set, as they share the daemon's queue."""
+    state = str(tmp_path / "state")
+    repos = []
+    for name in ("one", "two"):
+        root = tmp_path / name / ".claude"
+        root.mkdir(parents=True)
+        (root / "agent-identity.json").write_text(json.dumps({"dev_name": DEV}))
+        repos.append(root.parent)
+    fake = FakeDaemon(
+        short_dir / "d.sock", in_turn(with_id("mm:A"), with_id("mm:A"), with_id("mm:B"))
+    )
+    try:
+        ring(repos[0], fake.path, {"XDG_STATE_HOME": state})
+        code, out, _ = ring(repos[1], fake.path, {"XDG_STATE_HOME": state})
+    finally:
+        fake.close()
+    assert code == EXIT_EVENT and json.loads(out)["event_id"] == "mm:B"
+
+
+def test_id_recorded_only_after_flush(repo: Path, short_dir: Path) -> None:
+    """A one-shot that dies writing its line keeps no ID: the event comes again, not lost."""
+
+    class Broken(io.StringIO):
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout closed")
+
+    fake = FakeDaemon(short_dir / "d.sock", ok(with_id("mm:A")))
+    env = {"XDG_STATE_HOME": str(repo / "state")}
+    try:
+        with pytest.raises(BrokenPipeError):
+            run(repo, fake.path, env, Broken(), io.StringIO())
+    finally:
+        fake.close()
+    assert not seen_file(repo).exists()
+
+
+def test_concurrent_one_shots_record_both(tmp_path: Path) -> None:
+    """Two processes recording at once lose nothing: `record` holds an exclusive lock."""
+    path = tmp_path / "seen"
+    script = (
+        "import io, sys; from pathlib import Path;"
+        "from crewchat_clients.doorbell import SeenSet;"
+        "s = SeenSet(Path(sys.argv[1]), io.StringIO());"
+        "[s.record(f'{sys.argv[2]}:{n}') for n in range(150)]"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", script, str(path), tag]) for tag in ("x", "y")]
+    assert [p.wait(60) for p in procs] == [0, 0]
+    ids = path.read_text().splitlines()
+    assert sorted(ids) == sorted([f"x:{n}" for n in range(150)] + [f"y:{n}" for n in range(150)])
+
+
+def test_seen_set_capped_at_512(tmp_path: Path) -> None:
+    seen = doorbell.SeenSet(tmp_path / "seen", io.StringIO())
+    for n in range(600):
+        seen.record(f"mm:{n}")
+    ids = (tmp_path / "seen").read_text().splitlines()
+    assert ids == [f"mm:{n}" for n in range(88, 600)]
+    assert stat.S_IMODE((tmp_path / "seen").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "garbage", [b"\xff\xfe\x00", b"mm:A\nnot an id\n"], ids=["binary", "spaces"]
+)
+def test_corrupt_seen_file_warns_and_delivers(repo: Path, short_dir: Path, garbage: bytes) -> None:
+    """A seen file that can't be trusted is empty, with a warning. It never stops delivery."""
+    seen_file(repo).parent.mkdir(parents=True)
+    seen_file(repo).write_bytes(garbage)
+    fake = FakeDaemon(short_dir / "d.sock", ok(with_id("mm:A")))
+    try:
+        code, out, err = ring(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_EVENT and json.loads(out)["event_id"] == "mm:A"
+    assert "treated as empty" in err
+    assert seen_file(repo).read_text() == "mm:A\n"
+
+
+def test_timeout_spans_resubscribes(repo: Path, short_dir: Path) -> None:
+    """Nothing but repeats: the one timeout ends the whole run, not each subscribe."""
+    seen_file(repo).parent.mkdir(parents=True)
+    seen_file(repo).write_text("mm:A\n")
+    fake = FakeDaemon(short_dir / "d.sock", ok(with_id("mm:A")))
+    start = time.monotonic()
+    try:
+        code, out, err = ring(repo, fake.path, {"CREWCHAT_DOORBELL_TIMEOUT": "1"})
+    finally:
+        fake.close()
+    assert code == EXIT_TIMEOUT, err
+    assert out == ""
+    assert time.monotonic() - start < 2.5
+    assert len(fake.frames) > 1
+
+
+def test_event_without_id_is_printed_not_recorded(repo: Path, short_dir: Path) -> None:
+    """An older daemon's event, with no `event_id`, is delivered as before."""
+    fake = FakeDaemon(short_dir / "d.sock", ok(EVENT))
+    try:
+        code, out, _ = ring(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_EVENT and json.loads(out) == EVENT
+    assert not seen_file(repo).exists()

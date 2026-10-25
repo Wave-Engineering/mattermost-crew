@@ -686,7 +686,13 @@ class Daemon:
         """One run of the real `crewchat-doorbell`, as the agent's background task runs it,
         waiting at most `wait_s`: its exit code and its stdout lines."""
         assert DOORBELL.exists(), f"{DOORBELL} is not installed: run uv sync"
-        env = {**os.environ, "CREWCHAT_DOORBELL_TIMEOUT": f"{wait_s:g}"}
+        env = {
+            **os.environ,
+            "CREWCHAT_DOORBELL_TIMEOUT": f"{wait_s:g}",
+            # The agents' seen sets (#109): the world's, so they outlive a daemon restart as an
+            # agent's do, and never the runner's home.
+            "XDG_STATE_HOME": str(self.world.root / "agent-state"),
+        }
         proc = await asyncio.create_subprocess_exec(
             str(DOORBELL),
             "--socket",

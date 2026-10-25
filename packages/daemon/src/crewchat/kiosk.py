@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -107,6 +108,8 @@ REVIEW_TEXT = (
 REVIEW_FIELDS = ("ts", "thread", "asker_id", "question", "answer")
 # One review event's entries, encoded: well inside the shim's 1 MiB reply frame.
 REVIEW_MAX_BYTES = 256 * 1024
+# A transcript's head (#110): this many hex digits of the digest of its first record.
+HEAD_HEX = 16
 Deliver = Callable[[str, DoorbellEvent], bool]
 # A transcript line read for review: its entry (None when malformed), and the offset past it.
 ReviewLine = tuple[dict[str, Any] | None, int]
@@ -353,6 +356,9 @@ class Kiosk:
         # (dev, server) -> the transcript offset already queued for review but maybe not
         # yet handed over (#99). In memory only: after a restart the cursor on disk rules.
         self._queued: dict[tuple[str, str], int] = {}
+        # (dev, server) -> the head of the transcript last reviewed (#110). A handover of a
+        # review from an older head leaves the cursor alone.
+        self._heads: dict[tuple[str, str], str] = {}
 
     # -- lifecycle --------------------------------------------------------------------------
     def start(self) -> None:
@@ -442,39 +448,62 @@ class Kiosk:
         base = f"{dev_name}-{server_id}"
         return self.kiosk_dir / f"{base}.jsonl", self.kiosk_dir / f"{base}.cursor"
 
-    def read_cursor(self, dev_name: str, server_id: str) -> int:
-        """The byte offset reviewed up to: 0 when there is no cursor, or it is unreadable."""
+    def read_cursor(self, dev_name: str, server_id: str) -> tuple[int, str | None]:
+        """The byte offset reviewed up to, and the head of the transcript it is an offset into
+        (#110): `(0, None)` when there is no cursor, or it is unreadable. A cursor written
+        before #110 has no head."""
         _, path = self.review_paths(dev_name, server_id)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return 0
+            return 0, None
         except (OSError, ValueError) as exc:
             log.error("kiosk review cursor %s unreadable, reviewing from the start: %s", path, exc)
-            return 0
+            return 0, None
         offset = raw.get("offset") if isinstance(raw, dict) else None
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             log.error("kiosk review cursor %s holds no offset, reviewing from the start", path)
-            return 0
-        return offset
+            return 0, None
+        head = raw.get("head")
+        return offset, head if isinstance(head, str) and head else None
 
-    def _write_cursor(self, path: Path, offset: int) -> None:
+    def _write_cursor(self, path: Path, offset: int, head: str | None) -> None:
         path.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
-        write_private_json(path, {"offset": offset})
+        state: dict[str, Any] = {"offset": offset}
+        if head is not None:
+            state["head"] = head
+        write_private_json(path, state)
 
     @staticmethod
-    def _new_lines(transcript: Path, offset: int) -> tuple[list[ReviewLine], int]:
+    def _head(first_line: bytes) -> str | None:
+        """A transcript's generation (#110): a digest of its first record, which names the
+        answer's own post, so no two transcripts share one. None until that line is complete:
+        a head taken from a line mid-append would change once it was, and reset the review."""
+        if not first_line.endswith(b"\n"):
+            return None
+        return hashlib.sha256(first_line).hexdigest()[:HEAD_HEX]
+
+    @staticmethod
+    def _new_lines(
+        transcript: Path, offset: int, cursor_head: str | None
+    ) -> tuple[list[ReviewLine], int, str | None]:
         """Each complete transcript line past `offset`, parsed (None when malformed), with the
-        offset just past it; and the offset reading started from (0 for a replaced file)."""
+        offset just past it; the offset reading started from; and the transcript's head. A
+        replaced transcript is read from 0: one shorter than the cursor, or one whose head
+        isn't the cursor's (#110), though it may have grown past the old offset."""
         try:
             with transcript.open("rb") as fh:
+                head = Kiosk._head(fh.readline())
                 if os.fstat(fh.fileno()).st_size < offset:
                     log.warning("kiosk transcript %s is shorter than its cursor", transcript)
+                    offset = 0
+                elif head is not None and cursor_head is not None and head != cursor_head:
+                    log.warning("kiosk transcript %s was replaced since its cursor", transcript)
                     offset = 0
                 fh.seek(offset)
                 data = fh.read()
         except FileNotFoundError:
-            return [], offset
+            return [], offset, None
         complete = data[: data.rfind(b"\n") + 1]  # a record mid-append waits for next time
         lines: list[ReviewLine] = []
         pos = offset
@@ -489,7 +518,7 @@ class Kiosk:
                 lines.append((None, pos))
                 continue
             lines.append(({k: rec[k] for k in REVIEW_FIELDS if k in rec}, pos))
-        return lines, offset
+        return lines, offset, head
 
     def review_since_cursor(self, dev_name: str, server_id: str) -> int:
         """Enqueue `dev_name`'s kiosk exchanges on `server_id` since that server's cursor (or
@@ -501,9 +530,15 @@ class Kiosk:
             return 0
         transcript, cursor = self.review_paths(dev_name, server_id)
         key = (dev_name, server_id)
-        on_disk = self.read_cursor(dev_name, server_id)
+        on_disk, cursor_head = self.read_cursor(dev_name, server_id)
+        # What is queued is from the generation last seen; the cursor's head may be older.
+        cursor_head = self._heads.get(key) or cursor_head
         offset = max(on_disk, self._queued.get(key, on_disk))
-        lines, start = self._new_lines(transcript, offset)
+        lines, start, head = self._new_lines(transcript, offset, cursor_head)
+        if start != offset and key in self._queued:
+            del self._queued[key]  # an old transcript's offset: its handover won't write (below)
+        if head is not None:
+            self._heads[key] = head
         batches: list[tuple[list[dict[str, Any]], int]] = []
         chunk: list[dict[str, Any]] = []
         size, end = 0, start
@@ -524,7 +559,7 @@ class Kiosk:
                 # Nothing but malformed lines: move past them now, unless a review is still
                 # waiting, whose handover must not be overtaken.
                 if upto != offset and key not in self._queued:
-                    self._write_cursor(cursor, upto)
+                    self._write_cursor(cursor, upto, head)
                 continue
             payload = {
                 "type": REVIEW_TYPE,
@@ -538,8 +573,10 @@ class Kiosk:
                 backend,
                 payload,
                 ts=self.clock(),
-                on_handover=partial(self._handed_over, key, cursor, upto),
-                nonce=f"{REVIEW_TYPE}:{upto}",
+                on_handover=partial(self._handed_over, key, cursor, upto, head),
+                # The transcript's head as well as the offset: a replaced transcript starts
+                # its offsets again, and a repeat ID is dropped by the one-shot (#109, #110).
+                nonce=f"{REVIEW_TYPE}:{head}:{upto}",
             )
             before = self._queued.get(key)
             self._queued[key] = upto  # before `deliver`: a handover may run from inside it
@@ -555,9 +592,13 @@ class Kiosk:
             log.info("kiosk review: %d exchanges for %s on %s", delivered, dev_name, server_id)
         return delivered
 
-    def _handed_over(self, key: tuple[str, str], cursor: Path, upto: int) -> None:
-        """A review event reached the agent: its cursor moves past the event's entries."""
-        self._write_cursor(cursor, upto)
+    def _handed_over(self, key: tuple[str, str], cursor: Path, upto: int, head: str | None) -> None:
+        """A review event reached the agent: its cursor moves past the event's entries. A
+        review of a transcript since replaced leaves the cursor alone: its offset means
+        nothing in the new one (#110)."""
+        if self._heads.get(key, head) != head:
+            return
+        self._write_cursor(cursor, upto, head)
         if self._queued.get(key) == upto:
             del self._queued[key]  # nothing queued beyond it
 

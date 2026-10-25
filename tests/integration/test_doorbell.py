@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -120,6 +121,8 @@ class Rig:
             str(repo),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Its seen set (#109) under the rig, not in the runner's home.
+            env={**os.environ, "XDG_STATE_HOME": str(self.root / "agent-state")},
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)

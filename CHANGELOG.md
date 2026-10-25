@@ -6,6 +6,26 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+## [0.2.1] — 2026-10-25
+
+What K-2 (the kit's doorbell wiring) pins.
+
+### Fixed
+
+- `crewchat-doorbell` never exits 0 for an event it has already printed for the Dev-Name
+  (#109). Delivery is at least once, so an overlapping second `subscribe` gets the held event
+  again, and an agent re-arming on every exit would react to it twice. The one-shot keeps the
+  last 512 `event_id`s it printed, per Dev-Name, in
+  `${XDG_STATE_HOME:-~/.local/state}/crewchat/doorbell-seen/`, written under a lock and only
+  after the line is flushed. On a repeat it subscribes again within the same timeout. A seen
+  file it can't read is treated as empty, with a warning. Exit codes are unchanged.
+- A replaced kiosk transcript is reviewed from its start, under a new `event_id` (#110). The
+  review cursor now carries the transcript's head, a digest of its first record, beside the
+  offset. Before, a replacement was caught only when it was shorter than the cursor; one that
+  had grown past the old offset had its head skipped. And a review's `event_id` was its offset
+  alone, so a new transcript's review could repeat an old one's, which the one-shot would now
+  drop. A cursor written by 0.2.0 still works.
+
 ## [0.2.0] — 2026-10-25
 
 Phase 3: inbound defense, doorbell and kiosk (Plan #28). This release is IP-3, the base for
