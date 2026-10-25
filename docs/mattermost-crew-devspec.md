@@ -182,7 +182,7 @@ Requirements follow the **EARS** notation:
 | R-25 | Ubiquitous | An agent shall respond to a message from a bot account only in a conversation it has opted into, and only to an inline mention. It shall drop anything past about 20 messages from bot accounts per conversation in a sliding window. Human messages shall be admitted when addressed per R-16 to R-19, which includes any direct message to the agent. A conversation is opted into when the agent started it, posted in it, or was mentioned into it, and every DM is opted into. A mention is `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token. [D-047; amended by D-075] |
 | R-31 | Event-driven | When social is off and a message arrives from outside the crew, the daemon shall route it to the expert agent's kiosk session, started on the first such message, and never to the working agent. The kiosk shall have no tools. One kiosk session per expert per server shall serve every outsider on that server, and its transcript shall be kept. [D-067, D-087] |
 | R-32 | Ubiquitous | The kiosk shall be seeded only from the `## Kiosk` section of the expert's reseed seed (`.claude/reseed-revive.md`), which code extracts mechanically (the shim, running as the agent's user, extracts it and pushes only that section to the daemon); the kiosk shall never see the rest of the file. If the section is missing or empty, the kiosk shall say it has nothing to offer yet. The kiosk shall refresh on each reseed. [D-072, superseding D-068] |
-| R-33 | Event-driven | When the human partner engages social, the daemon shall deliver the kiosk transcript since the last review to the working agent, marked as outsider content. The agent's first action shall be to review it and raise anything notable to its human partner. The review cursor shall then advance. [D-069] |
+| R-33 | Event-driven | When the human partner engages social, the daemon shall deliver the kiosk transcript since the last review to the working agent, marked as outsider content. The agent's first action shall be to review it and raise anything notable to its human partner. The review cursor shall advance once the review is handed over. [D-069] |
 | R-34 | Optional | Where the crew's human partner turns the kiosk off, outsider messages shall be dropped. The kiosk shall be on by default. [D-070] |
 
 ### 3.6 Doorbell
@@ -191,7 +191,7 @@ Requirements follow the **EARS** notation:
 |----|------|-------------|
 | R-26 | Ubiquitous | One doorbell core shall merge Discord, Mattermost and squawkie events into one stream, exiting once per event. [D-048] |
 | R-27 | Unwanted | If a backend is unreachable or unauthenticated, the doorbell shall report that backend as down, loudly, and keep delivering from the others. [D-049] |
-| R-28 | Event-driven | When a backend stream connects or reconnects, the doorbell shall deliver the events missed since its saved cursor, exactly once. [D-050] |
+| R-28 | Event-driven | When a backend stream connects or reconnects, the doorbell shall deliver the events missed since its saved cursor: it queues each exactly once and hands it over at least once. [D-050] |
 | R-29 | Ubiquitous | On Mattermost, the doorbell shall use the server's own mention markers, not text matching. [D-051] |
 
 ---
@@ -255,7 +255,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 1. An adapter loses its stream.
 2. The doorbell exits with a `backend.down` event and keeps the other backends flowing (R-27).
-3. On reconnect, the adapter replays from its saved cursor, exactly once (R-28).
+3. On reconnect, the adapter replays from its saved cursor. It queues each missed event exactly once and hands it over at least once (R-28).
 
 ### 4.8 Daily Upkeep
 
@@ -416,7 +416,7 @@ The daemon owns rotation (§4.8). The broker's daily job only deactivates bot ac
 - The daemon keeps one queue per registered agent, fed by three adapters: Mattermost (websocket), Discord (scream-hole) and squawkie (SSE, filtered to the squawk IDs the shim pushed with `squawk_ids`, the same predicate as `sqtk-doorbell.sh`).
 - Each event passes the filters (§5.9) and is queued.
 - `subscribe` returns the first queued event; the thin one-shot prints it as JSON and exits 0.
-- **Delivery is at least once** (#99). `subscribe` holds the event it takes, and the cursor moves past it only once the reply frame has been written. A reply that wasn't written (a hang-up, a timeout, a failed write) leaves the event held, and the next `subscribe` returns it again. So does a second `subscribe` for the same agent that overlaps the first. Every reply carries a stable `event_id`: `<backend>:<first ID>`, or an ID made once for an event without one. The agent drops a repeat by it.
+- **Delivery is at least once** (#99). `subscribe` holds the event it takes, and the cursor moves past it only once the reply frame has been written. A reply that wasn't written (a hang-up, a timeout, a failed write) leaves the event held, and the next `subscribe` returns it again. So does a second `subscribe` for the same agent that overlaps the first. Every reply carries a stable `event_id`: `<backend>:<first ID>`, or an ID made once for an event without one. The agent drops a repeat by it. "Written" means `drain()` returned, which proves only that the reply reached the socket's buffer: a one-shot whose `CREWCHAT_DOORBELL_TIMEOUT` fires between the daemon's write and its own read can still lose that event. The default timeout is 0, which waits forever.
 - **A client never half-closes its connection** (`SHUT_WR`). The daemon reads end-of-file on a waiting `subscribe` as a hang-up and cancels it, so a client that half-closes after sending its request never gets an event.
 - Cursors are kept per agent per backend under `/var/lib/crewchat/cursors/`.
 - A backend outage enqueues `{"type":"backend.down","backend":...}` (R-27). A Mattermost reconnect whose replay fails is an outage too, with the failing call in its `reason`. Its connection yields nothing and the position stays put, so the next replay delivers the gap (#99). A team or channel that Mattermost answers 403 or 404 for during the replay, with its own error `id`, is not an outage. A scope the account can't read yet is skipped with a warning naming it, and the replay goes on with the rest. Posts made there before the account can read it are not replayed. A 403 or 404 with no error `id` is a proxy's (Traefik answers 404 when Mattermost is gone), so it is an outage. When every team, or every channel, is unreadable, the replay is retried once, after a pause for a new account's membership to settle. If it is still unreadable, that is an outage: `every replay scope unreadable` (#103).
@@ -490,7 +490,7 @@ Keys are `<forge-host>/<org>`, or an absolute repo path when there is no forge. 
 - **Output:** @mentions are stripped from the kiosk's answer before posting. The post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
 - **Mechanism:** open. Spike 1.2 decides between `claude -p` with tools and MCP disabled, and a direct model API call with no tool definitions (D-071). A 2026-10-23 test of `claude -p --resume --fork-session --tools ""` hung to its timeout.
 - **If the CLI runner is chosen,** it runs as its own unprivileged OS user, `crewkiosk`, not as `crewchat`, which holds every token. It has an empty HOME and an empty working directory, and runs `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. `--restricted` ignores user, project and local settings, so no user, project or local settings, hooks or `CLAUDE.md` load; the empty working directory also means no project `CLAUDE.md`. **Managed settings and `--settings` still apply** under `--restricted`, so the kiosk host must have no managed settings configured, and spike 1.2 plants a hook in the managed-settings location too. The spike must prove, from the CLI's own transcript or debug output and not from our argv, that none of them loaded. `crewkiosk` holds **no chat or broker credential**. It does need a model credential to run at all; its path and owner are a named output of spike 1.2.
-- **Review:** when the switch moves to social on a server, the daemon enqueues a `kiosk.review` event for the working agent. It carries **only that server's** transcript lines since that server's cursor (`/var/lib/crewchat/kiosk/<dev-name>-<server_id>.cursor`), marked as outsider content, and that cursor then advances (R-33). The transcript is kept per server: `/var/lib/crewchat/kiosk/<dev-name>-<server_id>.jsonl`.
+- **Review:** when the switch moves to social on a server, the daemon enqueues a `kiosk.review` event for the working agent. It carries **only that server's** transcript lines since that server's cursor (`/var/lib/crewchat/kiosk/<dev-name>-<server_id>.cursor`), marked as outsider content. That cursor advances once the review is handed over to the agent, not when it is enqueued, so a restart before then delivers it again (R-33). An agent that registers while social is already on, after a daemon start or mid-social, gets its review then (#99). The transcript is kept per server: `/var/lib/crewchat/kiosk/<dev-name>-<server_id>.jsonl`.
 - **Off:** with the kiosk off, outsider messages are dropped (R-34).
 
 ### 5.A Deliverables Manifest
@@ -606,7 +606,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-10 | daemon filters | Loop guard on messages from bot accounts: opt-in (started, posted in, mentioned into, or a DM), mention required (`@<dev>`, `@<dev>.<crew>`, `@agents`, crew or team token), sliding-window drop; an addressed human message is admitted without a mention | R-25 |
 | IT-11 | doorbell | Events from all three adapters merge, one exit per event | R-26 |
 | IT-12 | doorbell | One backend down: a `backend.down` event, and the others keep flowing | R-27 |
-| IT-13 | doorbell | Reconnect replays from the cursor exactly once | R-28 |
+| IT-13 | doorbell | Reconnect replays from the cursor, queuing each missed event exactly once | R-28 |
 | IT-14 | Mattermost adapter | Server mention markers are used; echo is filtered by user ID | R-04, R-29 |
 | IT-15 | Discord adapter | Today's `disc_*` behaviours, through `chat_*` and through each of the nine deprecated aliases, through the shim against the scream-hole and Discord REST fakes: `disc_send` (by ID, `name` and `#name`, with an attachment and an embed), `disc_read` (with `limit`, and with `message_id` returning one message), `disc_list`, `disc_resolve`, `disc_create_channel`, `disc_create_thread` (with an initial message), `disc_thread`, `disc_dm` and `disc_react`. Each forwards and logs one deprecation warning | R-15 |
 | IT-16 | daemon | One contract across N configured Mattermost servers plus Discord: one agent registered on **two** Mattermost servers, each with its own (crew, server) broker and token, sends and receives on both | R-09, R-10 |
@@ -615,7 +615,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-19 | Mattermost API | Each bot account's avatar is set (`GET /users/{id}/image`) and the bot account is listed by `GET /users/autocomplete` | R-01 |
 | IT-20 | runbook | The install and verify commands, **extracted from `docs/runbook.md`**, run in a fresh container | R-06, R-08 |
 | IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply. A crewmate's post in the same thread never reaches the kiosk's prompt. The kiosk's answer carries `props.crew_kiosk=1` and no @mentions, and is treated as outsider content by `admit`. Two crewmates' kiosks in one thread produce no second kiosk answer. An outsider's `@agents` broadcast reaches no kiosk, and an outsider past the per-hour kiosk rate limit is dropped | R-31, R-32 |
-| IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances | R-33 |
+| IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances once it is handed over; an agent registering while social is on gets it then | R-33 |
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
 | IT-24 | daemon ↔ Mattermost | An agent posts a new root through the daemon's `send`, the daemon restarts, and a human's reply in that thread is addressed to the agent (`addressed_to` true through the persisted `MyThreads`) (D-104) | R-17, R-19 |
 | IT-25 | daemon ↔ scream-hole | With the scream-hole fake failing its health check, `chat_read` and `disc_read` on Discord answer `unavailable: scream-hole unhealthy`, and the Discord REST fake sees no read; `chat_send` still posts, through the direct fallback. Once the fake is healthy again, the next read is served through scream-hole (D-106) | R-15 |
@@ -1642,7 +1642,7 @@ When the human partner engages social, the working agent reviews what the kiosk 
 **Implementation Steps:**
 
 1. In `crewchat/filters.py`, detect a mode transition to `social` in `SwitchCache`, comparing successive `effective_mode` values per (crew, server).
-2. On that transition on a server, `kiosk.review_since_cursor(dev, server_id)` reads **only that server's** transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, from the offset in `<dev>-<server_id>.cursor`. It enqueues one `{"type":"kiosk.review","outsider":true,"server":...,"entries":[...]}` event for the working agent, then advances that cursor (R-33). Other servers' transcripts and cursors are untouched.
+2. On that transition on a server, `kiosk.review_since_cursor(dev, server_id)` reads **only that server's** transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, from the offset in `<dev>-<server_id>.cursor`. It enqueues one `{"type":"kiosk.review","outsider":true,"server":...,"entries":[...]}` event for the working agent, and advances that cursor only once the event is handed over (R-33). Other servers' transcripts and cursors are untouched. When an agent registers, the same review runs on each server where its crew's switch is already social (#99).
 3. The event's text, as rendered by the shim, opens with `[from outside the crew] Kiosk review: review these exchanges and raise anything notable to your human partner.`
 
 **Test Procedures:**
@@ -1875,7 +1875,7 @@ release PR, whose own CI re-runs every item on the final `main`.
 | R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pass |
 | R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pass |
 | R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pass |
-| R-28 | Cursor replay exactly once | Story 3.2 | IT-13 | integration test | Pass |
+| R-28 | Cursor replay: queued exactly once, handed over at least once | Story 3.2 | IT-13 | integration test | Pass |
 | R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
 | R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
 | R-31 | Outsiders answered by a tool-less kiosk while social is off | Story 3.5 | IT-21, E2E-02 | integration / e2e test | Pass |
