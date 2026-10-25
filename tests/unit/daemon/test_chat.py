@@ -64,6 +64,7 @@ class FakeBackend:
         return [self._msg(channel, "old")]
 
     async def thread(self, dev_name: str, post_id: str) -> list[InboundMessage]:
+        self._check()
         self.calls.append(("thread", dev_name, post_id))
         return [self._msg("c", "root"), self._msg("c", "reply", post_id)]
 
@@ -72,6 +73,7 @@ class FakeBackend:
         return self._msg("dm-chan", text)
 
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
+        self._check()
         self.calls.append(("react", dev_name, post_id, emoji))
 
     async def stream(self, dev_name: str) -> AsyncIterator[InboundMessage]:
@@ -440,6 +442,21 @@ def test_unavailable_and_not_found_map(daemon: Any) -> None:
     h.discord.fail = NotFound("message 1")
     got = h.call("send", dev_name="babel", backend="discord", to="c", text="x")
     assert got["error"].startswith("not_found")
+
+
+def test_chat_ops_map_bad_id_to_bad_request(daemon: Any) -> None:
+    """An adapter's ID-shape refusal (#62) reaches the agent as `bad_request`, on every op that
+    takes an ID that goes into a path."""
+    asyncio.run(daemon.registry.register("babel", None, "s1"))
+    h = Harness(daemon)
+    h.discord.fail = ValueError("thread must be a Discord ID (digits only), not '1/../x'")
+    for op, args in (
+        ("send", {"to": "c", "text": "x", "thread": "1/../x"}),
+        ("react", {"post_id": "1/../x", "emoji": "👍"}),
+        ("thread", {"post_id": "1/../x"}),
+    ):
+        got = h.call(op, dev_name="babel", backend="discord", **args)
+        assert got["ok"] is False and got["error"].startswith("bad_request"), op
 
 
 # -- Story 2.4c: thread_backend (R-12) -------------------------------------------------------

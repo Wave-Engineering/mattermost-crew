@@ -61,7 +61,7 @@ MAX_SQUAWK_IDS = 1000
 MATTERMOST_PREFIX = "mattermost:"
 DISCORD = "discord"
 BACKEND_NAME_RE = re.compile(r"^(discord|mattermost:[a-z0-9._-]+)$")
-DISCORD_ID_RE = re.compile(r"^\d{17,20}$")  # a snowflake (D-106)
+DISCORD_ID_RE = re.compile(r"^[0-9]{17,20}$")  # a snowflake (D-106)
 MATTERMOST_ID_RE = re.compile(r"^[a-z0-9]{26}$")  # Mattermost's 26-character base32 id
 
 log = logging.getLogger("crewchat.chat")
@@ -77,7 +77,7 @@ class AgentContext:
 
 def check_backend_name(name: str) -> str:
     """`name` in the one form (§5.4), or `bad_request` saying why not."""
-    if BACKEND_NAME_RE.match(name):
+    if BACKEND_NAME_RE.fullmatch(name):
         return name
     if name.startswith("discord:"):
         raise OpError(
@@ -92,9 +92,9 @@ def check_backend_name(name: str) -> str:
 
 def post_kind(post_id: str) -> str:
     """`discord` or `mattermost` by the ID's shape (D-106); any other shape is `bad_request`."""
-    if DISCORD_ID_RE.match(post_id):
+    if DISCORD_ID_RE.fullmatch(post_id):
         return DISCORD
-    if MATTERMOST_ID_RE.match(post_id):
+    if MATTERMOST_ID_RE.fullmatch(post_id):
         return "mattermost"
     raise OpError(
         "bad_request",

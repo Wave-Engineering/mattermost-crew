@@ -18,6 +18,7 @@ from crewchat.tokens import Unauthorized
 
 T = TypeVar("T")
 SID = "dev"
+CHAN = "c" * 26  # a Mattermost-shaped channel ID: the adapter checks the shape (#62)
 
 
 class Tokens:
@@ -90,14 +91,14 @@ def test_send_sets_crew_proto_prop(mm: Any, run: Any) -> None:
     tokens = Tokens(mm)
     me = tokens.add("babel.oaw")
     b = backend(mm, tokens)
-    msg = run(b.send("babel.oaw", "chan", "hello"))
+    msg = run(b.send("babel.oaw", CHAN, "hello"))
     stored = mm.posts[msg.post_id]
     assert stored["props"] == {"crew_proto": PROTO} == {"crew_proto": 1}
     assert msg.proto == 1 and msg.author_id == me and msg.author_name == "babel.oaw"
-    assert msg.backend == "mattermost:dev" and msg.channel == "chan" and msg.text == "hello"
+    assert msg.backend == "mattermost:dev" and msg.channel == CHAN and msg.text == "hello"
     assert msg.is_bot is True and msg.kiosk is False
 
-    reply = run(b.send("babel.oaw", "chan", "again", thread=msg.post_id))
+    reply = run(b.send("babel.oaw", CHAN, "again", thread=msg.post_id))
     assert mm.posts[reply.post_id]["root_id"] == msg.post_id == reply.root_id
     assert mm.posts[reply.post_id]["props"]["crew_proto"] == 1
 
@@ -106,22 +107,22 @@ def test_inbound_proto_defaults_zero(mm: Any, run: Any) -> None:
     tokens = Tokens(mm)
     tokens.add("babel.oaw")
     human = mm.add_user("bj", is_bot=False)
-    old = mm.add_post(human, "chan", "an older post")
-    marked = mm.add_post(human, "chan", "a marked post", {"crew_proto": 1})
-    kiosk = mm.add_post(human, "chan", "a kiosk answer", {"crew_proto": 1, "crew_kiosk": 1})
+    old = mm.add_post(human, CHAN, "an older post")
+    marked = mm.add_post(human, CHAN, "a marked post", {"crew_proto": 1})
+    kiosk = mm.add_post(human, CHAN, "a kiosk answer", {"crew_proto": 1, "crew_kiosk": 1})
     b = backend(mm, tokens)
-    msgs = {m.post_id: m for m in run(b.read("babel.oaw", "chan"))}
+    msgs = {m.post_id: m for m in run(b.read("babel.oaw", CHAN))}
     assert msgs[old["id"]].proto == 0
     assert msgs[marked["id"]].proto == 1
     assert msgs[kiosk["id"]].kiosk is True and msgs[marked["id"]].kiosk is False
     assert all(m.is_bot is False and m.author_name == "bj" for m in msgs.values())
     # Oldest first.
-    assert [m.post_id for m in run(b.read("babel.oaw", "chan"))] == [
+    assert [m.post_id for m in run(b.read("babel.oaw", CHAN))] == [
         old["id"],
         marked["id"],
         kiosk["id"],
     ]
-    assert len(run(b.read("babel.oaw", "chan", limit=2))) == 2
+    assert len(run(b.read("babel.oaw", CHAN, limit=2))) == 2
 
 
 @pytest.mark.parametrize(
@@ -148,8 +149,8 @@ def test_thread_dm_and_react(mm: Any, run: Any) -> None:
     other = mm.add_user("kessel.oaw", is_bot=True)
     b = backend(mm, tokens)
 
-    root = mm.add_post(other, "chan", "root")
-    run(b.send("babel.oaw", "chan", "reply", thread=root["id"]))
+    root = mm.add_post(other, CHAN, "root")
+    run(b.send("babel.oaw", CHAN, "reply", thread=root["id"]))
     mm.add_post(other, "elsewhere", "unrelated")
     thread = run(b.thread("babel.oaw", root["id"]))
     assert [m.text for m in thread] == ["root", "reply"]
@@ -173,7 +174,7 @@ def test_two_agents_post_as_two_authors(mm: Any, run: Any) -> None:
 
     async def scenario() -> tuple[InboundMessage, InboundMessage]:
         return await asyncio.gather(
-            b.send("babel.oaw", "chan", "from babel"), b.send("kessel.oaw", "chan", "from kessel")
+            b.send("babel.oaw", CHAN, "from babel"), b.send("kessel.oaw", CHAN, "from kessel")
         )
 
     one, two = run(scenario())
@@ -188,11 +189,11 @@ def test_401_is_refreshed_through_the_store(mm: Any, run: Any) -> None:
     tokens = Tokens(mm)
     tokens.add("babel.oaw")
     b = backend(mm, tokens)
-    run(b.send("babel.oaw", "chan", "one"))
+    run(b.send("babel.oaw", CHAN, "one"))
     first_client = b._clients["babel.oaw"].client
     # The token expires on the server: the next request answers 401.
     mm.tokens.pop(tokens.held[("babel.oaw", SID)])
-    msg = run(b.send("babel.oaw", "chan", "two"))
+    msg = run(b.send("babel.oaw", CHAN, "two"))
     assert msg.text == "two"
     assert tokens.refreshes == [("babel.oaw", SID)]
     assert b._clients["babel.oaw"].client is not first_client  # rebuilt on the new token
@@ -204,9 +205,9 @@ def test_unauthorized_without_refresher(mm: Any, run: Any) -> None:
     mm.tokens.clear()
     b = MattermostBackend(SID, mm.URL, tokens.token_for, http_client=mm.http_client())
     with pytest.raises(Unauthorized):
-        run(b.send("babel.oaw", "chan", "x"))
+        run(b.send("babel.oaw", CHAN, "x"))
     with pytest.raises(KeyError):
-        run(b.send("nobody", "chan", "x"))
+        run(b.send("nobody", CHAN, "x"))
 
 
 def test_echo_filtered_by_user_id(mm: Any, recording_sleep: Any, run: Any) -> None:
@@ -221,8 +222,8 @@ def test_echo_filtered_by_user_id(mm: Any, recording_sleep: Any, run: Any) -> No
         gen = b.stream("babel.oaw")
         first = asyncio.ensure_future(next_message(gen))
         await until(lambda: mm.open_sockets(babel))
-        mm.broadcast_posted(mm.add_post(babel, "chan", "hi — **kessel** 🛰 (oaw)"))
-        mm.broadcast_posted(mm.add_post(kessel, "chan", "hi — **babel** 🐟 (oaw)"))
+        mm.broadcast_posted(mm.add_post(babel, CHAN, "hi — **kessel** 🛰 (oaw)"))
+        mm.broadcast_posted(mm.add_post(kessel, CHAN, "hi — **babel** 🐟 (oaw)"))
         msg = await first
         await b.close_agent("babel.oaw")
         return msg
@@ -244,9 +245,9 @@ def test_mentions_from_server_field(mm: Any, recording_sleep: Any, run: Any) -> 
         first = asyncio.ensure_future(next_message(gen))
         await until(lambda: mm.open_sockets(babel))
         # Text names @babel.oaw, but the server marked no mention.
-        mm.broadcast_posted(mm.add_post(human, "chan", "@babel.oaw look"))
+        mm.broadcast_posted(mm.add_post(human, CHAN, "@babel.oaw look"))
         # Text names nobody, but the server marked babel.
-        mm.broadcast_posted(mm.add_post(human, "chan", "look"), mentions=[babel])
+        mm.broadcast_posted(mm.add_post(human, CHAN, "look"), mentions=[babel])
         got = [await first, await next_message(gen)]
         await b.close_agent("babel.oaw")
         return got
@@ -262,11 +263,11 @@ def test_is_bot_read_from_user_object_once(mm: Any, run: Any) -> None:
     tokens = Tokens(mm)
     tokens.add("babel.oaw")
     human = mm.add_user("bj", is_bot=False)
-    mm.add_post(human, "chan", "one", {"is_bot": True, "from_bot": "true"})
-    mm.add_post(human, "chan", "two")
+    mm.add_post(human, CHAN, "one", {"is_bot": True, "from_bot": "true"})
+    mm.add_post(human, CHAN, "two")
     b = backend(mm, tokens)
-    msgs = run(b.read("babel.oaw", "chan"))
-    msgs += run(b.read("babel.oaw", "chan"))
+    msgs = run(b.read("babel.oaw", CHAN))
+    msgs += run(b.read("babel.oaw", CHAN))
     assert [m.is_bot for m in msgs] == [False] * 4
     lookups = [r for r in mm.requests if r[:2] == ("GET", f"/users/{human}")]
     assert len(lookups) == 1

@@ -95,3 +95,41 @@ def test_read_one_and_has_post(mm: Any, run: Any) -> None:
     mm.hidden_from[post["id"]] = {tokens.user_ids[DEV]}
     assert run(b.has_post(DEV, post["id"])) is False
     assert run(b.has_post("nobody", post["id"])) is False  # holds no token here
+
+
+HOSTILE_IDS = [
+    "..",
+    "p" * 25 + "/",
+    "../../users/me",
+    "a" * 26 + "?x=1",
+    "a" * 26 + "\n",
+    "A" * 26,
+    "a" * 27,
+    "a%2Fb",
+    "",
+]
+
+
+def test_mattermost_hostile_ids_send_nothing(mm: Any, run: Any) -> None:
+    """The client library puts its arguments into REST paths unchecked, and each carries the
+    agent's bot credential (R-08, #62). A hostile post, channel or user ID is refused before
+    any request: `ValueError` (`bad_request`), or `False` from the thread probe."""
+    tokens = Tokens(mm)
+    tokens.add(DEV)
+    b = backend(mm, tokens)
+    good = "c" * 26
+    before = list(mm.requests)
+    for bad in HOSTILE_IDS:
+        for call in (
+            lambda bad=bad: b.read_one(DEV, good, bad),
+            lambda bad=bad: b.thread(DEV, bad),
+            lambda bad=bad: b.read(DEV, bad),
+            lambda bad=bad: b.read(DEV, bad, since=1.0),
+        ):
+            with pytest.raises(ValueError):
+                run(call())
+        assert run(b.has_post(DEV, bad)) is False
+    for bad in ("../me", "bj/x", "bj?x", "bj\n", "@", "-bj"):
+        with pytest.raises(ValueError):
+            run(b.dm(DEV, bad, "hi"))
+    assert [r for r in mm.requests if r not in before] == []

@@ -188,7 +188,7 @@ class UploadStore:
             raise UploadError("bad_request", "attachments is a non-empty list of upload ids")
         out: list[Attachment] = []
         for upload_id in upload_ids:
-            if not isinstance(upload_id, str) or not UPLOAD_ID_RE.match(upload_id):
+            if not isinstance(upload_id, str) or not UPLOAD_ID_RE.fullmatch(upload_id):
                 raise UploadError("bad_request", f"{upload_id!r} is not an upload id")
             upload = self._uploads.get(upload_id)
             if upload is None or upload.dev_name != dev_name or not upload.done:
