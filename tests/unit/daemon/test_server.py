@@ -31,13 +31,12 @@ async def exchange(path: Path, frames: list[dict[str, Any] | bytes]) -> list[dic
 def run_server(daemon: Any, path: Path, frames: list[dict[str, Any] | bytes]) -> Any:
     async def main() -> list[dict[str, Any]]:
         server = DaemonServer(build_handlers(daemon.config, daemon.registry))
-        listener = await server.start(path, group=None)
+        await server.start(path, group=None)
         try:
             assert stat.S_IMODE(path.stat().st_mode) == 0o660
             return await exchange(path, frames)
         finally:
-            listener.close()
-            await listener.wait_closed()
+            await server.aclose()
 
     return asyncio.run(main())
 

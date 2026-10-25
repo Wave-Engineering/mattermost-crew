@@ -203,7 +203,7 @@ async def serve(
         )
     )
     server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
-    listener = await server.start(socket_path, group)
+    await server.start(socket_path, group)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -222,9 +222,7 @@ async def serve(
     try:
         await stop.wait()
     finally:
-        listener.close()
-        server.close_clients()  # a waiting `subscribe` would hold `wait_closed` (#107)
-        await listener.wait_closed()
+        await server.aclose()
         await rotation
         await switch_refresh
         await doorbell.aclose()

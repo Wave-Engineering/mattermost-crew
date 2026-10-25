@@ -82,10 +82,9 @@ class Waiting:
         return {}
 
 
-def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
-    """Two connections each with a waiting op, and one that has sent nothing: after `close()`
-    and `close_clients()`, `wait_closed()` returns, both ops were cancelled, and nothing was
-    written to any of them."""
+def test_aclose_returns_while_ops_wait(short_dir: Path) -> None:
+    """Two connections each with a waiting op, and one that has sent nothing: `aclose()`
+    returns, both ops were cancelled, and nothing was written to any of them."""
     sock = short_dir / "s.sock"
 
     async def scenario() -> tuple[list[Waiting], list[bytes]]:
@@ -94,7 +93,7 @@ def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
             {"wait0": waits[0], "wait1": waits[1]},
             hangup_cancels=frozenset({"wait0", "wait1"}),
         )
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         conns = []
         for i in range(3):
             reader, writer = await asyncio.open_unix_connection(str(sock))
@@ -109,9 +108,7 @@ def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
             conns.append((reader, writer))
         for w in waits:
             await asyncio.wait_for(w.started.wait(), 2)
-        listener.close()
-        server.close_clients()
-        await asyncio.wait_for(listener.wait_closed(), 1)
+        await asyncio.wait_for(server.aclose(), 1)
         tails = [await asyncio.wait_for(r.read(), 1) for r, _ in conns]
         for _, writer in conns:
             writer.close()
@@ -127,22 +124,20 @@ def test_a_frame_sent_while_an_op_waits_keeps_it_cancellable(
     short_dir: Path, extra: bytes
 ) -> None:
     """A second frame arriving while a `subscribe` waits doesn't take the op out of
-    `close_clients`' reach: shutdown still cancels it, and nothing is written (#107)."""
+    shutdown's reach: `aclose` still cancels it, and nothing is written (#107)."""
     sock = short_dir / "s.sock"
 
     async def scenario() -> tuple[Waiting, bytes]:
         wait = Waiting()
         server = DaemonServer({"wait": wait}, hangup_cancels=frozenset({"wait"}))
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         reader, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame("wait", {}) + extra)  # in one write
         await writer.drain()
         await asyncio.wait_for(wait.started.wait(), 2)
         for _ in range(5):
             await asyncio.sleep(0)  # the handler reads the second frame and waits on the op
-        listener.close()
-        server.close_clients()
-        await asyncio.wait_for(listener.wait_closed(), 1)
+        await asyncio.wait_for(server.aclose(), 1)
         tail = await asyncio.wait_for(reader.read(), 1)
         writer.close()
         return wait, tail
@@ -153,8 +148,8 @@ def test_a_frame_sent_while_an_op_waits_keeps_it_cancellable(
 
 
 def test_a_connection_accepted_before_close_still_closes(short_dir: Path) -> None:
-    """A connection the listener accepted just before `close()`, whose handler hasn't taken
-    its first step when `close_clients()` runs, closes as soon as it does: a `subscribe` it
+    """A connection the listener accepted just before `aclose()`, whose handler hasn't taken
+    its first step when `aclose()` closes the clients, closes as soon as it does: a `subscribe` it
     sends can't park shutdown (#107)."""
     sock = short_dir / "s.sock"
 
@@ -170,15 +165,15 @@ def test_a_connection_accepted_before_close_still_closes(short_dir: Path) -> Non
             await client(reader, writer)
 
         server._client = held  # type: ignore[method-assign]
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         reader, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame("wait", {}))
         await writer.drain()
         await asyncio.wait_for(entered.wait(), 2)
-        listener.close()
-        server.close_clients()
+        closing = asyncio.ensure_future(server.aclose())
+        await asyncio.sleep(0)  # `aclose` has closed the clients and waits for the handlers
         gate.set()
-        await asyncio.wait_for(listener.wait_closed(), 1)
+        await asyncio.wait_for(closing, 1)
         tail = await asyncio.wait_for(reader.read(), 1)
         writer.close()
         return wait, tail
@@ -203,15 +198,15 @@ def test_a_bounded_op_in_flight_at_shutdown_finishes(short_dir: Path) -> None:
             return {"posted": True}
 
         server = DaemonServer({"send": send})
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         reader, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame("send", {}))
         await writer.drain()
         await asyncio.wait_for(started.wait(), 2)
-        listener.close()
-        server.close_clients()
+        closing = asyncio.ensure_future(server.aclose())
+        await asyncio.sleep(0)  # `aclose` has closed the clients and waits for the handlers
         gate.set()
-        await asyncio.wait_for(listener.wait_closed(), 1)
+        await asyncio.wait_for(closing, 1)
         reply = json.loads(await asyncio.wait_for(reader.readline(), 1))
         tail = await asyncio.wait_for(reader.read(), 1)
         writer.close()
@@ -244,14 +239,17 @@ def test_failed_read_while_an_op_waits_is_a_hangup(
     async def scenario() -> Waiting:
         wait = Waiting()
         server = DaemonServer({"wait": wait}, hangup_cancels=frozenset({"wait"}))
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         reader, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame("wait", {}))
         await writer.drain()
         tail = await asyncio.wait_for(reader.read(), 2)
         assert tail == b""
-        listener.close()
-        await asyncio.wait_for(listener.wait_closed(), 1)  # no handler left behind
+        # Not `aclose`, whose `_close_clients` would cancel a stuck op: the handler has to
+        # have returned on its own.
+        assert server._server is not None
+        server._server.close()
+        await asyncio.wait_for(server._server.wait_closed(), 1)  # no handler left behind
         writer.close()
         return wait
 

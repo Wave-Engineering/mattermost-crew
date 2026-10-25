@@ -65,18 +65,25 @@ class DaemonServer:
         self.handlers = handlers
         self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
-        # For `close_clients` (#107): the handlers waiting for a frame, and the `hangup_cancels`
+        # For `_close_clients` (#107): the handlers waiting for a frame, and the `hangup_cancels`
         # ops waiting for their result.
         self._closing = False
         self._idle: set[asyncio.Task[Any]] = set()
         self._waiting: set[asyncio.Future[Any]] = set()
 
-    def close_clients(self) -> None:
-        """End every connection (#107). Call it after the listener's `close()` and before
-        `wait_closed()`: on Python 3.12, `wait_closed()` waits for every connection, and
-        `close()` closes none of them, so a waiting `subscribe` would hold shutdown forever.
+    async def aclose(self) -> None:
+        """Stop listening, end every connection, and wait for their handlers (#107). This is
+        the only shutdown: on Python 3.12, the listener's `wait_closed()` waits for every
+        connection, and its `close()` closes none of them, so a shutdown that skipped the
+        middle step would wait on a waiting `subscribe` forever."""
+        if self._server is None:
+            return
+        self._server.close()
+        self._close_clients()
+        await self._server.wait_closed()
 
-        A connection waiting for a frame is closed. A `hangup_cancels` op still waiting is
+    def _close_clients(self) -> None:
+        """A connection waiting for a frame is closed. A `hangup_cancels` op still waiting is
         cancelled and writes nothing, so the event a `subscribe` took stays held (#99). Any
         other op runs to its end and its reply is written: cancelling a `send` whose post had
         already reached the server would have the agent post it twice. A connection accepted
@@ -164,13 +171,13 @@ class DaemonServer:
                 # meanwhile is kept for the next turn of the loop.
                 handling = asyncio.ensure_future(self._handle(line))
                 next_line = asyncio.ensure_future(reader.readline())
-                # The op stays in `_waiting`, where `close_clients` can cancel it, until it
+                # The op stays in `_waiting`, where `_close_clients` can cancel it, until it
                 # ends, however the wait below comes out (#107).
                 self._waiting.add(handling)
                 try:
                     await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
                     if handling.cancelled():
-                        return  # by `close_clients`: nothing is written, the event stays held
+                        return  # by `_close_clients`: nothing is written, the event stays held
                     # A hangup is end-of-file or a failed read; a frame too large is
                     # answered once the op's reply is written.
                     hung_up = False
@@ -193,7 +200,7 @@ class DaemonServer:
                 finally:
                     self._waiting.discard(handling)
                 if handling.cancelled():
-                    return  # by `close_clients`, as above
+                    return  # by `_close_clients`, as above
                 frame, on_sent = handling.result()
                 writer.write(encode(frame))
                 await writer.drain()
@@ -208,8 +215,9 @@ class DaemonServer:
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
 
-    async def start(self, path: Path, group: str | None = CLIENTS_GROUP) -> asyncio.Server:
-        """Listen on `path`, mode 0660; with `group`, give the socket that group."""
+    async def start(self, path: Path, group: str | None = CLIENTS_GROUP) -> None:
+        """Listen on `path`, mode 0660; with `group`, give the socket that group. `aclose`
+        stops it: the listener isn't handed out, so no caller can shut it down another way."""
         path.unlink(missing_ok=True)
         self._server = await asyncio.start_unix_server(
             self._client, path=str(path), limit=MAX_FRAME_BYTES
@@ -217,7 +225,6 @@ class DaemonServer:
         os.chmod(path, SOCKET_MODE)
         if group is not None:
             os.chown(path, -1, grp.getgrnam(group).gr_gid)
-        return self._server
 
 
 class HealthSource(Protocol):

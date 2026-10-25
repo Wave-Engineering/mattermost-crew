@@ -91,7 +91,7 @@ class Rig:
 
     async def start(self) -> None:
         self.build()
-        self.listener = await self.server.start(self.sock, group=None)
+        await self.server.start(self.sock, group=None)
         self.doorbell.attach(self.dev, [MM, "discord", "squawkie"])
 
     async def subscribe(self, timeout: float = 20) -> dict[str, Any]:
@@ -152,13 +152,12 @@ class Rig:
         self.d.store.adapters.append(self.d.backend)
 
     async def stop(self) -> None:
+        await self.server.aclose()  # first, as `serve` does: no op waits on what closes next
         self.d.store.adapters.remove(self.doorbell)
         await self.doorbell.aclose()
         await self.d.backend.close_agent(self.dev)
         await self.discord.aclose()
         await self.squawkie.aclose()
-        self.listener.close()
-        await self.listener.wait_closed()
 
 
 @pytest.fixture
