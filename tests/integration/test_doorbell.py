@@ -5,12 +5,15 @@ Mattermost adapter of `test_mattermost_adapter.Daemon` (over its in-process brok
 Discord adapter on the scream-hole fake's real port, and the squawkie adapter on the squawkie
 fake's real port (`tests/fakes/squawkie.py`, a real SSE feed). The doorbell runs one task per
 (agent, backend) with its cursors on disk, and `subscribe` is served on a real socket, called
-the way the one-shot calls it: one frame, one reply.
+the way the one-shot calls it: one frame, one reply. IT-11 runs end to end through the real
+one-shot, the installed `crewchat-doorbell` console script (Story 3.4).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -101,6 +104,35 @@ class Rig:
         result: dict[str, Any] = reply["result"]
         return result
 
+    async def ring(self, timeout: float = 20) -> dict[str, Any]:
+        """One run of the real one-shot, `crewchat-doorbell`, as an agent's background task
+        runs it: it must print exactly one JSON line and exit 0 (R-26, CT-08)."""
+        repo = self.root / "agent-repo"
+        (repo / ".claude").mkdir(parents=True, exist_ok=True)
+        (repo / ".claude" / "agent-identity.json").write_text(json.dumps({"dev_name": self.dev}))
+        script = Path(sys.executable).parent / "crewchat-doorbell"
+        assert script.exists(), f"{script} is not installed: run uv sync"
+        proc = await asyncio.create_subprocess_exec(
+            str(script),
+            "--socket",
+            str(self.sock),
+            "--repo-root",
+            str(repo),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
+        assert proc.returncode == 0, err.decode()
+        lines = out.decode().splitlines()
+        assert len(lines) == 1, out
+        event: dict[str, Any] = json.loads(lines[0])
+        return event
+
     async def mm_connected(self) -> None:
         async with asyncio.timeout(20):
             while True:
@@ -146,8 +178,8 @@ def message_text(event: dict[str, Any]) -> str:
 def test_it11_three_adapters_merge_one_event_per_subscribe(
     mattermost: Any, setup: dict[str, str], tmp_path: Path, short_dir: Path, fakes: Any
 ) -> None:
-    """IT-11 (R-26): Mattermost, Discord and squawkie events merge onto the agent's one
-    queue, and each `subscribe` returns exactly one of them."""
+    """IT-11 (R-26, CT-08): Mattermost, Discord and squawkie events merge onto the agent's one
+    queue, and each run of the real one-shot prints exactly one of them and exits 0."""
     discord, sq, urls = fakes
     needs = sq.add_list("bj:needs")
     squawk = sq.add_squawk(needs, "ship it?")
@@ -166,7 +198,7 @@ def test_it11_three_adapters_merge_one_event_per_subscribe(
             await rig.d.backend.send("talk11", setup["channel_id"], "it-11 mattermost")
             discord.add_message(DISCORD_CHANNEL, "it-11 discord", author=HUMAN)
             sq.update(squawk["id"], text="ship it? → yes")
-            got = [await rig.subscribe() for _ in range(3)]
+            got = [await rig.ring() for _ in range(3)]
             assert rig.doorbell.queue(rig.dev).empty()
             return got
         finally:
