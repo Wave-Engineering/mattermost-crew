@@ -366,6 +366,7 @@ class MattermostBackend:
             is_bot=user.get("is_bot") is True,
             kiosk=post_kiosk(props),
             dm=dm,
+            author_resolved=bool(user),
         )
 
     async def _messages(

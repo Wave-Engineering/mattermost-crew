@@ -215,8 +215,8 @@ def test_subscribe_returns_one_event(world: World, run: Any) -> None:
         # `register` attaches the registration's backends and squawkie.
         await handlers["register"]({"dev_name": "stranger"})
         assert world.doorbell.attached("stranger") == []  # no registration, nothing attached
-        world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 1}, ("a",)))
-        world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 2}, ("b",)))
+        await world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 1}, ("a",)))
+        await world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 2}, ("b",)))
         first = await handlers["subscribe"]({"dev_name": DEV})
         left = world.doorbell.queue(DEV).qsize()
         second = await handlers["subscribe"]({"dev_name": DEV})
@@ -281,7 +281,7 @@ def test_subscribe_hangup_keeps_the_event(world: World, short_dir: Path, run: An
         writer.close()  # the one-shot hung up (a timeout, say)
         await writer.wait_closed()
         await asyncio.sleep(0.05)
-        world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 1}, ("a",)))
+        await world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 1}, ("a",)))
         await asyncio.sleep(0.01)
         queued = world.doorbell.queue(DEV).qsize()
         reader, writer = await asyncio.open_unix_connection(str(sock))
@@ -481,11 +481,11 @@ def test_filter_hook_and_full_queue(tmp_path: Path, run: Any) -> None:
     bell = Doorbell({}, CursorStore(None), admit=admit, queue_max=2)
 
     async def scenario() -> int:
-        assert bell.offer(DEV, "x", DoorbellEvent("x", {"n": 0}, ("no",))) is False
-        assert bell.offer(DEV, "x", DoorbellEvent("x", {"n": 1}, ("a",))) is True
-        assert bell.offer(DEV, "x", DoorbellEvent("x", {"n": 1}, ("a",))) is False  # repeat
-        bell.offer(DEV, "x", DoorbellEvent("x", {"n": 2}, ("b",)))
-        bell.offer(DEV, "x", DoorbellEvent("x", {"n": 3}, ("c",)))  # dropped: full
+        assert await bell.offer(DEV, "x", DoorbellEvent("x", {"n": 0}, ("no",))) is False
+        assert await bell.offer(DEV, "x", DoorbellEvent("x", {"n": 1}, ("a",))) is True
+        assert await bell.offer(DEV, "x", DoorbellEvent("x", {"n": 1}, ("a",))) is False  # repeat
+        await bell.offer(DEV, "x", DoorbellEvent("x", {"n": 2}, ("b",)))
+        await bell.offer(DEV, "x", DoorbellEvent("x", {"n": 3}, ("c",)))  # dropped: full
         return bell.queue(DEV).qsize()
 
     assert run(scenario()) == 2
