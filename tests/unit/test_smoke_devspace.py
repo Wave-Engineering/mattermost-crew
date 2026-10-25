@@ -44,6 +44,51 @@ def test_local_target_must_be_localhost() -> None:
     assert "localhost" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://mm.invalid",
+        "http://chat.apps.oakai.waveeng.com",
+        "https://chat.apps.oakai.waveeng.com.evil.invalid",
+        "https://evil.invalid/chat.apps.oakai.waveeng.com",
+        "https://xchat.apps.oakai.waveeng.com",
+    ],
+)
+def test_devspace_target_is_pinned_to_its_host(url: str, tmp_path: Path) -> None:
+    """#99: `oaw-devspace` with any other server stops before a single request, so the role
+    patch can never reach a partner's production server on the statement alone (CP-03)."""
+    marker = tmp_path / "requested"
+    shim = tmp_path / "curl"
+    shim.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    shim.chmod(0o755)
+    path = f"{tmp_path}:{os.environ['PATH']}"
+    result = run(MM_URL=url, MM_ADMIN_TOKEN="t", SMOKE_TARGET="oaw-devspace", PATH=path)
+    assert result.returncode == 2
+    assert "MM_URL=https://chat.apps.oakai.waveeng.com" in result.stderr
+    assert not marker.exists()
+
+
+def test_devspace_url_passes_the_pin(tmp_path: Path) -> None:
+    """The dev space itself (a trailing `/` is dropped) gets past the pin, to the server check."""
+    marker = tmp_path / "requested"
+    shim = tmp_path / "curl"
+    shim.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    shim.chmod(0o755)
+    path = f"{tmp_path}:{os.environ['PATH']}"
+    url = "https://chat.apps.oakai.waveeng.com/"
+    result = run(MM_URL=url, MM_ADMIN_TOKEN="t", SMOKE_TARGET="oaw-devspace", PATH=path)
+    assert result.returncode == 2
+    assert "no answer from" in result.stderr  # past the pin: the shim refused the request
+    assert marker.exists()
+
+
+def test_only_the_devspace_allows_a_remote_role_patch() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count("BROKER_ROLE_PATCH_ALLOW_REMOTE=1") == 1
+    gate = text.index('if [[ "$allow_remote" == 1 ]]; then')
+    assert gate < text.index("export BROKER_ROLE_PATCH_ALLOW_REMOTE=1") < text.index("fi", gate)
+
+
 def test_runs_every_e2e_flow() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     for flow in ("test_cross_crew.py", "test_outsider_switch.py", "test_broadcast.py"):

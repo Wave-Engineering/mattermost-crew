@@ -12,17 +12,24 @@ the registration, and squawkie when it is configured (§4.2 step 3).
 
 - **`subscribe{dev_name}`** awaits that agent's queue and returns **one** event (R-26): the
   thin one-shot exits on it. An agent that hasn't registered gets `not_registered`.
+- **At least once** (#99). `subscribe` takes the event as the agent's **held** event
+  (`take`), and the cursor moves only once the reply is written (`ack`, from the server's
+  `Reply.on_sent`). A reply that wasn't written leaves the event held, and the next
+  `subscribe` returns it again; so does a second `subscribe` overlapping the first. Every
+  reply carries a stable `event_id` (`<backend>:<first key>`, or one made when the event was)
+  for the agent to drop a repeat by.
 - **Events.** A chat message is `{"type":"message","backend":b,"message":{...}}`, the message
   as `read` returns one. squawkie's are its own JSON with `backend: "squawkie"`:
   `squawk.updated`, or `sqtk.catch-up` with its `changes`, as `sqtk-doorbell.sh` prints them.
 - **Cursors** (R-28). `CursorStore` keeps, per agent per backend,
   `/var/lib/crewchat/cursors/<dev>/<backend>.json`: `{"id", "ts", "seen": [...]}`, the last
   event handed to the agent, its time, and the most recent IDs handed over (file `0600`,
-  directories `0700`, written atomically). The cursor moves when `subscribe` hands an event
-  over, so an event still queued when the daemon stops is replayed after it starts. Each
-  stream starts from its cursor and replays what came after it; the doorbell also drops any
+  directories `0700`, written atomically). The cursor moves when `subscribe`'s reply has been
+  written, so an event still queued, or held, when the daemon stops is replayed after it
+  starts. Each stream starts from its cursor and replays what came after it; the doorbell also
+  drops any
   event whose IDs it has already queued or handed over, so a replay overlapping the live feed
-  delivers each event exactly once.
+  queues each event exactly once. Handing it to the agent is at least once (above).
 - **Backend health** (R-27). A stream reports its state through `on_status`; a stream that
   raises or ends counts as down too, and is restarted after a backoff (1 s, doubling, capped at
   60 s). The first report of an outage enqueues
@@ -42,6 +49,7 @@ import inspect
 import json
 import logging
 import os
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -53,7 +61,7 @@ from crewchat import filters
 from crewchat.adapters.base import InboundMessage, StatusSink, StreamCursor
 from crewchat.adapters.squawkie import SquawkEvent
 from crewchat.registry import Registry
-from crewchat.server import Handler, OpError
+from crewchat.server import Handler, OpError, Reply
 from crewchat.threads import SAFE_NAME_RE, STATE_DIR
 from crewchat.tokens import DIR_MODE, write_private_json
 
@@ -70,13 +78,31 @@ log = logging.getLogger("crewchat.doorbell")
 class DoorbellEvent:
     """One event on an agent's queue: what `subscribe` returns (`payload`), the backend it came
     from, and the IDs it carries (`keys`; none for `backend.down` and `backend.up`). A chat
-    message's event also carries the `InboundMessage` itself, for the filters (Story 3.3)."""
+    message's event also carries the `InboundMessage` itself, for the filters (Story 3.3).
+    `on_handover` runs once the event has been handed to the agent (`Doorbell.ack`): the kiosk
+    review moves its own cursor there (#99)."""
 
     backend: str
     payload: dict[str, Any]
     keys: tuple[str, ...] = ()
     ts: float = 0.0
     message: InboundMessage | None = dataclasses.field(default=None, compare=False, repr=False)
+    on_handover: Callable[[], None] | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
+    # A keyless event's own ID, made once, so a repeat of it carries the same `event_id`.
+    nonce: str = dataclasses.field(
+        default_factory=lambda: uuid.uuid4().hex, compare=False, repr=False
+    )
+
+    @property
+    def event_id(self) -> str:
+        """Stable across a redelivery (#99): the backend and the first ID, or the nonce."""
+        return f"{self.backend}:{self.keys[0] if self.keys and self.keys[0] else self.nonce}"
+
+    def reply(self) -> dict[str, Any]:
+        """What `subscribe` returns: the payload, with its `event_id`."""
+        return {**self.payload, "event_id": self.event_id}
 
 
 StreamItem = InboundMessage | SquawkEvent
@@ -248,6 +274,10 @@ class Doorbell:
         self._down: dict[tuple[str, str], bool] = {}
         # IDs queued or handed over in this process, per (agent, backend): never twice (R-28).
         self._handled: dict[tuple[str, str], _Recent] = {}
+        # Each agent's event taken but not yet acknowledged, and the lock that makes two
+        # overlapping `take`s return that same event (#99).
+        self._held: dict[str, DoorbellEvent] = {}
+        self._taking: dict[str, asyncio.Lock] = {}
 
     # -- the queue --------------------------------------------------------------------------
     def queue(self, dev_name: str) -> asyncio.Queue[DoorbellEvent]:
@@ -276,10 +306,35 @@ class Doorbell:
         queue, past the filters. False when the queue is full and it was dropped."""
         return self._enqueue(dev_name, event)
 
-    async def next_event(self, dev_name: str) -> DoorbellEvent:
-        """The agent's next event; its cursor moves past it (R-28)."""
-        event = await self.queue(dev_name).get()
+    async def take(self, dev_name: str) -> DoorbellEvent:
+        """The agent's held event, or else the next one off its queue, now held (#99). Two
+        overlapping calls return the same event; it stays held until `ack`."""
+        lock = self._taking.setdefault(dev_name, asyncio.Lock())
+        async with lock:
+            held = self._held.get(dev_name)
+            if held is not None:
+                return held
+            event = await self.queue(dev_name).get()
+            self._held[dev_name] = event
+            return event
+
+    def ack(self, dev_name: str, event: DoorbellEvent) -> None:
+        """`event` was handed to the agent: its cursor moves past it (R-28) and its
+        `on_handover` runs. An event no longer held (acknowledged already) changes nothing."""
+        if self._held.get(dev_name) is not event:
+            return
+        del self._held[dev_name]
         self.cursors.advance(dev_name, event.backend, event)
+        if event.on_handover is not None:
+            try:
+                event.on_handover()
+            except Exception:
+                log.exception("handover of a %s event for %s", event.payload.get("type"), dev_name)
+
+    async def next_event(self, dev_name: str) -> DoorbellEvent:
+        """The agent's next event, handed over at once: `take` and `ack` together."""
+        event = await self.take(dev_name)
+        self.ack(dev_name, event)
         return event
 
     # -- health (R-27) ----------------------------------------------------------------------
@@ -419,26 +474,34 @@ def build_doorbell_handlers(
     register: Handler,
     *,
     extra_backends: Iterable[str] = (),
+    on_registered: Callable[[Any], object] | None = None,
 ) -> dict[str, Handler]:
     """`subscribe`, and `register` wrapped so a registration attaches the agent's backends
-    (its registration's, plus `extra_backends`: squawkie)."""
+    (its registration's, plus `extra_backends`: squawkie) and then calls `on_registered(reg)`:
+    `crewchat serve` runs the kiosk review there when social is already on (R-33, #99)."""
     extra = list(extra_backends)
 
-    async def registered(args: dict[str, Any]) -> dict[str, Any]:
+    async def registered(args: dict[str, Any]) -> dict[str, Any] | Reply:
         result = await register(args)
         dev_name = args.get("dev_name")
         reg = registry.get(dev_name) if isinstance(dev_name, str) else None
         if reg is not None:
             doorbell.attach(reg.dev_name, [*reg.backends, *extra])
+            if on_registered is not None:
+                try:
+                    on_registered(reg)
+                except Exception:
+                    log.exception("after registering %s", reg.dev_name)
         return result
 
-    async def subscribe(args: dict[str, Any]) -> dict[str, Any]:
+    async def subscribe(args: dict[str, Any]) -> Reply:
         dev_name = args.get("dev_name")
         if not isinstance(dev_name, str) or not dev_name:
             raise OpError("bad_request", "dev_name is a required string")
         if registry.get(dev_name) is None:
             raise OpError("not_registered", dev_name)
-        event = await doorbell.next_event(dev_name)
-        return event.payload
+        event = await doorbell.take(dev_name)
+        # Acknowledged only once the reply is written (#99): until then it stays held.
+        return Reply(event.reply(), partial(doorbell.ack, dev_name, event))
 
     return {"register": registered, "subscribe": subscribe}

@@ -256,6 +256,11 @@ class SwitchCache:
     def switch_state(self, crew: str, server_id: str) -> SwitchState | None:
         return self._switch.get((crew, server_id))
 
+    def mode(self, crew: str, server_id: str) -> Mode | None:
+        """The cached switch's mode in force now, or None with no switch state cached."""
+        state = self.switch_state(crew, server_id)
+        return None if state is None else effective_mode(state, self.clock())
+
     # -- fetching ---------------------------------------------------------------------------
     async def _fetch_crew_info(self, key: BrokerKey) -> bool:
         client = self._brokers.get(key)

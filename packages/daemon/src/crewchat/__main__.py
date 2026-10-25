@@ -197,6 +197,9 @@ async def serve(
             doorbell,
             handlers["register"],
             extra_backends=[SQUAWKIE] if squawkie is not None else [],
+            # Social already on when an agent registers (after a daemon start, or mid-social):
+            # its kiosk review, which `social_listeners` alone would never send (R-33, #99).
+            on_registered=lambda reg: kiosk_answers.on_registered(reg, cache),
         )
     )
     server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))

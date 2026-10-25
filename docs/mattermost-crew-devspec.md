@@ -416,8 +416,10 @@ The daemon owns rotation (§4.8). The broker's daily job only deactivates bot ac
 - The daemon keeps one queue per registered agent, fed by three adapters: Mattermost (websocket), Discord (scream-hole) and squawkie (SSE, filtered to the squawk IDs the shim pushed with `squawk_ids`, the same predicate as `sqtk-doorbell.sh`).
 - Each event passes the filters (§5.9) and is queued.
 - `subscribe` returns the first queued event; the thin one-shot prints it as JSON and exits 0.
+- **Delivery is at least once** (#99). `subscribe` holds the event it takes, and the cursor moves past it only once the reply frame has been written. A reply that wasn't written (a hang-up, a timeout, a failed write) leaves the event held, and the next `subscribe` returns it again. So does a second `subscribe` for the same agent that overlaps the first. Every reply carries a stable `event_id`: `<backend>:<first ID>`, or an ID made once for an event without one. The agent drops a repeat by it.
+- **A client never half-closes its connection** (`SHUT_WR`). The daemon reads end-of-file on a waiting `subscribe` as a hang-up and cancels it, so a client that half-closes after sending its request never gets an event.
 - Cursors are kept per agent per backend under `/var/lib/crewchat/cursors/`.
-- A backend outage enqueues `{"type":"backend.down","backend":...}` (R-27).
+- A backend outage enqueues `{"type":"backend.down","backend":...}` (R-27). A Mattermost reconnect whose replay fails is an outage too, with the failing call in its `reason`. Its connection yields nothing and the position stays put, so the next replay delivers the gap (#99).
 - `sqtk-doorbell.sh` and `doorbell-oneshot.sh` stay as fallbacks until the cut-over (D-060).
 
 One-shot exit codes:

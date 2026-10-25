@@ -17,7 +17,7 @@ from typing import Any
 import crewchat.kiosk as kiosk_mod
 import pytest
 from crewchat.adapters.base import InboundMessage
-from crewchat.doorbell import CursorStore, Doorbell, DoorbellEvent
+from crewchat.doorbell import CursorStore, Doorbell, DoorbellEvent, build_doorbell_handlers
 from crewchat.filters import KIOSK, KioskQueue, SwitchCache
 from crewchat.kiosk import REVIEW_TEXT, REVIEW_TYPE, BriefStore, Kiosk
 from crewchat.tokens import BrokerClient
@@ -71,11 +71,20 @@ class NoRunner:
         raise AssertionError("the review never runs the model")
 
 
-def make_kiosk(tmp_path: Path, delivered: list[tuple[str, DoorbellEvent]] | None = None) -> Kiosk:
+def make_kiosk(
+    tmp_path: Path,
+    delivered: list[tuple[str, DoorbellEvent]] | None = None,
+    *,
+    handover: bool = True,
+) -> Kiosk:
+    """A kiosk whose reviews go to `delivered`. With `handover`, each is handed to the agent at
+    once (its `on_handover` runs, as `Doorbell.ack` would); without, it stays queued."""
     out = delivered if delivered is not None else []
 
     def deliver(dev: str, event: DoorbellEvent) -> bool:
         out.append((dev, event))
+        if handover and event.on_handover is not None:
+            event.on_handover()
         return True
 
     return Kiosk(KioskQueue(), BriefStore(), {}, NoRunner(), state_dir=tmp_path, deliver=deliver)
@@ -423,3 +432,115 @@ def test_no_kiosk_content_reaches_the_agent_while_social_is_off(tmp_path: Path) 
         assert doorbell.queue(DEV).empty()
 
     asyncio.run(scenario())
+
+
+# -- #99: review on register, cursor on handover ----------------------------------------------
+class Reg:
+    """The registration fields `Kiosk.on_registered` reads."""
+
+    dev_name = DEV
+    crew = "oaw"
+    backends = (f"mattermost:{A}", f"mattermost:{B}", "discord")
+
+
+class Rig:
+    """A doorbell, a kiosk delivering to it and a switch cache, on one state directory: a
+    fresh `Rig` on the same directory is a daemon restart."""
+
+    def __init__(self, tmp_path: Path, broker: SwitchBroker) -> None:
+        self.cache = SwitchCache({("oaw", A): broker}, clock=Clock())
+        self.doorbell = Doorbell({}, CursorStore(None))
+        self.kiosk = Kiosk(
+            KioskQueue(),
+            BriefStore(),
+            {},
+            NoRunner(),
+            state_dir=tmp_path,
+            deliver=self.doorbell.deliver,
+        )
+        self.handlers = build_doorbell_handlers(
+            StubRegistry(),  # type: ignore[arg-type]
+            self.doorbell,
+            lambda args: asyncio.sleep(0, {}),
+            on_registered=lambda reg: self.kiosk.on_registered(reg, self.cache),
+        )
+
+    async def register(self) -> None:
+        await self.handlers["register"]({"dev_name": DEV})
+
+
+class StubRegistry:
+    def get(self, dev_name: str) -> Any:
+        return Reg() if dev_name == DEV else None
+
+
+def test_register_while_social_reviews(tmp_path: Path) -> None:
+    """R-33: social already on when the agent registers (a daemon start, or mid-social): the
+    agent still gets its review. The cache's one social notice found nobody registered."""
+
+    async def scenario() -> None:
+        broker = SwitchBroker("oaw", A)
+        broker.set("social", expires_at=T0 + timedelta(hours=1))
+        rig = Rig(tmp_path, broker)
+        record(rig.kiosk, A, 1)
+        rig.cache.social_listeners.append(lambda crew, sid: rig.kiosk.on_social(sid, []))
+        await rig.cache.refresh_all()  # social found, nobody registered yet
+        assert rig.doorbell.queue(DEV).empty()
+        await rig.register()
+        event = await rig.doorbell.next_event(DEV)
+        assert event.payload["type"] == "kiosk.review" and event.payload["server"] == A
+        # Registering again with nothing new reviews nothing; under crew nothing either.
+        await rig.register()
+        assert rig.doorbell.queue(DEV).empty()
+        broker.set("crew")
+        await rig.cache.refresh_all()
+        record(rig.kiosk, A, 2)
+        await rig.register()
+        assert rig.doorbell.queue(DEV).empty()
+
+    asyncio.run(scenario())
+
+
+def test_review_cursor_moves_on_handover_only(tmp_path: Path) -> None:
+    """#99: a review queued but not handed over survives a restart: the re-register reviews it
+    again. A second review while one waits adds nothing; once handed over, nothing repeats."""
+
+    async def scenario() -> None:
+        broker = SwitchBroker("oaw", A)
+        broker.set("social", expires_at=T0 + timedelta(hours=1))
+        rig = Rig(tmp_path, broker)
+        await rig.cache.refresh_all()
+        record(rig.kiosk, A, 1)
+        cursor = cursor_of(rig.kiosk, A)
+        await rig.register()
+        assert rig.doorbell.queue(DEV).qsize() == 1
+        assert not cursor.exists()  # queued, not handed over
+        await rig.register()  # a review while one waits: nothing more
+        assert rig.doorbell.queue(DEV).qsize() == 1
+
+        # The daemon restarts before the agent subscribes: the queued review is gone.
+        rig = Rig(tmp_path, broker)
+        await rig.cache.refresh_all()
+        await rig.register()
+        held = await rig.doorbell.take(DEV)
+        assert [e["question"] for e in held.payload["entries"]] == ["question 1 on srv-a"]
+        assert held.reply()["event_id"] == f"mattermost:{A}:kiosk.review:{cursor_size(rig, A)}"
+        assert not cursor.exists()  # taken, still not sent
+        rig.doorbell.ack(DEV, held)
+        assert json.loads(cursor.read_text()) == {"offset": cursor_size(rig, A)}
+
+        # Handed over: a restart and a re-register review nothing; a new entry only itself.
+        rig = Rig(tmp_path, broker)
+        await rig.cache.refresh_all()
+        await rig.register()
+        assert rig.doorbell.queue(DEV).empty()
+        record(rig.kiosk, A, 2)
+        await rig.register()
+        event = await rig.doorbell.next_event(DEV)
+        assert [e["question"] for e in event.payload["entries"]] == ["question 2 on srv-a"]
+
+    asyncio.run(scenario())
+
+
+def cursor_size(rig: Rig, server_id: str) -> int:
+    return rig.kiosk.review_paths(DEV, server_id)[0].stat().st_size

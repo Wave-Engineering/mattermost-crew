@@ -25,7 +25,7 @@ from crewchat.doorbell import (
     Source,
     build_doorbell_handlers,
 )
-from crewchat.server import DaemonServer, OpError
+from crewchat.server import DaemonServer, OpError, Reply
 
 from tests.fakes.screamhole import BOT_TOKEN, DISCORD_API, SCREAMHOLE_URL, FakeDiscord
 from tests.fakes.squawkie import URL as SQUAWKIE_URL
@@ -211,7 +211,7 @@ def test_subscribe_returns_one_event(world: World, run: Any) -> None:
         extra_backends=["squawkie"],
     )
 
-    async def scenario() -> tuple[dict[str, Any], dict[str, Any], int]:
+    async def scenario() -> tuple[Reply, Reply, Reply, int]:
         # `register` attaches the registration's backends and squawkie.
         await handlers["register"]({"dev_name": "stranger"})
         assert world.doorbell.attached("stranger") == []  # no registration, nothing attached
@@ -219,18 +219,78 @@ def test_subscribe_returns_one_event(world: World, run: Any) -> None:
         await world.doorbell.offer(DEV, MM, DoorbellEvent(MM, {"type": "message", "n": 2}, ("b",)))
         first = await handlers["subscribe"]({"dev_name": DEV})
         left = world.doorbell.queue(DEV).qsize()
+        # Not yet sent: the next subscribe gets the same event again (#99).
+        again = await handlers["subscribe"]({"dev_name": DEV})
+        assert isinstance(first, Reply) and isinstance(again, Reply)
+        again.on_sent()
         second = await handlers["subscribe"]({"dev_name": DEV})
         with pytest.raises(OpError, match="not_registered"):
             await handlers["subscribe"]({"dev_name": "stranger"})
         with pytest.raises(OpError, match="bad_request"):
             await handlers["subscribe"]({})
         await world.close()
-        return first, second, left
+        assert isinstance(second, Reply)
+        return first, again, second, left
 
-    first, second, left = run(scenario())
-    assert first == {"type": "message", "n": 1}
+    first, again, second, left = run(scenario())
+    assert first.result == {"type": "message", "n": 1, "event_id": f"{MM}:a"}
+    assert again.result == first.result
     assert left == 1
-    assert second == {"type": "message", "n": 2}
+    assert second.result == {"type": "message", "n": 2, "event_id": f"{MM}:b"}
+
+
+def test_event_moves_the_cursor_only_once_sent(world: World, run: Any) -> None:
+    """#99: at least once. The cursor moves when the reply is sent, not when it is taken; two
+    overlapping subscribes get the one held event, and one acknowledgement moves it once."""
+    handlers = build_doorbell_handlers(
+        StubRegistry(DEV),  # type: ignore[arg-type]
+        world.doorbell,
+        lambda args: asyncio.sleep(0, {}),
+    )
+    cursors = world.doorbell.cursors
+
+    async def scenario() -> None:
+        a = asyncio.ensure_future(handlers["subscribe"]({"dev_name": DEV}))
+        b = asyncio.ensure_future(handlers["subscribe"]({"dev_name": DEV}))
+        await asyncio.sleep(0.01)
+        assert not a.done() and not b.done()  # both wait on the empty queue
+        for n, key in ((1, "a"), (2, "b")):
+            event = DoorbellEvent(MM, {"type": "message", "n": n}, (key,), float(n))
+            await world.doorbell.offer(DEV, MM, event)
+        first, second = await asyncio.wait_for(asyncio.gather(a, b), 2)
+        assert first.result == second.result  # the same held event, not the next one
+        assert first.result["n"] == 1
+        assert cursors.load(DEV, MM) is None  # taken, not sent: the cursor hasn't moved
+        first.on_sent()
+        moved = cursors.load(DEV, MM)
+        assert moved is not None and moved.id == "a"
+        second.on_sent()  # already acknowledged: nothing more
+        assert cursors.load(DEV, MM) == moved
+        third = await handlers["subscribe"]({"dev_name": DEV})
+        assert third.result["n"] == 2
+        await world.close()
+
+    run(scenario())
+
+
+def test_handover_runs_once(world: World, run: Any) -> None:
+    """An event's `on_handover` runs when it is acknowledged, and only once."""
+    calls: list[str] = []
+
+    async def scenario() -> None:
+        event = DoorbellEvent(MM, {"type": "kiosk.review"}, on_handover=lambda: calls.append("x"))
+        assert world.doorbell.deliver(DEV, event)
+        held = await world.doorbell.take(DEV)
+        assert held is event and calls == []
+        assert await world.doorbell.take(DEV) is event  # still held
+        world.doorbell.ack(DEV, event)
+        world.doorbell.ack(DEV, event)
+        assert calls == ["x"]
+        # A keyless event's ID is made once, so a repeat of it carries the same one.
+        assert event.event_id == f"{MM}:{event.nonce}" == event.reply()["event_id"]
+        await world.close()
+
+    run(scenario())
 
 
 def test_register_attaches_the_registrations_backends(world: World, run: Any) -> None:
@@ -296,7 +356,50 @@ def test_subscribe_hangup_keeps_the_event(world: World, short_dir: Path, run: An
 
     queued, reply = run(scenario())
     assert queued == 1
-    assert reply["ok"] is True and reply["result"] == {"type": "message", "n": 1}
+    assert reply["ok"] is True
+    assert reply["result"] == {"type": "message", "n": 1, "event_id": f"{MM}:a"}
+
+
+def test_on_sent_runs_only_after_the_reply_is_written(run: Any, short_dir: Path) -> None:
+    """#99: a `Reply`'s `on_sent` runs once its frame is written, and never for a client that
+    hung up before the reply was ready."""
+    sent: list[str] = []
+    release = asyncio.Event()
+
+    async def slow(args: dict[str, Any]) -> Reply:
+        await release.wait()
+        return Reply({"n": args["n"]}, lambda: sent.append(str(args["n"])))
+
+    server = DaemonServer({"subscribe": slow}, hangup_cancels=frozenset({"subscribe"}))
+    sock = short_dir / "s.sock"
+
+    def frame(n: int) -> bytes:
+        return json.dumps({"proto": 1, "id": str(n), "op": "subscribe", "args": {"n": n}}).encode()
+
+    async def scenario() -> dict[str, Any]:
+        listener = await server.start(sock, group=None)
+        _, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(frame(1) + b"\n")
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        writer.close()  # gone before the reply was ready
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(frame(2) + b"\n")
+        await writer.drain()
+        await asyncio.sleep(0.01)
+        release.set()
+        reply: dict[str, Any] = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        await asyncio.sleep(0.01)
+        writer.close()
+        listener.close()
+        await listener.wait_closed()
+        return reply
+
+    reply = run(scenario())
+    assert reply["result"] == {"n": 2}
+    assert sent == ["2"]
 
 
 async def _never(args: dict[str, Any]) -> dict[str, Any]:
@@ -349,6 +452,40 @@ def test_cursor_replay_exactly_once(world: World, run: Any) -> None:
     assert delivered == [f"event {n}" for n in (1, 2, 3, 4, 5, 6)]
     assert health == [(MM, "backend.down"), (MM, "backend.up")]
     assert after == ["event 7", "event 8"]
+
+
+def test_failed_replay_is_loud_and_loses_nothing(world: World, run: Any) -> None:
+    """R-27, R-28, #99: a reconnect whose replay fails is a `backend.down` naming the failing
+    call, yields nothing, and keeps the position, so the next replay delivers the gap."""
+
+    async def scenario() -> tuple[list[DoorbellEvent], list[str]]:
+        world.doorbell.attach(DEV, [MM])
+        async with asyncio.timeout(3):
+            while not (world.mm.open_sockets(world.me) and world.mattermost._agents[DEV].hello):
+                await asyncio.sleep(0.001)
+        world.mm_post("event 1")
+        got = [text_of(await world.next())]
+        # A daemon restart; a post lands meanwhile, and the first replay gets a 503.
+        await world.close()
+        world.mm_post("event 2", broadcast=False)
+        world.mm.errors[f"/channels/{world.chan}/posts"] = 1
+        world.build()
+        world.doorbell.attach(DEV, [MM])
+        health = [await world.next(), await world.next()]
+        got.append(text_of(await world.next()))
+        world.mm_post("event 3")
+        got.append(text_of(await world.next()))
+        await asyncio.sleep(0.05)
+        assert world.doorbell.queue(DEV).empty()
+        await world.close()
+        return health, got
+
+    health, got = run(scenario())
+    assert [kind(e) for e in health] == [(MM, "backend.down"), (MM, "backend.up")]
+    reason = str(health[0].payload["reason"])
+    assert reason.startswith(f"replay failed: GET /channels/{world.chan}/posts")
+    assert "503" in reason
+    assert got == ["event 1", "event 2", "event 3"]
 
 
 class Scripted:
