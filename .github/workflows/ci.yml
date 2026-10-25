@@ -32,6 +32,36 @@ jobs:
           path: reports/
           if-no-files-found: error
 
+  # IT-20 (Story 3.7): docs/runbook.md's own install and verify blocks, on a fresh VM from the
+  # ephemeral pool (#83). It shares no host with the `ci` legs: the runbook must create the
+  # service users itself, so nothing may set them up first.
+  install:
+    name: install (IT-20, runbook)
+    runs-on: [self-hosted, ephemeral]
+    timeout-minutes: 30
+    env:
+      MM_IMAGE: mattermost/mattermost-team-edition:11.11.3
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Start Mattermost
+        run: ./scripts/ci/mattermost-up.sh
+      - name: Runbook install and verify (IT-20)
+        run: ./scripts/ci/runbook-test.sh
+      - name: Mattermost logs
+        if: failure()
+        run: ./scripts/ci/mattermost-logs.sh
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-install
+          path: reports/
+          if-no-files-found: error
+
   # These legs useradd as root and start Mattermost, the broker and the daemon, so they run only
   # on the ephemeral pool: a fresh VM per job, destroyed after it (#83). Never `oaw` alone:
   # the persistent barry-org-1 carries that label too.

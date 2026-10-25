@@ -11,6 +11,8 @@ is no Monitor primitive on Bedrock, so a task's exit is the only wake-up there i
   doesn't know the agent answers `not_registered`.
 - **How long.** `CREWCHAT_DOORBELL_TIMEOUT` is the wait in seconds; the default `0` waits
   forever. On a timeout the one-shot hangs up, which cancels the daemon's `subscribe`.
+- **Outsider events.** An event marked `"outsider": true` (the kiosk review, Story 3.6) is
+  printed with its `text` prefixed `[from outside the crew]` (`mcp_shim.render_event`).
 
 Exit codes (§5.8). It **never** exits 0 without printing an event:
 
@@ -42,6 +44,7 @@ from crewchat_clients.mcp_shim import (
     PROTO,
     SOCKET_PATH,
     find_repo_root,
+    render_event,
 )
 
 EXIT_EVENT = 0
@@ -165,7 +168,7 @@ def run(
         print(f"crewchat-doorbell: {exc}", file=err)
         return exc.code
     # `json.dumps` without `indent` never emits a newline: the event is exactly one line.
-    out.write(json.dumps(event) + "\n")
+    out.write(json.dumps(render_event(event)) + "\n")
     out.flush()
     return EXIT_EVENT
 

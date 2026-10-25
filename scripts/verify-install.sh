@@ -24,6 +24,11 @@
 #   - the running daemon has NoNewPrivs set: it reaches the kiosk without changing user;
 #   - crewkiosk cannot read any of the known credential files above.
 #
+# The credentials that servers.toml names (Story 3.7): /etc/crewchat/discord.credential (or
+# `[discord] credential`) when Discord is enabled, and `[squawkie] credential` when set; and, on a
+# kiosk host, the kiosk's model credential /etc/crewkiosk/model.credential. Neither the agent's
+# user nor crewkiosk may read the first two; the agent's user may not read the third.
+#
 # CREWBROKER_BIN is the installed broker CLI (default /opt/mattermost-crew/.venv/bin/crewbroker),
 # CREWCHAT_BIN the daemon's (default /opt/mattermost-crew/.venv/bin/crewchat).
 # AGENT_USER is the agents' OS user (default agent). It needs sudo.
@@ -38,6 +43,10 @@ AGENT_USER="${AGENT_USER:-agent}"
 DAEMON_USER=crewchat
 KIOSK_USER=crewkiosk
 KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
+KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
+SERVERS_TOML=/etc/crewchat/servers.toml
+# The daemon's own interpreter, which has tomllib (Python 3.12).
+CREWCHAT_PYTHON="$(dirname "$CREWCHAT_BIN")/python"
 RUN_DIR=/run/crewbroker
 CONFIG_DIR=/etc/crewbroker
 STATE_ROOT=/var/lib/crewbroker
@@ -151,6 +160,38 @@ else
 fi
 no_agent_read "${CREWCHAT_TOKENS}/verify-canary.json"
 
+# The credentials servers.toml names (Discord when enabled, squawkie when configured), read
+# with the daemon's own interpreter, and the kiosk's model credential on a kiosk host. Each is
+# a KNOWN name, checked like the rest (R-08, Story 3.7).
+CONFIG_CREDENTIALS_PY='
+import sys, tomllib
+config = tomllib.loads(sys.stdin.read())
+discord = config.get("discord", {})
+if discord.get("enabled") is True:
+    print(discord.get("credential", "/etc/crewchat/discord.credential"))
+squawkie = config.get("squawkie", {})
+if isinstance(squawkie.get("credential"), str):
+    print(squawkie["credential"])
+'
+config_credentials=()
+if config_text="$($SUDO cat "$SERVERS_TOML" 2>/dev/null)"; then
+  if listed="$("$CREWCHAT_PYTHON" -c "$CONFIG_CREDENTIALS_PY" <<<"$config_text" 2>&1)"; then
+    while IFS= read -r file; do
+      [[ -n "$file" ]] && config_credentials+=("$file")
+    done <<<"$listed"
+  else
+    fail "could not read the credentials $SERVERS_TOML names: $listed"
+  fi
+else
+  fail "cannot read $SERVERS_TOML"
+fi
+for file in "${config_credentials[@]}"; do
+  no_agent_read "$file"
+done
+if id "$KIOSK_USER" >/dev/null 2>&1; then
+  no_agent_read "$KIOSK_CREDENTIAL"
+fi
+
 # The kiosk (D-107), when this host runs the CLI runner, i.e. has the crewkiosk user.
 if id "$KIOSK_USER" >/dev/null 2>&1; then
   if ! $SUDO test -S "$KIOSK_SOCKET"; then
@@ -183,6 +224,9 @@ if id "$KIOSK_USER" >/dev/null 2>&1; then
       done
     done
     no_read_as "$KIOSK_USER" "${CREWCHAT_TOKENS}/verify-canary.json"
+    for file in "${config_credentials[@]}"; do
+      no_read_as "$KIOSK_USER" "$file"
+    done
   fi
 fi
 

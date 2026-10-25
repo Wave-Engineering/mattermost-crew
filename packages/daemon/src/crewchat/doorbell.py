@@ -257,7 +257,7 @@ class Doorbell:
             self._queues[dev_name] = q
         return q
 
-    def _enqueue(self, dev_name: str, event: DoorbellEvent) -> None:
+    def _enqueue(self, dev_name: str, event: DoorbellEvent) -> bool:
         try:
             self.queue(dev_name).put_nowait(event)
         except asyncio.QueueFull:
@@ -268,6 +268,13 @@ class Doorbell:
                 event.payload.get("type"),
                 event.backend,
             )
+            return False
+        return True
+
+    def deliver(self, dev_name: str, event: DoorbellEvent) -> bool:
+        """Put a daemon-made event (the kiosk review, Story 3.6) straight on the agent's
+        queue, past the filters. False when the queue is full and it was dropped."""
+        return self._enqueue(dev_name, event)
 
     async def next_event(self, dev_name: str) -> DoorbellEvent:
         """The agent's next event; its cursor moves past it (R-28)."""

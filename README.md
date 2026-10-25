@@ -16,6 +16,11 @@ alongside Discord, behind one doorbell and one chat contract.
   own `/wavemachine` campaign: Phase 1 is #26, Phase 2 is #27 and Phase 3 is #28 (D-089).
 - **[`docs/for-mother.md`](docs/for-mother.md)** is what the OaW Mattermost instance needs to provide,
   written for mother, who deploys it.
+- **[`docs/runbook.md`](docs/runbook.md)** installs, configures, verifies and rolls back a host;
+  CI runs its install and verify commands (IT-20).
+  **[`docs/partner-guide.md`](docs/partner-guide.md)** is the human partner's switch and kiosk
+  commands, and **[`docs/architecture.md`](docs/architecture.md)** the components, data paths and
+  trust boundaries.
 - **[`docs/research-2026-10-19.md`](docs/research-2026-10-19.md)** is the research digest the ledger
   cites.
 

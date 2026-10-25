@@ -173,7 +173,19 @@ async def serve(
     # The kiosk (Story 3.5): answers the KIOSK queue from the briefs the shims push, through
     # the `crewkiosk` CLI runner (D-096). Sessions start on each expert's first outsider.
     kiosk_answers = Kiosk(
-        kiosk, context.briefs, chat_backends, ClaudeCliRunner(), state_dir=state_dir
+        kiosk,
+        context.briefs,
+        chat_backends,
+        ClaudeCliRunner(),
+        state_dir=state_dir,
+        deliver=doorbell.deliver,
+    )
+    # Social engaged on a server (Story 3.6, R-33): each of that crew's agents there gets its
+    # kiosk review on its doorbell queue.
+    cache.social_listeners.append(
+        lambda crew, server_id: kiosk_answers.on_social(
+            server_id, registry.agents_on(crew, server_id)
+        )
     )
     handlers = build_handlers(config, registry, health_sources)
     handlers.update(

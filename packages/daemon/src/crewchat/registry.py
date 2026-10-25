@@ -128,6 +128,15 @@ class Registry:
     def get(self, dev_name: str) -> Registration | None:
         return self._registrations.get(dev_name)
 
+    def agents_on(self, crew: str, server_id: str) -> list[str]:
+        """The Dev-Names registered in `crew` with a backend on Mattermost `server_id`."""
+        backend = mattermost_backend(server_id)
+        return sorted(
+            r.dev_name
+            for r in self._registrations.values()
+            if r.crew == crew and backend in r.backends
+        )
+
     async def register(
         self,
         dev_name: str,
