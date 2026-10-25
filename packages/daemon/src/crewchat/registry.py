@@ -63,6 +63,11 @@ class RegisterError(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
+def mattermost_backend(server_id: str) -> str:
+    """A Mattermost server's backend name, the one form on the socket and in files (§5.4)."""
+    return f"mattermost:{server_id}"
+
+
 def account_name(dev_name: str, crew: str) -> str:
     """`<dev_name>.<crew>`, as the broker names it: at most 64 of a-z 0-9 . _ - (CT-05)."""
     if not isinstance(dev_name, str) or not DEV_NAME_RE.match(dev_name):
@@ -81,6 +86,7 @@ class Registration:
     crew: str
     session_id: str
     account: str
+    # Backend names in the one form (§5.4): `mattermost:<server_id>` per server, `discord`.
     backends: list[str]
     needs_list: str
     registered_at: datetime
@@ -169,7 +175,7 @@ class Registry:
                     continue
                 await self.store.install_minted(dev_name, crew, server.id, minted, now)
                 await self.cache.refresh(crew, server.id)
-                backends.append(server.id)
+                backends.append(mattermost_backend(server.id))
 
         if unavailable and not backends:
             if squatted == unavailable:

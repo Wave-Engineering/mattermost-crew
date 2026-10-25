@@ -1,4 +1,5 @@
-"""Story 2.4: the thin MCP shim over the daemon's socket. IT-04, IT-05, IT-15 and IT-16.
+"""Stories 2.4 and 2.4c: the thin MCP shim over the daemon's socket. IT-04, IT-05, IT-15,
+IT-16 and IT-25.
 
 The daemon side is wired as `crewchat serve` wires it, on a real unix socket: the registry, the
 token store, one `MattermostBackend` per configured server (over in-process brokers, as in
@@ -8,15 +9,24 @@ through `SocketTransport`, as an agent's session does.
 
 - IT-04 (R-11): the default comes from the identity file, then the defaults file; with neither,
   a headless send fails loudly, leaves a squawk on the crew's needs list, and sends nothing.
-- IT-05 (R-12, R-13): a reply follows its thread's backend, whatever the default; a named
-  backend is used, and the daemon logs `off-default`.
-- IT-15 (R-15): today's Discord operations, through `chat_*` and through every `disc_*` alias.
+- IT-05 (R-12, R-13, R-15): a reply follows its thread's backend, whatever the default, through
+  the daemon's `thread_backend` (the shim keeps no map); a named backend is used, and the daemon
+  logs `off-default`. `chat_send` with `attach_path` and `embed` on Mattermost posts a file and
+  a message attachment, checked through `GET /api/v4/posts/{id}`.
+- IT-15 (R-15): today's Discord operations, through `chat_*` and through each of the nine
+  `disc_*` aliases: `disc_send` (with an attachment and an embed), `disc_read` (with
+  `message_id`), `disc_list`, `disc_resolve`, `disc_create_channel`, `disc_create_thread`,
+  and Story 2.4's `disc_thread`, `disc_dm` and `disc_react`. Each forwards and warns once.
 - IT-16 (R-09, R-10): one agent registered on two Mattermost servers, each with its own
   (crew, server) broker and token, plus Discord, sends and receives on all of them through the
   one contract. CI has one Mattermost per leg, so the two server ids point at that one server;
   each has its own broker instance, state, token and websocket.
+- IT-25 (R-15, D-106): with the scream-hole fake failing its health check, `chat_read` and
+  `disc_read` on Discord answer `unavailable: scream-hole unhealthy` and the Discord REST fake
+  sees no read; `chat_send` still posts, through the direct fallback; once the fake is healthy
+  again, the next read is served through scream-hole.
 
-IT-15 needs no Mattermost and always runs; the others skip without one.
+IT-15 and IT-25 need no Mattermost and always run; the others skip without one.
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ import asyncio
 import json
 import logging
 import tempfile
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -44,9 +54,16 @@ from crewchat.registry import Registry
 from crewchat.server import DaemonServer, build_handlers
 from crewchat.threads import MyThreads
 from crewchat.tokens import SwitchCache, TokenStore
+from crewchat.uploads import UploadStore
 from crewchat_clients.mcp_shim import ALIASES, Shim, ShimError, SocketTransport
 
-from tests.fakes.screamhole import BOT_TOKEN, DISCORD_API, SCREAMHOLE_URL, FakeDiscord
+from tests.fakes.screamhole import (
+    BOT_TOKEN,
+    DISCORD_API,
+    GUILD_ID,
+    SCREAMHOLE_URL,
+    FakeDiscord,
+)
 from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` is a fixture)
     Inbox,
     InProcessBroker,
@@ -92,6 +109,7 @@ class Host:
         mattermost: Any = None,
         setup: dict[str, str] | None = None,  # noqa: F811 (the module fixture's value)
         server_ids: Sequence[str] = (),
+        now: Callable[[], float] | None = None,
     ) -> None:
         mint.clear_expiry_cache()
         self.root = root
@@ -140,13 +158,25 @@ class Host:
         cred.write_text(BOT_TOKEN + "\n")
         cred.chmod(0o600)
         self.dc = DiscordBackend(
-            SCREAMHOLE_URL, cred, discord_api=DISCORD_API, http_client=discord.http_client()
+            SCREAMHOLE_URL,
+            cred,
+            discord_api=DISCORD_API,
+            http_client=discord.http_client(),
+            guild_id=GUILD_ID,
+            **({"now": now} if now is not None else {}),
         )
         self.registry = Registry(config, brokers, self.store, SwitchCache(brokers))
         backends: dict[str, Any] = {b.name: b for b in self.mm.values()}
         backends[self.dc.name] = self.dc
-        handlers = build_handlers(config, self.registry)
-        handlers.update(build_chat_handlers(self.registry, backends, MyThreads(), AgentContext()))
+        # As `crewchat serve` wires them: uploads beside the socket, Discord's own health.
+        self.uploads = UploadStore(root / "uploads")
+        self.threads = MyThreads()
+        handlers = build_handlers(config, self.registry, {self.dc.name: self.dc})
+        handlers.update(
+            build_chat_handlers(
+                self.registry, backends, self.threads, AgentContext(), self.uploads
+            )
+        )
         self.server = DaemonServer(handlers)
 
     @asynccontextmanager
@@ -303,12 +333,40 @@ def test_it05_reply_follows_thread_and_named_backend_is_logged(
             # A reply is not an off-default choice: one off-default line, for the root only.
             assert sum("off-default" in r.getMessage() for r in caplog.records) == 1
 
-            # A thread first seen in a read is followed too: a human's root on Mattermost.
+            # A thread the agent only read is followed too: a human's root on Mattermost,
+            # which the thread set never recorded, placed by the daemon's probe (R-12).
             human = as_admin_post(mattermost, channel, "it05 human root")
             await shim.chat_read(channel, limit=5, backend="mattermost:ci")
             answer = await shim.chat_send(channel, "it05 answer", thread=human["id"])
             assert answer["backend"] == "mattermost:ci"
             assert post(mattermost, answer["post_id"])["root_id"] == human["id"]
+            # A new shim instance (a session restart) replies on the old thread the same way:
+            # the shim kept nothing to lose.
+            again, transport = make_shim(repo, sock, tmp_path)
+            await again.start()
+            late = await again.chat_send(channel, "it05 after restart", thread=root["post_id"])
+            assert late["backend"] == "mattermost:ci"
+            assert post(mattermost, late["post_id"])["root_id"] == root["post_id"]
+            assert "thread_backend" in transport.ops
+
+            # R-15: attach_path and embed on Mattermost: a file, and a message attachment.
+            report = tmp_path / "it05-report.txt"
+            report.write_bytes(b"it05 attachment bytes\n")
+            rich = await shim.chat_send(
+                channel,
+                "it05 with a file",
+                backend="mattermost:ci",
+                attach_path=str(report),
+                embed="IT-05: file: and embed",
+            )
+            stored = post(mattermost, rich["post_id"])
+            assert len(stored["file_ids"]) == 1
+            info = admin(mattermost, "GET", f"/files/{stored['file_ids'][0]}/info").json()
+            assert info["name"] == "it05-report.txt" and info["size"] == len(report.read_bytes())
+            assert stored["props"]["attachments"][0]["title"] == "IT-05"
+            assert stored["props"]["attachments"][0]["text"] == "file: and embed"
+            assert stored["props"]["crew_proto"] == 1
+            assert list((tmp_path / "uploads").iterdir()) == []  # deleted after use
 
     asyncio.run(scenario())
 
@@ -354,13 +412,43 @@ def test_it15_discord_through_chat_and_aliases(
             await shim.chat_react(sent["post_id"], "👍")
             assert discord.reactions[-1] == (chan, sent["post_id"], "👍")
 
-            # disc_* aliases: the same operations, each forwarding with backend=discord.
-            a = await shim.disc_send(chan, "it15 alias send")
-            assert discord.messages[chan][-1]["id"] == a["post_id"]
+            # disc_* aliases: the same operations, each forwarding with backend=discord, with
+            # today's argument names and shapes.
+            report = tmp_path / "it15-report.txt"
+            report.write_bytes(b"it15 attachment bytes\n")
+            a = await shim.disc_send(
+                "#agent-ops",  # a name, resolved by the daemon against the guild
+                "it15 alias send",
+                attach_path=str(report),
+                embed="IT-15: all: green",
+            )
+            stored = discord.messages[chan][-1]
+            assert stored["id"] == a["post_id"]
+            assert stored["embeds"] == [{"title": "IT-15", "description": "all: green"}]
+            assert [x["filename"] for x in stored["attachments"]] == ["it15-report.txt"]
+            assert discord.files[(a["post_id"], "it15-report.txt")] == report.read_bytes()
+            assert list((tmp_path / "uploads").iterdir()) == []  # deleted after use
+            await shim.disc_send("agent-ops", content="it15 alias content")
             got = await shim.disc_read(chan, limit=2)
-            assert got["messages"][-1]["post_id"] == a["post_id"]
-            one = await shim.disc_read(chan, message_id=sent["post_id"])
+            assert [m["text"].split("\n")[0] for m in got["messages"]] == [
+                "it15 alias send",
+                "it15 alias content",
+            ]
+            one = await shim.disc_read("agent-ops", message_id=sent["post_id"])
             assert [m["post_id"] for m in one["messages"]] == [sent["post_id"]]
+            listed = await shim.disc_list(GUILD_ID)
+            assert {"id": chan, "name": "agent-ops", "type": "text"} in listed["channels"]
+            found = await shim.disc_resolve(GUILD_ID, "#agent-ops")
+            assert found["id"] == chan
+            made = await shim.disc_create_channel(GUILD_ID, "IT15 Room")
+            assert discord.channels[made["id"]]["name"] == "it15-room"
+            thr = await shim.disc_create_thread("agent-ops", "it15 thread", message="first")
+            assert discord.channels[thr["id"]]["parent_id"] == chan
+            assert discord.messages[thr["id"]][-1]["content"].startswith("first")
+            with pytest.raises(ShimError, match="bad_request"):
+                await shim.disc_list("900000000000000999")  # another guild: refused
+            with pytest.raises(ShimError, match="unknown channel 'no-such-room'"):
+                await shim.disc_send("no-such-room", "never sent")
             t = await shim.disc_thread(tid)
             assert [m["post_id"] for m in t["messages"]][-1] == reply["post_id"]
             d = await shim.disc_dm(HUMAN, "it15 alias dm")
@@ -370,9 +458,63 @@ def test_it15_discord_through_chat_and_aliases(
             await shim.disc_send(chan, "it15 alias send again")
 
     asyncio.run(scenario())
-    assert discord.direct_reads == []  # D-013: reads never hit Discord
+    assert discord.direct_reads == []  # D-013, D-106: reads never hit Discord
+    assert {s for s, _m, _p in discord.requests} == {"scream-hole"}  # healthy: all through it
     warnings = [r.getMessage() for r in caplog.records if "deprecated" in r.getMessage()]
+    assert len(ALIASES) == 9
     assert sorted(w.split()[1] for w in warnings) == sorted(ALIASES)  # each warns, once
+
+
+# -- IT-25 -------------------------------------------------------------------------------------
+def test_it25_screamhole_unhealthy_refuses_reads(tmp_path: Path, sock_dir: Path) -> None:
+    """IT-25 (R-15, D-106): no Discord read ever reaches Discord; writes fall back."""
+    clock = [1_800_000_000.0]
+    discord = FakeDiscord(now=lambda: clock[0])
+    chan = discord.add_channel("agent-ops")
+    early = discord.add_message(chan, "it25 before", author={"id": HUMAN, "username": "bj"})
+    sock = sock_dir / "crewchat.sock"
+    host = Host(tmp_path, discord, now=lambda: clock[0])
+
+    async def scenario() -> None:
+        async with host.serving(sock):
+            shim, _ = make_shim(make_repo(tmp_path, "shim-it25", home_backend="discord"), sock,
+                                tmp_path)
+            await shim.start()
+            assert (await shim.chat_health())["backends"]["discord"]["state"] == "ok"
+
+            discord.screamhole_healthy = False
+            clock[0] += host.dc.healthy_recheck_s  # the next call re-checks scream-hole
+            mark = len(discord.requests)
+            with pytest.raises(ShimError, match="unavailable: scream-hole unhealthy"):
+                await shim.chat_read(chan)
+            with pytest.raises(ShimError, match="unavailable: scream-hole unhealthy"):
+                await shim.disc_read(chan)
+            with pytest.raises(ShimError, match="unavailable: scream-hole unhealthy"):
+                await shim.disc_read(chan, message_id=early["id"])
+            health = (await shim.chat_health())["backends"]["discord"]
+            assert health["state"] == "degraded"
+            # A write still posts, straight to the Discord REST API.
+            sent = await shim.chat_send(chan, "it25 while scream-hole is down")
+            assert discord.messages[chan][-1]["id"] == sent["post_id"]
+            during = discord.requests[mark:]
+            assert ("discord", "POST", f"/channels/{chan}/messages") in during
+            assert [r for r in during if r[0] == "discord" and r[1] == "GET"] == []
+
+            # Healthy again: once the backoff is up, the next read is served by scream-hole.
+            discord.screamhole_healthy = True
+            clock[0] += 60.0
+            mark = len(discord.requests)
+            got = await shim.chat_read(chan)
+            assert [m["post_id"] for m in got["messages"]][-1] == sent["post_id"]
+            assert any(
+                s == "scream-hole" and m == "GET" and f"/channels/{chan}/messages" in p
+                for s, m, p in discord.requests[mark:]
+            )
+            assert (await shim.chat_health())["backends"]["discord"]["state"] == "ok"
+
+    asyncio.run(scenario())
+    assert discord.direct_reads == []  # the Discord REST fake saw no read, ever
+    assert not [r for r in discord.requests if r[0] == "discord" and r[1] == "GET"]
 
 
 # -- IT-16 -------------------------------------------------------------------------------------

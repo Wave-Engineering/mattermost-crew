@@ -29,6 +29,10 @@ from tests.fakes.screamhole import BOT_TOKEN, DISCORD_API, GUILD_ID, SCREAMHOLE_
 
 HUMAN = {"id": "500000000000000001", "username": "bj", "global_name": "BJ", "bot": False}
 ME = "hailing-frequencies"
+# Channel IDs, as snowflakes: since Story 2.4c anything else is a channel name to resolve.
+C1 = "700000000000000901"
+C2 = "700000000000000902"
+NEVER_POLLED = "700000000000000904"
 
 
 @pytest.fixture
@@ -80,8 +84,8 @@ def test_backend_satisfies_the_contract(discord: FakeDiscord, credential: Path) 
 # -- the signature (R-14, D-059) -------------------------------------------------------------
 def test_signature_with_p1_suffix(discord: FakeDiscord, credential: Path, run: Any) -> None:
     b = backend(discord, credential)
-    msg = run(b.send(ME, "c1", "status update"))
-    stored = discord.messages["c1"][-1]["content"]
+    msg = run(b.send(ME, C1, "status update"))
+    stored = discord.messages[C1][-1]["content"]
     assert stored == "status update\n\n— **hailing-frequencies** 📡 (oaw) ·p1"
     assert msg.proto == 1 and msg.author_name == ME and msg.backend == "discord"
 
@@ -96,10 +100,10 @@ def test_signature_with_p1_suffix(discord: FakeDiscord, credential: Path, run: A
     assert no_avatar is not None and (no_avatar.avatar, no_avatar.proto) == ("", 1)
 
     # Inbound: no suffix gives proto 0, the suffix gives 1.
-    discord.add_message("c1", "old\n\n— **kessel** 🚀 (oaw)")
-    discord.add_message("c1", "new\n\n— **kessel** 🚀 (oaw) ·p1")
-    discord.add_message("c1", "a human, unsigned", author=HUMAN)
-    msgs = run(b.read(ME, "c1"))
+    discord.add_message(C1, "old\n\n— **kessel** 🚀 (oaw)")
+    discord.add_message(C1, "new\n\n— **kessel** 🚀 (oaw) ·p1")
+    discord.add_message(C1, "a human, unsigned", author=HUMAN)
+    msgs = run(b.read(ME, C1))
     assert [(m.author_name, m.proto) for m in msgs[-3:]] == [
         ("kessel", 0),
         ("kessel", 1),
@@ -136,17 +140,17 @@ def test_send_replaces_an_existing_own_signature(
     discord: FakeDiscord, credential: Path, run: Any
 ) -> None:
     b = backend(discord, credential)
-    run(b.send(ME, "c1", "hello\n\n— **hailing-frequencies** 📡 (oaw)"))
+    run(b.send(ME, C1, "hello\n\n— **hailing-frequencies** 📡 (oaw)"))
     assert (
-        discord.messages["c1"][-1]["content"] == "hello\n\n— **hailing-frequencies** 📡 (oaw) ·p1"
+        discord.messages[C1][-1]["content"] == "hello\n\n— **hailing-frequencies** 📡 (oaw) ·p1"
     )
 
 
 def test_long_send_signs_every_chunk(discord: FakeDiscord, credential: Path, run: Any) -> None:
     b = backend(discord, credential)
     text = " ".join(["word"] * 900)  # about 4,500 characters
-    run(b.send(ME, "c1", text))
-    chunks = [m["content"] for m in discord.messages["c1"]]
+    run(b.send(ME, C1, text))
+    chunks = [m["content"] for m in discord.messages[C1]]
     assert len(chunks) == 3
     assert all(len(c) <= MAX_CHUNK for c in chunks)
     assert all(c.endswith("— **hailing-frequencies** 📡 (oaw) ·p1") for c in chunks)
@@ -166,18 +170,18 @@ def test_read_via_screamhole_fake(credential: Path, run: Any) -> None:
     clock = [1_800_000_000.0]
     discord = FakeDiscord(now=lambda: clock[0])
     b = backend(discord, credential)
-    discord.add_message("c1", "one", author=HUMAN)
+    discord.add_message(C1, "one", author=HUMAN)
     clock[0] += 10
-    discord.add_message("c1", "two", author=HUMAN)
-    discord.add_message("c2", "elsewhere", author=HUMAN)
+    discord.add_message(C1, "two", author=HUMAN)
+    discord.add_message(C2, "elsewhere", author=HUMAN)
 
-    msgs = run(b.read(ME, "c1"))
+    msgs = run(b.read(ME, C1))
     assert [m.text for m in msgs] == ["one", "two"]  # oldest first
-    assert all(m.channel == "c1" and m.is_bot is False for m in msgs)
+    assert all(m.channel == C1 and m.is_bot is False for m in msgs)
     assert msgs[1].ts == clock[0]
-    assert [m.text for m in run(b.read(ME, "c1", limit=1))] == ["two"]
-    assert [m.text for m in run(b.read(ME, "c1", since=clock[0] - 5))] == ["two"]
-    assert run(b.read(ME, "never-polled")) == []  # scream-hole fails open (#16)
+    assert [m.text for m in run(b.read(ME, C1, limit=1))] == ["two"]
+    assert [m.text for m in run(b.read(ME, C1, since=clock[0] - 5))] == ["two"]
+    assert run(b.read(ME, NEVER_POLLED)) == []  # scream-hole fails open (#16)
 
     # Every read went to scream-hole, without `limit` (watcher #92); none to Discord.
     reads = [r for r in discord.requests if r[1] == "GET"]
@@ -199,7 +203,7 @@ def test_reads_never_carry_the_bot_token(discord: FakeDiscord, credential: Path,
         discord_api=DISCORD_API,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(spy)),
     )
-    run(b.read(ME, "c1"))
+    run(b.read(ME, C1))
     assert seen and all("Authorization" not in r.headers for r in seen)
 
 
@@ -240,11 +244,11 @@ def test_thread_dm_and_react(discord: FakeDiscord, credential: Path, run: Any) -
 
 def test_reply_and_mentions_are_mapped(discord: FakeDiscord, credential: Path, run: Any) -> None:
     b = backend(discord, credential)
-    root = discord.add_message("c1", "root", author=HUMAN)
+    root = discord.add_message(C1, "root", author=HUMAN)
     discord.add_message(
-        "c1", "a reply @hailing-frequencies", author=HUMAN, reply_to=root["id"], mentions=[HUMAN]
+        C1, "a reply @hailing-frequencies", author=HUMAN, reply_to=root["id"], mentions=[HUMAN]
     )
-    msgs = run(b.read(ME, "c1"))
+    msgs = run(b.read(ME, C1))
     assert msgs[-1].root_id == root["id"] and msgs[0].root_id == ""
     assert msgs[-1].mentions == [HUMAN["id"]]
     assert msgs[-1].author_id == HUMAN["id"] and msgs[-1].ts > 0
@@ -254,7 +258,7 @@ def test_429_waits_and_retries(discord: FakeDiscord, credential: Path, run: Any)
     sleeps = Sleeps()
     b = backend(discord, credential, sleep=sleeps)
     discord.rate_limit_next = 1
-    msg = run(b.send(ME, "c1", "hello"))
+    msg = run(b.send(ME, C1, "hello"))
     assert msg.text.startswith("hello") and sleeps.waits == [0.25]
 
 
@@ -263,16 +267,16 @@ def test_credential_must_be_0600(discord: FakeDiscord, credential: Path, run: An
     b = backend(discord, credential)
     credential.chmod(0o640)
     with pytest.raises(CredentialError, match="0640"):
-        run(b.send(ME, "c1", "hello"))
+        run(b.send(ME, C1, "hello"))
     credential.chmod(0o600)
     credential.write_text("  \n")
     with pytest.raises(CredentialError, match="empty"):
-        run(b.send(ME, "c1", "hello"))
+        run(b.send(ME, C1, "hello"))
     with pytest.raises(CredentialError, match="no Discord credential"):
-        run(backend(discord, credential.parent / "missing").send(ME, "c1", "x"))
+        run(backend(discord, credential.parent / "missing").send(ME, C1, "x"))
     with pytest.raises(CredentialError, match="regular file"):
-        run(backend(discord, credential.parent).send(ME, "c1", "x"))
-    assert discord.messages.get("c1", []) == []
+        run(backend(discord, credential.parent).send(ME, C1, "x"))
+    assert discord.messages.get(C1, []) == []
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can chown to anyone")
@@ -281,7 +285,7 @@ def test_credential_owner_is_checked(
 ) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: credential.stat().st_uid + 1)
     with pytest.raises(CredentialError, match="not owned"):
-        run(backend(discord, credential).send(ME, "c1", "x"))
+        run(backend(discord, credential).send(ME, C1, "x"))
 
 
 # -- the stream and the echo filter (R-15) ---------------------------------------------------
@@ -327,7 +331,7 @@ def test_stream_skips_a_failing_channel_and_static_channels(
     discord: FakeDiscord, credential: Path, run: Any
 ) -> None:
     sleeps = Sleeps()
-    b = backend(discord, credential, channels=["c1", "bad"], sleep=sleeps)
+    b = backend(discord, credential, channels=[C1, "bad"], sleep=sleeps)
     real = discord.handle_screamhole
 
     def flaky(request: httpx.Request) -> httpx.Response:
@@ -341,7 +345,7 @@ def test_stream_skips_a_failing_channel_and_static_channels(
         gen = b.stream(ME)
         task = asyncio.ensure_future(take(gen, 1))
         await asyncio.sleep(0)
-        discord.add_message("c1", "hello", author=HUMAN)
+        discord.add_message(C1, "hello", author=HUMAN)
         got = await task
         await b.aclose()
         return got
