@@ -47,6 +47,66 @@
           ]
         }
       ]
+    },
+    {
+      "name": "Phase 2 (cont.): D-103/D-104 follow-up",
+      "waves": [
+        {
+          "id": "P2W3",
+          "issues": [
+            {
+              "number": 49,
+              "title": "register carries team and avatar; persisted my-threads",
+              "story": "2.4b",
+              "depends_on": [
+                "2.2",
+                "2.3",
+                "2.4"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Phase 2 (cont.): R-15 parity (D-105, D-106)",
+      "waves": [
+        {
+          "id": "P2W4",
+          "issues": [
+            {
+              "number": 51,
+              "title": "R-15 parity: every disc_* alias, attachments, embeds, one backend name",
+              "story": "2.4c",
+              "depends_on": [
+                "2.2",
+                "2.4",
+                "2.4b"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Phase 2 (cont.): IT-06 DoD gap",
+      "waves": [
+        {
+          "id": "P2W5",
+          "issues": [
+            {
+              "number": 56,
+              "title": "IT-06 protocol marker on both backends",
+              "story": "it06",
+              "depends_on": [
+                "2.1",
+                "2.2",
+                "2.4c"
+              ]
+            }
+          ]
+        }
+      ]
     }
   ]
 }
