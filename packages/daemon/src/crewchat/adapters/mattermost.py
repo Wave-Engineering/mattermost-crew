@@ -388,6 +388,8 @@ class MattermostBackend:
         thread: str | None,
         attachments: Sequence[Attachment],
         embed: Embed | None,
+        *,
+        kiosk: bool = False,
     ) -> InboundMessage:
         """Upload `attachments` with the agent's own token (`POST /api/v4/files`), then post
         with their `file_ids`; `embed` is a message attachment (CT-01)."""
@@ -399,6 +401,8 @@ class MattermostBackend:
                 raise MattermostAPIError(f"upload of {att.name} returned no file id")
             file_ids.append(str(infos[0]["id"]))
         props: dict[str, Any] = {"crew_proto": PROTO}
+        if kiosk:
+            props["crew_kiosk"] = 1  # outsider content to every admit (§5.9, §5.11)
         if embed is not None:
             props["attachments"] = [embed_attachment(embed)]
         post = await client.create_post(
@@ -420,6 +424,16 @@ class MattermostBackend:
     ) -> InboundMessage:
         async def request(client: MattermostClient) -> InboundMessage:
             return await self._post(client, channel, text, thread, attachments, embed)
+
+        return await self._call(dev_name, request)
+
+    async def send_kiosk(
+        self, dev_name: str, channel: str, text: str, thread: str
+    ) -> InboundMessage:
+        """The kiosk's answer, as `dev_name`, in `thread`: `props.crew_kiosk=1` (Story 3.5)."""
+
+        async def request(client: MattermostClient) -> InboundMessage:
+            return await self._post(client, channel, text, thread, (), None, kiosk=True)
 
         return await self._call(dev_name, request)
 

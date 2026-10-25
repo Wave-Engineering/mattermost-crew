@@ -27,6 +27,7 @@ import pytest
 from tests.integration.mmhttp import mm_request
 
 AGENT_USER = os.environ.get("AGENT_USER", "agent")
+KIOSK_USER = "crewkiosk"
 TOKENS_DIR = "/var/lib/crewchat/tokens"
 PATCHED_ROLE = "system_user_access_token"
 
@@ -114,21 +115,39 @@ def test_register_names_the_account(installed: dict[str, Any], registered: dict[
     assert registered["file"]["crew"] == crew
 
 
-def test_credential_files_not_readable_by_agent(
-    installed: dict[str, Any], registered: dict[str, Any]
-) -> None:
-    """R-08: each KNOWN file exists, and the agent's user cannot read it. No globs."""
+def credential_files(installed: dict[str, Any], registered: dict[str, Any]) -> list[str]:
+    """Every chat and broker credential file on the host, by its KNOWN name. No globs."""
     files = [f"{TOKENS_DIR}/{registered['dev']}.json", f"{TOKENS_DIR}/verify-canary.json"]
     for crew, server_id, _ in broker_instances(installed["servers"]):
         files.append(f"/etc/crewbroker/{crew}-{server_id}.credential")
         files.append(f"/var/lib/crewbroker/{crew}-{server_id}/tokens.json")
     if installed["servers"].get("discord", {}).get("enabled"):
         files.append("/etc/crewchat/discord.credential")
+    return files
+
+
+def test_credential_files_not_readable_by_agent(
+    installed: dict[str, Any], registered: dict[str, Any]
+) -> None:
+    """R-08: each KNOWN file exists, and the agent's user cannot read it. No globs."""
     # A refused sudo also exits non-zero, which would read as "cannot read": prove it works.
     assert as_agent("true").returncode == 0, f"cannot run commands as {AGENT_USER}"
-    for path in files:
+    for path in credential_files(installed, registered):
         assert as_root("test", "-e", path).returncode == 0, f"{path} does not exist"
         assert as_agent("test", "-r", path).returncode != 0, f"{AGENT_USER} can read {path}"
+
+
+def test_credential_files_not_readable_by_crewkiosk(
+    installed: dict[str, Any], registered: dict[str, Any]
+) -> None:
+    """R-08, R-31 (Story 3.5): the kiosk's CLI runner runs as `crewkiosk`, which can read no
+    chat or broker credential. Each KNOWN file is checked with `test -r`, as `crewkiosk`."""
+    pwd.getpwnam(KIOSK_USER)  # the CLI runner is the kiosk (D-096): the user must exist
+    as_kiosk = ("sudo", "-n", "-u", KIOSK_USER, "--")
+    assert run(*as_kiosk, "true").returncode == 0, f"cannot run commands as {KIOSK_USER}"
+    for path in credential_files(installed, registered):
+        assert as_root("test", "-e", path).returncode == 0, f"{path} does not exist"
+        assert run(*as_kiosk, "test", "-r", path).returncode != 0, f"{KIOSK_USER} can read {path}"
 
 
 def test_no_socket_op_returns_a_token(

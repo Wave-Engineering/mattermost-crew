@@ -55,6 +55,7 @@ from crewchat.adapters.base import (
     parse_embed,
 )
 from crewchat.filters import Filters
+from crewchat.kiosk import BriefStore
 from crewchat.registry import Registration, Registry
 from crewchat.server import Handler, OpError
 from crewchat.threads import MyThreads
@@ -75,7 +76,7 @@ log = logging.getLogger("crewchat.chat")
 class AgentContext:
     """What the shims pushed, by Dev-Name: the `## Kiosk` brief and the squawk ids."""
 
-    briefs: dict[str, str] = field(default_factory=dict)
+    briefs: BriefStore = field(default_factory=BriefStore)
     squawk_ids: dict[str, list[str]] = field(default_factory=dict)
 
 
