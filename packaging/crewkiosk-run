@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# The kiosk's CLI runner (Dev Spec §5.11; Story 3.5; D-096). Install root-owned, mode 0755, at
-# /usr/local/libexec/crewkiosk-run. The daemon (crewchat) runs it as crewkiosk through the one
-# rule in packaging/crewkiosk.sudoers, which allows this command with NO arguments:
+# The kiosk's CLI runner (Dev Spec §5.11; Story 3.5; D-096, D-107). Install root-owned, mode 0755,
+# at /usr/local/libexec/crewkiosk-run. The daemon never runs it: it connects to
+# /run/crewkiosk/kiosk.sock (packaging/crewkiosk.socket, Accept=yes), and systemd starts one
+# packaging/crewkiosk@.service instance per connection, as crewkiosk, with this script's stdin
+# and stdout on that connection. The daemon keeps NoNewPrivileges=yes and never changes user.
 #
-#   sudo -n -u crewkiosk -- /usr/local/libexec/crewkiosk-run    < prompt
-#
-# It reads the prompt on stdin and prints the answer on stdout. It:
+# It reads the prompt on stdin, to EOF (the daemon half-closes), and replies on stdout with
+# `ok` and the answer, or `error <rc>`: a socket carries no exit status. Its own refusals go
+# to stderr, which is the instance's journal, and reach the daemon as no reply at all. It:
 #   - refuses to run as anyone but crewkiosk;
 #   - drops every inherited environment variable;
 #   - gives the CLI an empty HOME and an empty working directory, fresh for every question and
@@ -45,8 +47,17 @@ export ANTHROPIC_API_KEY
 
 scratch="$(mktemp -d -t crewkiosk.XXXXXXXX)"
 trap 'rm -rf "$scratch"' EXIT
-mkdir -m 0700 "$scratch/home" "$scratch/work"
+mkdir -m 0700 "$scratch/home" "$scratch/work" "$scratch/io"
+cat >"$scratch/io/prompt"
 export HOME="$scratch/home"
 cd "$scratch/work"
 
-"$CLAUDE" -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"
+rc=0
+"$CLAUDE" -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*" <"$scratch/io/prompt" >"$scratch/io/answer" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  printf 'ok\n'
+  cat "$scratch/io/answer"
+else
+  echo "crewkiosk-run: claude exited $rc" >&2
+  printf 'error %d\n' "$rc"
+fi

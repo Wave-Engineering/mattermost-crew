@@ -1,0 +1,22 @@
+# The kiosk runner's socket (Dev Spec §5.11; Story 3.5; D-107).
+#
+#   systemctl enable --now crewkiosk.socket
+#
+# Only the daemon's group (crewchat) can connect. Each connection starts one
+# crewkiosk@.service instance, as crewkiosk, for one answer (Accept=yes): the daemon keeps
+# NoNewPrivileges=yes and never changes user to reach the kiosk.
+[Unit]
+Description=mattermost-crew kiosk runner socket
+
+[Socket]
+ListenStream=/run/crewkiosk/kiosk.sock
+SocketUser=root
+SocketGroup=crewchat
+SocketMode=0660
+DirectoryMode=0755
+Accept=yes
+# At most this many answers at once; the daemon answers each expert's queue in order.
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

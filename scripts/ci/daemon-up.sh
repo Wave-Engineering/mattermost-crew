@@ -65,8 +65,9 @@ $SUDO install -d -m 0700 -o crewchat -g crewchat /var/lib/crewchat
 
 log "starting crewchat serve; log in ${LOG}"
 mkdir -p "$(dirname "$LOG")"
+# No new privileges, as packaging/crewchat.service runs it (D-107): the kiosk must still answer.
 # shellcheck disable=SC2024  # the log is the runner's file, written by this shell
-nohup sudo -u crewchat -- "$BIN" serve >"$LOG" 2>&1 &
+nohup sudo -u crewchat -- setpriv --no-new-privs "$BIN" serve >"$LOG" 2>&1 &
 for _ in $(seq 1 30); do
   $SUDO test -S "$SOCK" && break
   sleep 1

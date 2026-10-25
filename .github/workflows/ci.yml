@@ -73,6 +73,8 @@ jobs:
         run: ./scripts/ci/ci.sh
       - name: Start broker
         run: ./scripts/ci/broker-up.sh
+      - name: Start kiosk socket
+        run: ./scripts/ci/kiosk-up.sh
       - name: Start daemon
         run: ./scripts/ci/daemon-up.sh
       - name: make verify-install
