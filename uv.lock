@@ -422,10 +422,14 @@ version = "0.1.0"
 source = { editable = "packages/broker" }
 dependencies = [
     { name = "httpx" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "httpx", specifier = ">=0.28" }]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "websockets", specifier = ">=15" },
+]
 
 [[package]]
 name = "crewchat"

@@ -10,6 +10,9 @@ Frames are JSON lines with the §5.4 shape. Requests are
 Every op is refused unless the peer's `SO_PEERCRED` UID is the daemon's, `crewchat` (R-08).
 No broker ever calls another broker: the handler touches only its own state and the
 Mattermost server.
+
+The broker also holds its account's websocket (`DMListener`): a DM from the crew's human
+partner is a switch command (`crewbroker.switch`), answered in the same DM (§4.6).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import signal
 import socket
 import socketserver
@@ -27,10 +31,16 @@ import sys
 import threading
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import EllipsisType
-from typing import Any
+from typing import Any, Protocol, cast
+from urllib.parse import urlencode
+
+import websockets.sync.client
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from crewbroker import config as cfg
 from crewbroker.config import CrewConfig
@@ -46,12 +56,27 @@ from crewbroker.mint import (
 )
 from crewbroker.prune import prune_idle
 from crewbroker.state import AccountStore, TokenStore
+from crewbroker.switch import (
+    Mode,
+    SwitchState,
+    SwitchStore,
+    apply_command,
+    effective_mode,
+    settle,
+)
 
 PROTO = 1
 DAEMON_USER = "crewchat"
 SOCKET_MODE = 0o660
 PRUNE_INTERVAL_S = 24 * 3600
 MAX_FRAME_BYTES = 64 * 1024
+# Every post the broker makes carries this prop, and the listener never answers a post that
+# does: two brokers (or a broker and itself) can't refuse each other in a loop.
+BROKER_PROP = "crew_broker"
+WS_PING_S = 30.0
+WS_RECV_POLL_S = 1.0
+WS_BACKOFF_FIRST_S = 1.0
+WS_BACKOFF_MAX_S = 60.0
 
 log = logging.getLogger("crewbroker")
 
@@ -89,6 +114,7 @@ class Broker:
         self.client = client
         self.accounts = AccountStore(state_dir)
         self.tokens = TokenStore(state_dir)
+        self.switch = SwitchStore(state_dir)
         self.server_key = server_key or config.server_url
         self.clock = clock
         self._lock = threading.Lock()
@@ -248,12 +274,75 @@ class Broker:
         with self._lock:
             return prune_idle(self.client, self.accounts, self.clock())
 
+    # -- the social switch (Story 3.1) ------------------------------------------------------
+    def _settle(self, now: datetime) -> tuple[SwitchState, Mode | None]:
+        """Load the switch and persist any lapse. Call with the lock held.
+
+        Returns the settled state and, when a lapse was just recorded, the mode it reverted to.
+        """
+        stored = self.switch.load()
+        mode, lapsed = effective_mode(stored, now)
+        settled = settle(stored, now)
+        if settled != stored:
+            self.switch.save(settled)
+        return settled, (mode if lapsed else None)
+
+    def _notify_lapse(self, mode: Mode) -> None:
+        """DM each human partner that social lapsed (R-23). Best effort: errors are logged."""
+        for human in self.config.human_user_ids:
+            try:
+                channel = self.client.direct_channel(self.config.broker_user_id, human)
+                self.client.create_post(channel, f"social lapsed → {mode}", props={BROKER_PROP: 1})
+            except MattermostError as exc:
+                log.error("lapse notice to %s failed: %s", human, exc)
+
+    def switch_state(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The stored switch, settled first, plus the mode in force (§5.6)."""
+        now = self.clock()
+        with self._lock:
+            state, lapsed_to = self._settle(now)
+        if lapsed_to is not None:
+            self._notify_lapse(lapsed_to)
+        mode, _ = effective_mode(state, now)
+        return {
+            "mode": state.mode,
+            "expires_at": state.expires_at.isoformat() if state.expires_at else None,
+            "revert_to": state.revert_to,
+            "kiosk_on": state.kiosk_on,
+            "effective_mode": mode,
+        }
+
+    def handle_dm(self, sender_user_id: str, text: str) -> str:
+        """A DM to the broker account: apply it as a switch command and return the reply.
+
+        Only the crew's human partners change anything (R-24); anyone else is refused and
+        the stored state is not touched.
+        """
+        now = self.clock()
+        lapsed_to: Mode | None = None
+        with self._lock:
+            if sender_user_id in self.config.human_user_ids:
+                state, lapsed_to = self._settle(now)
+            else:
+                state = self.switch.load()
+            new, reply = apply_command(state, sender_user_id, text, self.config, now)
+            if new != state:
+                self.switch.save(new)
+        if lapsed_to is not None:
+            self._notify_lapse(lapsed_to)
+        if new != state:
+            log.info("switch: %s by %s", reply, sender_user_id)
+        elif sender_user_id not in self.config.human_user_ids:
+            log.warning("switch command refused from %s", sender_user_id)
+        return reply
+
     def ops(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
         return {
             "mint": self.mint,
             "remint": self.remint,
             "revoke": self.revoke,
             "crew_info": self.crew_info,
+            "switch_state": self.switch_state,
         }
 
 
@@ -356,6 +445,159 @@ def start_prune_scheduler(
     return thread
 
 
+@dataclass(frozen=True)
+class DirectMessage:
+    channel_id: str
+    sender_user_id: str
+    message: str
+
+
+def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
+    """A websocket event, as a DM to the broker it should answer, or None.
+
+    Only a user's own `posted` post in a DM channel counts: not the broker's own posts, not
+    system posts, and never a post carrying `props.crew_broker` (another broker's reply).
+    """
+    if not isinstance(event, dict) or event.get("event") != "posted":
+        return None
+    data = event.get("data")
+    if not isinstance(data, dict) or data.get("channel_type") != "D":
+        return None
+    try:
+        post = json.loads(str(data.get("post", "")))
+    except ValueError:
+        return None
+    if not isinstance(post, dict):
+        return None
+    sender = post.get("user_id")
+    channel = post.get("channel_id")
+    message = post.get("message")
+    if not (isinstance(sender, str) and sender and isinstance(channel, str) and channel):
+        return None
+    if sender == broker_user_id or post.get("type") or not isinstance(message, str):
+        return None
+    props = post.get("props")
+    if isinstance(props, dict) and props.get(BROKER_PROP):
+        return None
+    members = str(data.get("channel_name", "")).split("__")
+    if broker_user_id not in members:
+        return None
+    return DirectMessage(channel_id=channel, sender_user_id=sender, message=message)
+
+
+class WebSocketLike(Protocol):
+    def recv(self, timeout: float | None = None) -> str | bytes: ...
+
+    def close(self) -> None: ...
+
+
+WsConnect = Callable[[str, dict[str, str]], WebSocketLike]
+
+
+def ws_connect(uri: str, headers: dict[str, str]) -> WebSocketLike:
+    conn = websockets.sync.client.connect(
+        uri,
+        additional_headers=headers,
+        ping_interval=WS_PING_S,
+        ping_timeout=WS_PING_S,
+        proxy=None,
+    )
+    return cast(WebSocketLike, conn)
+
+
+class DMListener:
+    """The broker account's websocket: switch commands from DMs, and their replies (§4.6).
+
+    Reconnects with a capped backoff, resuming from the last event it saw when the server
+    still has it.
+    """
+
+    def __init__(
+        self,
+        broker: Broker,
+        server_url: str,
+        token: str,
+        *,
+        connect: WsConnect = ws_connect,
+        sleep: Callable[[float], bool] | None = None,
+    ) -> None:
+        self.broker = broker
+        self.base_uri = re.sub(r"^http", "ws", server_url.rstrip("/")) + "/api/v4/websocket"
+        self.token = token
+        self._connect = connect
+        self._sleep = sleep
+        self.connection_id = ""
+        self.next_seq = 0
+
+    def uri(self) -> str:
+        if not self.connection_id:
+            return self.base_uri
+        query = {"connection_id": self.connection_id, "sequence_number": self.next_seq}
+        return f"{self.base_uri}?{urlencode(query)}"
+
+    def handle(self, raw: str | bytes) -> None:
+        """One websocket frame. Never raises for a malformed frame or a failed reply."""
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        seq = event.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and "event" in event:
+            self.next_seq = seq + 1
+        data = event.get("data")
+        if event.get("event") == "hello" and isinstance(data, dict):
+            conn_id = data.get("connection_id")
+            if isinstance(conn_id, str):
+                self.connection_id = conn_id
+            return
+        dm = dm_from_event(event, self.broker.config.broker_user_id)
+        if dm is None:
+            return
+        try:
+            reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
+            self.broker.client.create_post(dm.channel_id, reply, props={BROKER_PROP: 1})
+        except Exception:
+            log.exception("switch DM from %s failed", dm.sender_user_id)
+
+    def run(self, stop: threading.Event) -> None:
+        sleep = self._sleep or stop.wait
+        delay = WS_BACKOFF_FIRST_S
+        while not stop.is_set():
+            try:
+                ws = self._connect(self.uri(), {"Authorization": f"Bearer {self.token}"})
+            except (OSError, TimeoutError, WebSocketException) as exc:
+                log.warning("broker websocket: %s", exc)
+                if sleep(delay):
+                    return
+                delay = min(delay * 2, WS_BACKOFF_MAX_S)
+                continue
+            try:
+                while not stop.is_set():
+                    try:
+                        raw = ws.recv(timeout=WS_RECV_POLL_S)
+                    except TimeoutError:
+                        continue
+                    delay = WS_BACKOFF_FIRST_S  # connected: the next loss starts again at 1 s
+                    self.handle(raw)
+            except (ConnectionClosed, OSError) as exc:
+                if not stop.is_set():
+                    log.warning("broker websocket lost: %s", exc)
+            finally:
+                with suppress(Exception):
+                    ws.close()
+            if not stop.is_set() and sleep(delay):
+                return
+            delay = min(delay * 2, WS_BACKOFF_MAX_S)
+
+
+def start_dm_listener(listener: DMListener, stop: threading.Event) -> threading.Thread:
+    thread = threading.Thread(target=listener.run, args=(stop,), name="crewbroker-dm", daemon=True)
+    thread.start()
+    return thread
+
+
 def serve(instance: str, *, config_dir: Path, state_root: Path, run_dir: Path) -> int:
     credential = cfg.credential_path(instance, config_dir).read_text(encoding="utf-8").strip()
     if not credential:
@@ -367,6 +609,7 @@ def serve(instance: str, *, config_dir: Path, state_root: Path, run_dir: Path) -
     server = BrokerServer(cfg.socket_path(instance, run_dir), broker, allowed_uid)
     stop = threading.Event()
     start_prune_scheduler(broker, stop)
+    start_dm_listener(DMListener(broker, config.server_url, credential), stop)
 
     def shutdown(_signum: int, _frame: object) -> None:
         stop.set()
