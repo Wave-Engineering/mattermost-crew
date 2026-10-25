@@ -23,8 +23,9 @@ from typing import Any
 import httpx
 import pytest
 from crewchat.config import ServersConfig, parse_config
+from crewchat.filters import SwitchCache
 from crewchat.registry import Registry
-from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, SwitchCache, TokenStore
+from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, TokenStore
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
@@ -96,6 +97,14 @@ class FakeBroker(BrokerClient):
                 "human_user_ids": ["h1"],
                 "trusted": [],
                 "minted_bot_ids": [f"bot:{a}" for a in self.bots],
+            }
+        if op == "switch_state":
+            return {
+                "mode": "crew",
+                "expires_at": None,
+                "revert_to": "crew",
+                "kiosk_on": True,
+                "effective_mode": "crew",
             }
         raise BrokerError(op, "unsupported")
 

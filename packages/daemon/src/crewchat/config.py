@@ -3,6 +3,10 @@
     default_crew = "oaw"
     broker_timeout_s = 2                 # optional; every daemon->broker call's timeout
     my_threads_retention_days = 90       # optional; how long a thread stays "mine" (D-104)
+    crew_info_max_age_s = 300            # optional; a last good crew_info older is uncached
+    refetch_min_interval_s = 2           # optional; the floor between cache-miss re-fetch rounds
+    kiosk_rate_per_hour = 10             # optional; kiosk routings per outsider/expert/server
+    loop_guard_window = 20               # optional; bot messages per conversation (R-25)
 
     [[mattermost]]
     id = "oaw-dev"
@@ -42,6 +46,10 @@ DEFAULT_BROKER_TIMEOUT_S = 2.0
 # How long a thread the agent posted in keeps counting as "mine" (D-104). Our own setting:
 # it never reads any server's retention policy (CT-01).
 DEFAULT_MY_THREADS_RETENTION_DAYS = 90
+DEFAULT_CREW_INFO_MAX_AGE_S = 300.0
+DEFAULT_REFETCH_MIN_INTERVAL_S = 2.0
+DEFAULT_KIOSK_RATE_PER_HOUR = 10
+DEFAULT_LOOP_GUARD_WINDOW = 20
 DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 CREW_KEYS = {"needs_list"}
@@ -82,6 +90,10 @@ class ServersConfig:
     crews: dict[str, CrewEntry]
     broker_timeout_s: float = DEFAULT_BROKER_TIMEOUT_S
     my_threads_retention_days: int = DEFAULT_MY_THREADS_RETENTION_DAYS
+    crew_info_max_age_s: float = DEFAULT_CREW_INFO_MAX_AGE_S
+    refetch_min_interval_s: float = DEFAULT_REFETCH_MIN_INTERVAL_S
+    kiosk_rate_per_hour: int = DEFAULT_KIOSK_RATE_PER_HOUR
+    loop_guard_window: int = DEFAULT_LOOP_GUARD_WINDOW
     discord_screamhole_url: str | None = None
     discord_credential: Path = DISCORD_CREDENTIAL_PATH
     discord_guild_id: str | None = None
@@ -148,6 +160,11 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
     if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
         raise ConfigError(f"{source}: my_threads_retention_days must be an integer of at least 1")
 
+    max_age = _positive(raw, "crew_info_max_age_s", DEFAULT_CREW_INFO_MAX_AGE_S, source)
+    refetch = _positive(raw, "refetch_min_interval_s", DEFAULT_REFETCH_MIN_INTERVAL_S, source)
+    kiosk_rate = _count(raw, "kiosk_rate_per_hour", DEFAULT_KIOSK_RATE_PER_HOUR, source)
+    window = _count(raw, "loop_guard_window", DEFAULT_LOOP_GUARD_WINDOW, source)
+
     crews_raw = raw.get("crews", {})
     if not isinstance(crews_raw, dict):
         raise ConfigError(f"{source}: crews must be a table")
@@ -164,12 +181,30 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
         crews=crews,
         broker_timeout_s=float(timeout),
         my_threads_retention_days=retention,
+        crew_info_max_age_s=max_age,
+        refetch_min_interval_s=refetch,
+        kiosk_rate_per_hour=kiosk_rate,
+        loop_guard_window=window,
         discord_screamhole_url=screamhole_url,
         discord_credential=Path(credential),
         discord_guild_id=guild_id,
         squawkie_url=squawkie_url,
         squawkie_credential=Path(squawkie_credential) if squawkie_credential else None,
     )
+
+
+def _positive(raw: dict[str, Any], key: str, default: float, source: str) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        raise ConfigError(f"{source}: {key} must be a positive number")
+    return float(value)
+
+
+def _count(raw: dict[str, Any], key: str, default: int, source: str) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"{source}: {key} must be an integer of at least 1")
+    return value
 
 
 def _mattermost(value: Any, source: str) -> list[MattermostServer]:

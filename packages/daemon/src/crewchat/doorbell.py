@@ -3,10 +3,12 @@ R-26, R-27, R-28).
 
 `Doorbell(sources, cursors)` runs **one task per (agent, backend)**. Each task consumes that
 backend's `stream(dev_name, cursor=..., on_status=...)`, turns what it yields into a
-`DoorbellEvent`, passes it through the filter hook (`filters.admit`, a pass-through until
-Story 3.3) and puts it on the agent's one `asyncio.Queue`. `register` attaches the agent's
-backends (`attach`): its Mattermost servers and Discord from the registration, and squawkie
-when it is configured (§4.2 step 3).
+`DoorbellEvent`, passes it through the filter hook (`admit`: `crewchat serve` wires
+`filters.Filters.admit_event`, Story 3.3) and acts on the verdict: `DELIVER` puts it on the
+agent's one `asyncio.Queue`, `DELIVER_MARKED_OUTSIDER` puts it there with `"outsider": true`,
+`KIOSK` puts it on the kiosk's holding queue (Story 3.5) and `DROP` puts it nowhere.
+`register` attaches the agent's backends (`attach`): its Mattermost servers and Discord from
+the registration, and squawkie when it is configured (§4.2 step 3).
 
 - **`subscribe{dev_name}`** awaits that agent's queue and returns **one** event (R-26): the
   thin one-shot exits on it. An agent that hasn't registered gets `not_registered`.
@@ -36,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -66,12 +69,14 @@ log = logging.getLogger("crewchat.doorbell")
 @dataclass(frozen=True)
 class DoorbellEvent:
     """One event on an agent's queue: what `subscribe` returns (`payload`), the backend it came
-    from, and the IDs it carries (`keys`; none for `backend.down` and `backend.up`)."""
+    from, and the IDs it carries (`keys`; none for `backend.down` and `backend.up`). A chat
+    message's event also carries the `InboundMessage` itself, for the filters (Story 3.3)."""
 
     backend: str
     payload: dict[str, Any]
     keys: tuple[str, ...] = ()
     ts: float = 0.0
+    message: InboundMessage | None = dataclasses.field(default=None, compare=False, repr=False)
 
 
 StreamItem = InboundMessage | SquawkEvent
@@ -85,14 +90,11 @@ class Source(Protocol):
     ) -> AsyncIterator[Any]: ...
 
 
-Admit = Callable[[str, DoorbellEvent], bool]
-
-
 def to_event(backend: str, item: StreamItem) -> DoorbellEvent:
     """What a stream yielded, as a queued event."""
     if isinstance(item, InboundMessage):
         payload = {"type": "message", "backend": backend, "message": dataclasses.asdict(item)}
-        return DoorbellEvent(backend, payload, (item.post_id,), item.ts)
+        return DoorbellEvent(backend, payload, (item.post_id,), item.ts, item)
     return DoorbellEvent(backend, {**item.payload, "backend": backend}, item.keys, item.ts)
 
 
@@ -229,13 +231,16 @@ class Doorbell:
         sources: Mapping[str, Source],
         cursors: CursorStore,
         *,
-        admit: Admit = filters.admit,
+        admit: filters.Admit = filters.pass_through,
+        kiosk: filters.KioskQueue | None = None,
         queue_max: int = QUEUE_MAX,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.sources = dict(sources)
         self.cursors = cursors
         self.admit = admit
+        # Where push `KIOSK` verdicts wait for Story 3.5's kiosk; None drops them, loudly.
+        self.kiosk = kiosk
         self.queue_max = queue_max
         self._sleep = sleep
         self._queues: dict[str, asyncio.Queue[DoorbellEvent]] = {}
@@ -327,14 +332,34 @@ class Doorbell:
         base = saved if saved is not None else StreamCursor()
         return StreamCursor(base.id, base.ts, frozenset(handled) | base.seen)
 
-    def offer(self, dev_name: str, backend: str, event: DoorbellEvent) -> bool:
-        """Queue `event` unless it is a repeat or the filter refuses it. True when queued."""
+    async def verdict(self, dev_name: str, event: DoorbellEvent) -> filters.Verdict:
+        result = self.admit(dev_name, event)
+        if inspect.isawaitable(result):
+            result = await result
+        if isinstance(result, filters.Verdict):
+            return result
+        return filters.DELIVER if result else filters.DROP("refused")
+
+    async def offer(self, dev_name: str, backend: str, event: DoorbellEvent) -> bool:
+        """Put `event` through the filters (R-21) unless it is a repeat: on the agent's queue
+        (marked when it is outsider content), on the kiosk's holding queue, or nowhere.
+        True when it went on the agent's queue."""
         handled = self._handled_for(dev_name, backend)
         if event.keys and all(k in handled for k in event.keys):
             return False  # a replay of an event already queued or handed over (R-28)
         handled.add(event.keys)
-        if not self.admit(dev_name, event):
+        verdict = await self.verdict(dev_name, event)
+        if verdict.kind == filters.Kind.KIOSK:
+            if self.kiosk is None:
+                log.error("no kiosk queue: dropped a kiosk event for %s from %s", dev_name, backend)
+            else:
+                self.kiosk.put(dev_name, event)
             return False
+        if not verdict.delivers:
+            log.debug("dropped an event for %s from %s: %s", dev_name, backend, verdict.reason)
+            return False
+        if verdict.kind == filters.Kind.DELIVER_MARKED_OUTSIDER:
+            event = filters.mark_outsider(event)
         self._enqueue(dev_name, event)
         return True
 
@@ -349,7 +374,7 @@ class Doorbell:
                 )
                 async for item in stream:
                     delays = restart_delays()
-                    self.offer(dev_name, backend, to_event(backend, item))
+                    await self.offer(dev_name, backend, to_event(backend, item))
                 reason = "stream ended"
             except asyncio.CancelledError:
                 raise

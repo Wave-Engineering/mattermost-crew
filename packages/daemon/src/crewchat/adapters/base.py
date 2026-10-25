@@ -57,6 +57,9 @@ class InboundMessage:
     # A direct message to the receiving agent: a DM channel whose members are the author and
     # that agent (R-19). Set on the push path, the only one addressing reads (R-21).
     dm: bool = False
+    # The server resolved the author's user object. False when it couldn't, and the filters
+    # then drop the message as unresolvable (R-22).
+    author_resolved: bool = True
 
 
 @dataclass(frozen=True)

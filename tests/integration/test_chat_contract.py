@@ -49,10 +49,11 @@ from crewchat.adapters.discord import DiscordBackend
 from crewchat.adapters.mattermost import MattermostBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import parse_config
+from crewchat.filters import SwitchCache
 from crewchat.registry import Registry
 from crewchat.server import DaemonServer, build_handlers
 from crewchat.threads import MyThreads
-from crewchat.tokens import SwitchCache, TokenStore
+from crewchat.tokens import TokenStore
 from crewchat.uploads import UploadStore
 from crewchat_clients.mcp_shim import ALIASES, Shim, ShimError, SocketTransport
 
