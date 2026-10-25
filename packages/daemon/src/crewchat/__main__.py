@@ -34,6 +34,7 @@ from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
 from crewchat.filters import Filters, KioskQueue, SwitchCache
+from crewchat.kiosk import ClaudeCliRunner, Kiosk
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import (
@@ -169,6 +170,11 @@ async def serve(
         sources[SQUAWKIE] = squawkie
     doorbell = Doorbell(sources, CursorStore(state_dir), admit=filters.admit_event, kiosk=kiosk)
     store.adapters.insert(0, doorbell)
+    # The kiosk (Story 3.5): answers the KIOSK queue from the briefs the shims push, through
+    # the `crewkiosk` CLI runner (D-096). Sessions start on each expert's first outsider.
+    kiosk_answers = Kiosk(
+        kiosk, context.briefs, chat_backends, ClaudeCliRunner(), state_dir=state_dir
+    )
     handlers = build_handlers(config, registry, health_sources)
     handlers.update(
         build_chat_handlers(registry, chat_backends, threads, context, uploads, filters=filters)
@@ -189,6 +195,7 @@ async def serve(
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     rotation = asyncio.create_task(rotation_loop(Rotator(store), stop))
+    kiosk_answers.start()
     # `switch_state` and `crew_info` from every local broker, now and every 30 s (§5.9).
     switch_refresh = asyncio.create_task(cache.run(stop))
     log.info(
@@ -205,6 +212,7 @@ async def serve(
         await rotation
         await switch_refresh
         await doorbell.aclose()
+        await kiosk_answers.aclose()
         if squawkie is not None:
             await squawkie.aclose()
         for backend in backends:
