@@ -9,6 +9,31 @@ permissions:
   contents: read
 
 jobs:
+  # Lint and unit tests: no root, no OS users, no systemd, no Mattermost, so it can run on the
+  # org's persistent self-hosted runner (#79). The legs below can't: they change the host.
+  unit:
+    name: unit
+    runs-on: ${{ vars.OAW_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: lint and unit tests
+        run: ./scripts/ci/unit.sh
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-unit
+          path: reports/
+          if-no-files-found: error
+
+  # Stays on GitHub-hosted, throwaway VMs until there is an ephemeral self-hosted pool: these
+  # legs useradd as root, start Mattermost, the broker and the daemon (babelfish, #79).
   ci:
     name: ci (${{ matrix.leg }})
     runs-on: ubuntu-24.04
