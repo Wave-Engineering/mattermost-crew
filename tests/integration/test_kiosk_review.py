@@ -32,6 +32,21 @@ RENDERED = (
 )
 
 
+def cursor_state(transcript: Path) -> dict[str, Any]:
+    """The cursor a review of all of `transcript` leaves (#110): its size, and its head as the
+    kiosk derives it."""
+    with transcript.open("rb") as fh:
+        head = Kiosk._head(fh.readline())
+    assert head is not None
+    return {"offset": transcript.stat().st_size, "head": head}
+
+
+def review_id(transcript: Path) -> str:
+    """The `event_id` of a review of all of `transcript` (#110): its head and its end."""
+    state = cursor_state(transcript)
+    return f"{MM}:kiosk.review:{state['head']}:{state['offset']}"
+
+
 class Stub:
     def __init__(self) -> None:
         self.calls = 0
@@ -86,7 +101,9 @@ def test_it22_kiosk_review(mattermost: Any, world: dict[str, Any], tmp_path: Pat
             # server's transcript since the cursor.
             assert "social" in rig.flip("social 1h")
             await rig.cache.refresh_all()
-            payload = await rig.next_event()
+            event = await asyncio.wait_for(rig.doorbell.next_event("babel"), EVENT_TIMEOUT_S)
+            payload = event.payload
+            assert event.reply()["event_id"] == review_id(transcript)
             assert payload["type"] == "kiosk.review"
             assert payload["outsider"] is True
             assert payload["server"] == SID
@@ -102,7 +119,8 @@ def test_it22_kiosk_review(mattermost: Any, world: dict[str, Any], tmp_path: Pat
             assert entries[0]["answer"].startswith("We build a chat daemon (answer 1)")
 
             # The cursor advanced past them, and a refresh under social reviews nothing more.
-            assert json.loads(cursor.read_text()) == {"offset": transcript.stat().st_size}
+            assert json.loads(cursor.read_text()) == cursor_state(transcript)
+            first_id = event.reply()["event_id"]
             await rig.cache.refresh_all()
             await asyncio.sleep(0.2)
             assert rig.doorbell.queue("babel").empty()
@@ -115,10 +133,13 @@ def test_it22_kiosk_review(mattermost: Any, world: dict[str, Any], tmp_path: Pat
             assert rig.doorbell.queue("babel").empty()
             assert "social" in rig.flip("social 1h")
             await rig.cache.refresh_all()
-            payload = await asyncio.wait_for(rig.next_event(), EVENT_TIMEOUT_S)
+            event = await asyncio.wait_for(rig.doorbell.next_event("babel"), EVENT_TIMEOUT_S)
+            payload = event.payload
             assert payload["type"] == "kiosk.review"
             assert [e["question"] for e in payload["entries"]] == ["@babel anything new?"]
-            assert json.loads(cursor.read_text()) == {"offset": transcript.stat().st_size}
+            # Same transcript, so the same head; a later offset, so a new ID.
+            assert event.reply()["event_id"] == review_id(transcript) != first_id
+            assert json.loads(cursor.read_text()) == cursor_state(transcript)
         finally:
             rig.flip("crew")
             await kiosk.aclose()
