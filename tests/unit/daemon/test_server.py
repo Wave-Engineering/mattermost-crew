@@ -8,7 +8,10 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from crewchat.adapters.base import InboundMessage
+from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.server import DaemonServer, build_handlers
+from crewchat.threads import MyThreads
 
 
 async def exchange(path: Path, frames: list[dict[str, Any] | bytes]) -> list[dict[str, Any]]:
@@ -96,6 +99,87 @@ def test_register_over_the_socket_returns_no_token(daemon: Any, short_dir: Path)
         assert token not in json.dumps(reply)
         assert "token" not in json.dumps(reply)
     assert replies[2]["ok"] is False and replies[2]["error"].startswith("bad_request")
+
+
+def call(server: DaemonServer, op: str, **args: Any) -> dict[str, Any]:
+    frame = {"proto": 1, "id": "x", "op": op, "args": args}
+    return asyncio.run(server.handle_line(json.dumps(frame).encode()))
+
+
+def test_register_accepts_team_and_avatar(daemon: Any) -> None:
+    """D-103: register stores dev_team and dev_avatar; non-strings are bad_request."""
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    base = {"dev_name": "babel", "session_id": "s1"}
+    got = call(server, "register", **base, dev_team="oaw", dev_avatar="📡")
+    assert got["ok"] is True
+    assert set(got["result"]) == {"account", "backends", "needs_list"}
+    reg = daemon.registry.get("babel")
+    assert (reg.dev_team, reg.dev_avatar) == ("oaw", "📡")
+
+    # Absent: both "". A re-register overwrites.
+    assert call(server, "register", **base)["ok"] is True
+    reg = daemon.registry.get("babel")
+    assert (reg.dev_team, reg.dev_avatar) == ("", "")
+
+    for bad in ({"dev_team": 7}, {"dev_avatar": ["x"]}, {"dev_team": None}):
+        got = call(server, "register", **base, **bad)
+        assert got["ok"] is False and got["error"].startswith("bad_request"), bad
+
+
+class _Backend:
+    name = "mattermost:dev"
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.fail = False
+
+    async def send(
+        self, dev_name: str, channel: str, text: str, thread: str | None = None
+    ) -> InboundMessage:
+        if self.fail:
+            raise RuntimeError("server said no")
+        self.n += 1
+        return InboundMessage(
+            backend=self.name,
+            channel=channel,
+            post_id=f"p{self.n}",
+            root_id=thread or "",
+            author_id="me",
+            author_name="babel",
+            text=text,
+        )
+
+    async def dm(self, dev_name: str, to: str, text: str) -> InboundMessage:
+        return await self.send(dev_name, "dm-chan", text)
+
+
+def test_send_records_thread(daemon: Any, tmp_path: Path) -> None:
+    """D-104: a successful send (new root, then reply) and dm record into the persisted
+    MyThreads; a failed one records nothing."""
+    asyncio.run(daemon.registry.register("babel", None, "s1"))
+    threads = MyThreads.load(tmp_path / "state", 90)
+    backend = _Backend()
+    handlers = build_handlers(daemon.config, daemon.registry)
+    handlers.update(
+        build_chat_handlers(daemon.registry, {backend.name: backend}, threads, AgentContext())
+    )
+    server = DaemonServer(handlers)
+    base = {"dev_name": "babel", "backend": backend.name}
+
+    root = call(server, "send", **base, to="town", text="new thread")
+    assert root["ok"] is True and root["result"]["thread"] == "p1"
+    reply = call(server, "send", **base, to="town", text="re", thread="other-root")
+    assert reply["ok"] is True and reply["result"]["thread"] == "other-root"
+    assert threads.roots("babel") == {"p1", "other-root"}
+    assert call(server, "dm", **base, to="kessel", text="psst")["ok"] is True
+    assert threads.roots("babel") == {"p1", "other-root", "p3"}
+
+    backend.fail = True
+    assert call(server, "send", **base, to="town", text="x", thread="never")["ok"] is False
+    assert call(server, "dm", **base, to="kessel", text="x")["ok"] is False
+    assert threads.roots("babel") == {"p1", "other-root", "p3"}
+    # What was recorded is on disk: a fresh load sees it.
+    assert MyThreads.load(tmp_path / "state", 90).roots("babel") == {"p1", "other-root", "p3"}
 
 
 def test_handler_crash_is_internal(daemon: Any) -> None:

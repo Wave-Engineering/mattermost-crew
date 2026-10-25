@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
-from crewchat.registry import RegisterError, account_name
+from crewchat.adapters.discord import DiscordBackend
+from crewchat.registry import RegisterError, Registry, account_name
 from crewchat.tokens import BrokerError, BrokerUnavailable
 
 
@@ -138,3 +140,32 @@ def test_register_keeps_the_servers_that_answered(
     assert reg.unavailable == ["prod"]
     assert daemon.store.token_for("babel", "dev") is not None
     assert daemon.store.token_for("babel", "prod") is None
+
+
+def test_register_sets_discord_identity(daemon: Any, tmp_path: Path) -> None:
+    """D-103: register hands the avatar and team to the Discord adapter's set_identity."""
+    discord = DiscordBackend("http://screamhole.invalid", tmp_path / "discord.credential")
+    registry = Registry(
+        daemon.config, daemon.brokers, daemon.store, daemon.cache, identity_sink=discord
+    )
+    reg = asyncio.run(registry.register("babel", "oaw", "s1", dev_team="oaw", dev_avatar="📡"))
+    assert (reg.dev_team, reg.dev_avatar) == ("oaw", "📡")
+    assert discord.signature("babel") == "— **babel** 📡 (oaw) ·p1"
+    assert discord.signed("babel", "hello")[-1].endswith("— **babel** 📡 (oaw) ·p1")
+    # A re-register overwrites both, on the registration and in the signature.
+    reg = asyncio.run(registry.register("babel", "oaw", "s2", dev_team="wave", dev_avatar="🦊"))
+    assert (reg.dev_team, reg.dev_avatar) == ("wave", "🦊")
+    assert discord.signature("babel") == "— **babel** 🦊 (wave) ·p1"
+    # result() is unchanged: no team, no avatar.
+    assert set(reg.result()) == {"account", "backends", "needs_list"}
+
+
+def test_register_without_discord_skips_identity(
+    make_daemon: Any, servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    servers_toml["discord"] = {"enabled": False}
+    d = make_daemon(servers_toml)
+    discord = DiscordBackend("http://screamhole.invalid", tmp_path / "discord.credential")
+    registry = Registry(d.config, d.brokers, d.store, d.cache, identity_sink=discord)
+    asyncio.run(registry.register("babel", "oaw", "s1", dev_team="oaw", dev_avatar="📡"))
+    assert discord.identity("babel") is None

@@ -1,6 +1,7 @@
 """The crewchat daemon's entry point.
 
     crewchat serve [--config /etc/crewchat/servers.toml] [--socket /run/crewchat/crewchat.sock]
+                   [--state-dir /var/lib/crewchat]
     crewchat call <socket> <op> ['<args json>']
 
 `serve` loads `servers.toml`, reads the token store, and serves the socket; the daily rotation
@@ -33,7 +34,7 @@ from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import CLIENTS_GROUP, SOCKET_PATH, DaemonServer, build_handlers
-from crewchat.threads import MyThreads
+from crewchat.threads import STATE_DIR, MyThreads
 from crewchat.tokens import (
     TOKENS_DIR,
     Rotator,
@@ -96,7 +97,13 @@ async def rotation_loop(
             return
 
 
-async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: str | None) -> int:
+async def serve(
+    config_path: Path,
+    socket_path: Path,
+    tokens_dir: Path,
+    group: str | None,
+    state_dir: Path = STATE_DIR,
+) -> int:
     config = load_config(config_path)
     brokers = broker_clients(config)
     store = TokenStore(tokens_dir, brokers)
@@ -119,9 +126,12 @@ async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: s
         )
         chat_backends[discord.name] = discord
     cache = SwitchCache(brokers)
-    registry = Registry(config, brokers, store, cache)
+    registry = Registry(config, brokers, store, cache, identity_sink=discord)
+    # The one persisted "my threads" set (D-104): every send and dm records into it, and
+    # Phase 3's addressing reads the same instance, so replies survive a restart.
+    threads = MyThreads.load(state_dir, config.my_threads_retention_days)
     handlers = build_handlers(config, registry)
-    handlers.update(build_chat_handlers(registry, chat_backends, MyThreads(), AgentContext()))
+    handlers.update(build_chat_handlers(registry, chat_backends, threads, AgentContext()))
     server = DaemonServer(handlers)
     listener = await server.start(socket_path, group)
 
@@ -174,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--config", type=Path, default=CONFIG_PATH)
     p_serve.add_argument("--socket", type=Path, default=SOCKET_PATH)
     p_serve.add_argument("--tokens-dir", type=Path, default=TOKENS_DIR)
+    p_serve.add_argument("--state-dir", type=Path, default=STATE_DIR)
     p_serve.add_argument(
         "--group", default=CLIENTS_GROUP, help="the socket's group ('' leaves it unchanged)"
     )
@@ -189,7 +200,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     if ns.cmd == "serve":
-        return asyncio.run(serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None))
+        return asyncio.run(
+            serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None, ns.state_dir)
+        )
     reply = call(ns.socket, ns.op, json.loads(ns.args))
     print(json.dumps(reply))
     return 0 if reply.get("ok") else 1

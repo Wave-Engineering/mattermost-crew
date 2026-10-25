@@ -219,7 +219,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 ### 4.2 Session Start
 
-1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, crew, session_id}`. `crew` comes from the identity file's `crew` field, or else the host's default crew in `servers.toml`. The shim then pushes the agent's kiosk brief and squawk IDs (`kiosk_brief`, `squawk_ids`), because the daemon never reads agent-home or repo paths.
+1. `/name` picks a Dev-Name. The thin MCP registers with the daemon: `register{dev_name, dev_team, dev_avatar, crew, session_id}`. `crew` comes from the identity file's `crew` field, or else the host's default crew in `servers.toml`. `dev_team` and `dev_avatar` come from the identity file too (D-103). The shim then pushes the agent's kiosk brief and squawk IDs (`kiosk_brief`, `squawk_ids`), because the daemon never reads agent-home or repo paths.
 2. For each configured Mattermost server, the daemon asks that crew's broker for that server for a token for `<dev-name>.<crew>` (`mint{dev_name, crew, current_token_id, deadline}`). Brokers are keyed by (crew, server_id). Only `register` causes a `mint`. The broker creates the bot account if it is missing (R-03), records `last_register`, and mints a token (R-05).
 3. The daemon opens that agent's Mattermost websocket, pinging every 30 s (CT-07), and attaches the Discord and squawkie adapters.
 
@@ -318,6 +318,7 @@ The broker remains a separate package, a separate service and a separate OS user
 
 - Each host has **one** daemon socket, `/run/crewchat/crewchat.sock`. It is mode `0660`, owned by `crewchat:crewchat-clients`, and mounted into every container on that host.
 - A thin client registers with the Dev-Name and `crew` from `.claude/agent-identity.json`, and the daemon accepts it. If the file has no `crew`, the host's `default_crew` in `/etc/crewchat/servers.toml` is used.
+- The shim also sends `dev_team` and `dev_avatar` from the identity file, falling back to the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). Both are self-declared, like the Dev-Name. The avatar is display only (the Discord signature); no addressing, membership or trust decision reads it. Only the shim reads these files; the daemon package never names them.
 - The daemon never reads files in an agent's home or repo. Its `~` is `crewchat`'s home, and in containers the agent's paths aren't host paths. Anything it needs from the agent's side (the kiosk brief, squawk IDs, the resolved default backend) is pushed by the shim over the socket.
 - Agents on one host are one trust boundary (D-055). The accepted cost is that a same-host agent could post as a crewmate, which falls under D-005.
 
@@ -327,16 +328,18 @@ JSON lines over the unix socket. Every frame carries `"proto": 1` (D-056). Reque
 
 | op | args | result |
 |----|------|--------|
-| `register` | `dev_name, crew, session_id` | `{account, backends, needs_list}`. `needs_list` is the crew's configured sqtk list for R-11's headless squawk. |
-| `send` | `to, text, backend, thread?` (`backend` already resolved by the shim) | `{backend, post_id, thread}` |
-| `dm` | `to, text, backend` | `{backend, post_id, channel}` |
-| `read` | `channel, since?, limit?` | `{messages:[...]}` (filtered, R-21) |
-| `thread` | `post_id` | `{messages:[...]}` |
-| `react` | `post_id, emoji` | `{}` |
+| `register` | `dev_name, dev_team, dev_avatar, crew, session_id` (`dev_team`, `dev_avatar` optional strings, default `""`; D-103) | `{account, backends, needs_list}`. `needs_list` is the crew's configured sqtk list for R-11's headless squawk. With Discord enabled, `dev_avatar` and `dev_team` go to the Discord signature. |
+| `send` | `dev_name, backend, to, text, thread?, off_default?` (`backend` already resolved by the shim) | `{backend, post_id, thread}`. The thread root is recorded in the agent's persisted `MyThreads` (D-104). |
+| `dm` | `dev_name, backend, to, text, off_default?` | `{backend, post_id, channel}`. Recorded in `MyThreads` like `send`. |
+| `read` | `dev_name, backend, channel, since?, limit?` | `{backend, messages:[...]}` (filtered, R-21) |
+| `thread` | `dev_name, backend, post_id` | `{backend, messages:[...]}` |
+| `react` | `dev_name, backend, post_id, emoji` | `{}` |
 | `kiosk_brief` | `dev_name, text` | `{}`. The shim pushes the extracted `## Kiosk` section whenever the seed's mtime changes (R-32). |
 | `squawk_ids` | `dev_name, ids` | `{}`. The shim pushes the ids from `.claude/sqtk-mine.json` (R-26). |
 | `subscribe` | `dev_name` | stream of events; the thin one-shot exits on the first |
 | `health` | — | `{backends:{name:{state, since}}}` |
+
+Every chat frame (`send`, `dm`, `read`, `thread`, `react`) names the agent it acts as (`dev_name`) and the backend it goes to (`backend`: `mattermost:<server_id>` or `discord`), because one daemon per host serves N backends. `off_default: true` on `send`/`dm` marks a call that named a backend other than the agent's default, and is logged (R-13).
 
 Unknown ops, and frames with a `proto` higher than the daemon supports, get `ok:false, error:"unsupported"`. Lower `proto` values are accepted (CP-05).
 
@@ -425,6 +428,8 @@ One-shot exit codes:
 | Discord | Messages are **crew-equivalent**: our guild is membership-controlled, and its existing kill switch still applies. This keeps today's Discord behaviour (R-15). The switch and the kiosk do not apply to Discord. |
 | squawkie | **Exempt.** The adapter delivers only the agent's own squawks (R-26). |
 
+**My threads (R-19, D-104):** every successful daemon-side `send` and `dm` records the post's thread root in the agent's `MyThreads`, the set `addressed_to` and `is_direct_address` read for "a reply to me". The daemon holds one persisted instance, loaded at start from `<state_dir>/threads/<dev>.json` (`/var/lib/crewchat/threads/`, JSON `{"roots": {"<root_id>": "<iso8601 last_seen>"}}`, file `0600`, directory `0700`, written atomically after each change). Roots whose `last_seen` is older than `my_threads_retention_days` (top-level in `servers.toml`, default 90) are pruned on load and on save; this is our own setting and never reads a server's retention policy (CT-01). A corrupt file is logged once and read as empty.
+
 **Verdicts by path:**
 - **Push order:** crew resolution, then addressing (R-16 to R-19), then the loop guard (R-25), then the switch. Push verdicts are `DELIVER`, `DELIVER_MARKED_OUTSIDER`, `KIOSK` (the event goes to the kiosk's holding queue), or `DROP`.
 - **Kiosk routing needs direct address.** Only `@<dev>`, `@<dev>.<crew>`, a DM, or a reply in the agent's own thread can earn a `KIOSK` verdict. An outsider's broadcast (`@agents`) or crew/team token is `DROP` under crew only and trusted. Each outsider is also rate-limited to 10 kiosk routings per hour **per expert, per server** (`kiosk_rate_per_hour`, configurable); excess is `DROP`.
@@ -492,7 +497,7 @@ Tier 2 triggers, recorded:
 2. **Daemon:** create the `crewchat` user and the `crewchat-clients` group.
    - `uv sync --frozen --package crewchat`
    - Install `packaging/crewchat.service` as a systemd system service.
-   - `/etc/crewchat/servers.toml` lists the configured servers (D-032), the host's `default_crew`, a `[crews.<crew>] needs_list` per crew, and a `[crews.<crew>.<server_id>]` table per crew and Mattermost server on the host with `broker_socket` and `broker_user_id`. The `broker_user_id` entries are **the configured broker list**: the only accounts that may hold the patched role (R-06).
+   - `/etc/crewchat/servers.toml` lists the configured servers (D-032), the host's `default_crew`, the optional top-level `my_threads_retention_days` (default 90, D-104), a `[crews.<crew>] needs_list` per crew, and a `[crews.<crew>.<server_id>]` table per crew and Mattermost server on the host with `broker_socket` and `broker_user_id`. The `broker_user_id` entries are **the configured broker list**: the only accounts that may hold the patched role (R-06).
    - The socket is `/run/crewchat/crewchat.sock`. The agents' user, and each container's mount, must be in `crewchat-clients`.
 3. **Kiosk user** (only if spike 1.2 picks the CLI runner): create the unprivileged `crewkiosk` user with an empty HOME. It holds no chat or broker credential. Its model credential is installed at the path and with the owner that spike 1.2 names. Configure no managed Claude Code settings on the kiosk host (§5.11).
 4. **Broker:** create the `crewbroker` user.
@@ -586,6 +591,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-21 | daemon ↔ kiosk | Under crew only, an outsider's message reaches the kiosk; the kiosk starts lazily, has no tools, and sees only the `## Kiosk` section; an empty section gives the fixed reply. A crewmate's post in the same thread never reaches the kiosk's prompt. The kiosk's answer carries `props.crew_kiosk=1` and no @mentions, and is treated as outsider content by `admit`. Two crewmates' kiosks in one thread produce no second kiosk answer. An outsider's `@agents` broadcast reaches no kiosk, and an outsider past the per-hour kiosk rate limit is dropped | R-31, R-32 |
 | IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances | R-33 |
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
+| IT-24 | daemon ↔ Mattermost | An agent posts a new root through the daemon's `send`, the daemon restarts, and a human's reply in that thread is addressed to the agent (`addressed_to` true through the persisted `MyThreads`) (D-104) | R-17, R-19 |
 
 ### 6.3 End-to-End Tests (Automated)
 
@@ -605,7 +611,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 
 - [ ] All Phase DoD checklists are satisfied.
 - [ ] Every requirement R-01 to R-34 traces to at least one IT or E2E item in the VRTM, and that item passes. [R-01 to R-34]
-- [ ] All IT-01 to IT-23 and E2E-01 to E2E-03 pass in CI on all three legs: Team Edition and Enterprise at 11.11.3, and Team Edition 11.8.x. [CT-01, CT-11]
+- [ ] All IT-01 to IT-24 and E2E-01 to E2E-03 pass in CI on all three legs: Team Edition and Enterprise at 11.11.3, and Team Edition 11.8.x. [CT-01, CT-11]
 - [ ] IT-01 runs the daemon under a separate user in CI. [R-08]
 - [ ] Every Deliverables Manifest row (5.A) is delivered at its path.
 - [ ] The §5.N questions each have a recorded answer, and any answer that changes a decision has a superseding `[ledger]` entry.
@@ -652,6 +658,8 @@ P2W1 ─┬─ 2.1 Mattermost adapter
            │
 P2W2 ─── 2.4 Thin MCP: chat_*, default resolution, disc_* aliases
            │
+P2W3 ─── 2.4b register carries team and avatar; persisted my-threads
+           │
    ⇒ #27 lands on main ⇒ IP-2: tag release → K-1 (babelfish, claudecode-workflow): skills → chat_*, /name registers,
            install thin MCP, chat-defaults ask-once, chat_* tool reference (DM-09b)
            │
@@ -683,6 +691,7 @@ P3W6 ─── 3.9 Closing: VRTM, manifest, partner-name grep, dev-space smoke
 | P1W3 | 1.4 | Story 1.4 | Single story |
 | P2W1 | 2.1, 2.2, 2.3 | P2W1 master | Yes — 3 independent stories |
 | P2W2 | 2.4 | Story 2.4 | Single story |
+| P2W3 | 2.4b | Story 2.4b | Single story (D-103, D-104; after 2.4 integrates) |
 | P3W1 | 3.1, 3.2 | P3W1 master | Yes — 2 independent stories |
 | P3W2 | 3.3, 3.4 | P3W2 master | Yes — 2 independent stories |
 | P3W3 | 3.5 | Story 3.5 | Single story |
@@ -980,7 +989,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 
 #### Phase 2 Definition of Done
 
-- [ ] IT-02, IT-04 to IT-07, and IT-14 to IT-16, pass on all three CI legs. [R-04, R-05, R-07, R-09 to R-19, R-29]
+- [ ] IT-02, IT-04 to IT-07, IT-14 to IT-16, and IT-24, pass on all three CI legs. [R-04, R-05, R-07, R-09 to R-19, R-29]
 - [ ] Every `disc_*` alias is covered by IT-15. [R-15]
 - [ ] A `mattermost-crew` release is tagged, ready for IP-2 (K-1).
 - [ ] All Phase 2 unit tests pass.
@@ -1089,15 +1098,22 @@ Implements the addressing rules every adapter inherits: `@agents`, `@all` during
 1. `crewchat/addressing.py`:
    - `tokens(text) -> set[str]` extracts `@`-tokens and keeps `.` inside them (R-18);
    - `is_broadcast(tokens, backend) -> bool` is true for `@agents` on every backend, and for `@all` only on Discord (R-16).
-2. `addressed_to(msg, reg: Registration, my_threads: set[str]) -> bool` is true when any of these holds:
+2. `addressed_to(msg, reg: Registration, my_threads: set[str], author_crew: str | None = None) -> bool` is true when any of these holds:
    - a broadcast;
    - `@<dev-name>` or `@<dev-name>.<crew>`;
-   - `@<crew>` or `@<dev-team>`, matched by our filter and never by Mattermost user groups (R-17);
+   - `@<crew>`, or `@<dev-team>` where `team_scope` allows it, matched by our filter and never by Mattermost user groups (R-17). `group_tokens(reg, backend, author_crew)` always includes the crew token; it includes `reg.dev_team` only as the per-backend policy `team_scope(backend)` says (D-103):
+
+     | `team_scope(backend)` | Backends | `@<dev-team>` matches when |
+     |---|---|---|
+     | `"backend"` | Discord (`discord`, `discord:*`) | `reg.dev_team` is non-empty; any author (the guild is the trust boundary) |
+     | `"crew"` | every Mattermost server | `reg.dev_team` is non-empty **and** `author_crew == reg.crew`; with `author_crew` None it never matches (fail closed) |
+
+     Phase 2 has no membership step, so every Phase 2 caller passes `author_crew=None`; Story 3.3 supplies it. The agent's avatar is display only and never addresses it;
    - `msg.root_id` is in `my_threads`, the threads the agent started or posted in (R-19);
    - the message is a direct message to the agent (a DM channel whose members are the sender and the agent) (R-19).
 
    `is_direct_address(msg, reg, my_threads) -> bool` is the narrower test used for kiosk routing (§5.9): true only for `@<dev-name>`, `@<dev-name>.<crew>`, a DM to the agent, or a reply in one of the agent's own threads. Broadcasts and crew or team tokens are never direct address.
-3. `crewchat/threads.py`: a `MyThreads` store that records the root ID of every post the agent makes, and that is consulted by `addressed_to`.
+3. `crewchat/threads.py`: a `MyThreads` store that records the root ID of every post the agent makes, and that is consulted by `addressed_to`. Story 2.4b persists it at `<state_dir>/threads/<dev>.json` (`/var/lib/crewchat/threads/`, file `0600`, directory `0700`), with each root's `last_seen`, pruned by `my_threads_retention_days` (default 90), so "reply to me" survives a daemon restart (D-104).
 
 **Test Procedures:**
 
@@ -1182,6 +1198,60 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 - [ ] `grep -rn "token" packages/clients/` finds no credential handling. [R-08]
 - [ ] Every `disc_*` alias forwards and warns. [R-15]
 - [ ] No daemon module opens a path under an agent's home or repo; a test asserts the daemon package has no reference to `agent-identity.json`, `chat-defaults.json`, `reseed-revive.md` or `sqtk-mine.json`. [R-11, R-32]
+
+---
+
+#### Story 2.4b: register carries team and avatar; persisted my-threads (#49)
+
+**Wave:** P2W3
+**Repository:** Wave-Engineering/mattermost-crew
+**Dependencies:** 2.2, 2.3, 2.4
+**Ledger:** D-103, D-104
+
+Carries the agent's Dev-Team and avatar through `register`, scopes `@<dev-team>` per backend, and makes "replies on my threads" survive a daemon restart, by recording every send into a persisted thread set. Added by D-103 and D-104 (from `mattermost-crew:triage` #5 and #6, found by the P2W1 flights); not folded into 2.4, which was already in flight.
+
+**Implementation Steps:**
+
+1. **`register` carries `dev_team` and `dev_avatar` (D-103).** The `register` handler accepts both as optional strings (anything else is `bad_request`), default `""`, and passes them to `Registry.register(dev_name, crew, session_id, *, dev_team="", dev_avatar="")`, which stores both on `Registration` (a re-register overwrites both; `result()` is unchanged). With Discord enabled, a successful `register` calls `DiscordBackend.set_identity(dev_name, avatar=dev_avatar, team=dev_team)`. The shim's `register` frame (and its daily re-register) reads `dev_team` and `dev_avatar` from `<repo_root>/.claude/agent-identity.json`, then the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then `""` (§5.3).
+2. **Team addressing is a per-backend policy (D-103).** `addressing.py` adds `TeamScope = Literal["crew", "backend"]` and `team_scope(backend)`, and `group_tokens(reg, backend, author_crew)` and `addressed_to(..., author_crew=None)` follow the table in Story 2.3. Phase 2 callers pass `author_crew=None`.
+3. **Every daemon-side send records into `MyThreads` (D-104).** `send` and `dm` record after the backend accepts the post; a failed send records nothing. `crewchat serve` builds one persisted `MyThreads.load(state_dir, my_threads_retention_days)` and hands that instance to the chat ops.
+4. **`MyThreads` is persisted (D-104).** `<state_dir>/threads/<dev>.json`, `{"roots": {"<root_id>": "<iso8601>"}}`, file `0600`, directory `0700`, written atomically after each `add`; each root's `last_seen` is refreshed on `add`; roots older than `retention_days` are pruned on load and on save, then the `limit` cap applies; `forget` deletes the file; a corrupt file is logged once and read as empty (§5.9).
+5. **`my_threads_retention_days` in `servers.toml` (D-104):** top-level, an integer ≥ 1, default 90. It never reads a server's retention policy (CT-01).
+6. **Dev Spec amendments** in the same PR: §4.2, §5.3, §5.4, Story 2.3, Story 3.3, §5.9, the `servers.toml` key lists, IT-24 and the VRTM, and this block.
+
+**Test Procedures:**
+
+*Unit Tests:*
+
+| Test Name | Purpose | File Location |
+|-----------|---------|---------------|
+| `test_register_accepts_team_and_avatar` | `register` stores `dev_team`/`dev_avatar`; non-strings give `bad_request`; absent gives `""` | `tests/unit/daemon/test_server.py` |
+| `test_register_sets_discord_identity` | `register` calls `DiscordBackend.set_identity`, and the next signature carries the avatar and team | `tests/unit/daemon/test_registry.py` |
+| `test_shim_register_reads_identity` | The shim's `register` frame takes `dev_team`/`dev_avatar` from `agent-identity.json`, then the legacy `/tmp` file, then `""` | `tests/unit/clients/test_mcp_shim.py` |
+| `test_team_scope_policy` | `discord` and `discord:x` are `"backend"`; a Mattermost server is `"crew"` | `tests/unit/daemon/test_addressing.py` |
+| `test_team_token_discord_no_author_check` | On Discord, `@<dev-team>` is addressed with `author_crew=None` | `tests/unit/daemon/test_addressing.py` |
+| `test_team_token_mattermost_fails_closed` | On Mattermost, `author_crew=None` or another crew → not addressed; the agent's own crew → addressed | `tests/unit/daemon/test_addressing.py` |
+| `test_avatar_never_addresses` | A message naming the agent's avatar is not addressed to it | `tests/unit/daemon/test_addressing.py` |
+| `test_send_records_thread` | A successful `send` (new post, then reply) records its root; a failed send records nothing | `tests/unit/daemon/test_server.py` |
+| `test_threads_persist_roundtrip` | `add`, then a new `MyThreads.load` gives the same roots; file `0600`, directory `0700` | `tests/unit/daemon/test_threads.py` |
+| `test_threads_prune_by_retention` | With an injected clock, roots past `retention_days` are dropped on load and on save | `tests/unit/daemon/test_threads.py` |
+| `test_threads_corrupt_file_is_empty` | A corrupt file loads as empty, logs once, and doesn't raise | `tests/unit/daemon/test_threads.py` |
+| `test_threads_forget_deletes_file` | `forget` removes the agent's file | `tests/unit/daemon/test_threads.py` |
+| `test_config_retention_default` | `my_threads_retention_days` defaults to 90, is top-level, and rejects values below 1 | `tests/unit/daemon/test_config.py` |
+
+*Integration/E2E Coverage:*
+
+- IT-24 is now runnable (`tests/integration/test_my_threads_restart.py`).
+- IT-07 still passes with the new `addressed_to` signature.
+
+**Acceptance Criteria:**
+
+- [ ] IT-24 and IT-07 pass on all three CI legs. [R-17, R-19]
+- [ ] `register` carries `dev_team` and `dev_avatar` end to end: shim → daemon → `Registration`, and into `DiscordBackend.set_identity`. [D-103]
+- [ ] `team_scope` is the only place a backend's team trust is decided. [D-103]
+- [ ] On Mattermost a team token never matches with `author_crew=None`; on Discord it matches on `reg.dev_team` alone. [D-103]
+- [ ] Every successful daemon-side `send` and `dm` records into `MyThreads`, persisted at `<state_dir>/threads/<dev>.json` (`0600`, directory `0700`), pruned by `my_threads_retention_days`. [D-104]
+- [ ] The daemon package still has no reference to `agent-identity.json` or the legacy `/tmp/claude-agent-` file. [R-11, R-32, §5.3]
 
 ---
 
@@ -1316,7 +1386,7 @@ Applies the social switch and the loop guard on both the push path and the pull 
      - **username suffixes are never used for membership.**
 
      If the author can't be resolved by the server, or no switch state or `crew_info` is cached, it returns `DROP` (R-22).
-   - **Push order on Mattermost:** membership, then addressing (`addressed_to`, Story 2.3), then the loop guard (step 3), then the switch. An outsider post that isn't addressed to the agent, or fails the loop guard, is `DROP`, never `KIOSK`.
+   - **Push order on Mattermost:** membership, then addressing (`addressed_to`, Story 2.3), then the loop guard (step 3), then the switch. Membership supplies `author_crew` to `addressed_to` (the author's crew when it is ours or a trusted crew's, else None), so on Mattermost a `@<dev-team>` token matches only for an author of the agent's own crew (D-103). An outsider post that isn't addressed to the agent, or fails the loop guard, is `DROP`, never `KIOSK`.
    - **Pull order on Mattermost:** membership, then the switch, **only**. Addressing and the loop guard do not apply on pull, so `chat_read` and `chat_thread` return crewmates' posts whether or not they address the agent.
    - A post with `msg.kiosk` true (`props.crew_kiosk=1`) is classed as an outsider whoever authored it, and is never `KIOSK`: `DROP` (omitted on pull) under `crew` or `trusted`, `DELIVER_MARKED_OUTSIDER` under `social` (§5.9).
    - A crewmate → `DELIVER`.
@@ -1526,7 +1596,7 @@ Delivers the operator runbook (with its prerequisites and install verification f
    - "Prerequisites": the OS users `crewchat`, `crewbroker` and (if the CLI kiosk runner is used) `crewkiosk` with an empty HOME, the group `crewchat-clients` (and `crewbroker` not in `crewchat`; the broker socket directory gets its group from tmpfiles.d), Python 3.12, uv, and the socket mount into containers;
    - "Install the daemon" and "Install the broker", as fenced `bash` blocks taken from §5.B, the broker as one `crewbroker@<crew>-<server_id>` instance per (crew, Mattermost server);
    - "Configure", listing every required field exactly as the spec defines it:
-     - `/etc/crewchat/servers.toml`: the array of `mattermost` server tables (`id`, `url`), `[discord] enabled`, `default_crew`, `broker_timeout_s` (default 2), `kiosk_rate_per_hour` (default 10), `loop_guard_window` (default 20), `[crews.<crew>] needs_list`, and per crew and server `[crews.<crew>.<server_id>] broker_socket` and `broker_user_id` (one table for every local broker, including trusted crews' brokers);
+     - `/etc/crewchat/servers.toml`: the array of `mattermost` server tables (`id`, `url`), `[discord] enabled`, `default_crew`, `broker_timeout_s` (default 2), `kiosk_rate_per_hour` (default 10), `loop_guard_window` (default 20), `my_threads_retention_days` (default 90, D-104), `[crews.<crew>] needs_list`, and per crew and server `[crews.<crew>.<server_id>] broker_socket` and `broker_user_id` (one table for every local broker, including trusted crews' brokers);
      - `/etc/crewbroker/<crew>-<server_id>.toml`: `crew`, `server_id`, `server_url`, `human_user_ids`, and `trusted = ["<crew>", …]` (names only); `broker_user_id` is filled at startup from `/users/me`;
    - "Verify the install": a fenced `bash` block that runs `make verify-install`. That target checks every known credential file with `test -e <file> && ! sudo -u agent test -r <file>`, and the same for `crewkiosk`;
    - "Rollback".
@@ -1679,6 +1749,7 @@ The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[l
 | — | Approval | D-088 |
 | — | Pre-kickoff amendments: one Plan per phase (#26, #27, #28), the spike without CI, the 11.8 floor (CT-11), the S-NN citation rule | D-089 (supersedes D-065 in part), D-090, D-091, D-092 |
 | — | Spike 1.2 answers to §5.N (`docs/spikes/2026-10-spike-1.2.md`) | D-093 to D-101; D-096 resolves D-071 (the kiosk is the CLI runner); D-100 supersedes D-079 and D-087 in part (bot ownership is checked in the broker) |
+| — | P2W1 flight findings (Story 2.4b): `register` carries team and avatar, per-backend team scope; persisted my-threads | D-103, D-104 |
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 
@@ -1702,9 +1773,9 @@ Story 3.9 fills in the Status column.
 | R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pending |
 | R-15 | Discord parity | Stories 2.2, 2.4 | IT-15 | integration test | Pending |
 | R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pending |
-| R-17 | Crew and team tokens by our filter | Story 2.3 | IT-07 | integration test | Pending |
+| R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
 | R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pending |
-| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3 | IT-07 | integration test | Pending |
+| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
 | R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pending |
 | R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pending |
 | R-22 | Unresolvable crew dropped; membership by `owner_id` plus `minted_bot_ids` | Stories 1.3, 3.3 | IT-08 | integration test | Pending |

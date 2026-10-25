@@ -5,7 +5,7 @@
 # Needs the crewchat user, the crewchat-clients group (crewchat is a member), and
 # /etc/crewchat/servers.toml. systemd creates /run/crewchat (RuntimeDirectory; /run is emptied
 # on every boot) and /var/lib/crewchat (StateDirectory, mode 0700). The daemon creates
-# /var/lib/crewchat/tokens (0700) and every token file in it (0600), and gives its socket,
+# /var/lib/crewchat/tokens and /var/lib/crewchat/threads (0700) and every file in them (0600), and gives its socket,
 # /run/crewchat/crewchat.sock, mode 0660 and group crewchat-clients. It reaches each broker's
 # socket under /run/crewbroker through the crewchat group (packaging/crewbroker.tmpfiles.conf).
 [Unit]
