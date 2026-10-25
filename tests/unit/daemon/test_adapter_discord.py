@@ -262,6 +262,47 @@ def test_discord_reads_only_screamhole(credential: Path, run: Any) -> None:
     assert discord.direct_reads == []
 
 
+def test_channel_names_while_unhealthy(credential: Path, run: Any) -> None:
+    """While scream-hole is unhealthy a name resolves from the last healthy listing, however
+    old, so a name-addressed write still goes direct to Discord (#74). The listing is not
+    re-read: no read reaches scream-hole or Discord. With no listing, or a name the listing
+    lacks, the error says to use the channel ID."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    ops = discord.add_channel("agent-ops")
+    b = backend(discord, credential, now=clock)
+    assert run(b.channel_id("agent-ops")) == ops  # one healthy listing
+
+    discord.screamhole_healthy = False
+    clock.t += max(b.channel_refresh_s, b.healthy_recheck_s) * 10  # the listing is stale
+    later = discord.add_channel("later")  # made after the listing: not in it
+    mark = len(discord.requests)
+    sent = run(b.send(ME, "#agent-ops", "by name while degraded"))
+    assert sent.channel == ops and discord.messages[ops][-1]["id"] == sent.post_id
+    thread = run(b.create_thread(ME, "agent-ops", "a thread while degraded"))
+    assert thread["channel"] == ops
+    new = discord.requests[mark:]
+    assert [r for r in new if r[1] == "GET" and "/health" not in r[2]] == []  # no listing read
+    assert ("discord", "POST", f"/channels/{ops}/messages") in new
+    with pytest.raises(BackendUnavailable, match="address it by channel ID"):
+        run(b.send(ME, "later", "x"))
+    run(b.send(ME, later, "by ID still goes"))
+    assert discord.messages[later][-1]["content"].startswith("by ID still goes")
+    for read in (lambda: b.list_channels(ME), lambda: b.resolve(ME, "agent-ops")):
+        with pytest.raises(BackendUnavailable, match=SCREAMHOLE_UNHEALTHY):
+            run(read())
+    assert "channel names resolve from the last listing" in run(b.health())["detail"]
+    assert discord.direct_reads == []
+
+    # Unhealthy from the start: no listing to fall back on.
+    cold_discord = FakeDiscord(now=clock)
+    cold_discord.screamhole_healthy = False
+    cold = backend(cold_discord, credential, now=clock)
+    with pytest.raises(BackendUnavailable, match="address it by channel ID"):
+        run(cold.send(ME, "agent-ops", "x"))
+    assert cold_discord.direct_reads == []
+
+
 def test_stream_does_not_poll_while_unhealthy(credential: Path, run: Any) -> None:
     import asyncio
 
