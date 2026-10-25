@@ -618,7 +618,7 @@ class Daemon:
         self.server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
 
     async def __aenter__(self) -> Daemon:
-        self.listener = await self.server.start(self.sock, group=None)
+        await self.server.start(self.sock, group=None)
         self.stop = asyncio.Event()
         self.kiosk.start()
         # `switch_state` and `crew_info` from every broker, now and every 30 s (§5.9).
@@ -630,8 +630,7 @@ class Daemon:
         self.refresher.cancel()  # it may be waiting on the hung broker
         with contextlib.suppress(asyncio.CancelledError):
             await self.refresher
-        self.listener.close()
-        await self.listener.wait_closed()
+        await self.server.aclose()
         await self.doorbell.aclose()
         await self.kiosk.aclose()
         await self.backend.aclose()

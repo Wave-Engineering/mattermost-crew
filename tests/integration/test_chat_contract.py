@@ -181,12 +181,11 @@ class Host:
 
     @asynccontextmanager
     async def serving(self, sock: Path) -> AsyncIterator[None]:
-        listener = await self.server.start(sock, group=None)
+        await self.server.start(sock, group=None)
         try:
             yield
         finally:
-            listener.close()
-            await listener.wait_closed()
+            await self.server.aclose()
             for b in self.mm.values():
                 await b.aclose()
             await self.dc.aclose()

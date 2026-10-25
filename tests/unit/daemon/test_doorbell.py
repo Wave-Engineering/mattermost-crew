@@ -335,7 +335,7 @@ def test_subscribe_hangup_keeps_the_event(world: World, short_dir: Path, run: An
     frame = b'{"proto":1,"id":"1","op":"subscribe","args":{"dev_name":"babel"}}\n'
 
     async def scenario() -> tuple[int, dict[str, Any]]:
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         reader, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame)
         await writer.drain()
@@ -351,8 +351,7 @@ def test_subscribe_hangup_keeps_the_event(world: World, short_dir: Path, run: An
         await writer.drain()
         reply = json.loads(await asyncio.wait_for(reader.readline(), 2))
         writer.close()
-        listener.close()
-        await listener.wait_closed()
+        await server.aclose()
         await world.close()
         return queued, reply
 
@@ -379,7 +378,7 @@ def test_on_sent_runs_only_after_the_reply_is_written(run: Any, short_dir: Path)
         return json.dumps({"proto": 1, "id": str(n), "op": "subscribe", "args": {"n": n}}).encode()
 
     async def scenario() -> dict[str, Any]:
-        listener = await server.start(sock, group=None)
+        await server.start(sock, group=None)
         _, writer = await asyncio.open_unix_connection(str(sock))
         writer.write(frame(1) + b"\n")
         await writer.drain()
@@ -395,8 +394,7 @@ def test_on_sent_runs_only_after_the_reply_is_written(run: Any, short_dir: Path)
         reply: dict[str, Any] = json.loads(await asyncio.wait_for(reader.readline(), 2))
         await asyncio.sleep(0.01)
         writer.close()
-        listener.close()
-        await listener.wait_closed()
+        await server.aclose()
         return reply
 
     reply = run(scenario())

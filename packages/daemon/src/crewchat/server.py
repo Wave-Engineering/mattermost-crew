@@ -65,6 +65,34 @@ class DaemonServer:
         self.handlers = handlers
         self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
+        # For `_close_clients` (#107): the handlers waiting for a frame, and the `hangup_cancels`
+        # ops waiting for their result.
+        self._closing = False
+        self._idle: set[asyncio.Task[Any]] = set()
+        self._waiting: set[asyncio.Future[Any]] = set()
+
+    async def aclose(self) -> None:
+        """Stop listening, end every connection, and wait for their handlers (#107). This is
+        the only shutdown: on Python 3.12, the listener's `wait_closed()` waits for every
+        connection, and its `close()` closes none of them, so a shutdown that skipped the
+        middle step would wait on a waiting `subscribe` forever."""
+        if self._server is None:
+            return
+        self._server.close()
+        self._close_clients()
+        await self._server.wait_closed()
+
+    def _close_clients(self) -> None:
+        """A connection waiting for a frame is closed. A `hangup_cancels` op still waiting is
+        cancelled and writes nothing, so the event a `subscribe` took stays held (#99). Any
+        other op runs to its end and its reply is written: cancelling a `send` whose post had
+        already reached the server would have the agent post it twice. A connection accepted
+        from now on closes at once."""
+        self._closing = True
+        for task in list(self._idle):
+            task.cancel()
+        for op in list(self._waiting):
+            op.cancel()
 
     @staticmethod
     def _op(line: bytes) -> str | None:
@@ -111,8 +139,12 @@ class DaemonServer:
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         next_line: asyncio.Future[bytes] | None = None
+        handling: asyncio.Future[tuple[dict[str, Any], Sent]] | None = None
+        task = asyncio.current_task()
         try:
-            while True:
+            while not self._closing:  # set before this handler's first step, it closes at once
+                if task is not None:
+                    self._idle.add(task)
                 try:
                     if next_line is None:
                         line = await reader.readline()
@@ -122,6 +154,9 @@ class DaemonServer:
                     writer.write(encode(err(None, "bad_request: frame too large")))
                     await writer.drain()
                     return
+                finally:
+                    if task is not None:
+                        self._idle.discard(task)
                 if not line:
                     return
                 if not line.strip():
@@ -136,33 +171,53 @@ class DaemonServer:
                 # meanwhile is kept for the next turn of the loop.
                 handling = asyncio.ensure_future(self._handle(line))
                 next_line = asyncio.ensure_future(reader.readline())
-                await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
-                hung_up = (
-                    next_line.done() and next_line.exception() is None and not next_line.result()
-                )
-                if hung_up:
-                    # Gone before its reply: nothing is written and `on_sent` never runs,
-                    # so an event `subscribe` took stays held for the next one (#99).
-                    if not handling.done():
-                        handling.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await handling
-                    return
-                frame, on_sent = await handling
+                # The op stays in `_waiting`, where `_close_clients` can cancel it, until it
+                # ends, however the wait below comes out (#107).
+                self._waiting.add(handling)
+                try:
+                    await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                    if handling.cancelled():
+                        return  # by `_close_clients`: nothing is written, the event stays held
+                    # A hangup is end-of-file or a failed read; a frame too large is
+                    # answered once the op's reply is written.
+                    hung_up = False
+                    if next_line.done():
+                        exc = next_line.exception()
+                        if exc is None:
+                            hung_up = not next_line.result()
+                        else:
+                            hung_up = not isinstance(exc, ValueError | asyncio.LimitOverrunError)
+                    if hung_up:
+                        # Gone before its reply: nothing is written and `on_sent` never runs,
+                        # so an event `subscribe` took stays held for the next one (#99).
+                        if not handling.done():
+                            handling.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await handling
+                        return
+                    # A frame came in meanwhile, kept for the next turn: the op still waits.
+                    await asyncio.wait({handling})
+                finally:
+                    self._waiting.discard(handling)
+                if handling.cancelled():
+                    return  # by `_close_clients`, as above
+                frame, on_sent = handling.result()
                 writer.write(encode(frame))
                 await writer.drain()
                 self._sent(on_sent)
         except ConnectionError:
             return
         finally:
-            if next_line is not None and not next_line.done():
-                next_line.cancel()
+            for pending in (handling, next_line):
+                if pending is not None and not pending.done():
+                    pending.cancel()
             writer.close()
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
 
-    async def start(self, path: Path, group: str | None = CLIENTS_GROUP) -> asyncio.Server:
-        """Listen on `path`, mode 0660; with `group`, give the socket that group."""
+    async def start(self, path: Path, group: str | None = CLIENTS_GROUP) -> None:
+        """Listen on `path`, mode 0660; with `group`, give the socket that group. `aclose`
+        stops it: the listener isn't handed out, so no caller can shut it down another way."""
         path.unlink(missing_ok=True)
         self._server = await asyncio.start_unix_server(
             self._client, path=str(path), limit=MAX_FRAME_BYTES
@@ -170,7 +225,6 @@ class DaemonServer:
         os.chmod(path, SOCKET_MODE)
         if group is not None:
             os.chown(path, -1, grp.getgrnam(group).gr_gid)
-        return self._server
 
 
 class HealthSource(Protocol):
