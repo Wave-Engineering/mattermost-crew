@@ -631,6 +631,7 @@ class Daemon:
         with contextlib.suppress(asyncio.CancelledError):
             await self.refresher
         self.listener.close()
+        self.server.close_clients()  # as `serve` does (#107)
         await self.listener.wait_closed()
         await self.doorbell.aclose()
         await self.kiosk.aclose()

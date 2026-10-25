@@ -67,6 +67,10 @@ K-2 (the kit's doorbell wiring to the chat daemon).
   settled in yet, is skipped with a warning instead. Posts made there before the bot can
   read it are not replayed. A proxy's 404, every scope unreadable on a retry, 5xx and 429
   are still `backend.down` (#103).
+- The daemon stops while an agent's doorbell is waiting. On Python 3.12 a waiting `subscribe`
+  held shutdown forever, so `systemctl stop crewchat` ran out its stop timeout. The CI suite's
+  teardown hung the same way. A read that fails while a `subscribe` waits now ends it, too
+  (#107).
 - `scripts/smoke-devspace.sh` pins `SMOKE_TARGET=oaw-devspace` to the OaW dev space's URL, and
   only that host lets the broker role patch reach a non-local server (#99).
 

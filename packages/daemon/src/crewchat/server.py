@@ -65,6 +65,16 @@ class DaemonServer:
         self.handlers = handlers
         self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
+        self._clients: set[asyncio.Task[Any]] = set()  # each live connection's handler
+
+    def close_clients(self) -> None:
+        """Cancel every connection's handler, and with it any op still waiting (#107). Call it
+        after the listener's `close()` and before `wait_closed()`: on Python 3.12,
+        `wait_closed()` waits for every connection, and `close()` closes none of them, so a
+        waiting `subscribe` would hold shutdown forever. The op writes nothing, so the event a
+        `subscribe` took stays held (#99)."""
+        for task in list(self._clients):
+            task.cancel()
 
     @staticmethod
     def _op(line: bytes) -> str | None:
@@ -111,6 +121,10 @@ class DaemonServer:
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         next_line: asyncio.Future[bytes] | None = None
+        handling: asyncio.Future[tuple[dict[str, Any], Sent]] | None = None
+        task = asyncio.current_task()
+        if task is not None:
+            self._clients.add(task)
         try:
             while True:
                 try:
@@ -137,9 +151,15 @@ class DaemonServer:
                 handling = asyncio.ensure_future(self._handle(line))
                 next_line = asyncio.ensure_future(reader.readline())
                 await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
-                hung_up = (
-                    next_line.done() and next_line.exception() is None and not next_line.result()
-                )
+                # A hangup is end-of-file or a failed read (#107); a frame too large is
+                # answered once the op's reply is written.
+                hung_up = False
+                if next_line.done():
+                    exc = next_line.exception()
+                    if exc is None:
+                        hung_up = not next_line.result()
+                    else:
+                        hung_up = not isinstance(exc, ValueError | asyncio.LimitOverrunError)
                 if hung_up:
                     # Gone before its reply: nothing is written and `on_sent` never runs,
                     # so an event `subscribe` took stays held for the next one (#99).
@@ -155,8 +175,11 @@ class DaemonServer:
         except ConnectionError:
             return
         finally:
-            if next_line is not None and not next_line.done():
-                next_line.cancel()
+            if task is not None:
+                self._clients.discard(task)
+            for pending in (handling, next_line):
+                if pending is not None and not pending.done():
+                    pending.cancel()
             writer.close()
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()

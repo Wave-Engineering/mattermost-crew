@@ -223,6 +223,7 @@ async def serve(
         await stop.wait()
     finally:
         listener.close()
+        server.close_clients()  # a waiting `subscribe` would hold `wait_closed` (#107)
         await listener.wait_closed()
         await rotation
         await switch_refresh
