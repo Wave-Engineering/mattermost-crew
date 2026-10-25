@@ -11,8 +11,10 @@
   `GET /api/v10/guilds/{guild}/channels` for the text channels to poll. Every read URL is built
   by `_screamhole_get`, which only ever targets the scream-hole base.
 - **While scream-hole is unhealthy** (D-106), reads (polling, `read`, `read_one`, `thread`,
-  `list_channels`, `resolve`, channel-name resolution) **never** go to Discord: they raise
-  `BackendUnavailable("scream-hole unhealthy")` and `health` reports `degraded`. Writes (`send`,
+  `list_channels`, `resolve`, refreshing the channel listing) **never** go to Discord: they
+  raise `BackendUnavailable("scream-hole unhealthy")` and `health` reports `degraded`. A
+  channel name resolves from the last healthy listing, however old, so a name-addressed write
+  still goes through (#74). Writes (`send`,
   `dm`, `react`, `create_channel`, `create_thread`, attachments) fall back to the Discord REST
   API (`discord_api`). Health is `GET <scream-hole>/health`, re-checked when stale: every
   `HEALTHY_RECHECK_S` while healthy, and on a backoff (1 s, doubling, capped at 60 s) while
@@ -421,7 +423,10 @@ class DiscordBackend:
         return {
             "state": "degraded",
             "since": since,
-            "detail": f"{SCREAMHOLE_UNHEALTHY}: reads refused, writes direct to Discord",
+            "detail": (
+                f"{SCREAMHOLE_UNHEALTHY}: reads refused, writes direct to Discord; "
+                "channel names resolve from the last listing"
+            ),
         }
 
     # -- HTTP -------------------------------------------------------------------------------
@@ -519,7 +524,12 @@ class DiscordBackend:
 
     async def channel_id(self, channel: str) -> str:
         """A channel ID as is; a name (`agent-ops`, `#agent-ops`) resolved to the guild's text
-        channel of that name. An unknown name is a `ValueError` naming it."""
+        channel of that name. An unknown name is a `ValueError` naming it.
+
+        While scream-hole is unhealthy the listing can't be refreshed, so a name resolves from
+        the last healthy listing, however old: that is no request at all, so no read reaches
+        Discord (D-106), and a name-addressed write still goes through (#74). With no listing,
+        or a name the old listing lacks (it may be newer), it is `BackendUnavailable`."""
         raw = channel.strip()
         if is_snowflake(raw):
             return raw
@@ -529,10 +539,27 @@ class DiscordBackend:
         if self.guild_id is None:
             raise ValueError(f"channel {channel!r}: names need [discord] guild_id configured")
         for fresh in (False, True):
-            for c in await self.guild_channels(fresh=fresh):
-                if c.get("type") == TEXT_CHANNEL and str(c.get("name", "")).lower() == name:
-                    return str(c["id"])
+            try:
+                listing = await self.guild_channels(fresh=fresh)
+            except BackendUnavailable:
+                found = self._text_channel(self._guild, name)
+                if found is not None:
+                    return found
+                raise BackendUnavailable(
+                    f"{SCREAMHOLE_UNHEALTHY}: channel {channel!r} is not in the last listing; "
+                    "address it by channel ID"
+                ) from None
+            found = self._text_channel(listing, name)
+            if found is not None:
+                return found
         raise ValueError(f"unknown channel {channel!r} in guild {self.guild_id}")
+
+    @staticmethod
+    def _text_channel(listing: Sequence[Mapping[str, Any]], name: str) -> str | None:
+        for c in listing:
+            if c.get("type") == TEXT_CHANNEL and str(c.get("name", "")).lower() == name:
+                return str(c["id"])
+        return None
 
     async def list_channels(
         self, dev_name: str, type: str = "text", guild_id: str | None = None

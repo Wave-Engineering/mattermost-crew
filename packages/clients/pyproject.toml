@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Thin clients of the crewchat daemon: the MCP shim and the doorbell."
 requires-python = ">=3.12"
 dependencies = [
-    "mcp>=1.20",
+    # mcp 2 removed mcp.server.fastmcp, which the shim is built on (#73).
+    "mcp>=1.20,<2",
 ]
 
 [project.scripts]
