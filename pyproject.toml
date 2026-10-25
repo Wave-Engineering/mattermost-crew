@@ -15,6 +15,7 @@ dev = [
     "pytest-cov>=7.1",
     "ruff>=0.17",
     "mypy>=2.4",
+    "pytest-timeout>=2.4",
 ]
 
 [tool.uv]
@@ -52,6 +53,12 @@ addopts = ["--import-mode=importlib", "-p", "pytester"]
 # The repo root, so tests can import the shared fakes as `tests.fakes.*`.
 pythonpath = ["."]
 testpaths = ["tests"]
+# A test that hangs fails inside the CI job's 30 minutes, with every thread's stack (#105);
+# the slowest test, E2E-03's broadcast to about 30 agents, takes well under a minute.
+timeout = 120
+timeout_method = "thread"
+# The backstop, just under the job's 30 minutes, if the timeout itself can't fire.
+faulthandler_timeout = 1500
 
 [tool.coverage.run]
 branch = true

@@ -5,7 +5,8 @@ set -euo pipefail
 MM_PREFIX="${MM_PREFIX:-mmcrew}"
 MM_ENV_FILE="${MM_ENV_FILE:-.mattermost.env}"
 
-docker rm -f "${MM_PREFIX}-mm" "${MM_PREFIX}-pg" >/dev/null 2>&1 || true
+# -v: the images' anonymous volumes go with their containers (#105)
+docker rm -fv "${MM_PREFIX}-mm" "${MM_PREFIX}-pg" >/dev/null 2>&1 || true
 docker network rm "${MM_PREFIX}-net" >/dev/null 2>&1 || true
 rm -f "$MM_ENV_FILE"
-echo "mattermost-down: removed ${MM_PREFIX}-mm, ${MM_PREFIX}-pg and ${MM_PREFIX}-net" >&2
+echo "mattermost-down: removed ${MM_PREFIX}-mm, ${MM_PREFIX}-pg, their volumes and ${MM_PREFIX}-net" >&2
