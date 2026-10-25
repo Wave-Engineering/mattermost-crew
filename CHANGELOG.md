@@ -6,7 +6,9 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
-Phase 3: inbound defense, doorbell and kiosk (Plan #28). The release IP-3 tags, the base for
+## [0.2.0] — 2026-10-25
+
+Phase 3: inbound defense, doorbell and kiosk (Plan #28). This release is IP-3, the base for
 K-2 (the kit's doorbell wiring to the chat daemon).
 
 ### Added
