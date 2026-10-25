@@ -47,6 +47,11 @@ K-2 (the kit's doorbell wiring to the chat daemon).
   self-hosted runner.
 - Broker websockets are bounded; `mcp` is bounded below 2, and `httpx` and `websockets` are
   bounded.
+- A test that hangs fails after 120 s with every thread's stack (`pytest-timeout`), and
+  `make test` names each test as it runs (#105). Ten seconds before the timeout, each running
+  event loop prints where its tasks are awaiting. A timeout ends the whole run, so no reports
+  are written and the upload step fails too. `mattermost-down.sh` removes the containers'
+  anonymous volumes too.
 
 ### Fixed
 
