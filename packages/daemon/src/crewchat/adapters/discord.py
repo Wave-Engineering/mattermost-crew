@@ -50,6 +50,7 @@ import os
 import re
 import stat
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -78,7 +79,11 @@ RETRY_AFTER_MAX_S = 60.0
 TEXT_CHANNEL = 0  # the watcher polls type-0 (GUILD_TEXT) channels only
 PUBLIC_THREAD = 11
 THREAD_ARCHIVE_MINUTES = 1440  # today's disc_create_thread default
-SNOWFLAKE_RE = re.compile(r"^\d+$")
+# A snowflake: ASCII digits only, used with `fullmatch`. `^\d+$` with `match` let a trailing
+# newline and non-ASCII digits through, and every ID that reaches a REST path carries the
+# shared bot token (R-08, #62).
+SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
+WHERE_MAX = 10_000  # message ID -> channel ID entries kept for `react`, least recent evicted
 # Today's disc_list / disc_create_channel `type` names.
 CHANNEL_TYPES = {"text": 0, "voice": 2, "category": 4}
 CHANNEL_TYPE_NAMES = {v: k for k, v in CHANNEL_TYPES.items()}
@@ -99,7 +104,7 @@ TEAM_RE = re.compile(r"\((?P<team>[^()\n]*)\)")
 PROTO_SUFFIX_RE = re.compile(r"(?:^|\s)·p(?P<proto>\d+)\s*$")
 FENCED_RE = re.compile(r"```[\s\S]*?```")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
-USER_MENTION_RE = re.compile(r"^<@!?(\d+)>$")
+USER_MENTION_RE = re.compile(r"<@!?([0-9]{1,20})>")
 
 log = logging.getLogger("crewchat.adapters.discord")
 
@@ -189,15 +194,27 @@ def snowflake_at(seconds: float) -> str:
     return str(ms << 22)
 
 
+def is_snowflake(value: str) -> bool:
+    return bool(SNOWFLAKE_RE.fullmatch(value))
+
+
+def require_snowflake(value: str, what: str) -> str:
+    """`value` if it is a snowflake, else a `ValueError` naming `what` (`bad_request`). Every
+    caller-supplied ID passes this before it reaches a REST path (R-08, #62)."""
+    if not isinstance(value, str) or not is_snowflake(value):
+        raise ValueError(f"{what} must be a Discord ID (digits only), not {value!r}")
+    return value
+
+
 def snowflake_time(snowflake: str) -> float:
-    if not SNOWFLAKE_RE.match(snowflake):
+    if not is_snowflake(snowflake):
         return 0.0
     return ((int(snowflake) >> 22) + DISCORD_EPOCH_MS) / 1000.0
 
 
 def _snowflake_key(msg: Mapping[str, Any]) -> int:
     msg_id = str(msg.get("id", ""))
-    return int(msg_id) if SNOWFLAKE_RE.match(msg_id) else 0
+    return int(msg_id) if is_snowflake(msg_id) else 0
 
 
 def _timestamp(msg: Mapping[str, Any]) -> float:
@@ -315,7 +332,8 @@ class DiscordBackend:
         self.channel_refresh_s = channel_refresh_s
         self.max_retries = max_retries
         self._agents: dict[str, _Agent] = {}
-        self._where: dict[str, str] = {}  # message ID -> channel ID, for `react`
+        # message ID -> channel ID, for `react`: an LRU, so it can't grow without bound.
+        self._where: OrderedDict[str, str] = OrderedDict()
         self._channels: list[str] = []
         self._channels_at: float | None = None
 
@@ -500,7 +518,7 @@ class DiscordBackend:
         """A channel ID as is; a name (`agent-ops`, `#agent-ops`) resolved to the guild's text
         channel of that name. An unknown name is a `ValueError` naming it."""
         raw = channel.strip()
-        if SNOWFLAKE_RE.match(raw):
+        if is_snowflake(raw):
             return raw
         name = raw.removeprefix("#").lower()
         if not name:
@@ -618,6 +636,9 @@ class DiscordBackend:
         channel = str(msg.get("channel_id", ""))
         if post_id and channel:
             self._where[post_id] = channel
+            self._where.move_to_end(post_id)
+            while len(self._where) > WHERE_MAX:
+                self._where.popitem(last=False)
         return InboundMessage(
             backend=self.name,
             channel=channel,
@@ -655,6 +676,8 @@ class DiscordBackend:
     ) -> InboundMessage:
         """Post `text`, signed, in `channel` (an ID or a name); or in the thread `thread` (a
         channel on Discord). `attachments` and `embed` ride on the last chunk, as today."""
+        if thread is not None:
+            require_snowflake(thread, "thread")
         target = thread or await self.channel_id(channel)
         chunks = self.signed(dev_name, text)
         last: Any = None
@@ -692,8 +715,7 @@ class DiscordBackend:
 
     async def read_one(self, dev_name: str, channel: str, post_id: str) -> InboundMessage:
         """Today's `disc_read(message_id)`: one message, from scream-hole."""
-        if not SNOWFLAKE_RE.match(post_id):
-            raise ValueError(f"message id {post_id!r} is not a snowflake")
+        require_snowflake(post_id, "message id")
         target = await self.channel_id(channel)
         data = await self._screamhole_get(f"/channels/{target}/messages/{post_id}", {})
         if not isinstance(data, dict) or str(data.get("id", "")) != post_id:
@@ -703,6 +725,7 @@ class DiscordBackend:
 
     async def thread(self, dev_name: str, post_id: str) -> list[InboundMessage]:
         """Every message in the thread `post_id` (the thread channel's ID), oldest first."""
+        require_snowflake(post_id, "thread")
         return [self.message(m, root_id=post_id) for m in await self._messages_after(post_id, "0")]
 
     async def dm(
@@ -716,9 +739,9 @@ class DiscordBackend:
     ) -> InboundMessage:
         """A DM from the bot to the user `to`: a snowflake, `@<id>` or `<@id>`, signed."""
         user = to.strip()
-        mention = USER_MENTION_RE.match(user)
+        mention = USER_MENTION_RE.fullmatch(user)
         user = mention.group(1) if mention else user.removeprefix("@")
-        if not SNOWFLAKE_RE.match(user):
+        if not is_snowflake(user):
             raise ValueError(f"a Discord DM needs a user ID, not {to!r}")
         channel = await self._discord_write("POST", "/users/@me/channels", {"recipient_id": user})
         if not isinstance(channel, dict) or "id" not in channel:
@@ -730,14 +753,21 @@ class DiscordBackend:
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
         """Add `emoji` (a unicode emoji, or `name:id` for a custom one) to `post_id`."""
         channel, _, message = post_id.rpartition("/")
-        if not channel:
-            message = post_id
-            channel = self._where.get(post_id, "")
+        if channel:
+            # `<channel>/<message>`: both parts reach the PUT path, so both are checked (#62).
+            require_snowflake(channel, "the channel part of post_id")
+            require_snowflake(message, "the message part of post_id")
+        else:
+            message = require_snowflake(post_id, "post_id")
+            channel = self._where.get(post_id, "")  # server data, so trusted
         if not channel:
             raise KeyError(f"no channel known for message {post_id}; pass <channel>/<message>")
         name = emoji.strip()
         if len(name) > 2 and name.startswith(":") and name.endswith(":"):
             name = name[1:-1]
+        if not name.strip("."):
+            # Quoting leaves `.` and `..` alone, and httpx resolves them as dot segments (#62).
+            raise ValueError(f"emoji {emoji!r} is not an emoji")
         await self._discord_write(
             "PUT", f"/channels/{channel}/messages/{message}/reactions/{quote(name, safe='')}/@me"
         )

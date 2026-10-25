@@ -158,7 +158,7 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
         if not isinstance(item, dict):
             raise ConfigError(f"{source}: each [[mattermost]] entry is a table")
         sid, url = item.get("id"), item.get("url")
-        if not isinstance(sid, str) or not NAME_RE.match(sid):
+        if not isinstance(sid, str) or not NAME_RE.fullmatch(sid):
             raise ConfigError(f"{source}: mattermost id {sid!r} is not a server id")
         if not isinstance(url, str) or not url:
             raise ConfigError(f"{source}: mattermost {sid} needs a url")
@@ -169,7 +169,7 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
 
 
 def _crew(name: str, value: Any, server_ids: set[str], source: str) -> CrewEntry:
-    if not NAME_RE.match(name):
+    if not NAME_RE.fullmatch(name):
         raise ConfigError(f"{source}: crew {name!r} has characters outside a-z0-9._-")
     if not isinstance(value, dict):
         raise ConfigError(f"{source}: crews.{name} must be a table")

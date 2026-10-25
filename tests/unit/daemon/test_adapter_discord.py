@@ -13,7 +13,13 @@ from typing import Any
 
 import pytest
 from crewchat.adapters.base import Attachment, BackendUnavailable, Embed, NotFound
-from crewchat.adapters.discord import HEALTH_BACKOFF_MAX_S, SCREAMHOLE_UNHEALTHY, DiscordBackend
+from crewchat.adapters.discord import (
+    HEALTH_BACKOFF_MAX_S,
+    SCREAMHOLE_UNHEALTHY,
+    WHERE_MAX,
+    DiscordBackend,
+    is_snowflake,
+)
 
 from tests.fakes.screamhole import BOT_TOKEN, DISCORD_API, GUILD_ID, SCREAMHOLE_URL, FakeDiscord
 
@@ -288,3 +294,69 @@ def test_stream_does_not_poll_while_unhealthy(credential: Path, run: Any) -> Non
     # While down: health checks only, never a poll, and nothing to Discord.
     assert down and all(p == "/health" for _s, _m, p in down)
     assert discord.direct_reads == []
+
+
+# -- caller IDs never steer the bot credential (R-08, #62) ----------------------------------
+HOSTILE_IDS = [
+    "..",
+    "1/../../guilds/9/prune",
+    "1?x=/m",
+    "1%2F2",
+    "123\n",
+    "١٢٣",  # Arabic-Indic digits: `\d` matches them, a snowflake doesn't
+    "",
+    "1" * 21,
+    "C",
+]
+
+
+def test_snowflake_strict() -> None:
+    assert is_snowflake("123") and is_snowflake("1" * 20)
+    for bad in [*HOSTILE_IDS, "1/2"]:
+        assert not is_snowflake(bad), bad
+
+
+def test_discord_hostile_ids_send_nothing(credential: Path, run: Any) -> None:
+    """A hostile thread or post ID is a `ValueError` before any request, on every path that
+    would put it in a URL: `send(thread)`, `react` (either part), `thread` and `read_one`."""
+    discord = FakeDiscord()
+    ops = discord.add_channel("agent-ops")
+    good = discord.add_message(ops, "a message", author=HUMAN)["id"]
+    b = backend(discord, credential)
+    before = list(discord.requests)
+    for bad in HOSTILE_IDS:
+        calls = [
+            lambda bad=bad: b.send(ME, ops, "hi", thread=bad),
+            lambda bad=bad: b.react(ME, bad, "👍"),
+            lambda bad=bad: b.react(ME, f"{ops}/{bad}", "👍"),
+            lambda bad=bad: b.react(ME, f"{bad}/{good}", "👍"),
+            lambda bad=bad: b.react(ME, f"{ops}/{good}/{good}", "👍"),
+            lambda bad=bad: b.thread(ME, bad),
+            lambda bad=bad: b.read_one(ME, ops, bad),
+        ]
+        for call in calls:
+            with pytest.raises(ValueError):
+                run(call())
+    for emoji in (".", "..", "...", " .. "):  # a dot segment would walk the reactions path
+        with pytest.raises(ValueError):
+            run(b.react(ME, f"{ops}/{good}", emoji))
+    assert discord.requests == before  # not one request, not even a health check
+
+
+def test_react_channel_message_form_ok(credential: Path, run: Any) -> None:
+    discord = FakeDiscord()
+    ops = discord.add_channel("agent-ops")
+    msg = discord.add_message(ops, "react to me", author=HUMAN)["id"]
+    b = backend(discord, credential)
+    run(b.react(ME, f"{ops}/{msg}", "👍"))
+    puts = [p for s, m, p in discord.requests if m == "PUT"]
+    assert len(puts) == 1 and f"/channels/{ops}/messages/{msg}/reactions/" in puts[0]
+
+
+def test_where_is_bounded_lru(credential: Path) -> None:
+    b = backend(FakeDiscord(), credential)
+    for n in range(WHERE_MAX + 1):
+        b.message({"id": str(1_000_000 + n), "channel_id": "42", "content": ""})
+    assert len(b._where) == WHERE_MAX
+    assert "1000000" not in b._where  # the least recent, evicted
+    assert str(1_000_000 + WHERE_MAX) in b._where

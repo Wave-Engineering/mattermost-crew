@@ -70,9 +70,9 @@ def mattermost_backend(server_id: str) -> str:
 
 def account_name(dev_name: str, crew: str) -> str:
     """`<dev_name>.<crew>`, as the broker names it: at most 64 of a-z 0-9 . _ - (CT-05)."""
-    if not isinstance(dev_name, str) or not DEV_NAME_RE.match(dev_name):
+    if not isinstance(dev_name, str) or not DEV_NAME_RE.fullmatch(dev_name):
         raise ValueError(f"dev_name {dev_name!r} must be a-z0-9._- and not start with a dot")
-    if not isinstance(crew, str) or not CREW_RE.match(crew):
+    if not isinstance(crew, str) or not CREW_RE.fullmatch(crew):
         raise ValueError(f"crew {crew!r} has characters outside a-z0-9._-")
     name = f"{dev_name}.{crew}"
     if len(name) > ACCOUNT_NAME_MAX:

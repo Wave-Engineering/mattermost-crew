@@ -46,7 +46,7 @@ class DefaultsError(ValueError):
 
 
 def is_backend(value: Any) -> bool:
-    return isinstance(value, str) and bool(BACKEND_RE.match(value))
+    return isinstance(value, str) and bool(BACKEND_RE.fullmatch(value))
 
 
 def defaults_path(home: Path | None = None) -> Path:

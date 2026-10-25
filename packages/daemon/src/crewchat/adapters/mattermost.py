@@ -58,7 +58,28 @@ PING_TIMEOUT_S = 30.0
 BACKOFF_FIRST_S = 1.0
 BACKOFF_MAX_S = 60.0  # CT-07
 DEFAULT_READ_LIMIT = 60
-USER_ID_RE = re.compile(r"^[a-z0-9]{26}$")
+# Mattermost IDs and usernames, used with `fullmatch`. The client library interpolates its
+# arguments into REST paths unchecked, and each path carries the agent's bot token, which the
+# agent never holds (R-08). So every caller-supplied ID is shape-checked first (#62).
+MM_ID_RE = re.compile(r"[a-z0-9]{26}")
+MM_USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+
+def is_mm_id(value: str) -> bool:
+    return isinstance(value, str) and bool(MM_ID_RE.fullmatch(value))
+
+
+def require_mm_id(value: str, what: str) -> str:
+    """`value` if it is a Mattermost ID, else a `ValueError` naming `what` (`bad_request`)."""
+    if not is_mm_id(value):
+        raise ValueError(f"{what} must be a 26-character Mattermost ID, not {value!r}")
+    return value
+
+
+def require_mm_username(value: str) -> str:
+    if not isinstance(value, str) or not MM_USERNAME_RE.fullmatch(value.lower()):
+        raise ValueError(f"{value!r} is not a Mattermost username")
+    return value.lower()
 
 log = logging.getLogger("crewchat.adapters.mattermost")
 
@@ -375,6 +396,7 @@ class MattermostBackend:
 
     async def read_one(self, dev_name: str, channel: str, post_id: str) -> InboundMessage:
         """One post, `GET /api/v4/posts/{id}`; one in another channel is not found."""
+        require_mm_id(post_id, "post_id")
 
         async def request(client: MattermostClient) -> InboundMessage:
             try:
@@ -389,6 +411,8 @@ class MattermostBackend:
 
     async def has_post(self, dev_name: str, post_id: str) -> bool:
         """`GET /api/v4/posts/{id}` as the agent answers 200 (R-12's probe)."""
+        if not is_mm_id(post_id):
+            return False  # never a request for an ID of the wrong shape (#62)
 
         async def request(client: MattermostClient) -> bool:
             try:
@@ -408,6 +432,8 @@ class MattermostBackend:
     async def read(
         self, dev_name: str, channel: str, since: float | None = None, limit: int | None = None
     ) -> list[InboundMessage]:
+        require_mm_id(channel, "channel")
+
         async def request(client: MattermostClient) -> list[InboundMessage]:
             if since is not None:
                 result = await client.get_posts_since(channel, int(since * 1000))
@@ -419,6 +445,8 @@ class MattermostBackend:
         return messages[-limit:] if limit else messages
 
     async def thread(self, dev_name: str, post_id: str) -> list[InboundMessage]:
+        require_mm_id(post_id, "thread")
+
         async def request(client: MattermostClient) -> list[InboundMessage]:
             return await self._messages(client, await client.get_thread(post_id))
 
@@ -434,14 +462,13 @@ class MattermostBackend:
         embed: Embed | None = None,
     ) -> InboundMessage:
         """`to` is a username (with or without `@`) or a user ID."""
-        me = await self.user_id(dev_name)
         name = to.removeprefix("@")
+        user_id = name if is_mm_id(name) else None
+        username = None if user_id else require_mm_username(name)  # before any request (#62)
+        me = await self.user_id(dev_name)
 
         async def request(client: MattermostClient) -> InboundMessage:
-            if USER_ID_RE.match(name):
-                other = name
-            else:
-                other = str((await client.get_user_by_username(name))["id"])
+            other = user_id or str((await client.get_user_by_username(str(username)))["id"])
             channel = await client.create_direct_channel([me, other])
             return await self._post(client, str(channel["id"]), text, None, attachments, embed)
 

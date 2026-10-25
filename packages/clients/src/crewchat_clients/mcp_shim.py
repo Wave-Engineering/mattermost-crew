@@ -55,6 +55,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -85,6 +86,9 @@ CALL_TIMEOUT_S = 30.0
 REGISTER_EVERY = timedelta(hours=24)
 POLL_INTERVAL_S = 5.0
 DISCORD = "discord"
+# A Discord snowflake, used with `fullmatch` (#62): the one shape a `<channel>/<message>` part
+# may have, since it ends up in a REST path that carries the bot credential.
+SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
 DISC_READ_LIMIT = 20  # today's disc_read default
 # An attachment goes to the daemon in `upload` chunks (§5.4). The daemon's frames are at most
 # 64 KiB; 45 KiB of raw bytes is 60 KiB of base64, leaving room for the frame around it.
@@ -112,6 +116,28 @@ def utc_now() -> datetime:
 
 class ShimError(Exception):
     """A tool call that failed; the message goes to the agent as the tool's error."""
+
+
+def discord_ref(ref: str) -> tuple[str, str] | None:
+    """Discord's `<channel>/<message>` form as its two snowflakes; `None` for a bare ID.
+
+    Any other `/`, or a part that isn't a snowflake, is a `ShimError` before any frame is sent:
+    the parts reach REST paths that carry the bot credential (R-08, #62). Mattermost IDs never
+    contain a `/`.
+    """
+    if "/" not in ref:
+        return None
+    parts = ref.split("/")
+    if len(parts) != 2 or not all(SNOWFLAKE_RE.fullmatch(p) for p in parts):
+        raise ShimError(f"{ref!r} is not <channel>/<message>: two Discord IDs, digits only")
+    return parts[0], parts[1]
+
+
+def thread_id(ref: str) -> str:
+    """The thread to reply on or read: the channel part of `<channel>/<message>` (on Discord,
+    the thread channel the message is in), or the bare ID as given."""
+    pair = discord_ref(ref)
+    return pair[0] if pair else ref
 
 
 class DaemonError(ShimError):
@@ -417,8 +443,9 @@ class Shim:
         """The backend `post_id`'s thread is on, as the daemon answers it (R-12). The shim
         keeps no map of its own, so the answer survives a restart of either side. Unknown is
         a loud failure: a reply never falls back to the default backend."""
-        # Discord's `<channel>/<message>` form names the message by its last part.
-        lookup = post_id.rsplit("/", 1)[-1]
+        # Discord's `<channel>/<message>` form, both parts checked, is looked up by its message.
+        pair = discord_ref(post_id)
+        lookup = pair[1] if pair else post_id
         try:
             result = await self._forward(
                 "thread_backend", {"dev_name": self.dev_name, "post_id": lookup}
@@ -577,14 +604,16 @@ class Shim:
         attach_path: str | None = None,
         embed: str | None = None,
     ) -> dict[str, Any]:
+        # The thread is checked first: `_post_args` sends `upload` frames (#62).
+        tid = thread_id(thread) if thread else None
         route = await self._route(backend, thread)
         if isinstance(route, dict):
             return route
         name, off = route
         args = await self._post_args(name, off, attach_path, embed)
         args.update({"to": to, "text": text})
-        if thread:
-            args["thread"] = thread
+        if tid:
+            args["thread"] = tid
         return await self._forward("send", args)
 
     async def chat_dm(
@@ -641,7 +670,11 @@ class Shim:
         if isinstance(route, dict):
             return route
         name, off = route
-        args: dict[str, Any] = {"dev_name": self.dev_name, "backend": name, "post_id": post_id}
+        args: dict[str, Any] = {
+            "dev_name": self.dev_name,
+            "backend": name,
+            "post_id": thread_id(post_id),
+        }
         if off:
             args["off_default"] = True
         return await self._forward("thread", args)
@@ -649,6 +682,7 @@ class Shim:
     async def chat_react(
         self, post_id: str, emoji: str, backend: str | None = None
     ) -> dict[str, Any]:
+        discord_ref(post_id)  # a malformed `<channel>/<message>` fails here, before any frame
         route = await self._route(backend, post_id)
         if isinstance(route, dict):
             return route

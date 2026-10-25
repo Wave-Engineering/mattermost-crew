@@ -494,6 +494,41 @@ def test_reply_backend_survives_shim_restart(tmp_path: Path) -> None:
     assert daemon.of("thread_backend")[-1] == {"dev_name": DEV, "post_id": root["post_id"]}
 
 
+def test_shim_thread_form(tmp_path: Path) -> None:
+    """Discord's `<channel>/<message>`: both parts must be snowflakes. A reply or a thread read
+    forwards only the thread channel, and the lookup uses the message. Any other `/` fails in
+    the shim, before a frame (R-08, #62)."""
+    daemon = FakeDaemon()
+    chan, msg = "700000000000000001", "1563738882191654913"
+    daemon.where[msg] = "discord"
+    shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.chat_send("town", "a reply", thread=f"{chan}/{msg}")
+        assert daemon.of("thread_backend")[-1] == {"dev_name": DEV, "post_id": msg}
+        assert daemon.of("send")[-1]["thread"] == chan
+        await shim.chat_thread(f"{chan}/{msg}")
+        assert daemon.of("thread")[-1]["post_id"] == chan
+        report = tmp_path / "report.txt"
+        report.write_text("attached")
+        start = len(daemon.frames)
+        for bad in ("a/b/c", "../x", f"{chan}/../x", f"{chan}/x", f"{chan}/", f"/{msg}"):
+            for call in (
+                lambda bad=bad: shim.chat_send("town", "x", thread=bad),
+                lambda bad=bad: shim.chat_send("town", "x", thread=bad, attach_path=str(report)),
+                lambda bad=bad: shim.chat_send("town", "x", thread=bad, backend="discord"),
+                lambda bad=bad: shim.chat_thread(bad, backend="discord"),
+                lambda bad=bad: shim.chat_react(bad, "👍"),
+                lambda bad=bad: shim.chat_react(bad, "👍", backend="discord"),
+            ):
+                with pytest.raises(ShimError, match="<channel>/<message>"):
+                    await call()
+        assert len(daemon.frames) == start  # no frame for any of them
+
+    asyncio.run(scenario())
+
+
 def test_named_default_is_not_off_default(tmp_path: Path) -> None:
     daemon = FakeDaemon()
     shim = make_shim(tmp_path, daemon, home_backend="discord")

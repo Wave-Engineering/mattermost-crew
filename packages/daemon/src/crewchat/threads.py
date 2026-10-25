@@ -101,7 +101,7 @@ class MyThreads:
         os.chmod(directory, DIR_MODE)
         for path in sorted(directory.glob("*.json")):
             dev_name = path.stem
-            if not SAFE_NAME_RE.match(dev_name):
+            if not SAFE_NAME_RE.fullmatch(dev_name):
                 continue
             roots = store._read(path)
             if roots:
@@ -115,7 +115,7 @@ class MyThreads:
 
     def path(self, dev_name: str) -> Path | None:
         directory = self.threads_dir
-        if directory is None or not SAFE_NAME_RE.match(dev_name):
+        if directory is None or not SAFE_NAME_RE.fullmatch(dev_name):
             return None
         return directory / f"{dev_name}.json"
 
@@ -131,7 +131,7 @@ class MyThreads:
                 if not isinstance(root_id, str) or not root_id or not isinstance(entry, dict):
                     raise ValueError(f"bad entry {root_id!r}")
                 backend, stamp = entry.get("backend"), entry.get("last_seen")
-                if not isinstance(backend, str) or not BACKEND_NAME_RE.match(backend):
+                if not isinstance(backend, str) or not BACKEND_NAME_RE.fullmatch(backend):
                     raise ValueError(f"entry {root_id!r} has no valid backend")
                 if not isinstance(stamp, str):
                     raise ValueError(f"entry {root_id!r} has no last_seen")
@@ -182,7 +182,7 @@ class MyThreads:
         recent last)."""
         if not root_id:
             return
-        if not BACKEND_NAME_RE.match(backend):
+        if not BACKEND_NAME_RE.fullmatch(backend):
             raise ValueError(f"backend {backend!r} is not mattermost:<server_id> or discord")
         roots = self._roots.setdefault(dev_name, OrderedDict())
         roots[root_id] = _Entry(backend, self.clock())
