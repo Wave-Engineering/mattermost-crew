@@ -164,31 +164,37 @@ class DaemonServer:
                 # meanwhile is kept for the next turn of the loop.
                 handling = asyncio.ensure_future(self._handle(line))
                 next_line = asyncio.ensure_future(reader.readline())
+                # The op stays in `_waiting`, where `close_clients` can cancel it, until it
+                # ends, however the wait below comes out (#107).
                 self._waiting.add(handling)
                 try:
                     await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                    if handling.cancelled():
+                        return  # by `close_clients`: nothing is written, the event stays held
+                    # A hangup is end-of-file or a failed read; a frame too large is
+                    # answered once the op's reply is written.
+                    hung_up = False
+                    if next_line.done():
+                        exc = next_line.exception()
+                        if exc is None:
+                            hung_up = not next_line.result()
+                        else:
+                            hung_up = not isinstance(exc, ValueError | asyncio.LimitOverrunError)
+                    if hung_up:
+                        # Gone before its reply: nothing is written and `on_sent` never runs,
+                        # so an event `subscribe` took stays held for the next one (#99).
+                        if not handling.done():
+                            handling.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await handling
+                        return
+                    # A frame came in meanwhile, kept for the next turn: the op still waits.
+                    await asyncio.wait({handling})
                 finally:
                     self._waiting.discard(handling)
                 if handling.cancelled():
-                    return  # by `close_clients`: nothing is written, the event stays held
-                # A hangup is end-of-file or a failed read (#107); a frame too large is
-                # answered once the op's reply is written.
-                hung_up = False
-                if next_line.done():
-                    exc = next_line.exception()
-                    if exc is None:
-                        hung_up = not next_line.result()
-                    else:
-                        hung_up = not isinstance(exc, ValueError | asyncio.LimitOverrunError)
-                if hung_up:
-                    # Gone before its reply: nothing is written and `on_sent` never runs,
-                    # so an event `subscribe` took stays held for the next one (#99).
-                    if not handling.done():
-                        handling.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await handling
-                    return
-                frame, on_sent = await handling
+                    return  # by `close_clients`, as above
+                frame, on_sent = handling.result()
                 writer.write(encode(frame))
                 await writer.drain()
                 self._sent(on_sent)

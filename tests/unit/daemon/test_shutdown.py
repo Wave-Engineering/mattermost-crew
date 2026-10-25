@@ -101,6 +101,11 @@ def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
             if i < 2:
                 writer.write(frame(f"wait{i}", {}))
                 await writer.drain()
+            else:
+                # One round trip, so its handler is surely parked reading its next frame.
+                writer.write(frame("nosuch", {}))
+                await writer.drain()
+                assert json.loads(await reader.readline())["error"] == "unsupported"
             conns.append((reader, writer))
         for w in waits:
             await asyncio.wait_for(w.started.wait(), 2)
@@ -115,6 +120,36 @@ def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
     waits, tails = asyncio.run(scenario())
     assert [w.cancelled for w in waits] == [True, True]
     assert tails == [b"", b"", b""]
+
+
+@pytest.mark.parametrize("extra", [b"\n", b"x" * 80 + b"\n"], ids=["blank", "unknown"])
+def test_a_frame_sent_while_an_op_waits_keeps_it_cancellable(
+    short_dir: Path, extra: bytes
+) -> None:
+    """A second frame arriving while a `subscribe` waits doesn't take the op out of
+    `close_clients`' reach: shutdown still cancels it, and nothing is written (#107)."""
+    sock = short_dir / "s.sock"
+
+    async def scenario() -> tuple[Waiting, bytes]:
+        wait = Waiting()
+        server = DaemonServer({"wait": wait}, hangup_cancels=frozenset({"wait"}))
+        listener = await server.start(sock, group=None)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(frame("wait", {}) + extra)  # in one write
+        await writer.drain()
+        await asyncio.wait_for(wait.started.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)  # the handler reads the second frame and waits on the op
+        listener.close()
+        server.close_clients()
+        await asyncio.wait_for(listener.wait_closed(), 1)
+        tail = await asyncio.wait_for(reader.read(), 1)
+        writer.close()
+        return wait, tail
+
+    wait, tail = asyncio.run(scenario())
+    assert wait.cancelled
+    assert tail == b""
 
 
 def test_a_connection_accepted_before_close_still_closes(short_dir: Path) -> None:
