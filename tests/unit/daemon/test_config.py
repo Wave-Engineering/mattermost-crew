@@ -67,6 +67,26 @@ def test_servers_toml_rejects(change: Any, message: str) -> None:
         parse_config(raw)
 
 
+def test_squawkie_table() -> None:
+    """Story 3.2: `[squawkie]` is optional; `credential` is an absolute path, with a url."""
+    raw = _raw()
+    cfg = parse_config(raw)
+    assert cfg.squawkie_url is None and cfg.squawkie_credential is None
+    raw["squawkie"] = {"url": "http://sq.lan:3000", "credential": "/etc/crewchat/sq.credential"}
+    cfg = parse_config(raw)
+    assert cfg.squawkie_url == "http://sq.lan:3000"
+    assert cfg.squawkie_credential == Path("/etc/crewchat/sq.credential")
+    assert parse_config({**raw, "squawkie": {"url": "http://x"}}).squawkie_credential is None
+    for bad, message in (
+        ("nope", "squawkie must be a table"),
+        ({"url": ""}, "squawkie.url"),
+        ({"url": "http://x", "credential": "rel"}, "absolute"),
+        ({"credential": "/etc/x"}, "needs squawkie.url"),
+    ):
+        with pytest.raises(ConfigError, match=message):
+            parse_config({**raw, "squawkie": bad})
+
+
 def test_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="no such file"):
         load_config(tmp_path / "nope.toml")

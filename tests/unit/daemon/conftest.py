@@ -226,6 +226,8 @@ class FakeMattermost:
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
         self.fail_connects = 0
+        # team id -> the channels every user is in there (`GET /users/me/teams/{id}/channels`)
+        self.teams: dict[str, list[dict[str, Any]]] = {}
         self._n = itertools.count(1)
 
     def _id(self, prefix: str) -> str:
@@ -335,8 +337,16 @@ class FakeMattermost:
             if found is None or me in self.hidden_from.get(parts[1], set()):
                 return httpx.Response(404, json={"id": "app.post.get.app_error"})
             return httpx.Response(200, json=found)
+        if request.method == "GET" and path == "/users/me/teams":
+            return httpx.Response(200, json=[{"id": t} for t in self.teams])
+        if request.method == "GET" and parts[:3] == ["users", "me", "teams"] and len(parts) == 5:
+            channels = self.teams.get(parts[3], [])
+            return httpx.Response(200, json=[dict(c) for c in channels])
         if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
             posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
+            since = request.url.params.get("since")
+            if since is not None:  # `update_at > since`; a post here is never edited
+                posts = {k: p for k, p in posts.items() if p["create_at"] > int(since)}
             order = sorted(posts, key=lambda k: -posts[k]["create_at"])
             return httpx.Response(200, json={"posts": posts, "order": order})
         if request.method == "GET" and parts[0] == "posts" and parts[2:] == ["thread"]:

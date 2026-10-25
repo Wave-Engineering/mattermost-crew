@@ -61,11 +61,14 @@ from urllib.parse import quote
 import httpx
 
 from crewchat.adapters.base import (
+    NO_STATUS,
     Attachment,
     BackendUnavailable,
     Embed,
     InboundMessage,
     NotFound,
+    StatusSink,
+    StreamCursor,
 )
 from crewchat.protocol import PROTO
 
@@ -797,37 +800,57 @@ class DiscordBackend:
             self._channels_at = now
         return self._channels
 
-    async def stream(self, dev_name: str) -> AsyncIterator[InboundMessage]:
-        """New messages for `dev_name`, polled from scream-hole, its own signed posts dropped."""
+    async def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        """New messages for `dev_name`, polled from scream-hole, its own signed posts dropped.
+
+        With a `cursor` whose `id` is a snowflake, every channel is polled from it, so the
+        messages since the agent's last event are replayed (R-28); a snowflake orders by time
+        across channels. Each channel's own position then only moves forward, so nothing is
+        yielded twice, and an ID in `cursor.seen` is never yielded. While scream-hole is
+        unhealthy, or a poll is refused, `on_status(False, ...)`; a clean poll round is
+        `on_status(True, "")` (R-27).
+        """
         agent = self._agents.setdefault(dev_name, _Agent())
         agent.closed = False
         start = snowflake_at(self._now())
+        seen: frozenset[str] = frozenset()
+        if cursor is not None:
+            seen = cursor.seen
+            if is_snowflake(cursor.id):
+                start = cursor.id
         cursors: dict[str, str] = {}
         warned = False
         while not agent.closed:
             if not await self.check_health():
                 # D-106: no poll while scream-hole is unhealthy; never Discord instead.
+                on_status(False, SCREAMHOLE_UNHEALTHY)
                 await self._sleep(self.poll_interval_s)
                 continue
             channels = await self.poll_channels()
             if not channels and not warned:
                 log.warning("discord stream %s: no channels to poll", dev_name)
                 warned = True
+            refused = ""
             for channel in channels:
                 if agent.closed:
                     break
-                cursor = cursors.setdefault(channel, start)
+                position = cursors.setdefault(channel, start)
                 try:
-                    raw = await self._messages_after(channel, cursor)
-                except (
-                    DiscordError,
-                    BackendUnavailable,
-                    NotFound,
-                    httpx.HTTPError,
-                    ValueError,
-                ) as exc:
+                    raw = await self._messages_after(channel, position)
+                except BackendUnavailable as exc:
+                    log.warning("discord poll %s for %s: %s", channel, dev_name, exc)
+                    refused = str(exc) or SCREAMHOLE_UNHEALTHY
+                    break
+                except (DiscordError, NotFound, httpx.HTTPError, ValueError) as exc:
                     log.warning("discord poll %s for %s: %s", channel, dev_name, exc)
                     continue
+                on_status(True, "")  # scream-hole answered: up, before what it carried
                 for m in raw:
                     if _snowflake_key(m) <= int(cursors[channel]):
                         continue
@@ -835,7 +858,13 @@ class DiscordBackend:
                     msg = self.message(m)
                     if is_own_signature(msg.text, dev_name):
                         continue  # echo, by signature (R-15)
+                    if msg.post_id in seen:
+                        continue  # handed over before the cursor was saved (R-28)
                     yield msg
+            if refused:
+                on_status(False, refused)
+            elif not channels:
+                on_status(True, "")  # healthy, with nothing to poll
             if agent.closed:
                 break
             await self._sleep(self.poll_interval_s)

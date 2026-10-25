@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
-from crewchat.adapters.base import ChatBackend, InboundMessage
+from crewchat.adapters.base import ChatBackend, InboundMessage, StreamCursor
 from crewchat.adapters.discord import (
     MAX_CHUNK,
     CredentialError,
@@ -413,3 +413,47 @@ def test_backend_reads_from_a_served_fake(discord: FakeDiscord, credential: Path
 
         msgs = run(scenario())
     assert [m.text for m in msgs] == ["over the wire"]
+
+
+# -- Story 3.2: cursor replay (R-28) and status (R-27) ----------------------------------------
+def test_stream_resumes_from_cursor_and_reports_status(credential: Path, run: Any) -> None:
+    """With a snowflake cursor, every channel is polled from it: the messages after it are
+    replayed once, the ones in `cursor.seen` are not; scream-hole down is reported down."""
+    clock = [1_800_000_000.0]
+    discord = FakeDiscord(now=lambda: clock[0])
+    c1 = discord.add_channel("general", channel_id=C1)
+    c2 = discord.add_channel("random", channel_id=C2)
+    discord.add_message(c1, "before the cursor", author=HUMAN)
+    clock[0] += 1
+    last = discord.add_message(c1, "the cursor's own", author=HUMAN)
+    clock[0] += 1
+    seen = discord.add_message(c2, "already handed over", author=HUMAN)
+    missed = discord.add_message(c2, "missed", author=HUMAN)
+    clock[0] += 1
+    b = backend(discord, credential, channels=[C1, C2], sleep=Sleeps(), now=lambda: clock[0])
+    cursor = StreamCursor(last["id"], 0.0, frozenset({last["id"], seen["id"]}))
+    status: list[tuple[bool, str]] = []
+
+    async def scenario() -> list[InboundMessage]:
+        gen = b.stream(ME, cursor=cursor, on_status=lambda up, why: status.append((up, why)))
+        got = await take(gen, 1)
+        discord.screamhole_healthy = False
+        b._health_next = 0.0  # re-check now
+        task = asyncio.ensure_future(take(gen, 1))
+        while not any(not up for up, _ in status):
+            await asyncio.sleep(0)
+        discord.screamhole_healthy = True
+        b._health_next = 0.0
+        discord.add_message(c1, "after recovery", author=HUMAN)
+        got += await task
+        await b.aclose()
+        await gen.aclose()
+        return got
+
+    got = run(scenario())
+    assert [m.text for m in got] == ["missed", "after recovery"]
+    assert got[0].post_id == missed["id"]
+    assert status[0] == (True, "")
+    down = [s for s in status if not s[0]]
+    assert down and all(why == "scream-hole unhealthy" for _, why in down)
+    assert status[-1] == (True, "")
