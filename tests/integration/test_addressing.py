@@ -20,10 +20,10 @@ from crewchat.adapters.base import InboundMessage
 from crewchat.addressing import addressed_to, is_broadcast, is_direct_address, tokens
 from crewchat.threads import MyThreads
 
+from tests.integration.mmhttp import mm_request
 from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` is a fixture)
     Daemon,
     Inbox,
-    admin,
     as_admin_post,
     setup,
 )
@@ -32,7 +32,7 @@ TEAM = "it07team"
 
 
 def admin_reply(mattermost: Any, channel_id: str, root_id: str, message: str) -> str:
-    resp = admin(
+    resp = mm_request(
         mattermost,
         "POST",
         "/posts",
@@ -108,7 +108,9 @@ def test_it07_addressing(mattermost: Any, setup: dict[str, str], tmp_path: Path)
             assert judge(m) == (True, True)
 
             # R-19 (D-080): a plain DM to babel, no mention, outside its threads.
-            dm = admin(mattermost, "POST", "/channels/direct", json=[setup["admin_id"], babel_id])
+            dm = mm_request(
+                mattermost, "POST", "/channels/direct", json=[setup["admin_id"], babel_id]
+            )
             assert dm.status_code in (200, 201), dm.text
             dm_channel = dm.json()["id"]
             m = await arrives(as_admin_post(mattermost, dm_channel, "got a minute?")["message"])

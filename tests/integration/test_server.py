@@ -5,14 +5,15 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import httpx
 import pytest
+
+from tests.integration.mmhttp import mm_request
 
 # `mattermost` is conftest.MattermostServer; conftest is not importable as a module.
 
 
 def test_server_answers_ping(mattermost: Any) -> None:
-    resp = httpx.get(f"{mattermost.api}/system/ping", timeout=10)
+    resp = mm_request(mattermost, "GET", "/system/ping", timeout=10)
     assert resp.status_code == 200
     assert resp.json()["status"] == "OK"
 
@@ -22,13 +23,13 @@ def test_server_version_matches_leg(mattermost: Any) -> None:
     if ":" not in image:
         pytest.skip("MM_IMAGE is unset, so there is no leg version to compare")
     tag = image.rsplit(":", 1)[1]
-    resp = httpx.get(f"{mattermost.api}/system/ping", timeout=10)
+    resp = mm_request(mattermost, "GET", "/system/ping", timeout=10)
     # X-Version-Id reads e.g. "11.11.3.<build>.<hash>.<flag>"; the release is its prefix.
     assert resp.headers["X-Version-Id"].startswith(f"{tag}.")
 
 
 def test_admin_token_is_system_admin(mattermost: Any) -> None:
-    resp = httpx.get(f"{mattermost.api}/users/me", headers=mattermost.auth_headers, timeout=10)
+    resp = mm_request(mattermost, "GET", "/users/me", timeout=10)
     assert resp.status_code == 200
     assert "system_admin" in resp.json()["roles"].split()
 
@@ -42,11 +43,12 @@ def test_native_token_expiry_is_detected(mattermost: Any) -> None:
     expected = mattermost.expected_native_token_expiry
     if expected is None:
         pytest.skip("MM_NATIVE_TOKEN_EXPIRY is unset; CI sets it on every leg")
-    headers = mattermost.auth_headers
-    me = httpx.get(f"{mattermost.api}/users/me", headers=headers, timeout=10).json()
-    resp = httpx.post(
-        f"{mattermost.api}/users/{me['id']}/tokens",
-        headers=headers,
+    me = mm_request(mattermost, "GET", "/users/me", timeout=10)
+    assert me.status_code == 200, me.text
+    resp = mm_request(
+        mattermost,
+        "POST",
+        f"/users/{me.json()['id']}/tokens",
         json={"description": "native expiry probe"},
         timeout=10,
     )
@@ -56,16 +58,17 @@ def test_native_token_expiry_is_detected(mattermost: Any) -> None:
         detected = "present" if "expires_at" in token else "absent"
         assert detected == expected
     finally:
-        httpx.post(
-            f"{mattermost.api}/users/tokens/revoke",
-            headers=headers,
+        mm_request(
+            mattermost,
+            "POST",
+            "/users/tokens/revoke",
             json={"token_id": token["id"]},
             timeout=10,
         )
 
 
 def test_dev_space_settings_are_applied(mattermost: Any) -> None:
-    resp = httpx.get(f"{mattermost.api}/config", headers=mattermost.auth_headers, timeout=10)
+    resp = mm_request(mattermost, "GET", "/config", timeout=10)
     assert resp.status_code == 200
     config = resp.json()
     assert config["ServiceSettings"]["EnableBotAccountCreation"] is True

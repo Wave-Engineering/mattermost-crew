@@ -40,7 +40,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 from crewbroker import mint
 from crewbroker.config import CrewConfig
@@ -64,10 +63,10 @@ from tests.fakes.screamhole import (
     SCREAMHOLE_URL,
     FakeDiscord,
 )
+from tests.integration.mmhttp import mm_request
 from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` is a fixture)
     Inbox,
     InProcessBroker,
-    admin,
     as_admin_post,
     setup,
 )
@@ -194,16 +193,16 @@ class Host:
     def seat(self, account: str) -> str:
         """Seat the agent's bot in the module's team and channel. Its user ID."""
         assert self.mattermost is not None and self.setup is not None
-        user_id = str(admin(self.mattermost, "GET", f"/users/username/{account}").json()["id"])
+        user_id = str(mm_request(self.mattermost, "GET", f"/users/username/{account}").json()["id"])
         team, channel = self.setup["team_id"], self.setup["channel_id"]
-        resp = admin(
+        resp = mm_request(
             self.mattermost,
             "POST",
             f"/teams/{team}/members",
             json={"team_id": team, "user_id": user_id},
         )
         assert resp.status_code == 201, resp.text
-        resp = admin(
+        resp = mm_request(
             self.mattermost, "POST", f"/channels/{channel}/members", json={"user_id": user_id}
         )
         assert resp.status_code == 201, resp.text
@@ -244,7 +243,7 @@ def make_shim(
 
 
 def post(mattermost: Any, post_id: str) -> dict[str, Any]:
-    resp = admin(mattermost, "GET", f"/posts/{post_id}")
+    resp = mm_request(mattermost, "GET", f"/posts/{post_id}")
     assert resp.status_code == 200, resp.text
     data: dict[str, Any] = resp.json()
     return data
@@ -361,7 +360,7 @@ def test_it05_reply_follows_thread_and_named_backend_is_logged(
             )
             stored = post(mattermost, rich["post_id"])
             assert len(stored["file_ids"]) == 1
-            info = admin(mattermost, "GET", f"/files/{stored['file_ids'][0]}/info").json()
+            info = mm_request(mattermost, "GET", f"/files/{stored['file_ids'][0]}/info").json()
             assert info["name"] == "it05-report.txt" and info["size"] == len(report.read_bytes())
             assert stored["props"]["attachments"][0]["title"] == "IT-05"
             assert stored["props"]["attachments"][0]["text"] == "file: and embed"
@@ -548,11 +547,7 @@ def test_it16_one_contract_across_two_mattermost_servers_and_discord(
             ta, tb = (host.store.token_for(IT16_DEV, sid) for sid in servers)
             assert ta and tb and ta != tb
             for t in (ta, tb):
-                me = httpx.get(
-                    f"{mattermost.api}/users/me",
-                    headers={"Authorization": f"Bearer {t}"},
-                    timeout=15,
-                )
+                me = mm_request(mattermost, "GET", "/users/me", token=t)
                 assert me.status_code == 200
 
             inboxes = {sid: Inbox(host.mm[sid], IT16_DEV) for sid in ("ci-a", "ci-b")}

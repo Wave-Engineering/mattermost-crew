@@ -15,13 +15,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 from crewbroker import mint
 from crewbroker.config import CrewConfig, parse_config
 from crewbroker.mattermost import MattermostClient
 from crewbroker.service import Broker, OpError
 from crewchat.registry import account_name as daemon_account_name
+
+from tests.integration.mmhttp import mm_request
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE_PATCH = ROOT / "scripts" / "ci" / "broker-role-patch.sh"
@@ -36,19 +37,8 @@ class Clock:
         return self.now
 
 
-def admin(mattermost: Any, method: str, path: str, **kw: Any) -> httpx.Response:
-    return httpx.request(
-        method, f"{mattermost.api}{path}", headers=mattermost.auth_headers, timeout=15, **kw
-    )
-
-
-def as_token(mattermost: Any, token: str, method: str, path: str, **kw: Any) -> httpx.Response:
-    headers = {"Authorization": f"Bearer {token}"}
-    return httpx.request(method, f"{mattermost.api}{path}", headers=headers, timeout=15, **kw)
-
-
 def mkuser(mattermost: Any, username: str) -> str:
-    resp = admin(
+    resp = mm_request(
         mattermost,
         "POST",
         "/users",
@@ -70,7 +60,7 @@ def setup(mattermost: Any) -> Iterator[dict[str, str]]:
     partner_id = mkuser(mattermost, f"partner-{run}")
     env = {**os.environ, "MM_URL": mattermost.url, "MM_ADMIN_TOKEN": mattermost.admin_token}
     subprocess.run([str(ROLE_PATCH), broker_id], env=env, check=True)
-    resp = admin(mattermost, "POST", f"/users/{broker_id}/tokens", json={"description": "it"})
+    resp = mm_request(mattermost, "POST", f"/users/{broker_id}/tokens", json={"description": "it"})
     assert resp.status_code == 200, resp.text
     yield {
         "crew": crew,
@@ -80,7 +70,7 @@ def setup(mattermost: Any) -> Iterator[dict[str, str]]:
     }
     # This module's broker account is not in servers.toml, so it gives the patched role back:
     # IT-01 asserts that only the configured brokers hold it (R-06).
-    resp = admin(mattermost, "PUT", f"/users/{broker_id}/roles", json={"roles": "system_user"})
+    resp = mm_request(mattermost, "PUT", f"/users/{broker_id}/roles", json={"roles": "system_user"})
     assert resp.status_code == 200, resp.text
 
 
@@ -111,7 +101,7 @@ def test_it17_account_naming_fits_ct05(mattermost: Any, broker: Broker) -> None:
     minted = broker.mint(args(broker, dev))
     assert minted["account"] == f"{dev}.{crew}" == daemon_account_name(dev, crew)
     assert len(minted["account"]) == 64
-    found = admin(mattermost, "GET", f"/users/username/{minted['account']}").json()
+    found = mm_request(mattermost, "GET", f"/users/username/{minted['account']}").json()
     assert found["is_bot"] is True
     with pytest.raises(OpError, match="bad_request"):
         broker.mint(args(broker, dev + "n"))
@@ -147,23 +137,23 @@ def args(broker: Broker, dev: str) -> dict[str, str]:
 
 
 def user(mattermost: Any, user_id: str) -> dict[str, Any]:
-    resp = admin(mattermost, "GET", f"/users/{user_id}")
+    resp = mm_request(mattermost, "GET", f"/users/{user_id}")
     assert resp.status_code == 200, resp.text
     data: dict[str, Any] = resp.json()
     return data
 
 
 def token_works(mattermost: Any, token: str) -> bool:
-    return as_token(mattermost, token, "GET", "/users/me").status_code == 200
+    return mm_request(mattermost, "GET", "/users/me", token=token).status_code == 200
 
 
 def test_broker_role_is_patched_and_not_admin(mattermost: Any, setup: dict[str, str]) -> None:
     """R-06: the broker account holds the patched role and no system-admin role."""
-    me = as_token(mattermost, setup["broker_token"], "GET", "/users/me").json()
+    me = mm_request(mattermost, "GET", "/users/me", token=setup["broker_token"]).json()
     roles = set(me["roles"].split())
     assert roles == {"system_user", "system_user_access_token"}
     assert "system_admin" not in roles
-    role = admin(mattermost, "GET", "/roles/name/system_user_access_token").json()
+    role = mm_request(mattermost, "GET", "/roles/name/system_user_access_token").json()
     assert set(role["permissions"]) >= PATCHED
 
 
@@ -175,10 +165,10 @@ def test_ensure_bot_creates_once(
     second = broker.mint(args(broker, "once"))
     name = f"once.{broker.config.crew}"
     assert first["account"] == second["account"] == name
-    found = admin(mattermost, "GET", f"/users/username/{name}").json()
+    found = mm_request(mattermost, "GET", f"/users/username/{name}").json()
     assert found["is_bot"] is True
     assert broker.accounts.minted_bot_ids() == [found["id"]]
-    bot = as_token(mattermost, setup["broker_token"], "GET", f"/bots/{found['id']}").json()
+    bot = mm_request(mattermost, "GET", f"/bots/{found['id']}", token=setup["broker_token"]).json()
     assert bot["owner_id"] == setup["broker_id"]
 
 
@@ -187,10 +177,10 @@ def test_mint_token_works_with_native_expiry_where_supported(
 ) -> None:
     """R-05, R-07: a working token; native expiry is set exactly when the server has it."""
     minted = broker.mint(args(broker, "expiry"))
-    me = as_token(mattermost, minted["token"], "GET", "/users/me").json()
+    me = mm_request(mattermost, "GET", "/users/me", token=minted["token"]).json()
     assert me["username"] == minted["account"]
-    meta = as_token(
-        mattermost, setup["broker_token"], "GET", f"/users/tokens/{minted['token_id']}"
+    meta = mm_request(
+        mattermost, "GET", f"/users/tokens/{minted['token_id']}", token=setup["broker_token"]
     ).json()
     detected = "present" if meta.get("expires_at") else "absent"
     supported = mint.native_expiry_supported(
@@ -227,8 +217,11 @@ def test_crew_info_drops_reassigned_bot(
     assert info["trusted"] == []
     assert info["minted_bot_ids"] == [keep_id, moved_id]
 
-    resp = as_token(
-        mattermost, setup["broker_token"], "POST", f"/bots/{moved_id}/assign/{setup['partner_id']}"
+    resp = mm_request(
+        mattermost,
+        "POST",
+        f"/bots/{moved_id}/assign/{setup['partner_id']}",
+        token=setup["broker_token"],
     )
     assert resp.status_code == 200, resp.text
     assert broker.crew_info({})["minted_bot_ids"] == [keep_id]
@@ -236,7 +229,7 @@ def test_crew_info_drops_reassigned_bot(
     with pytest.raises(OpError, match="squatted"):
         broker.mint(args(broker, "moved"))
 
-    resp = admin(mattermost, "POST", f"/bots/{moved_id}/assign/{setup['broker_id']}")
+    resp = mm_request(mattermost, "POST", f"/bots/{moved_id}/assign/{setup['broker_id']}")
     assert resp.status_code == 200, resp.text
     assert broker.crew_info({})["minted_bot_ids"] == [keep_id, moved_id]
 
@@ -263,7 +256,7 @@ def test_mint_refuses_squatted_name(mattermost: Any, broker: Broker) -> None:
     """R-01, R-03: an existing account not owned by this broker → loud failure, no token."""
     crew = broker.config.crew
     mkuser(mattermost, f"human.{crew}")
-    resp = admin(
+    resp = mm_request(
         mattermost,
         "POST",
         "/bots",

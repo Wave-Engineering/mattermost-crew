@@ -27,6 +27,7 @@ from typing import Any
 from crewchat.protocol import PROTO
 
 from tests.fakes.screamhole import FakeDiscord
+from tests.integration.mmhttp import mm_request
 from tests.integration.test_chat_contract import (  # noqa: F401 (`sock_dir` is a fixture)
     HUMAN,
     Host,
@@ -36,7 +37,6 @@ from tests.integration.test_chat_contract import (  # noqa: F401 (`sock_dir` is 
 )
 from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` is a fixture)
     Daemon,
-    admin,
     as_admin_post,
     setup,
 )
@@ -57,7 +57,7 @@ def test_it06_mattermost_send_writes_crew_proto(
             assert sent.proto == PROTO
         finally:
             await d.backend.aclose()
-        stored = admin(mattermost, "GET", f"/posts/{sent.post_id}")
+        stored = mm_request(mattermost, "GET", f"/posts/{sent.post_id}")
         assert stored.status_code == 200, stored.text
         assert stored.json()["props"]["crew_proto"] == PROTO
 
@@ -71,7 +71,7 @@ def test_it06_mattermost_unmarked_post_reads_as_proto_0(
     channel = setup["channel_id"]
     raw = as_admin_post(mattermost, channel, "it06 unmarked admin post")
     assert "crew_proto" not in (raw.get("props") or {})
-    admin_name = admin(mattermost, "GET", "/users/me").json()["username"]
+    admin_name = mm_request(mattermost, "GET", "/users/me").json()["username"]
 
     async def scenario() -> None:
         d = Daemon(mattermost, setup, tmp_path)
