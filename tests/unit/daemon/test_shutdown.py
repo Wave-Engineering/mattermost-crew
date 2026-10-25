@@ -83,34 +83,108 @@ class Waiting:
 
 
 def test_close_clients_lets_wait_closed_return(short_dir: Path) -> None:
-    """Two connections each with a waiting op: after `close()` and `close_clients()`,
-    `wait_closed()` returns, and both ops were cancelled."""
+    """Two connections each with a waiting op, and one that has sent nothing: after `close()`
+    and `close_clients()`, `wait_closed()` returns, both ops were cancelled, and nothing was
+    written to any of them."""
     sock = short_dir / "s.sock"
 
-    async def scenario() -> list[Waiting]:
+    async def scenario() -> tuple[list[Waiting], list[bytes]]:
         waits = [Waiting(), Waiting()]
         server = DaemonServer(
             {"wait0": waits[0], "wait1": waits[1]},
             hangup_cancels=frozenset({"wait0", "wait1"}),
         )
         listener = await server.start(sock, group=None)
-        writers = []
-        for i in range(2):
-            _, writer = await asyncio.open_unix_connection(str(sock))
-            writer.write(frame(f"wait{i}", {}))
-            await writer.drain()
-            writers.append(writer)
+        conns = []
+        for i in range(3):
+            reader, writer = await asyncio.open_unix_connection(str(sock))
+            if i < 2:
+                writer.write(frame(f"wait{i}", {}))
+                await writer.drain()
+            conns.append((reader, writer))
         for w in waits:
             await asyncio.wait_for(w.started.wait(), 2)
         listener.close()
         server.close_clients()
         await asyncio.wait_for(listener.wait_closed(), 1)
-        for writer in writers:
+        tails = [await asyncio.wait_for(r.read(), 1) for r, _ in conns]
+        for _, writer in conns:
             writer.close()
-        return waits
+        return waits, tails
 
-    waits = asyncio.run(scenario())
+    waits, tails = asyncio.run(scenario())
     assert [w.cancelled for w in waits] == [True, True]
+    assert tails == [b"", b"", b""]
+
+
+def test_a_connection_accepted_before_close_still_closes(short_dir: Path) -> None:
+    """A connection the listener accepted just before `close()`, whose handler hasn't taken
+    its first step when `close_clients()` runs, closes as soon as it does: a `subscribe` it
+    sends can't park shutdown (#107)."""
+    sock = short_dir / "s.sock"
+
+    async def scenario() -> tuple[Waiting, bytes]:
+        wait = Waiting()
+        server = DaemonServer({"wait": wait}, hangup_cancels=frozenset({"wait"}))
+        gate, entered = asyncio.Event(), asyncio.Event()
+        client = server._client
+
+        async def held(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            entered.set()
+            await gate.wait()  # accepted, but its handler hasn't started
+            await client(reader, writer)
+
+        server._client = held  # type: ignore[method-assign]
+        listener = await server.start(sock, group=None)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(frame("wait", {}))
+        await writer.drain()
+        await asyncio.wait_for(entered.wait(), 2)
+        listener.close()
+        server.close_clients()
+        gate.set()
+        await asyncio.wait_for(listener.wait_closed(), 1)
+        tail = await asyncio.wait_for(reader.read(), 1)
+        writer.close()
+        return wait, tail
+
+    wait, tail = asyncio.run(scenario())
+    assert not wait.started.is_set()  # the frame was never read
+    assert tail == b""
+
+
+def test_a_bounded_op_in_flight_at_shutdown_finishes(short_dir: Path) -> None:
+    """An op outside `hangup_cancels`, a `send` say, runs to its end at shutdown and its reply
+    is written: cancelling it after its post reached the server would have the agent post it
+    twice. Then the connection closes (#107)."""
+    sock = short_dir / "s.sock"
+
+    async def scenario() -> tuple[dict[str, Any], bytes]:
+        gate, started = asyncio.Event(), asyncio.Event()
+
+        async def send(args: dict[str, Any]) -> dict[str, Any]:
+            started.set()
+            await gate.wait()  # the post is on its way
+            return {"posted": True}
+
+        server = DaemonServer({"send": send})
+        listener = await server.start(sock, group=None)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        writer.write(frame("send", {}))
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), 2)
+        listener.close()
+        server.close_clients()
+        gate.set()
+        await asyncio.wait_for(listener.wait_closed(), 1)
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 1))
+        tail = await asyncio.wait_for(reader.read(), 1)
+        writer.close()
+        return reply, tail
+
+    reply, tail = asyncio.run(scenario())
+    assert reply["ok"] is True and reply["result"] == {"posted": True}
+    assert tail == b""  # and then the connection closed
 
 
 @pytest.mark.parametrize("failure", [ConnectionResetError("reset"), OSError("gone")])

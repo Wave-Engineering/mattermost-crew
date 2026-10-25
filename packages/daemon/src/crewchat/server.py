@@ -65,16 +65,27 @@ class DaemonServer:
         self.handlers = handlers
         self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
-        self._clients: set[asyncio.Task[Any]] = set()  # each live connection's handler
+        # For `close_clients` (#107): the handlers waiting for a frame, and the `hangup_cancels`
+        # ops waiting for their result.
+        self._closing = False
+        self._idle: set[asyncio.Task[Any]] = set()
+        self._waiting: set[asyncio.Future[Any]] = set()
 
     def close_clients(self) -> None:
-        """Cancel every connection's handler, and with it any op still waiting (#107). Call it
-        after the listener's `close()` and before `wait_closed()`: on Python 3.12,
-        `wait_closed()` waits for every connection, and `close()` closes none of them, so a
-        waiting `subscribe` would hold shutdown forever. The op writes nothing, so the event a
-        `subscribe` took stays held (#99)."""
-        for task in list(self._clients):
+        """End every connection (#107). Call it after the listener's `close()` and before
+        `wait_closed()`: on Python 3.12, `wait_closed()` waits for every connection, and
+        `close()` closes none of them, so a waiting `subscribe` would hold shutdown forever.
+
+        A connection waiting for a frame is closed. A `hangup_cancels` op still waiting is
+        cancelled and writes nothing, so the event a `subscribe` took stays held (#99). Any
+        other op runs to its end and its reply is written: cancelling a `send` whose post had
+        already reached the server would have the agent post it twice. A connection accepted
+        from now on closes at once."""
+        self._closing = True
+        for task in list(self._idle):
             task.cancel()
+        for op in list(self._waiting):
+            op.cancel()
 
     @staticmethod
     def _op(line: bytes) -> str | None:
@@ -123,10 +134,10 @@ class DaemonServer:
         next_line: asyncio.Future[bytes] | None = None
         handling: asyncio.Future[tuple[dict[str, Any], Sent]] | None = None
         task = asyncio.current_task()
-        if task is not None:
-            self._clients.add(task)
         try:
-            while True:
+            while not self._closing:  # set before this handler's first step, it closes at once
+                if task is not None:
+                    self._idle.add(task)
                 try:
                     if next_line is None:
                         line = await reader.readline()
@@ -136,6 +147,9 @@ class DaemonServer:
                     writer.write(encode(err(None, "bad_request: frame too large")))
                     await writer.drain()
                     return
+                finally:
+                    if task is not None:
+                        self._idle.discard(task)
                 if not line:
                     return
                 if not line.strip():
@@ -150,7 +164,13 @@ class DaemonServer:
                 # meanwhile is kept for the next turn of the loop.
                 handling = asyncio.ensure_future(self._handle(line))
                 next_line = asyncio.ensure_future(reader.readline())
-                await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                self._waiting.add(handling)
+                try:
+                    await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    self._waiting.discard(handling)
+                if handling.cancelled():
+                    return  # by `close_clients`: nothing is written, the event stays held
                 # A hangup is end-of-file or a failed read (#107); a frame too large is
                 # answered once the op's reply is written.
                 hung_up = False
@@ -175,8 +195,6 @@ class DaemonServer:
         except ConnectionError:
             return
         finally:
-            if task is not None:
-                self._clients.discard(task)
             for pending in (handling, next_line):
                 if pending is not None and not pending.done():
                     pending.cancel()
