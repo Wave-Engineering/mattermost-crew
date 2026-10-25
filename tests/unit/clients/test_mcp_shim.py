@@ -165,6 +165,37 @@ def bump_mtime(path: Path, seconds: int) -> None:
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 1_000_000_000))
 
 
+# -- outsider content (Story 3.3) ------------------------------------------------------------
+class OutsiderDaemon(FakeDaemon):
+    """Marks post R2 as outsider content in every read or thread, as the daemon's pull filter
+    does under social."""
+
+    async def __call__(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        result = await super().__call__(op, args)
+        if op in ("read", "thread"):
+            msgs = [{**m, "text": f"text of {m['post_id']}"} for m in result["messages"]]
+            for m in msgs:
+                if m["post_id"] == R2:
+                    m["outsider"] = True
+            result = {**result, "messages": msgs}
+        return result
+
+
+def test_outsider_text_prefixed(tmp_path: Path) -> None:
+    daemon = OutsiderDaemon()
+    shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        await shim.start()
+        return await shim.chat_read("c9"), await shim.chat_thread(R2)
+
+    read, thread = asyncio.run(scenario())
+    marked = f"[from outside the crew] text of {R2}"
+    assert [m["text"] for m in read["messages"]] == [f"text of {R1}", marked]
+    assert [m["text"] for m in thread["messages"]] == [marked]
+    assert mcp_shim.mark_outsiders({"error": "x"}) == {"error": "x"}
+
+
 # -- register --------------------------------------------------------------------------------
 def test_register_sends_identity_and_omits_missing_crew(tmp_path: Path) -> None:
     daemon = FakeDaemon()

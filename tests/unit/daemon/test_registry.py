@@ -62,6 +62,7 @@ def test_reregister_revokes_previous_token(daemon: Any) -> None:
         ("hook", "babel"),
         ("broker", "revoke"),
         ("broker", "crew_info"),
+        ("broker", "switch_state"),
     ]
     # The mint names the token held, so the broker keeps it live until the swap (#41).
     assert broker.ops("mint")[-1]["current_token_id"] == first.token_id

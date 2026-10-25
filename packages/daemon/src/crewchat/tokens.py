@@ -3,7 +3,8 @@
 - `BrokerClient`: one per (crew, server_id) on this host, from `[crews.<crew>.<server_id>]
   broker_socket`. Every call has a short timeout (`broker_timeout_s`, default 2 s); a timeout
   raises `BrokerUnavailable` and never stalls the daemon.
-- `SwitchCache`: each broker's last good `crew_info`. A broker that times out keeps it.
+- `SwitchCache` (`crewchat.filters`, Story 3.3) holds each broker's last good `crew_info` and
+  `switch_state`, fetched through these clients.
 - `TokenStore`: tokens by (dev_name, server_id), in memory and in
   `/var/lib/crewchat/tokens/<dev>.json` (file `0600`, directory `0700`, owner `crewchat`).
 - `Rotator`: the daily remint -> swap -> `on_token_rotated` -> revoke, paced at 5/s or less.
@@ -143,34 +144,6 @@ def broker_clients(config: ServersConfig) -> dict[BrokerKey, BrokerClient]:
         )
         for b in config.broker_entries()
     }
-
-
-class SwitchCache:
-    """Each local broker's last good `crew_info`, by (crew, server_id) (§5.9).
-
-    Story 3.3 adds `switch_state` and the filters that read both. A broker that doesn't
-    answer keeps its last good entry; with none cached, the crew is unresolvable (`DROP`).
-    """
-
-    def __init__(self, brokers: Mapping[BrokerKey, BrokerClient]) -> None:
-        self._brokers = brokers
-        self._crew_info: dict[BrokerKey, dict[str, Any]] = {}
-
-    def crew_info(self, crew: str, server_id: str) -> dict[str, Any] | None:
-        return self._crew_info.get((crew, server_id))
-
-    async def refresh(self, crew: str, server_id: str) -> dict[str, Any] | None:
-        """Re-fetch one broker's `crew_info`; on failure keep, and return, the last good."""
-        client = self._brokers.get((crew, server_id))
-        if client is None:
-            return None
-        try:
-            info = await client.crew_info()
-        except (BrokerUnavailable, BrokerError) as exc:
-            log.warning("crew_info %s-%s: %s; keeping the last good", crew, server_id, exc)
-            return self._crew_info.get((crew, server_id))
-        self._crew_info[(crew, server_id)] = info
-        return info
 
 
 class Adapter(Protocol):

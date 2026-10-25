@@ -31,8 +31,9 @@ from crewbroker.service import Broker, OpError
 from crewchat.adapters.base import InboundMessage
 from crewchat.adapters.mattermost import MattermostBackend
 from crewchat.config import parse_config
+from crewchat.filters import SwitchCache
 from crewchat.registry import Registry
-from crewchat.tokens import BrokerClient, BrokerError, Rotator, SwitchCache, TokenStore
+from crewchat.tokens import BrokerClient, BrokerError, Rotator, TokenStore
 
 from tests.integration.mmhttp import mm_request
 

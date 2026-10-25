@@ -6,8 +6,77 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+## [0.2.0] — 2026-10-25
+
+Phase 3: inbound defense, doorbell and kiosk (Plan #28). This release is IP-3, the base for
+K-2 (the kit's doorbell wiring to the chat daemon).
+
 ### Added
 
+- The social switch in the broker (#15): per crew and per server, three settings (crew only by
+  default, trusted crews, social with an expiry) and the kiosk on or off, changed only by the
+  crew's human partner over a DM to the broker account (`social 2h`, `trusted`, `crew`,
+  `kiosk off`, `kiosk on`). The broker holds the state; social lapses on delivery, reverts and
+  notifies the partner (R-20, R-23, R-24, R-34).
+- The doorbell core (#16): one stream merging Discord, Mattermost and squawkie, one exit per
+  event, with saved cursors replayed exactly once on reconnect and a loud `backend.down` while
+  the others keep flowing (R-26 to R-28). The squawkie adapter and its fake.
+- The daemon's inbound filters (#17): a switch cache with fail-closed membership by `owner_id`
+  plus `minted_bot_ids`, each trusted crew's `crew_info` fetched from its own broker with a
+  timeout, the switch gating push and pull, and the loop guard on messages from bot accounts
+  (opt-in, mention required, sliding window) (R-21, R-22, R-25).
+- `crewchat-doorbell` (#18), the thin one-shot doorbell client.
+- The kiosk (#19): a tool-less session per expert per server answering outsiders while social is
+  off, seeded only from the `## Kiosk` section of the expert's reseed seed, rate-limited per
+  outsider, with its transcript kept (R-31, R-32). `packaging/crewkiosk.socket`,
+  `crewkiosk@.service` and `crewkiosk-run`.
+- The kiosk review on social engage (#20): the transcript since the last review, delivered to the
+  working agent marked as outsider content, and the cursor advanced (R-33).
+- `docs/runbook.md`, `docs/partner-guide.md` and `docs/architecture.md` (#21). CI runs the
+  runbook's install and verify blocks on a fresh VM (IT-20).
+- The E2E suite (#22): a cross-crew exchange, an outsider and the switch, and an `@agents`
+  broadcast to about 30 agents within the rate limit (E2E-01 to E2E-03), plus bot-account
+  avatars and autocomplete (IT-19).
+- `scripts/smoke-devspace.sh` (#23): the E2E flows against the OaW dev space, with a markdown
+  report for Plan #3. The Dev Spec's VRTM (Appendix V) is complete, with every R-01 to R-34
+  passing, and `tests/unit/test_devspec.py` holds it to that.
+
+### Changed
+
+- The privileged CI legs run on the ephemeral on-prem pool, and lint and unit tests on the
+  self-hosted runner.
+- Broker websockets are bounded; `mcp` is bounded below 2, and `httpx` and `websockets` are
+  bounded.
+
+### Fixed
+
+- Discord channel names resolve while scream-hole is degraded.
+- The kiosk no longer answers an outsider's question a second time after a daemon restart: each
+  transcript record keeps the question's `post_id` (#97).
+- An outsider message delivered under social now reaches the agent's doorbell with its text
+  prefixed `[from outside the crew]`, as it already did on the pull path (#97).
+- The kiosk review reaches an agent that registers while social is already on, after a daemon
+  start or mid-social. Its cursor moves only once the review is handed over, so a restart
+  before then no longer loses it (#99).
+- The doorbell delivers at least once: the cursor moves only after `subscribe`'s reply is
+  written, an overlapping `subscribe` gets the same event, and every event carries an
+  `event_id` (#99).
+- A Mattermost reconnect whose replay fails is now a `backend.down` naming the failing call,
+  and the gap is delivered by the next replay rather than skipped (#99).
+- `scripts/smoke-devspace.sh` pins `SMOKE_TARGET=oaw-devspace` to the OaW dev space's URL, and
+  only that host lets the broker role patch reach a non-local server (#99).
+
+## [0.1.0] — 2026-10-24
+
+Phases 1 and 2 (Plans #26 and #27): the base for the kit's IP-2 (K-1, `chat_*` in the kit).
+
+### Added
+
+- Phase 2: the Mattermost and Discord adapters behind one chat contract, with the `chat_*` tools
+  and every `disc_*` alias the kit uses; addressing (`@agents`, `@all` on Discord, crew and team
+  tokens, `@name.crew`, replies on an agent's own threads persisted across restarts);
+  attachments and embeds on both backends; all Discord REST through scream-hole (#11 to #14,
+  #49, #51).
 - The uv workspace (Python 3.12) with three package skeletons: `crewchat` (the daemon),
   `crewbroker` (the broker) and `crewchat_clients` (the thin clients), each at 0.1.0 (#7).
 - `uv.lock`, hash-locked, with the upstream `mcp-server-mattermost` pinned at 0.6.1 (CT-03).

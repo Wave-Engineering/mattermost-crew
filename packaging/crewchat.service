@@ -8,10 +8,12 @@
 # /var/lib/crewchat/tokens and /var/lib/crewchat/threads (0700) and every file in them (0600), and gives its socket,
 # /run/crewchat/crewchat.sock, mode 0660 and group crewchat-clients. It reaches each broker's
 # socket under /run/crewbroker through the crewchat group (packaging/crewbroker.tmpfiles.conf).
+# It reaches the kiosk the same way, through /run/crewkiosk/kiosk.sock (packaging/crewkiosk.socket):
+# the kiosk runs as crewkiosk without the daemon changing user, so NoNewPrivileges stays (D-107).
 [Unit]
 Description=mattermost-crew chat daemon
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target crewkiosk.socket
+After=network-online.target crewkiosk.socket
 
 [Service]
 Type=simple

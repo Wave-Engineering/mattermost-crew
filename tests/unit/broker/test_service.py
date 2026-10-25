@@ -21,6 +21,7 @@ ALL_OPS: dict[str, dict[str, Any]] = {
     "remint": {"dev_name": "babel", "crew": "oaw"},
     "revoke": {"token_id": "t1"},
     "crew_info": {},
+    "switch_state": {},
 }
 
 
@@ -259,7 +260,7 @@ def test_crew_info_own_fields_only(
     ("line", "error"),
     [
         (b'{"proto":2,"id":"x","op":"crew_info"}', "unsupported"),
-        (b'{"proto":1,"id":"x","op":"switch_state"}', "unsupported"),
+        (b'{"proto":1,"id":"x","op":"no_such_op"}', "unsupported"),
         (b"not json", "bad_request: not JSON"),
         (b'{"proto":1,"id":"x","op":"mint","args":[]}', "bad_request: args is an object"),
         (b'{"proto":1,"id":"x","op":"mint","args":{"dev_name":"a","crew":"other"}}', None),

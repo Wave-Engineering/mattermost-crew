@@ -4,6 +4,10 @@
 Each connection carries JSON-line frames (`crewchat.protocol`); each frame is dispatched to
 the handler for its `op`. Unknown ops get `unsupported`. No op ever returns a token: tokens
 stay inside the daemon (R-08).
+
+A handler may return a `Reply`: its `result` is sent, and its `on_sent` runs only once the
+response frame has been written and drained. A client that hangs up first, or a failed
+write, never runs it. `subscribe` acknowledges its event there (#99).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import grp
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,7 +33,17 @@ CLIENTS_GROUP = "crewchat-clients"
 
 log = logging.getLogger("crewchat.server")
 
-Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+@dataclass(frozen=True)
+class Reply:
+    """A handler's result, and what to run once the client has been sent it."""
+
+    result: dict[str, Any]
+    on_sent: Callable[[], None]
+
+
+Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | Reply]]
+Sent = Callable[[], None] | None
 
 
 class OpError(Exception):
@@ -41,32 +56,68 @@ class OpError(Exception):
 
 
 class DaemonServer:
-    def __init__(self, handlers: dict[str, Handler]) -> None:
+    """`hangup_cancels` names the ops a client's hangup cancels while they run: `subscribe`,
+    which would otherwise take an event off the agent's queue for a client that has gone."""
+
+    def __init__(
+        self, handlers: dict[str, Handler], *, hangup_cancels: frozenset[str] = frozenset()
+    ) -> None:
         self.handlers = handlers
+        self.hangup_cancels = hangup_cancels
         self._server: asyncio.Server | None = None
 
+    @staticmethod
+    def _op(line: bytes) -> str | None:
+        try:
+            return parse_frame(line).op
+        except ProtocolError:
+            return None
+
     async def handle_line(self, line: bytes) -> dict[str, Any]:
-        """One request frame in, one response frame out. Never raises."""
+        """One request frame in, one response frame out. Never raises. A `Reply`'s
+        `on_sent` runs here at once: the caller has the frame."""
+        frame, on_sent = await self._handle(line)
+        self._sent(on_sent)
+        return frame
+
+    async def _handle(self, line: bytes) -> tuple[dict[str, Any], Sent]:
+        """The response frame, and what to run once it has been written."""
         try:
             req = parse_frame(line)
         except ProtocolError as exc:
-            return err(exc.req_id, str(exc))
+            return err(exc.req_id, str(exc)), None
         handler = self.handlers.get(req.op)
         if handler is None:
-            return err(req.id, "unsupported")
+            return err(req.id, "unsupported"), None
         try:
-            return ok(req.id, await handler(req.args))
+            result = await handler(req.args)
         except (OpError, RegisterError) as exc:
-            return err(req.id, str(exc))
+            return err(req.id, str(exc)), None
         except Exception:
             log.exception("%s failed", req.op)
-            return err(req.id, "internal")
+            return err(req.id, "internal"), None
+        if isinstance(result, Reply):
+            return ok(req.id, result.result), result.on_sent
+        return ok(req.id, result), None
+
+    @staticmethod
+    def _sent(on_sent: Sent) -> None:
+        if on_sent is None:
+            return
+        try:
+            on_sent()
+        except Exception:
+            log.exception("after sending a reply")
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        next_line: asyncio.Future[bytes] | None = None
         try:
             while True:
                 try:
-                    line = await reader.readline()
+                    if next_line is None:
+                        line = await reader.readline()
+                    else:
+                        line, next_line = await next_line, None
                 except (ValueError, asyncio.LimitOverrunError):
                     writer.write(encode(err(None, "bad_request: frame too large")))
                     await writer.drain()
@@ -75,11 +126,37 @@ class DaemonServer:
                     return
                 if not line.strip():
                     continue
-                writer.write(encode(await self.handle_line(line)))
+                if self._op(line) not in self.hangup_cancels:
+                    frame, on_sent = await self._handle(line)
+                    writer.write(encode(frame))
+                    await writer.drain()
+                    self._sent(on_sent)
+                    continue
+                # Watch for the client hanging up while the op waits; a line it sends
+                # meanwhile is kept for the next turn of the loop.
+                handling = asyncio.ensure_future(self._handle(line))
+                next_line = asyncio.ensure_future(reader.readline())
+                await asyncio.wait({handling, next_line}, return_when=asyncio.FIRST_COMPLETED)
+                hung_up = (
+                    next_line.done() and next_line.exception() is None and not next_line.result()
+                )
+                if hung_up:
+                    # Gone before its reply: nothing is written and `on_sent` never runs,
+                    # so an event `subscribe` took stays held for the next one (#99).
+                    if not handling.done():
+                        handling.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await handling
+                    return
+                frame, on_sent = await handling
+                writer.write(encode(frame))
                 await writer.drain()
+                self._sent(on_sent)
         except ConnectionError:
             return
         finally:
+            if next_line is not None and not next_line.done():
+                next_line.cancel()
             writer.close()
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()

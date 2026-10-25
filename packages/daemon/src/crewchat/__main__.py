@@ -27,10 +27,14 @@ from pathlib import Path
 from typing import Any
 
 from crewchat.adapters.base import ChatBackend
-from crewchat.adapters.discord import DiscordBackend
+from crewchat.adapters.discord import DiscordBackend, read_credential
 from crewchat.adapters.mattermost import MattermostBackend
+from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
+from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
+from crewchat.filters import Filters, KioskQueue, SwitchCache
+from crewchat.kiosk import ClaudeCliRunner, Kiosk
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import (
@@ -44,7 +48,6 @@ from crewchat.threads import STATE_DIR, MyThreads
 from crewchat.tokens import (
     TOKENS_DIR,
     Rotator,
-    SwitchCache,
     TokenStore,
     broker_clients,
     retry_delays,
@@ -133,19 +136,73 @@ async def serve(
             guild_id=config.discord_guild_id,
         )
         chat_backends[discord.name] = discord
-    cache = SwitchCache(brokers)
+    cache = SwitchCache.from_config(brokers, config)
     registry = Registry(config, brokers, store, cache, identity_sink=discord)
     # The one persisted "my threads" set (D-104): every send and dm records into it, and
-    # Phase 3's addressing reads the same instance, so replies survive a restart.
+    # the filters' addressing and loop guard read the same instance, so replies survive a
+    # restart.
     threads = MyThreads.load(state_dir, config.my_threads_retention_days)
+    # Membership, addressing, the loop guard and the switch, on push and pull (Story 3.3).
+    filters = Filters.from_config(registry, cache, threads, config)
+    kiosk = KioskQueue()  # push KIOSK verdicts, for Story 3.5's kiosk
     # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
     uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
     health_sources: dict[str, HealthSource] = {discord.name: discord} if discord else {}
+    # What the shims push (the kiosk brief, the squawk ids): squawkie filters by the ids.
+    context = AgentContext()
+    squawkie: SquawkieBackend | None = None
+    if config.squawkie_url is not None:
+        token = (
+            read_credential(config.squawkie_credential)
+            if config.squawkie_credential is not None
+            else None
+        )
+        squawkie = SquawkieBackend(
+            config.squawkie_url,
+            token,
+            ids_for=lambda dev: context.squawk_ids.get(dev, ()),
+        )
+    # The doorbell (Story 3.2): one task per (agent, backend), one queue per agent. It goes
+    # first among the store's adapters, so an agent leaving rotation has its doorbell tasks
+    # stopped before its streams close.
+    sources: dict[str, Source] = dict(chat_backends)
+    if squawkie is not None:
+        sources[SQUAWKIE] = squawkie
+    doorbell = Doorbell(sources, CursorStore(state_dir), admit=filters.admit_event, kiosk=kiosk)
+    store.adapters.insert(0, doorbell)
+    # The kiosk (Story 3.5): answers the KIOSK queue from the briefs the shims push, through
+    # the `crewkiosk` CLI runner (D-096). Sessions start on each expert's first outsider.
+    kiosk_answers = Kiosk(
+        kiosk,
+        context.briefs,
+        chat_backends,
+        ClaudeCliRunner(),
+        state_dir=state_dir,
+        deliver=doorbell.deliver,
+    )
+    # Social engaged on a server (Story 3.6, R-33): each of that crew's agents there gets its
+    # kiosk review on its doorbell queue.
+    cache.social_listeners.append(
+        lambda crew, server_id: kiosk_answers.on_social(
+            server_id, registry.agents_on(crew, server_id)
+        )
+    )
     handlers = build_handlers(config, registry, health_sources)
     handlers.update(
-        build_chat_handlers(registry, chat_backends, threads, AgentContext(), uploads)
+        build_chat_handlers(registry, chat_backends, threads, context, uploads, filters=filters)
     )
-    server = DaemonServer(handlers)
+    handlers.update(
+        build_doorbell_handlers(
+            registry,
+            doorbell,
+            handlers["register"],
+            extra_backends=[SQUAWKIE] if squawkie is not None else [],
+            # Social already on when an agent registers (after a daemon start, or mid-social):
+            # its kiosk review, which `social_listeners` alone would never send (R-33, #99).
+            on_registered=lambda reg: kiosk_answers.on_registered(reg, cache),
+        )
+    )
+    server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
     listener = await server.start(socket_path, group)
 
     stop = asyncio.Event()
@@ -153,6 +210,9 @@ async def serve(
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     rotation = asyncio.create_task(rotation_loop(Rotator(store), stop))
+    kiosk_answers.start()
+    # `switch_state` and `crew_info` from every local broker, now and every 30 s (§5.9).
+    switch_refresh = asyncio.create_task(cache.run(stop))
     log.info(
         "serving %s: crews %s, servers %s",
         socket_path,
@@ -165,6 +225,11 @@ async def serve(
         listener.close()
         await listener.wait_closed()
         await rotation
+        await switch_refresh
+        await doorbell.aclose()
+        await kiosk_answers.aclose()
+        if squawkie is not None:
+            await squawkie.aclose()
         for backend in backends:
             await backend.aclose()
         if discord is not None:

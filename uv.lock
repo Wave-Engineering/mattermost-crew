@@ -418,18 +418,22 @@ wheels = [
 
 [[package]]
 name = "crewbroker"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/broker" }
 dependencies = [
     { name = "httpx" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "httpx", specifier = ">=0.28,<1" }]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "websockets", specifier = ">=15,<18" },
+]
 
 [[package]]
 name = "crewchat"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/daemon" }
 dependencies = [
     { name = "httpx" },
@@ -446,7 +450,7 @@ requires-dist = [
 
 [[package]]
 name = "crewchat-clients"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/clients" }
 dependencies = [
     { name = "mcp" },
@@ -951,7 +955,7 @@ wheels = [
 
 [[package]]
 name = "mattermost-crew"
-version = "0.1.0"
+version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
     { name = "crewbroker" },

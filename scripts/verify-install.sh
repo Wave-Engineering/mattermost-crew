@@ -19,6 +19,16 @@
 #     /var/lib/crewchat/tokens/verify-canary.json, exists and the agent's user cannot read it.
 #     Never a glob: a shell that can't list the directory would pass vacuously (R-08).
 #
+# The kiosk (Story 3.5, D-107), on a host with the crewkiosk user:
+#   - its socket /run/crewkiosk/kiosk.sock exists, mode 0660, group crewchat;
+#   - the running daemon has NoNewPrivs set: it reaches the kiosk without changing user;
+#   - crewkiosk cannot read any of the known credential files above.
+#
+# The credentials that servers.toml names (Story 3.7): /etc/crewchat/discord.credential (or
+# `[discord] credential`) when Discord is enabled, and `[squawkie] credential` when set; and, on a
+# kiosk host, the kiosk's model credential /etc/crewkiosk/model.credential. Neither the agent's
+# user nor crewkiosk may read the first two; the agent's user may not read the third.
+#
 # CREWBROKER_BIN is the installed broker CLI (default /opt/mattermost-crew/.venv/bin/crewbroker),
 # CREWCHAT_BIN the daemon's (default /opt/mattermost-crew/.venv/bin/crewchat).
 # AGENT_USER is the agents' OS user (default agent). It needs sudo.
@@ -31,6 +41,12 @@ CREWCHAT_TOKENS=/var/lib/crewchat/tokens
 CLIENTS_GROUP=crewchat-clients
 AGENT_USER="${AGENT_USER:-agent}"
 DAEMON_USER=crewchat
+KIOSK_USER=crewkiosk
+KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
+KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
+SERVERS_TOML=/etc/crewchat/servers.toml
+# The daemon's own interpreter, which has tomllib (Python 3.12).
+CREWCHAT_PYTHON="$(dirname "$CREWCHAT_BIN")/python"
 RUN_DIR=/run/crewbroker
 CONFIG_DIR=/etc/crewbroker
 STATE_ROOT=/var/lib/crewbroker
@@ -54,16 +70,17 @@ if ! sudo -n -u "$AGENT_USER" true; then
 fi
 
 # no_agent_read FILE: the file exists, and the agent's user cannot read it.
-no_agent_read() {
-  local file="$1"
+no_read_as() {
+  local user="$1" file="$2"
   if ! $SUDO test -e "$file"; then
     fail "$file does not exist"
-  elif sudo -n -u "$AGENT_USER" test -r "$file"; then
-    fail "$file is readable by $AGENT_USER"
+  elif sudo -n -u "$user" test -r "$file"; then
+    fail "$file is readable by $user"
   else
-    pass "$file exists and $AGENT_USER cannot read it"
+    pass "$file exists and $user cannot read it"
   fi
 }
+no_agent_read() { no_read_as "$AGENT_USER" "$1"; }
 
 for entry in $CREWBROKER_INSTANCES; do
   crew="${entry%%:*}"
@@ -142,6 +159,76 @@ else
   fail "register for verify-canary: $(jq -c '.error // .' <<<"$reply" 2>/dev/null || echo "no reply")"
 fi
 no_agent_read "${CREWCHAT_TOKENS}/verify-canary.json"
+
+# The credentials servers.toml names (Discord when enabled, squawkie when configured), read
+# with the daemon's own interpreter, and the kiosk's model credential on a kiosk host. Each is
+# a KNOWN name, checked like the rest (R-08, Story 3.7).
+CONFIG_CREDENTIALS_PY='
+import sys, tomllib
+config = tomllib.loads(sys.stdin.read())
+discord = config.get("discord", {})
+if discord.get("enabled") is True:
+    print(discord.get("credential", "/etc/crewchat/discord.credential"))
+squawkie = config.get("squawkie", {})
+if isinstance(squawkie.get("credential"), str):
+    print(squawkie["credential"])
+'
+config_credentials=()
+if config_text="$($SUDO cat "$SERVERS_TOML" 2>/dev/null)"; then
+  if listed="$("$CREWCHAT_PYTHON" -c "$CONFIG_CREDENTIALS_PY" <<<"$config_text" 2>&1)"; then
+    while IFS= read -r file; do
+      [[ -n "$file" ]] && config_credentials+=("$file")
+    done <<<"$listed"
+  else
+    fail "could not read the credentials $SERVERS_TOML names: $listed"
+  fi
+else
+  fail "cannot read $SERVERS_TOML"
+fi
+for file in "${config_credentials[@]}"; do
+  no_agent_read "$file"
+done
+if id "$KIOSK_USER" >/dev/null 2>&1; then
+  no_agent_read "$KIOSK_CREDENTIAL"
+fi
+
+# The kiosk (D-107), when this host runs the CLI runner, i.e. has the crewkiosk user.
+if id "$KIOSK_USER" >/dev/null 2>&1; then
+  if ! $SUDO test -S "$KIOSK_SOCKET"; then
+    fail "$KIOSK_SOCKET is not a socket (is crewkiosk.socket enabled?)"
+  else
+    read -r mode group < <($SUDO stat -c '%a %G' "$KIOSK_SOCKET")
+    if [[ "$mode" == 660 && "$group" == "$DAEMON_USER" ]]; then
+      pass "$KIOSK_SOCKET is mode 0660, group $DAEMON_USER"
+    else
+      fail "$KIOSK_SOCKET is mode $mode, group $group (want 660, $DAEMON_USER)"
+    fi
+  fi
+  # The daemon must run with no new privileges: it reaches the kiosk without changing user.
+  pid="$(pgrep -u "$DAEMON_USER" -f -o "crewchat serve" || true)"
+  if [[ -z "$pid" ]]; then
+    fail "no 'crewchat serve' process running as $DAEMON_USER"
+  elif $SUDO grep -qE '^NoNewPrivs:[[:space:]]+1$' "/proc/${pid}/status"; then
+    pass "the daemon (pid $pid) runs with NoNewPrivileges"
+  else
+    fail "the daemon (pid $pid) can gain privileges; crewchat.service must set NoNewPrivileges=yes"
+  fi
+  # crewkiosk can read no chat or broker credential: the same KNOWN names, never a glob.
+  if ! sudo -n -u "$KIOSK_USER" true; then
+    fail "cannot run commands as $KIOSK_USER (sudo -n -u $KIOSK_USER)"
+  else
+    for entry in $CREWBROKER_INSTANCES; do
+      instance="${entry%%:*}-${entry#*:}"
+      for file in "${CONFIG_DIR}/${instance}.credential" "${STATE_ROOT}/${instance}/tokens.json"; do
+        no_read_as "$KIOSK_USER" "$file"
+      done
+    done
+    no_read_as "$KIOSK_USER" "${CREWCHAT_TOKENS}/verify-canary.json"
+    for file in "${config_credentials[@]}"; do
+      no_read_as "$KIOSK_USER" "$file"
+    done
+  fi
+fi
 
 if ((failures > 0)); then
   echo "verify-install: $failures check(s) failed" >&2

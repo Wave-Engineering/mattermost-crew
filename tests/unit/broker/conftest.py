@@ -38,6 +38,8 @@ class FakeMattermost:
         self.bots: dict[str, dict[str, Any]] = {}
         self.tokens: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, Any]] = []
+        self.posts: list[dict[str, Any]] = []
+        self.post_fails = False
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
@@ -141,6 +143,20 @@ class FakeMattermost:
         if token_id not in self.tokens:
             raise NotFound("POST", "/users/tokens/revoke", 404, "not found")
         self.tokens[token_id]["revoked"] = True
+
+    def direct_channel(self, user_id: str, other_id: str) -> str:
+        self.calls.append(("direct_channel", (user_id, other_id)))
+        return "__".join(sorted([user_id, other_id]))
+
+    def create_post(
+        self, channel_id: str, message: str, props: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        self.calls.append(("create_post", channel_id))
+        if self.post_fails:
+            raise MattermostError("POST", "/posts", 500, "boom")
+        post = {"channel_id": channel_id, "message": message, "props": dict(props or {})}
+        self.posts.append(post)
+        return post
 
 
 class Clock:

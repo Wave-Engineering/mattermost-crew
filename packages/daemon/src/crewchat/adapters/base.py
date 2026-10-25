@@ -17,11 +17,21 @@ silently dropped (R-15): a backend delivers both or raises.
 Two optional capabilities sit beside the contract: `GuildBackend` (Discord's channel listing,
 name resolution and creation, Story 2.4c) and `PostProbe` (a Mattermost server answering
 whether it holds a post, for `thread_backend`, R-12).
+
+**The doorbell's stream hooks** (Story 3.2; R-27, R-28). `stream` takes two keyword-only
+arguments from the doorbell:
+
+- `cursor`: a `StreamCursor`, the last event the agent was handed from this backend. On every
+  (re)connect the stream replays what it missed after that point, and leaves out the IDs in
+  `cursor.seen` (R-28). With no cursor the stream starts at now.
+- `on_status`: a `StatusSink`, called `(True, "")` when the stream is connected and
+  `(False, reason)` when it is not: a lost connection, a refused connect, or an auth error
+  (R-27). The stream keeps retrying on its own; it reports, the doorbell decides what is loud.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -47,6 +57,31 @@ class InboundMessage:
     # A direct message to the receiving agent: a DM channel whose members are the author and
     # that agent (R-19). Set on the push path, the only one addressing reads (R-21).
     dm: bool = False
+    # The server resolved the author's user object. False when it couldn't, and the filters
+    # then drop the message as unresolvable (R-22).
+    author_resolved: bool = True
+
+
+@dataclass(frozen=True)
+class StreamCursor:
+    """Where a backend's stream resumes for one agent (R-28): the last event handed to the
+    agent (`id`, at `ts` seconds since the epoch) and the IDs recently handed over (`seen`),
+    which a replay never repeats."""
+
+    id: str = ""
+    ts: float = 0.0
+    seen: frozenset[str] = frozenset()
+
+
+# `(True, "")` when the stream is connected, `(False, reason)` when it is not (R-27).
+StatusSink = Callable[[bool, str], None]
+
+
+def _no_status(up: bool, reason: str) -> None:
+    """The default `on_status`: nobody is listening."""
+
+
+NO_STATUS: StatusSink = _no_status
 
 
 class BackendUnavailable(Exception):
@@ -137,8 +172,16 @@ class ChatBackend(Protocol):
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
         """Add `emoji` to `post_id`."""
 
-    def stream(self, dev_name: str) -> AsyncIterator[InboundMessage]:
-        """Messages as they arrive for `dev_name`, its own posts already dropped (R-04)."""
+    def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        """Messages as they arrive for `dev_name`, its own posts already dropped (R-04);
+        replayed from `cursor` on every (re)connect, with the connection's state reported to
+        `on_status` (R-27, R-28)."""
         ...
 
 

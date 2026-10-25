@@ -1,0 +1,26 @@
+# One kiosk answer (Dev Spec §5.11; Story 3.5; D-107), started by crewkiosk.socket for one
+# connection. stdin is the prompt, stdout the framed reply; packaging/crewkiosk-run holds the
+# fixed `claude -p` command line, the empty HOME and working directory, and the model credential.
+# Needs the crewkiosk user and /etc/crewkiosk/model.credential (0600, crewkiosk:crewkiosk).
+[Unit]
+Description=mattermost-crew kiosk answer
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=crewkiosk
+Group=crewkiosk
+ExecStart=/usr/local/libexec/crewkiosk-run
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077
+# The daemon's timeout is 120 s; this is the backstop.
+RuntimeMaxSec=150
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# No chat or broker state or config, even by mistake in a permission bit.
+InaccessiblePaths=-/var/lib/crewchat -/etc/crewchat -/etc/crewbroker -/var/lib/crewbroker

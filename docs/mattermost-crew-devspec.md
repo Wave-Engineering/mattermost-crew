@@ -416,8 +416,10 @@ The daemon owns rotation (§4.8). The broker's daily job only deactivates bot ac
 - The daemon keeps one queue per registered agent, fed by three adapters: Mattermost (websocket), Discord (scream-hole) and squawkie (SSE, filtered to the squawk IDs the shim pushed with `squawk_ids`, the same predicate as `sqtk-doorbell.sh`).
 - Each event passes the filters (§5.9) and is queued.
 - `subscribe` returns the first queued event; the thin one-shot prints it as JSON and exits 0.
+- **Delivery is at least once** (#99). `subscribe` holds the event it takes, and the cursor moves past it only once the reply frame has been written. A reply that wasn't written (a hang-up, a timeout, a failed write) leaves the event held, and the next `subscribe` returns it again. So does a second `subscribe` for the same agent that overlaps the first. Every reply carries a stable `event_id`: `<backend>:<first ID>`, or an ID made once for an event without one. The agent drops a repeat by it.
+- **A client never half-closes its connection** (`SHUT_WR`). The daemon reads end-of-file on a waiting `subscribe` as a hang-up and cancels it, so a client that half-closes after sending its request never gets an event.
 - Cursors are kept per agent per backend under `/var/lib/crewchat/cursors/`.
-- A backend outage enqueues `{"type":"backend.down","backend":...}` (R-27).
+- A backend outage enqueues `{"type":"backend.down","backend":...}` (R-27). A Mattermost reconnect whose replay fails is an outage too, with the failing call in its `reason`. Its connection yields nothing and the position stays put, so the next replay delivers the gap (#99).
 - `sqtk-doorbell.sh` and `doorbell-oneshot.sh` stay as fallbacks until the cut-over (D-060).
 
 One-shot exit codes:
@@ -1590,11 +1592,11 @@ Answers outsiders while social is off, through a tool-less session seeded only f
    - It uses the current brief from `BriefStore`. With no brief, it replies "I have nothing to share yet."
    - Its prompt is `KIOSK_HEADER + brief + history`. **`history` holds only the asker's own posts in that thread and the kiosk's own earlier answers to that asker.** Crewmates' posts in the thread are never included (§5.11).
 3. `runner` implements the mechanism chosen in spike 1.2. Either:
-   - `ClaudeCliRunner` runs, as OS user `crewkiosk` (never `crewchat`), with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. It is started through a fixed `sudo -u crewkiosk` rule that allows only this command line. `crewkiosk` can read no chat or broker credential; its only credential is the model credential spike 1.2 names; or
+   - `ClaudeCliRunner` runs, as OS user `crewkiosk` (never `crewchat`), with an empty HOME and an empty working directory: `claude -p --restricted --strict-mcp-config --tools "" --disallowedTools "mcp__*"`. It is started through `crewkiosk.socket` and `crewkiosk@.service` (`Accept=yes`): the daemon, which keeps `NoNewPrivileges=yes`, connects to `/run/crewkiosk/kiosk.sock` (0660, group `crewchat`) and systemd runs this one fixed command line as `crewkiosk` for that connection. No sudo rule ships (D-107, which supersedes the earlier `sudo -u crewkiosk` rule). `crewkiosk` can read no chat or broker credential; its only credential is the model credential spike 1.2 names; or
    - `ApiRunner` makes a direct model API call with no tool definitions, using the credential decided in 1.2.
 
    Both expose `answer(prompt) -> str`.
-4. One session per expert **per server** serves every outsider on that server, so their contexts mingle (D-067); outsiders on different servers never share a session, and the session is keyed `(<dev>, <server_id>)`. Each Q&A is appended to that server's transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, asker_id, question, answer}`.
+4. One session per expert **per server** serves every outsider on that server, so their contexts mingle (D-067); outsiders on different servers never share a session, and the session is keyed `(<dev>, <server_id>)`. Each Q&A is appended to that server's transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, post_id, asker_id, question, answer}`. A question whose `post_id` is already in the transcript is not answered again, so a replay after a daemon restart gets no second answer (#97).
 5. Consume the `KIOSK` holding queue from 3.3. Answer in the outsider's thread on the originating backend (Mattermost only; §5.9):
    - `strip_mentions(answer)` removes every `@token` before posting;
    - the post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
@@ -1837,41 +1839,46 @@ The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[l
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 
-Story 3.9 fills in the Status column.
+Story 3.9 fills in the Status column. Each status is the result of its verification items in CI
+run [40200284162](https://github.com/Wave-Engineering/mattermost-crew/actions/runs/40200284162)
+(2026-10-25, head `ad27c94`, the Phase 3 content through Story 3.8): all three legs
+(Team 11.11.3, Enterprise 11.11.3, Team 11.8.5), the installed tests (IT-01) and the `install` job
+(IT-20), with no failures and no IT or E2E item skipped. `main` does not carry Phase 3 until #28's
+release PR, whose own CI re-runs every item on the final `main`.
 
 | Req ID | Requirement (short) | Source | Verification Item | Verification Method | Status |
 |--------|-------------------|--------|------------------|-------------------|--------|
-| R-01 | Per-agent account `<dev>.<crew>` | Stories 1.3, 1.4, 2.1 | IT-01, IT-17, IT-19, E2E-01 | integration / e2e test | Pending |
-| R-02 | Crew defaults to the partner's username | Story 1.3 | IT-17 | integration test | Pending |
-| R-03 | Broker creates a missing bot account | Story 1.3 | IT-01 | integration test | Pending |
-| R-04 | Echo filtered by user ID | Story 2.1 | IT-14 | integration test | Pending |
-| R-05 | Mint on register, re-mint daily (daemon-driven rotation) | Stories 1.3, 1.4, 2.1 | IT-01, IT-02 | integration test | Pending |
-| R-06 | Broker has no admin; patched role held only by configured broker accounts | Stories 1.3, 1.4 | IT-01, IT-20 | integration test | Pending |
-| R-07 | Native expiry, else revocation | Stories 1.3, 1.4, 2.1 | IT-02 | integration test | Pending |
-| R-08 | Token not readable by the agent | Stories 1.4, 3.7 | IT-01, IT-20 | integration test | Pending |
-| R-09 | One tool contract | Story 2.4 | IT-16, E2E-01 | integration / e2e test | Pending |
-| R-10 | Configured server instances | Stories 1.4, 2.1, 2.4 | IT-16 | integration test | Pending |
-| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04 | integration test | Pending |
-| R-12 | Reply follows thread and backend | Story 2.4 | IT-05, E2E-01 | integration / e2e test | Pending |
-| R-13 | Explicit backend used and logged | Story 2.4 | IT-05 | integration test | Pending |
-| R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pending |
-| R-15 | Discord parity | Stories 2.2, 2.4, 2.4c | IT-15, IT-25 | integration test | Pending |
-| R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pending |
-| R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
-| R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pending |
-| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
-| R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pending |
-| R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pending |
-| R-22 | Unresolvable crew dropped; membership by `owner_id` plus `minted_bot_ids` | Stories 1.3, 3.3 | IT-08 | integration test | Pending |
-| R-23 | Social marked, lapses per delivery, reverts, notifies | Stories 3.1, 3.3 | IT-09, IT-18, E2E-02 | integration / e2e test | Pending |
-| R-24 | Only the partner flips; broker holds state | Story 3.1 | IT-09, IT-18 | integration test | Pending |
-| R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pending |
-| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pending |
-| R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pending |
-| R-28 | Cursor replay exactly once | Story 3.2 | IT-13 | integration test | Pending |
-| R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pending |
-| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pending |
-| R-31 | Outsiders answered by a tool-less kiosk while social is off | Story 3.5 | IT-21, E2E-02 | integration / e2e test | Pending |
-| R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pending |
-| R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pending |
-| R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pending |
+| R-01 | Per-agent account `<dev>.<crew>` | Stories 1.3, 1.4, 2.1 | IT-01, IT-17, IT-19, E2E-01 | integration / e2e test | Pass |
+| R-02 | Crew defaults to the partner's username | Story 1.3 | IT-17 | integration test | Pass |
+| R-03 | Broker creates a missing bot account | Story 1.3 | IT-01 | integration test | Pass |
+| R-04 | Echo filtered by user ID | Story 2.1 | IT-14 | integration test | Pass |
+| R-05 | Mint on register, re-mint daily (daemon-driven rotation) | Stories 1.3, 1.4, 2.1 | IT-01, IT-02 | integration test | Pass |
+| R-06 | Broker has no admin; patched role held only by configured broker accounts | Stories 1.3, 1.4 | IT-01, IT-20 | integration test | Pass |
+| R-07 | Native expiry, else revocation | Stories 1.3, 1.4, 2.1 | IT-02 | integration test | Pass |
+| R-08 | Token not readable by the agent | Stories 1.4, 3.7 | IT-01, IT-20 | integration test | Pass |
+| R-09 | One tool contract | Story 2.4 | IT-16, E2E-01 | integration / e2e test | Pass |
+| R-10 | Configured server instances | Stories 1.4, 2.1, 2.4 | IT-16 | integration test | Pass |
+| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04 | integration test | Pass |
+| R-12 | Reply follows thread and backend | Story 2.4 | IT-05, E2E-01 | integration / e2e test | Pass |
+| R-13 | Explicit backend used and logged | Story 2.4 | IT-05 | integration test | Pass |
+| R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pass |
+| R-15 | Discord parity | Stories 2.2, 2.4, 2.4c | IT-15, IT-25 | integration test | Pass |
+| R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pass |
+| R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
+| R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pass |
+| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
+| R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pass |
+| R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pass |
+| R-22 | Unresolvable crew dropped; membership by `owner_id` plus `minted_bot_ids` | Stories 1.3, 3.3 | IT-08 | integration test | Pass |
+| R-23 | Social marked, lapses per delivery, reverts, notifies | Stories 3.1, 3.3 | IT-09, IT-18, E2E-02 | integration / e2e test | Pass |
+| R-24 | Only the partner flips; broker holds state | Story 3.1 | IT-09, IT-18 | integration test | Pass |
+| R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pass |
+| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pass |
+| R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pass |
+| R-28 | Cursor replay exactly once | Story 3.2 | IT-13 | integration test | Pass |
+| R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
+| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
+| R-31 | Outsiders answered by a tool-less kiosk while social is off | Story 3.5 | IT-21, E2E-02 | integration / e2e test | Pass |
+| R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pass |
+| R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pass |
+| R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pass |

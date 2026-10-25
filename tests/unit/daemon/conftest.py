@@ -23,8 +23,9 @@ from typing import Any
 import httpx
 import pytest
 from crewchat.config import ServersConfig, parse_config
+from crewchat.filters import SwitchCache
 from crewchat.registry import Registry
-from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, SwitchCache, TokenStore
+from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, TokenStore
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
@@ -96,6 +97,14 @@ class FakeBroker(BrokerClient):
                 "human_user_ids": ["h1"],
                 "trusted": [],
                 "minted_bot_ids": [f"bot:{a}" for a in self.bots],
+            }
+        if op == "switch_state":
+            return {
+                "mode": "crew",
+                "expires_at": None,
+                "revert_to": "crew",
+                "kiosk_on": True,
+                "effective_mode": "crew",
             }
         raise BrokerError(op, "unsupported")
 
@@ -226,6 +235,10 @@ class FakeMattermost:
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
         self.fail_connects = 0
+        # path fragment -> how many more requests whose path holds it get a 503
+        self.errors: dict[str, int] = {}
+        # team id -> the channels every user is in there (`GET /users/me/teams/{id}/channels`)
+        self.teams: dict[str, list[dict[str, Any]]] = {}
         self._n = itertools.count(1)
 
     def _id(self, prefix: str) -> str:
@@ -303,6 +316,10 @@ class FakeMattermost:
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
         path = request.url.path.removeprefix("/api/v4")
         self.requests.append((request.method, path, token))
+        for fragment, left in self.errors.items():
+            if left > 0 and fragment in path:
+                self.errors[fragment] = left - 1
+                return httpx.Response(503, json={"id": "fake.unavailable"})
         me = self.tokens.get(token)
         if me is None:
             return httpx.Response(401, json={"id": "api.context.session_expired.app_error"})
@@ -335,8 +352,16 @@ class FakeMattermost:
             if found is None or me in self.hidden_from.get(parts[1], set()):
                 return httpx.Response(404, json={"id": "app.post.get.app_error"})
             return httpx.Response(200, json=found)
+        if request.method == "GET" and path == "/users/me/teams":
+            return httpx.Response(200, json=[{"id": t} for t in self.teams])
+        if request.method == "GET" and parts[:3] == ["users", "me", "teams"] and len(parts) == 5:
+            channels = self.teams.get(parts[3], [])
+            return httpx.Response(200, json=[dict(c) for c in channels])
         if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
             posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
+            since = request.url.params.get("since")
+            if since is not None:  # `update_at > since`; a post here is never edited
+                posts = {k: p for k, p in posts.items() if p["create_at"] > int(since)}
             order = sorted(posts, key=lambda k: -posts[k]["create_at"])
             return httpx.Response(200, json={"posts": posts, "order": order})
         if request.method == "GET" and parts[0] == "posts" and parts[2:] == ["thread"]:

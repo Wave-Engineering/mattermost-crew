@@ -11,8 +11,8 @@ For each Mattermost server the crew has a broker for, `register` asks that broke
 It is the **only** caller of `BrokerClient.mint` (R-30). For an agent that already holds a
 token there (the shim's daily re-register), the new token goes through the rotation sequence:
 swap, `on_token_rotated`, then `revoke` the previous token, so none is left live. After each
-`mint`, that broker's `crew_info` is refreshed, so the new bot account is in `minted_bot_ids`
-before its first post (§5.9).
+`mint`, that broker's `crew_info` and `switch_state` are refreshed, so the new bot account is
+in `minted_bot_ids` before its first post (§5.9).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from crewchat.config import ServersConfig
 from crewchat.tokens import (
@@ -30,9 +30,11 @@ from crewchat.tokens import (
     BrokerError,
     BrokerKey,
     BrokerUnavailable,
-    SwitchCache,
     TokenStore,
 )
+
+if TYPE_CHECKING:
+    from crewchat.filters import SwitchCache
 
 ACCOUNT_NAME_MAX = 64  # Mattermost's UserNameMaxLength (CT-05)
 # A Dev-Name is also a file name under /var/lib/crewchat/tokens, so no leading dot.
@@ -125,6 +127,15 @@ class Registry:
 
     def get(self, dev_name: str) -> Registration | None:
         return self._registrations.get(dev_name)
+
+    def agents_on(self, crew: str, server_id: str) -> list[str]:
+        """The Dev-Names registered in `crew` with a backend on Mattermost `server_id`."""
+        backend = mattermost_backend(server_id)
+        return sorted(
+            r.dev_name
+            for r in self._registrations.values()
+            if r.crew == crew and backend in r.backends
+        )
 
     async def register(
         self,
