@@ -1837,41 +1837,46 @@ The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[l
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 
-Story 3.9 fills in the Status column.
+Story 3.9 fills in the Status column. Each status is the result of its verification items in CI
+run [40200284162](https://github.com/Wave-Engineering/mattermost-crew/actions/runs/40200284162)
+(2026-10-25, head `ad27c94`, the Phase 3 content through Story 3.8): all three legs
+(Team 11.11.3, Enterprise 11.11.3, Team 11.8.5), the installed tests (IT-01) and the `install` job
+(IT-20), with no failures and no IT or E2E item skipped. `main` does not carry Phase 3 until #28's
+release PR, whose own CI re-runs every item on the final `main`.
 
 | Req ID | Requirement (short) | Source | Verification Item | Verification Method | Status |
 |--------|-------------------|--------|------------------|-------------------|--------|
-| R-01 | Per-agent account `<dev>.<crew>` | Stories 1.3, 1.4, 2.1 | IT-01, IT-17, IT-19, E2E-01 | integration / e2e test | Pending |
-| R-02 | Crew defaults to the partner's username | Story 1.3 | IT-17 | integration test | Pending |
-| R-03 | Broker creates a missing bot account | Story 1.3 | IT-01 | integration test | Pending |
-| R-04 | Echo filtered by user ID | Story 2.1 | IT-14 | integration test | Pending |
-| R-05 | Mint on register, re-mint daily (daemon-driven rotation) | Stories 1.3, 1.4, 2.1 | IT-01, IT-02 | integration test | Pending |
-| R-06 | Broker has no admin; patched role held only by configured broker accounts | Stories 1.3, 1.4 | IT-01, IT-20 | integration test | Pending |
-| R-07 | Native expiry, else revocation | Stories 1.3, 1.4, 2.1 | IT-02 | integration test | Pending |
-| R-08 | Token not readable by the agent | Stories 1.4, 3.7 | IT-01, IT-20 | integration test | Pending |
-| R-09 | One tool contract | Story 2.4 | IT-16, E2E-01 | integration / e2e test | Pending |
-| R-10 | Configured server instances | Stories 1.4, 2.1, 2.4 | IT-16 | integration test | Pending |
-| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04 | integration test | Pending |
-| R-12 | Reply follows thread and backend | Story 2.4 | IT-05, E2E-01 | integration / e2e test | Pending |
-| R-13 | Explicit backend used and logged | Story 2.4 | IT-05 | integration test | Pending |
-| R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pending |
-| R-15 | Discord parity | Stories 2.2, 2.4, 2.4c | IT-15, IT-25 | integration test | Pending |
-| R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pending |
-| R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
-| R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pending |
-| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pending |
-| R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pending |
-| R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pending |
-| R-22 | Unresolvable crew dropped; membership by `owner_id` plus `minted_bot_ids` | Stories 1.3, 3.3 | IT-08 | integration test | Pending |
-| R-23 | Social marked, lapses per delivery, reverts, notifies | Stories 3.1, 3.3 | IT-09, IT-18, E2E-02 | integration / e2e test | Pending |
-| R-24 | Only the partner flips; broker holds state | Story 3.1 | IT-09, IT-18 | integration test | Pending |
-| R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pending |
-| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pending |
-| R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pending |
-| R-28 | Cursor replay exactly once | Story 3.2 | IT-13 | integration test | Pending |
-| R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pending |
-| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pending |
-| R-31 | Outsiders answered by a tool-less kiosk while social is off | Story 3.5 | IT-21, E2E-02 | integration / e2e test | Pending |
-| R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pending |
-| R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pending |
-| R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pending |
+| R-01 | Per-agent account `<dev>.<crew>` | Stories 1.3, 1.4, 2.1 | IT-01, IT-17, IT-19, E2E-01 | integration / e2e test | Pass |
+| R-02 | Crew defaults to the partner's username | Story 1.3 | IT-17 | integration test | Pass |
+| R-03 | Broker creates a missing bot account | Story 1.3 | IT-01 | integration test | Pass |
+| R-04 | Echo filtered by user ID | Story 2.1 | IT-14 | integration test | Pass |
+| R-05 | Mint on register, re-mint daily (daemon-driven rotation) | Stories 1.3, 1.4, 2.1 | IT-01, IT-02 | integration test | Pass |
+| R-06 | Broker has no admin; patched role held only by configured broker accounts | Stories 1.3, 1.4 | IT-01, IT-20 | integration test | Pass |
+| R-07 | Native expiry, else revocation | Stories 1.3, 1.4, 2.1 | IT-02 | integration test | Pass |
+| R-08 | Token not readable by the agent | Stories 1.4, 3.7 | IT-01, IT-20 | integration test | Pass |
+| R-09 | One tool contract | Story 2.4 | IT-16, E2E-01 | integration / e2e test | Pass |
+| R-10 | Configured server instances | Stories 1.4, 2.1, 2.4 | IT-16 | integration test | Pass |
+| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04 | integration test | Pass |
+| R-12 | Reply follows thread and backend | Story 2.4 | IT-05, E2E-01 | integration / e2e test | Pass |
+| R-13 | Explicit backend used and logged | Story 2.4 | IT-05 | integration test | Pass |
+| R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pass |
+| R-15 | Discord parity | Stories 2.2, 2.4, 2.4c | IT-15, IT-25 | integration test | Pass |
+| R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pass |
+| R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
+| R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pass |
+| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
+| R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pass |
+| R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pass |
+| R-22 | Unresolvable crew dropped; membership by `owner_id` plus `minted_bot_ids` | Stories 1.3, 3.3 | IT-08 | integration test | Pass |
+| R-23 | Social marked, lapses per delivery, reverts, notifies | Stories 3.1, 3.3 | IT-09, IT-18, E2E-02 | integration / e2e test | Pass |
+| R-24 | Only the partner flips; broker holds state | Story 3.1 | IT-09, IT-18 | integration test | Pass |
+| R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pass |
+| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pass |
+| R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pass |
+| R-28 | Cursor replay exactly once | Story 3.2 | IT-13 | integration test | Pass |
+| R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
+| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
+| R-31 | Outsiders answered by a tool-less kiosk while social is off | Story 3.5 | IT-21, E2E-02 | integration / e2e test | Pass |
+| R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pass |
+| R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pass |
+| R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pass |
