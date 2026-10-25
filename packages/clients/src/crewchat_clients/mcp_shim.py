@@ -131,12 +131,21 @@ def mark_outsiders(result: dict[str, Any]) -> dict[str, Any]:
 
 def render_event(event: dict[str, Any]) -> dict[str, Any]:
     """A doorbell event as the agent reads it: an event the daemon marked `"outsider": true`
-    (the kiosk review, Story 3.6, R-33) has its `text` prefixed with `OUTSIDER_PREFIX`."""
-    text = event.get("text")
-    marked = event.get("outsider") is True and isinstance(text, str)
-    if marked and not str(text).startswith(OUTSIDER_PREFIX):
-        return {**event, "text": f"{OUTSIDER_PREFIX} {text}"}
-    return event
+    has its text prefixed with `OUTSIDER_PREFIX`. That is the top-level `text` of the kiosk
+    review (Story 3.6, R-33), and `message.text` of an outsider message delivered under social
+    (Story 3.3, R-23, #97)."""
+    if event.get("outsider") is not True:
+        return event
+    out = dict(event)
+    text = out.get("text")
+    if isinstance(text, str) and not text.startswith(OUTSIDER_PREFIX):
+        out["text"] = f"{OUTSIDER_PREFIX} {text}"
+    message = out.get("message")
+    if isinstance(message, dict):
+        body = message.get("text")
+        if isinstance(body, str) and not body.startswith(OUTSIDER_PREFIX):
+            out["message"] = {**message, "text": f"{OUTSIDER_PREFIX} {body}"}
+    return out
 
 
 class ShimError(Exception):

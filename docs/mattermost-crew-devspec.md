@@ -1594,7 +1594,7 @@ Answers outsiders while social is off, through a tool-less session seeded only f
    - `ApiRunner` makes a direct model API call with no tool definitions, using the credential decided in 1.2.
 
    Both expose `answer(prompt) -> str`.
-4. One session per expert **per server** serves every outsider on that server, so their contexts mingle (D-067); outsiders on different servers never share a session, and the session is keyed `(<dev>, <server_id>)`. Each Q&A is appended to that server's transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, asker_id, question, answer}`.
+4. One session per expert **per server** serves every outsider on that server, so their contexts mingle (D-067); outsiders on different servers never share a session, and the session is keyed `(<dev>, <server_id>)`. Each Q&A is appended to that server's transcript, `/var/lib/crewchat/kiosk/<dev>-<server_id>.jsonl`, as `{ts, thread, post_id, asker_id, question, answer}`. A question whose `post_id` is already in the transcript is not answered again, so a replay after a daemon restart gets no second answer (#97).
 5. Consume the `KIOSK` holding queue from 3.3. Answer in the outsider's thread on the originating backend (Mattermost only; §5.9):
    - `strip_mentions(answer)` removes every `@token` before posting;
    - the post carries `props.crew_kiosk=1`, so `admit` treats it as outsider content (§5.9).
