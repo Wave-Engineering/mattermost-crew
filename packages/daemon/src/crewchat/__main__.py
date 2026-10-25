@@ -33,7 +33,13 @@ from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
-from crewchat.server import CLIENTS_GROUP, SOCKET_PATH, DaemonServer, build_handlers
+from crewchat.server import (
+    CLIENTS_GROUP,
+    SOCKET_PATH,
+    DaemonServer,
+    HealthSource,
+    build_handlers,
+)
 from crewchat.threads import STATE_DIR, MyThreads
 from crewchat.tokens import (
     TOKENS_DIR,
@@ -43,8 +49,10 @@ from crewchat.tokens import (
     broker_clients,
     retry_delays,
 )
+from crewchat.uploads import UploadStore
 
 ROTATION_INTERVAL_S = 24 * 3600
+UPLOADS_SUBDIR = "uploads"  # /run/crewchat/uploads, beside the socket
 
 log = logging.getLogger("crewchat")
 
@@ -130,8 +138,13 @@ async def serve(
     # The one persisted "my threads" set (D-104): every send and dm records into it, and
     # Phase 3's addressing reads the same instance, so replies survive a restart.
     threads = MyThreads.load(state_dir, config.my_threads_retention_days)
-    handlers = build_handlers(config, registry)
-    handlers.update(build_chat_handlers(registry, chat_backends, threads, AgentContext()))
+    # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
+    uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
+    health_sources: dict[str, HealthSource] = {discord.name: discord} if discord else {}
+    handlers = build_handlers(config, registry, health_sources)
+    handlers.update(
+        build_chat_handlers(registry, chat_backends, threads, AgentContext(), uploads)
+    )
     server = DaemonServer(handlers)
     listener = await server.start(socket_path, group)
 

@@ -29,6 +29,8 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
 
+from tests.fakes.screamhole import parse_multipart
+
 Event = tuple[Any, ...]
 
 SERVERS_TOML: dict[str, Any] = {
@@ -218,6 +220,8 @@ class FakeMattermost:
         self.tokens: dict[str, str] = {}  # token -> user_id
         self.posts: dict[str, dict[str, Any]] = {}
         self.reactions: list[dict[str, Any]] = []
+        self.files: dict[str, dict[str, Any]] = {}  # file id -> {id, name, data, ...}
+        self.hidden_from: dict[str, set[str]] = {}  # post id -> user ids it 404s for
         self.requests: list[tuple[str, str, str]] = []  # (method, path, token)
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
@@ -303,7 +307,8 @@ class FakeMattermost:
         if me is None:
             return httpx.Response(401, json={"id": "api.context.session_expired.app_error"})
         parts = path.strip("/").split("/")
-        body = json.loads(request.content) if request.content else None
+        multipart = request.headers.get("Content-Type", "").startswith("multipart/")
+        body = json.loads(request.content) if request.content and not multipart else None
         if request.method == "GET" and path == "/users/me":
             return httpx.Response(200, json=self.users[me])
         if request.method == "GET" and parts[:2] == ["users", "username"]:
@@ -312,10 +317,24 @@ class FakeMattermost:
         if request.method == "GET" and parts[0] == "users" and len(parts) == 2:
             user = self.users.get(parts[1])
             return httpx.Response(200, json=user) if user else httpx.Response(404, json={})
+        if request.method == "POST" and path == "/files":
+            fields, files = parse_multipart(request.headers["Content-Type"], request.content)
+            name, data = files["files"]
+            file_id = self._id("f")
+            self.files[file_id] = {"id": file_id, "name": name, "data": data, "user_id": me}
+            self.files[file_id]["channel_id"] = fields.get("channel_id", "")
+            return httpx.Response(201, json={"file_infos": [{"id": file_id, "name": name}]})
         if request.method == "POST" and path == "/posts":
             post = self.add_post(me, body["channel_id"], body["message"], body.get("props"))
             post["root_id"] = body.get("root_id", "")
+            if body.get("file_ids"):
+                post["file_ids"] = list(body["file_ids"])
             return httpx.Response(201, json=post)
+        if request.method == "GET" and parts[0] == "posts" and len(parts) == 2:
+            found = self.posts.get(parts[1])
+            if found is None or me in self.hidden_from.get(parts[1], set()):
+                return httpx.Response(404, json={"id": "app.post.get.app_error"})
+            return httpx.Response(200, json=found)
         if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
             posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
             order = sorted(posts, key=lambda k: -posts[k]["create_at"])

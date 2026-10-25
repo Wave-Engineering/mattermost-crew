@@ -40,7 +40,8 @@ def test_register_defaults_crew(daemon: Any) -> None:
 def test_register_returns_needs_list(daemon: Any, servers_toml: dict[str, Any]) -> None:
     result = register(daemon).result()
     assert result["needs_list"] == servers_toml["crews"]["oaw"]["needs_list"] == "bj:needs"
-    assert result["backends"] == ["dev", "discord"]
+    # Story 2.4c: the one backend-name form, mattermost:<server_id> (not the bare id).
+    assert result["backends"] == ["mattermost:dev", "discord"]
 
 
 def test_reregister_revokes_previous_token(daemon: Any) -> None:
@@ -136,8 +137,8 @@ def test_register_keeps_the_servers_that_answered(
     daemon = make_daemon(raw)
     daemon.broker("oaw", "prod").fail["mint"] = BrokerUnavailable("timeout")
     reg = register(daemon)
-    assert reg.backends == ["dev", "discord"]
-    assert reg.unavailable == ["prod"]
+    assert reg.backends == ["mattermost:dev", "discord"]
+    assert reg.unavailable == ["prod"]  # the server ids whose broker didn't mint (log only)
     assert daemon.store.token_for("babel", "dev") is not None
     assert daemon.store.token_for("babel", "prod") is None
 
