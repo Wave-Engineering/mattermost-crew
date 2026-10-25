@@ -25,11 +25,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from crewchat.adapters.base import ChatBackend
+from crewchat.adapters.discord import DiscordBackend
 from crewchat.adapters.mattermost import MattermostBackend
-from crewchat.config import CONFIG_PATH, load_config
+from crewchat.chat import AgentContext, build_chat_handlers
+from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import CLIENTS_GROUP, SOCKET_PATH, DaemonServer, build_handlers
+from crewchat.threads import MyThreads
 from crewchat.tokens import (
     TOKENS_DIR,
     Rotator,
@@ -103,9 +107,22 @@ async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: s
         MattermostBackend(s.id, s.url, store.token_for, refresher=store) for s in config.mattermost
     ]
     store.adapters.extend(backends)
+    chat_backends: dict[str, ChatBackend] = {b.name: b for b in backends}
+    discord: DiscordBackend | None = None
+    if config.discord_enabled:
+        if config.discord_screamhole_url is None:
+            raise ConfigError(f"{config_path}: discord is enabled but has no screamhole_url")
+        discord = DiscordBackend(
+            config.discord_screamhole_url,
+            config.discord_credential,
+            guild_id=config.discord_guild_id,
+        )
+        chat_backends[discord.name] = discord
     cache = SwitchCache(brokers)
     registry = Registry(config, brokers, store, cache)
-    server = DaemonServer(build_handlers(config, registry))
+    handlers = build_handlers(config, registry)
+    handlers.update(build_chat_handlers(registry, chat_backends, MyThreads(), AgentContext()))
+    server = DaemonServer(handlers)
     listener = await server.start(socket_path, group)
 
     stop = asyncio.Event()
@@ -127,6 +144,8 @@ async def serve(config_path: Path, socket_path: Path, tokens_dir: Path, group: s
         await rotation
         for backend in backends:
             await backend.aclose()
+        if discord is not None:
+            await discord.aclose()
         socket_path.unlink(missing_ok=True)
     return 0
 
