@@ -1,39 +1,168 @@
-"""The threads each agent started or posted in (Dev Spec §5.9; Story 2.3; R-19).
+"""The threads each agent started or posted in (Dev Spec §5.9; Story 2.3; R-19; D-104).
 
-`MyThreads.record(dev_name, msg)` is called with every post the agent makes. It keeps the
-post's thread root: `root_id` for a reply, the post's own ID for a new root post, which is the
-thread the agent started. `addressed_to` consults `roots(dev_name)` for "a reply to me".
+`MyThreads.record(dev_name, msg)` is called with every post the agent makes through the daemon
+(`send` and `dm`, after the backend accepted it). It keeps the post's thread root: `root_id`
+for a reply, the post's own ID for a new root post, which is the thread the agent started.
+`addressed_to` consults `roots(dev_name)` for "a reply to me".
 
-One daemon holds every agent on its host, so the store is keyed by Dev-Name. It lives in
-memory and keeps each agent's most recent `limit` roots, so a long-lived agent's set can't
-grow without bound.
+One daemon holds every agent on its host, so the store is keyed by Dev-Name. Each root carries
+`last_seen` (UTC), refreshed whenever the agent posts in that thread again.
+
+**Persisted (D-104).** The daemon's instance comes from `MyThreads.load(state_dir, ...)`, and
+every `add` saves the agent's set to `<state_dir>/threads/<dev>.json`, so "replies on my
+threads" survive a daemon restart. The file is `{"roots": {"<root_id>": "<iso8601>"}}`, mode
+`0600`, in a directory of mode `0700`, written atomically. `state_dir` is
+`/var/lib/crewchat`, the daemon's `StateDirectory`. Roots whose `last_seen` is older than
+`my_threads_retention_days` (`servers.toml`, default 90) are pruned on load and on save, and
+each agent keeps at most its most recent `limit` roots after that. A corrupt or unreadable
+file is logged once and treated as empty; it never stops the daemon.
+
+A `MyThreads()` built directly is in memory only (no `state_dir`): what the unit tests use.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 from collections import OrderedDict
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from crewchat.adapters.base import InboundMessage
+from crewchat.tokens import DIR_MODE, write_private_json
 
 DEFAULT_LIMIT = 10_000
+DEFAULT_RETENTION_DAYS = 90
+STATE_DIR = Path("/var/lib/crewchat")
+THREADS_SUBDIR = "threads"
+# A Dev-Name names a file here, so the same rule `register` enforces: no `/`, no leading dot.
+SAFE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+log = logging.getLogger("crewchat.threads")
+
+Clock = Callable[[], datetime]
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class MyThreads:
-    def __init__(self, limit: int = DEFAULT_LIMIT) -> None:
+    def __init__(
+        self,
+        limit: int = DEFAULT_LIMIT,
+        *,
+        state_dir: Path | None = None,
+        retention_days: int | None = None,
+        clock: Clock = utc_now,
+    ) -> None:
         if limit < 1:
             raise ValueError("limit must be at least 1")
+        if retention_days is not None and retention_days < 1:
+            raise ValueError("retention_days must be at least 1")
         self.limit = limit
-        self._roots: dict[str, OrderedDict[str, None]] = {}
+        self.retention_days = retention_days
+        self.clock = clock
+        self.state_dir = state_dir
+        # dev_name -> root_id -> last_seen, oldest first
+        self._roots: dict[str, OrderedDict[str, datetime]] = {}
 
+    # -- persistence ------------------------------------------------------------------------
+    @classmethod
+    def load(
+        cls,
+        state_dir: Path = STATE_DIR,
+        retention_days: int = DEFAULT_RETENTION_DAYS,
+        clock: Clock = utc_now,
+        *,
+        limit: int = DEFAULT_LIMIT,
+    ) -> MyThreads:
+        """The persisted store under `<state_dir>/threads/`, pruned by `retention_days`."""
+        store = cls(limit, state_dir=state_dir, retention_days=retention_days, clock=clock)
+        directory = store.threads_dir
+        assert directory is not None
+        directory.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+        os.chmod(directory, DIR_MODE)
+        for path in sorted(directory.glob("*.json")):
+            dev_name = path.stem
+            if not SAFE_NAME_RE.match(dev_name):
+                continue
+            roots = store._read(path)
+            if roots:
+                store._roots[dev_name] = roots
+                store._prune(dev_name)
+        return store
+
+    @property
+    def threads_dir(self) -> Path | None:
+        return None if self.state_dir is None else self.state_dir / THREADS_SUBDIR
+
+    def path(self, dev_name: str) -> Path | None:
+        directory = self.threads_dir
+        if directory is None or not SAFE_NAME_RE.match(dev_name):
+            return None
+        return directory / f"{dev_name}.json"
+
+    def _read(self, path: Path) -> OrderedDict[str, datetime]:
+        """One agent's file, oldest root first; a bad file is logged and read as empty."""
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            entries = raw["roots"]
+            if not isinstance(entries, dict):
+                raise ValueError("roots is not an object")
+            parsed: list[tuple[datetime, str]] = []
+            for root_id, stamp in entries.items():
+                if not isinstance(root_id, str) or not root_id or not isinstance(stamp, str):
+                    raise ValueError(f"bad entry {root_id!r}")
+                seen = datetime.fromisoformat(stamp)
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=UTC)
+                parsed.append((seen, root_id))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.error("ignoring unreadable thread set %s: %s", path, exc)
+            return OrderedDict()
+        parsed.sort()
+        return OrderedDict((root_id, seen) for seen, root_id in parsed)
+
+    def save(self, dev_name: str) -> None:
+        """Write `dev_name`'s set to its file, pruned first. A failed write is logged."""
+        path = self.path(dev_name)
+        if path is None:
+            return
+        self._prune(dev_name)
+        roots = self._roots.get(dev_name, OrderedDict())
+        data = {"roots": {root_id: seen.isoformat() for root_id, seen in roots.items()}}
+        try:
+            path.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+            write_private_json(path, data)
+        except OSError as exc:
+            log.error("cannot save the thread set for %s at %s: %s", dev_name, path, exc)
+
+    def _prune(self, dev_name: str) -> None:
+        """Drop roots past retention, then the oldest past `limit`."""
+        roots = self._roots.get(dev_name)
+        if roots is None:
+            return
+        if self.retention_days is not None:
+            cutoff = self.clock() - timedelta(days=self.retention_days)
+            for root_id in [r for r, seen in roots.items() if seen < cutoff]:
+                del roots[root_id]
+        while len(roots) > self.limit:
+            roots.popitem(last=False)
+
+    # -- the set ----------------------------------------------------------------------------
     def add(self, dev_name: str, root_id: str) -> None:
-        """Remember `root_id` as one of `dev_name`'s threads (most recent last)."""
+        """Remember `root_id` as one of `dev_name`'s threads, seen now (most recent last)."""
         if not root_id:
             return
         roots = self._roots.setdefault(dev_name, OrderedDict())
-        roots[root_id] = None
+        roots[root_id] = self.clock()
         roots.move_to_end(root_id)
-        while len(roots) > self.limit:
-            roots.popitem(last=False)
+        self._prune(dev_name)
+        self.save(dev_name)
 
     def record(self, dev_name: str, msg: InboundMessage) -> str:
         """Record a post `dev_name` made; return the thread root it was filed under."""
@@ -46,5 +175,11 @@ class MyThreads:
         return set(self._roots.get(dev_name, ()))
 
     def forget(self, dev_name: str) -> None:
-        """Drop an agent's threads (it left rotation)."""
+        """Drop an agent's threads (it left rotation), and its file."""
         self._roots.pop(dev_name, None)
+        path = self.path(dev_name)
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.error("cannot delete the thread set %s: %s", path, exc)

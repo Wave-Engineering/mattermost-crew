@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +12,14 @@ from typing import Any
 import pytest
 from crewchat.adapters.base import InboundMessage
 from crewchat.adapters.mattermost import MattermostBackend, event_dm
-from crewchat.addressing import addressed_to, is_broadcast, is_direct_address, tokens
+from crewchat.addressing import (
+    addressed_to,
+    group_tokens,
+    is_broadcast,
+    is_direct_address,
+    team_scope,
+    tokens,
+)
 from crewchat.registry import Registration
 from crewchat.threads import MyThreads
 
@@ -88,12 +96,51 @@ def test_tokens_skip_email_and_ignore_case() -> None:
 def test_crew_and_team_tokens() -> None:
     r = reg()
     assert addressed_to(msg("@oaw anyone?"), r, set())
-    assert addressed_to(msg("@waveteam anyone?"), r, set())
-    assert addressed_to(msg("@WaveTeam anyone?"), r, set())
+    assert addressed_to(msg("@waveteam anyone?"), r, set(), author_crew="oaw")
+    assert addressed_to(msg("@WaveTeam anyone?"), r, set(), author_crew="oaw")
+    assert addressed_to(msg("@WaveTeam anyone?", backend=DISCORD), r, set())
     assert not addressed_to(msg("@frogstar anyone?"), r, set())
     # No Dev-Team: only the crew token is ours.
-    assert not addressed_to(msg("@waveteam anyone?"), reg(dev_team=""), set())
+    assert not addressed_to(msg("@waveteam anyone?"), reg(dev_team=""), set(), author_crew="oaw")
+    assert not addressed_to(msg("@waveteam anyone?", backend=DISCORD), reg(dev_team=""), set())
     assert addressed_to(msg("@oaw anyone?"), reg(dev_team=""), set())
+
+
+def test_team_scope_policy() -> None:
+    """D-103: Discord's team trust is the backend; every Mattermost server's is the crew."""
+    assert team_scope("discord") == "backend"
+    assert team_scope("discord:x") == "backend"
+    assert team_scope(MM) == "crew"
+    assert team_scope("mattermost:other") == "crew"
+
+
+def test_team_token_discord_no_author_check() -> None:
+    """On Discord a non-agent author's `@<dev-team>` reaches the team, with no crew known."""
+    r = reg(dev_team="oaw", crew="frogstar")
+    m = msg("@oaw who's around?", backend=DISCORD)
+    assert addressed_to(m, r, set(), author_crew=None)
+    assert "oaw" in group_tokens(r, DISCORD, None)
+
+
+def test_team_token_mattermost_fails_closed() -> None:
+    """On Mattermost the team token needs an author of the agent's own crew (D-103)."""
+    r = reg(dev_team="waveteam", crew="oaw")
+    m = msg("@waveteam who's around?", backend=MM)
+    assert not addressed_to(m, r, set(), author_crew=None)
+    assert not addressed_to(m, r, set())  # the Phase 2 default
+    assert addressed_to(m, r, set(), author_crew="oaw")
+    assert not addressed_to(m, r, set(), author_crew="frogstar")
+    assert group_tokens(r, MM, None) == {"oaw"}
+    # The crew token itself is never gated.
+    assert addressed_to(msg("@oaw ping", backend=MM), r, set(), author_crew=None)
+
+
+def test_avatar_never_addresses() -> None:
+    r = dataclasses.replace(reg(), dev_avatar="lighthouse")
+    for backend in (MM, DISCORD):
+        m = msg("@lighthouse hello", backend=backend)
+        assert not addressed_to(m, r, set(), author_crew="oaw")
+        assert not is_direct_address(m, r, set())
 
 
 def test_reply_to_me_by_thread_root() -> None:
@@ -132,9 +179,10 @@ def test_direct_address_excludes_broadcast_and_crew_tokens() -> None:
         ("@all look", DISCORD),
         ("@oaw look", MM),
         ("@waveteam look", MM),
+        ("@waveteam look", DISCORD),
     ]:
         m = msg(text, backend=backend)
-        assert addressed_to(m, r, mine), text
+        assert addressed_to(m, r, mine, author_crew="oaw"), text
         assert not is_direct_address(m, r, mine), text
 
 

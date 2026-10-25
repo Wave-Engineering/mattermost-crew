@@ -18,9 +18,11 @@ and the daemon acts on the agent's behalf with what it holds itself.
   `off_default: true`, and the daemon logs `off-default: <dev> <backend>`.
 - **Replies (R-12).** The shim remembers the backend of every post it has seen. A `chat_send`
   with `thread` goes to that thread's backend, whatever the default is.
-- **Register.** At start, `register{dev_name, crew, session_id}` from the identity file (`crew`
-  omitted when the file has none); again every 24 hours, and before any call when the last one
-  is older than that, so a long-lived session never ages out (R-30). A daemon that answers
+- **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id}` from the
+  identity file (`crew` omitted when the file has none). `dev_team` and `dev_avatar` fall back
+  to the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). It
+  registers again every 24 hours, and before any call when the last one is older than that,
+  so a long-lived session never ages out (R-30). A daemon that answers
   `not_registered` (it restarted) gets a fresh `register` and the call is retried once.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
@@ -35,6 +37,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +73,8 @@ POLL_INTERVAL_S = 5.0
 DISCORD = "discord"
 MAX_KNOWN_POSTS = 10_000
 IDENTITY_FILE = Path(".claude/agent-identity.json")
+# The legacy identity file lives here as `claude-agent-<md5(repo_root)>.json` (transition).
+LEGACY_IDENTITY_DIR = Path("/tmp")
 SEED_FILE = Path(".claude/reseed-revive.md")
 SQUAWKS_FILE = Path(".claude/sqtk-mine.json")
 # CLAUDE_CODE_ENTRYPOINT values of a session with a human at the keyboard.
@@ -232,6 +237,7 @@ class Shim:
         remote_for: RemoteFor = git_remote,
         session_id: str | None = None,
         environ: Mapping[str, str] | None = None,
+        legacy_dir: Path = LEGACY_IDENTITY_DIR,
     ) -> None:
         env = os.environ if environ is None else environ
         self.repo_root = repo_root
@@ -242,7 +248,9 @@ class Shim:
         self.squawk = squawk
         self.remote_for = remote_for
         self.session_id = session_id or env.get("CLAUDE_CODE_SESSION_ID") or str(uuid.uuid4())
+        self.legacy_dir = legacy_dir
         self.identity = self._load_identity()
+        self.legacy_identity = self._load_legacy_identity()
         dev_name = self.identity.get("dev_name")
         if not isinstance(dev_name, str) or not dev_name:
             raise ShimError(f"{repo_root / IDENTITY_FILE} names no dev_name; run /name first")
@@ -267,6 +275,28 @@ class Shim:
             raise ShimError(f"{path} is not a JSON object")
         return raw
 
+    def legacy_identity_path(self) -> Path:
+        """`/tmp/claude-agent-<md5(repo_root)>.json`, the md5 of the absolute repo-root path
+        string, as `/name` keys it."""
+        digest = hashlib.md5(str(self.repo_root.absolute()).encode(), usedforsecurity=False)
+        return self.legacy_dir / f"claude-agent-{digest.hexdigest()}.json"
+
+    def _load_legacy_identity(self) -> dict[str, Any]:
+        """The legacy identity file, or `{}` when it is absent or unreadable."""
+        try:
+            raw = json.loads(self.legacy_identity_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def identity_field(self, key: str) -> str:
+        """`key` from the identity file, then the legacy `/tmp` file, then `""` (D-103)."""
+        for source in (self.identity, self.legacy_identity):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
     @property
     def needs_list(self) -> str | None:
         value = self.registration.get("needs_list")
@@ -274,7 +304,12 @@ class Shim:
 
     # -- register -------------------------------------------------------------------------------
     async def register(self) -> dict[str, Any]:
-        args: dict[str, Any] = {"dev_name": self.dev_name, "session_id": self.session_id}
+        args: dict[str, Any] = {
+            "dev_name": self.dev_name,
+            "session_id": self.session_id,
+            "dev_team": self.identity_field("dev_team"),
+            "dev_avatar": self.identity_field("dev_avatar"),
+        }
         crew = self.identity.get("crew")
         if isinstance(crew, str) and crew:
             args["crew"] = crew

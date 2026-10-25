@@ -7,6 +7,7 @@ daemon would. Time is an injected clock.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -91,6 +92,7 @@ def make_repo(tmp_path: Path, **identity: Any) -> Path:
     root = tmp_path / "repo"
     (root / ".claude").mkdir(parents=True)
     ident = {"dev_name": DEV, "dev_team": "oaw", "dev_avatar": "x", **identity}
+    ident = {k: v for k, v in ident.items() if v is not None}  # None: leave the field out
     (root / ".claude" / "agent-identity.json").write_text(json.dumps(ident))
     return root
 
@@ -114,6 +116,7 @@ def make_shim(
         remote_for=lambda _root: None,
         session_id="s1",
         environ={},
+        legacy_dir=tmp_path / "no-legacy",
     )
 
 
@@ -127,13 +130,68 @@ def test_register_sends_identity_and_omits_missing_crew(tmp_path: Path) -> None:
     daemon = FakeDaemon()
     shim = make_shim(tmp_path, daemon)
     asyncio.run(shim.start())
-    assert daemon.of("register") == [{"dev_name": DEV, "session_id": "s1"}]
+    ident = {"dev_name": DEV, "session_id": "s1", "dev_team": "oaw", "dev_avatar": "x"}
+    assert daemon.of("register") == [ident]
     assert shim.needs_list == "bj:needs"
 
     daemon2 = FakeDaemon()
     shim2 = make_shim(tmp_path / "b", daemon2, crew="wave")
     asyncio.run(shim2.start())
-    assert daemon2.of("register") == [{"dev_name": DEV, "session_id": "s1", "crew": "wave"}]
+    assert daemon2.of("register") == [{**ident, "crew": "wave"}]
+
+
+def test_shim_register_reads_identity(tmp_path: Path) -> None:
+    """D-103: dev_team/dev_avatar from agent-identity.json, then the legacy /tmp file, then ""."""
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+
+    def frame(sub: str, **identity: Any) -> dict[str, Any]:
+        daemon = FakeDaemon()
+        root = make_repo(tmp_path / sub, **identity)
+        shim = Shim(
+            root,
+            daemon,
+            clock=Clock(),
+            headless=False,
+            defaults_file=tmp_path / sub / "chat-defaults.json",
+            squawk=Squawks(),
+            remote_for=lambda _root: None,
+            session_id="s1",
+            environ={},
+            legacy_dir=legacy_dir,
+        )
+        asyncio.run(shim.register())
+        (args,) = daemon.of("register")
+        return args
+
+    # (1) The identity file, with the field names /name writes.
+    got = frame("a", dev_team="oaw", dev_avatar="📡")
+    assert (got["dev_team"], got["dev_avatar"]) == ("oaw", "📡")
+
+    # (2) Missing there: the legacy /tmp/claude-agent-<md5(repo_root)>.json.
+    root_b = (tmp_path / "b" / "repo").absolute()
+    digest = hashlib.md5(str(root_b).encode()).hexdigest()
+    (legacy_dir / f"claude-agent-{digest}.json").write_text(
+        json.dumps({"dev_name": DEV, "dev_team": "legacy-team", "dev_avatar": "🦊"})
+    )
+    got = frame("b", dev_team=None, dev_avatar=None)
+    assert (got["dev_team"], got["dev_avatar"]) == ("legacy-team", "🦊")
+
+    # (3) Neither: "".
+    got = frame("c", dev_team=None, dev_avatar=None)
+    assert (got["dev_team"], got["dev_avatar"]) == ("", "")
+
+    # The daily re-register sends them too.
+    daemon, clock = FakeDaemon(), Clock()
+    shim = make_shim(tmp_path / "d", daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        clock.now += timedelta(hours=24)
+        await shim.tick()
+
+    asyncio.run(scenario())
+    assert [(a["dev_team"], a["dev_avatar"]) for a in daemon.of("register")] == [("oaw", "x")] * 2
 
 
 def test_shim_reregisters_daily(tmp_path: Path) -> None:
