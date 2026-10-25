@@ -22,8 +22,9 @@ import sys
 import tomllib
 from typing import Any
 
-import httpx
 import pytest
+
+from tests.integration.mmhttp import mm_request
 
 AGENT_USER = os.environ.get("AGENT_USER", "agent")
 TOKENS_DIR = "/var/lib/crewchat/tokens"
@@ -166,11 +167,7 @@ def test_minted_token_works(
     """R-03, R-05: the broker created the bot account, and the token the daemon holds works."""
     crew = installed["servers"]["default_crew"]
     for held in registered["file"]["servers"].values():
-        resp = httpx.get(
-            f"{mattermost.api}/users/me",
-            headers={"Authorization": f"Bearer {held['token']}"},
-            timeout=15,
-        )
+        resp = mm_request(mattermost, "GET", "/users/me", token=held["token"])
         assert resp.status_code == 200, resp.text
         me = resp.json()
         assert me["username"] == f"{registered['dev']}.{crew}"
@@ -186,12 +183,7 @@ def test_patched_role_held_only_by_configured_brokers(
     holders: dict[str, set[str]] = {}
     page = 0
     while True:
-        resp = httpx.get(
-            f"{mattermost.api}/users",
-            headers=mattermost.auth_headers,
-            params={"page": page, "per_page": 200},
-            timeout=15,
-        )
+        resp = mm_request(mattermost, "GET", "/users", params={"page": page, "per_page": 200})
         assert resp.status_code == 200, resp.text
         batch = resp.json()
         for user in batch:

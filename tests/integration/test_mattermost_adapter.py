@@ -23,7 +23,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 from crewbroker import mint
 from crewbroker.config import CrewConfig
@@ -35,19 +34,15 @@ from crewchat.config import parse_config
 from crewchat.registry import Registry
 from crewchat.tokens import BrokerClient, BrokerError, Rotator, SwitchCache, TokenStore
 
+from tests.integration.mmhttp import mm_request
+
 ROOT = Path(__file__).resolve().parents[2]
 ROLE_PATCH = ROOT / "scripts" / "ci" / "broker-role-patch.sh"
 SID = "ci"
 
 
-def admin(mattermost: Any, method: str, path: str, **kw: Any) -> httpx.Response:
-    return httpx.request(
-        method, f"{mattermost.api}{path}", headers=mattermost.auth_headers, timeout=15, **kw
-    )
-
-
 def mkuser(mattermost: Any, username: str) -> str:
-    resp = admin(
+    resp = mm_request(
         mattermost,
         "POST",
         "/users",
@@ -82,9 +77,9 @@ def setup(mattermost: Any) -> Iterator[dict[str, str]]:
     partner_id = mkuser(mattermost, f"partner-ad{run}")
     env = {**os.environ, "MM_URL": mattermost.url, "MM_ADMIN_TOKEN": mattermost.admin_token}
     subprocess.run([str(ROLE_PATCH), broker_id], env=env, check=True)
-    resp = admin(mattermost, "POST", f"/users/{broker_id}/tokens", json={"description": "it"})
+    resp = mm_request(mattermost, "POST", f"/users/{broker_id}/tokens", json={"description": "it"})
     assert resp.status_code == 200, resp.text
-    team = admin(
+    team = mm_request(
         mattermost,
         "POST",
         "/teams",
@@ -92,14 +87,14 @@ def setup(mattermost: Any) -> Iterator[dict[str, str]]:
     )
     assert team.status_code == 201, team.text
     team_id = team.json()["id"]
-    channel = admin(
+    channel = mm_request(
         mattermost,
         "POST",
         "/channels",
         json={"team_id": team_id, "name": f"crew-ad{run}", "display_name": "crew", "type": "O"},
     )
     assert channel.status_code == 201, channel.text
-    me = admin(mattermost, "GET", "/users/me").json()
+    me = mm_request(mattermost, "GET", "/users/me").json()
     yield {
         "crew": f"ad{run}",
         "broker_id": broker_id,
@@ -110,7 +105,7 @@ def setup(mattermost: Any) -> Iterator[dict[str, str]]:
         "admin_id": me["id"],
     }
     # Not a configured broker: give the patched role back (IT-01 asserts on it, R-06).
-    resp = admin(mattermost, "PUT", f"/users/{broker_id}/roles", json={"roles": "system_user"})
+    resp = mm_request(mattermost, "PUT", f"/users/{broker_id}/roles", json={"roles": "system_user"})
     assert resp.status_code == 200, resp.text
 
 
@@ -160,16 +155,16 @@ class Daemon:
     async def register(self, dev: str) -> str:
         """Register `dev` and seat its bot in the module's team and channel. Its user ID."""
         reg = await self.registry.register(dev, None, "it-session")
-        found = admin(self.mattermost, "GET", f"/users/username/{reg.account}")
+        found = mm_request(self.mattermost, "GET", f"/users/username/{reg.account}")
         user_id = str(found.json()["id"])
-        resp = admin(
+        resp = mm_request(
             self.mattermost,
             "POST",
             f"/teams/{self.setup['team_id']}/members",
             json={"team_id": self.setup["team_id"], "user_id": user_id},
         )
         assert resp.status_code == 201, resp.text
-        resp = admin(
+        resp = mm_request(
             self.mattermost,
             "POST",
             f"/channels/{self.setup['channel_id']}/members",
@@ -222,7 +217,9 @@ class Inbox:
 
 
 def as_admin_post(mattermost: Any, channel_id: str, message: str) -> dict[str, Any]:
-    resp = admin(mattermost, "POST", "/posts", json={"channel_id": channel_id, "message": message})
+    resp = mm_request(
+        mattermost, "POST", "/posts", json={"channel_id": channel_id, "message": message}
+    )
     assert resp.status_code == 201, resp.text
     data: dict[str, Any] = resp.json()
     return data
@@ -306,11 +303,7 @@ def test_it02_rotation_reconnects_websocket_and_loses_no_event(
             await inbox.connected(new_token)
             assert agent.ws_token == new_token and agent.connects == 2
             # The old token is revoked; the websocket on it would have gone deaf (§4.8).
-            gone = httpx.get(
-                f"{mattermost.api}/users/me",
-                headers={"Authorization": f"Bearer {old_token}"},
-                timeout=15,
-            )
+            gone = mm_request(mattermost, "GET", "/users/me", token=old_token)
             assert gone.status_code == 401
 
             after = await d.backend.send("talker", channel, "after rotation")

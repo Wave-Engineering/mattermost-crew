@@ -18,6 +18,10 @@ from typing import Literal
 
 import pytest
 
+from tests.integration.mmhttp import mm_request
+
+__all__ = ["MattermostServer", "mattermost_from_env", "mm_request"]
+
 NativeTokenExpiry = Literal["absent", "present"]
 
 SKIP_REASON = (

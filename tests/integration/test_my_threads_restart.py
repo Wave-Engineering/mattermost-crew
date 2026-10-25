@@ -21,10 +21,10 @@ from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.server import DaemonServer, build_handlers
 from crewchat.threads import MyThreads
 
+from tests.integration.mmhttp import mm_request
 from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` is a fixture)
     Daemon,
     Inbox,
-    admin,
     setup,
 )
 
@@ -89,7 +89,7 @@ def test_it24_my_threads_survive_restart(
         inbox = Inbox(d2.backend, "babel")
         try:
             await inbox.connected()
-            resp = admin(
+            resp = mm_request(
                 mattermost,
                 "POST",
                 "/posts",
