@@ -9,6 +9,9 @@
 
     [discord]
     enabled = true
+    screamhole_url = "http://127.0.0.1:8787"   # required when enabled, for `crewchat serve`
+    credential = "/etc/crewchat/discord.credential"  # optional; this is the default
+    guild_id = "<the guild's id>"               # optional: the channels the stream polls
 
     [crews.oaw]
     needs_list = "bj:needs"              # the sqtk list `register` returns (R-11)
@@ -31,6 +34,7 @@ from typing import Any
 
 CONFIG_PATH = Path("/etc/crewchat/servers.toml")
 DEFAULT_BROKER_TIMEOUT_S = 2.0
+DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 CREW_KEYS = {"needs_list"}
 
@@ -69,6 +73,9 @@ class ServersConfig:
     default_crew: str
     crews: dict[str, CrewEntry]
     broker_timeout_s: float = DEFAULT_BROKER_TIMEOUT_S
+    discord_screamhole_url: str | None = None
+    discord_credential: Path = DISCORD_CREDENTIAL_PATH
+    discord_guild_id: str | None = None
 
     def broker_entries(self) -> list[BrokerEntry]:
         return [b for crew in self.crews.values() for b in crew.brokers.values()]
@@ -98,6 +105,15 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
     enabled = discord.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ConfigError(f"{source}: discord.enabled must be true or false")
+    screamhole_url = discord.get("screamhole_url")
+    if screamhole_url is not None and (not isinstance(screamhole_url, str) or not screamhole_url):
+        raise ConfigError(f"{source}: discord.screamhole_url must be a non-empty string")
+    credential = discord.get("credential", str(DISCORD_CREDENTIAL_PATH))
+    if not isinstance(credential, str) or not credential.startswith("/"):
+        raise ConfigError(f"{source}: discord.credential must be an absolute path")
+    guild_id = discord.get("guild_id")
+    if guild_id is not None and (not isinstance(guild_id, str) or not guild_id.isdigit()):
+        raise ConfigError(f"{source}: discord.guild_id must be a snowflake string")
 
     timeout = raw.get("broker_timeout_s", DEFAULT_BROKER_TIMEOUT_S)
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
@@ -118,6 +134,9 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
         default_crew=default_crew,
         crews=crews,
         broker_timeout_s=float(timeout),
+        discord_screamhole_url=screamhole_url,
+        discord_credential=Path(credential),
+        discord_guild_id=guild_id,
     )
 
 
