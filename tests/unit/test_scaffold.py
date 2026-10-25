@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 import importlib
+import tomllib
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 
 INTEGRATION_CONFTEST = Path(__file__).resolve().parents[1] / "integration" / "conftest.py"
+ROOT_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 
-@pytest.mark.parametrize("module", ["crewchat", "crewbroker", "crewchat_clients"])
-def test_packages_import(module: str) -> None:
+@pytest.mark.parametrize(
+    ("module", "dist"),
+    [
+        ("crewchat", "crewchat"),
+        ("crewbroker", "crewbroker"),
+        ("crewchat_clients", "crewchat-clients"),
+    ],
+)
+def test_packages_import(module: str, dist: str) -> None:
+    # Each package's __version__ matches its installed metadata, and every package carries the
+    # workspace's release version (the root pyproject, which is not installed), so one release
+    # can't ship mixed versions.
+    release = tomllib.loads(ROOT_PYPROJECT.read_text())["project"]["version"]
     mod = importlib.import_module(module)
-    assert mod.__version__ == "0.1.0"
+    assert mod.__version__ == version(dist) == release
 
 
 def test_mattermost_fixture_skips_without_env(
