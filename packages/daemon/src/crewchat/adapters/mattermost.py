@@ -32,7 +32,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast
@@ -42,10 +42,14 @@ import httpx
 import websockets.asyncio.client
 from mcp_server_mattermost.client import MattermostClient, create_http_client
 from mcp_server_mattermost.config import AuthMode, Settings
-from mcp_server_mattermost.exceptions import AuthenticationError, MattermostAPIError
+from mcp_server_mattermost.exceptions import (
+    AuthenticationError,
+    MattermostAPIError,
+    NotFoundError,
+)
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
-from crewchat.adapters.base import InboundMessage
+from crewchat.adapters.base import Attachment, Embed, InboundMessage, NotFound
 from crewchat.protocol import PROTO
 from crewchat.tokens import Unauthorized
 
@@ -127,6 +131,12 @@ def post_proto(props: Any) -> int:
 
 def post_kiosk(props: Any) -> bool:
     return isinstance(props, dict) and _int_prop(props.get("crew_kiosk")) == 1
+
+
+def embed_attachment(embed: Embed) -> dict[str, str]:
+    """Today's Discord embed as a Mattermost message attachment, which both editions render
+    (`props.attachments: [{title, text}]`, CT-01)."""
+    return {"title": embed.title, "text": embed.body}
 
 
 def event_mentions(data: Mapping[str, Any]) -> list[str]:
@@ -320,16 +330,80 @@ class MattermostBackend:
         return [await self.message(client, p) for p in ordered]
 
     # -- the contract -----------------------------------------------------------------------
+    async def _post(
+        self,
+        client: MattermostClient,
+        channel: str,
+        text: str,
+        thread: str | None,
+        attachments: Sequence[Attachment],
+        embed: Embed | None,
+    ) -> InboundMessage:
+        """Upload `attachments` with the agent's own token (`POST /api/v4/files`), then post
+        with their `file_ids`; `embed` is a message attachment (CT-01)."""
+        file_ids: list[str] = []
+        for att in attachments:
+            uploaded = await client.upload_file(channel, str(att.path), filename=att.name)
+            infos = uploaded.get("file_infos") or []
+            if not infos or not isinstance(infos[0], dict) or "id" not in infos[0]:
+                raise MattermostAPIError(f"upload of {att.name} returned no file id")
+            file_ids.append(str(infos[0]["id"]))
+        props: dict[str, Any] = {"crew_proto": PROTO}
+        if embed is not None:
+            props["attachments"] = [embed_attachment(embed)]
+        post = await client.create_post(
+            channel, text, root_id=thread, file_ids=file_ids or None, props=props
+        )
+        if file_ids and len(post.get("file_ids") or []) < len(file_ids):
+            raise MattermostAPIError("the post was made without its attachments")
+        return await self.message(client, post)
+
     async def send(
-        self, dev_name: str, channel: str, text: str, thread: str | None = None
+        self,
+        dev_name: str,
+        channel: str,
+        text: str,
+        thread: str | None = None,
+        *,
+        attachments: Sequence[Attachment] = (),
+        embed: Embed | None = None,
     ) -> InboundMessage:
         async def request(client: MattermostClient) -> InboundMessage:
-            post = await client.create_post(
-                channel, text, root_id=thread, props={"crew_proto": PROTO}
-            )
+            return await self._post(client, channel, text, thread, attachments, embed)
+
+        return await self._call(dev_name, request)
+
+    async def read_one(self, dev_name: str, channel: str, post_id: str) -> InboundMessage:
+        """One post, `GET /api/v4/posts/{id}`; one in another channel is not found."""
+
+        async def request(client: MattermostClient) -> InboundMessage:
+            try:
+                post = await client.get_post(post_id)
+            except NotFoundError as exc:
+                raise NotFound(f"post {post_id}") from exc
+            if channel and str(post.get("channel_id", "")) != channel:
+                raise NotFound(f"post {post_id} in {channel}")
             return await self.message(client, post)
 
         return await self._call(dev_name, request)
+
+    async def has_post(self, dev_name: str, post_id: str) -> bool:
+        """`GET /api/v4/posts/{id}` as the agent answers 200 (R-12's probe)."""
+
+        async def request(client: MattermostClient) -> bool:
+            try:
+                post = await client.get_post(post_id)
+            except AuthenticationError:
+                raise  # the store's refresh path
+            except MattermostAPIError:
+                return False  # 404, or a 403 on a channel the agent can't see
+            return str(post.get("id", "")) == post_id
+
+        try:
+            return await self._call(dev_name, request)
+        except (KeyError, Unauthorized, MattermostAPIError, httpx.HTTPError) as exc:
+            log.warning("thread probe %s on %s: %s", post_id, self.server_id, exc)
+            return False
 
     async def read(
         self, dev_name: str, channel: str, since: float | None = None, limit: int | None = None
@@ -350,7 +424,15 @@ class MattermostBackend:
 
         return await self._call(dev_name, request)
 
-    async def dm(self, dev_name: str, to: str, text: str) -> InboundMessage:
+    async def dm(
+        self,
+        dev_name: str,
+        to: str,
+        text: str,
+        *,
+        attachments: Sequence[Attachment] = (),
+        embed: Embed | None = None,
+    ) -> InboundMessage:
         """`to` is a username (with or without `@`) or a user ID."""
         me = await self.user_id(dev_name)
         name = to.removeprefix("@")
@@ -361,10 +443,7 @@ class MattermostBackend:
             else:
                 other = str((await client.get_user_by_username(name))["id"])
             channel = await client.create_direct_channel([me, other])
-            post = await client.create_post(
-                str(channel["id"]), text, props={"crew_proto": PROTO}
-            )
-            return await self.message(client, post)
+            return await self._post(client, str(channel["id"]), text, None, attachments, embed)
 
         return await self._call(dev_name, request)
 

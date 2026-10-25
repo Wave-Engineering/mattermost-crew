@@ -68,7 +68,7 @@ def test_proto_2_unsupported_and_proto_0_handled(daemon: Any, short_dir: Path) -
     )
     assert replies[0] == {"proto": 1, "id": "new", "ok": False, "error": "unsupported"}
     assert replies[1]["ok"] is True
-    assert set(replies[1]["result"]["backends"]) == {"dev", "discord"}
+    assert set(replies[1]["result"]["backends"]) == {"mattermost:dev", "discord"}
     assert replies[2]["ok"] is False and replies[2]["error"].startswith("bad_request")
 
 
@@ -90,7 +90,7 @@ def test_register_over_the_socket_returns_no_token(daemon: Any, short_dir: Path)
     )
     assert replies[0]["result"] == {
         "account": "babel.oaw",
-        "backends": ["dev", "discord"],
+        "backends": ["mattermost:dev", "discord"],
         "needs_list": "bj:needs",
     }
     token = daemon.store.token_for("babel", "dev")
@@ -189,3 +189,38 @@ def test_handler_crash_is_internal(daemon: Any) -> None:
     server = DaemonServer({"boom": boom})
     reply = asyncio.run(server.handle_line(b'{"proto":1,"id":"x","op":"boom"}'))
     assert reply == {"proto": 1, "id": "x", "ok": False, "error": "internal"}
+
+
+def test_backend_name_single_form(daemon: Any) -> None:
+    """Story 2.4c (§5.4): one backend-name form on the socket. `register` and `health` answer
+    `mattermost:<id>`; a bare server id on a chat frame is `bad_request`, never translated."""
+    backend = _Backend()
+    handlers = build_handlers(daemon.config, daemon.registry)
+    handlers.update(
+        build_chat_handlers(daemon.registry, {backend.name: backend}, MyThreads(), AgentContext())
+    )
+    server = DaemonServer(handlers)
+    got = call(server, "register", dev_name="babel", session_id="s1")
+    assert got["result"]["backends"] == ["mattermost:dev", "discord"]
+    assert set(call(server, "health")["result"]["backends"]) == {"mattermost:dev", "discord"}
+
+    base = {"dev_name": "babel", "to": "town", "text": "hi"}
+    for bare in ("dev", "discord:900000000000000001", "Mattermost:dev"):
+        got = call(server, "send", **base, backend=bare)
+        assert got["ok"] is False and got["error"].startswith("bad_request"), bare
+    assert backend.n == 0  # nothing reached the backend
+    ok = call(server, "send", **base, backend="mattermost:dev")
+    assert ok["ok"] is True and ok["result"]["backend"] == "mattermost:dev"
+
+
+def test_health_reports_a_backend_that_answers_for_itself(daemon: Any) -> None:
+    """D-106: Discord's entry comes from the adapter, `degraded` while scream-hole is down."""
+
+    class Source:
+        async def health(self) -> dict[str, Any]:
+            return {"state": "degraded", "since": "t", "detail": "scream-hole unhealthy"}
+
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry, {"discord": Source()}))
+    backends = call(server, "health")["result"]["backends"]
+    assert backends["discord"]["state"] == "degraded"
+    assert backends["mattermost:dev"]["state"] == "configured"

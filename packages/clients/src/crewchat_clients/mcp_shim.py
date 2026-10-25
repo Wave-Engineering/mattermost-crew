@@ -1,5 +1,5 @@
 """The thin MCP shim: the `chat_*` tools over the crewchat daemon's socket (Dev Spec §5.5;
-Story 2.4; R-09 to R-13, R-15).
+Stories 2.4, 2.4c; R-09 to R-13, R-15).
 
 The shim is a stdio MCP server that runs in the agent's session, as the agent's user. It holds
 **no credentials** (R-08): every chat tool forwards one frame to `/run/crewchat/crewchat.sock`,
@@ -16,8 +16,17 @@ and the daemon acts on the agent's behalf with what it holds itself.
   Discord fallback.
 - **Off-default (R-13).** A call that names a backend other than the default is sent with
   `off_default: true`, and the daemon logs `off-default: <dev> <backend>`.
-- **Replies (R-12).** The shim remembers the backend of every post it has seen. A `chat_send`
-  with `thread` goes to that thread's backend, whatever the default is.
+- **Replies (R-12).** The shim keeps no map of posts to backends. A `chat_send` with
+  `thread` (and `chat_thread`, `chat_react`) that names no backend asks the daemon
+  (`thread_backend`), so the reply goes to that thread's backend whatever the default is, and
+  across a restart of either side. A post the daemon can't place fails loudly; it never falls
+  back to the default.
+- **Backend names.** One form, as `register` lists them and every frame carries them:
+  `mattermost:<server-id>` and `discord` (§5.4).
+- **Attachments and embeds (R-15).** `chat_send` and `chat_dm` take `attach_path` and `embed`
+  (`title:body`). The shim reads the file as the agent's user and streams it to the daemon in
+  `upload` chunks that each fit a frame, then names the upload in the post's `attachments`. A
+  file over 8 MiB, or one the daemon refuses, fails the call loudly before anything is posted.
 - **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id}` from the
   identity file (`crew` omitted when the file has none). `dev_team` and `dev_avatar` fall back
   to the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). It
@@ -28,23 +37,28 @@ and the daemon acts on the agent's behalf with what it holds itself.
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
   squawk records, at start and whenever they change.
-- **Aliases (R-15).** `disc_send`, `disc_read`, `disc_thread`, `disc_dm` and `disc_react` map
-  to the `chat_*` tool with `backend="discord"`. Each logs one deprecation warning per session.
+- **Aliases (R-15).** Every `disc_*` tool in today's kit takes today's args and maps to
+  `backend="discord"`: `disc_send` (with `attach_path` and `embed`) and `disc_read` (with
+  `message_id`) to `chat_send` and `chat_read`; `disc_list`, `disc_resolve`,
+  `disc_create_channel` and `disc_create_thread` to the daemon's Discord ops. `disc_thread`,
+  `disc_dm` and `disc_react` stay from Story 2.4. Each logs one deprecation warning per
+  session.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
 import logging
 import os
+import stat
 import subprocess
 import sys
 import uuid
-from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -71,7 +85,12 @@ CALL_TIMEOUT_S = 30.0
 REGISTER_EVERY = timedelta(hours=24)
 POLL_INTERVAL_S = 5.0
 DISCORD = "discord"
-MAX_KNOWN_POSTS = 10_000
+DISC_READ_LIMIT = 20  # today's disc_read default
+# An attachment goes to the daemon in `upload` chunks (§5.4). The daemon's frames are at most
+# 64 KiB; 45 KiB of raw bytes is 60 KiB of base64, leaving room for the frame around it.
+UPLOAD_CHUNK_BYTES = 45 * 1024
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # the daemon's cap on one upload
+MAX_UPLOAD_NAME = 255
 IDENTITY_FILE = Path(".claude/agent-identity.json")
 # The legacy identity file lives here as `claude-agent-<md5(repo_root)>.json` (transition).
 LEGACY_IDENTITY_DIR = Path("/tmp")
@@ -259,7 +278,6 @@ class Shim:
         self.registration: dict[str, Any] = {}
         self._brief = _FileState()
         self._squawks = _FileState()
-        self._posts: OrderedDict[str, Backend] = OrderedDict()  # post ID -> its backend
         self._warned: set[str] = set()
         self._squawked: set[str] = set()
         self._lock = asyncio.Lock()
@@ -320,11 +338,10 @@ class Shim:
         return result
 
     def backends(self) -> list[str]:
-        """The agent's backends, as calls name them: `register` lists a Mattermost server by
-        its id, and a call names it `mattermost:<server-id>`."""
+        """The agent's backends, as `register` lists them: the one form on the socket
+        (`mattermost:<server-id>`, `discord`; §5.4). Nothing is translated."""
         value = self.registration.get("backends")
-        names = [b for b in value if isinstance(b, str)] if isinstance(value, list) else []
-        return [b if b == DISCORD or ":" in b else f"mattermost:{b}" for b in names]
+        return [b for b in value if isinstance(b, str)] if isinstance(value, list) else []
 
     def register_due(self) -> bool:
         return self.registered_at is None or self.clock() - self.registered_at >= REGISTER_EVERY
@@ -396,24 +413,25 @@ class Shim:
                 await self.sync_files(force=True)
             return await self.transport(op, args)
 
-    def _remember(self, post_id: Any, backend: Backend) -> None:
-        if not isinstance(post_id, str) or not post_id:
-            return
-        self._posts[post_id] = backend
-        self._posts.move_to_end(post_id)
-        while len(self._posts) > MAX_KNOWN_POSTS:
-            self._posts.popitem(last=False)
-
-    def _remember_messages(self, result: Mapping[str, Any], backend: Backend) -> None:
-        msgs = result.get("messages")
-        for msg in msgs if isinstance(msgs, list) else []:
-            if isinstance(msg, dict):
-                self._remember(msg.get("post_id"), backend)
-                self._remember(msg.get("root_id"), backend)
-
-    def backend_of(self, post_id: str) -> Backend | None:
-        """The backend of a post the shim has seen (sent, read or in a thread)."""
-        return self._posts.get(post_id)
+    async def thread_backend(self, post_id: str) -> Backend:
+        """The backend `post_id`'s thread is on, as the daemon answers it (R-12). The shim
+        keeps no map of its own, so the answer survives a restart of either side. Unknown is
+        a loud failure: a reply never falls back to the default backend."""
+        # Discord's `<channel>/<message>` form names the message by its last part.
+        lookup = post_id.rsplit("/", 1)[-1]
+        try:
+            result = await self._forward(
+                "thread_backend", {"dev_name": self.dev_name, "post_id": lookup}
+            )
+        except DaemonError as exc:
+            raise ShimError(
+                f"cannot tell which backend {post_id} is on ({exc.error}). Nothing was sent; "
+                "a reply never falls back to the default backend. Name the backend."
+            ) from exc
+        found = result.get("backend")
+        if not is_backend(found):
+            raise ShimError(f"crewchat thread_backend answered {found!r} for {post_id}")
+        return str(found)
 
     def default(self) -> Backend | NeedsHuman:
         try:
@@ -470,54 +488,120 @@ class Shim:
     async def _route(
         self, named: str | None, post_id: str | None = None
     ) -> tuple[Backend, bool] | dict[str, Any]:
-        """The backend for a call, and whether it is off-default; or the question to ask."""
-        known = self.backend_of(post_id) if post_id else None
-        if named is not None and not is_backend(named):
-            raise ShimError(f"backend {named!r} is not mattermost:<server-id> or discord")
-        if known is not None:
-            if named is not None and named != known:
-                raise ShimError(f"{post_id} is on {known}, not {named}; a reply follows its thread")
-            return known, False
+        """The backend for a call, and whether it is off-default; or the question to ask.
+
+        A named backend is used as named. Otherwise a call on a post (a reply, a thread, a
+        reaction) goes where the daemon says that post is (R-12), and any other call goes to
+        the default (R-11).
+        """
         if named is not None:
+            if not is_backend(named):
+                raise ShimError(f"backend {named!r} is not mattermost:<server-id> or discord")
             try:
                 default = self.default()
             except ShimError:
                 default = None
             return named, named != default
+        if post_id:
+            return await self.thread_backend(post_id), False
         default = self.default()
         if isinstance(default, NeedsHuman):
             return await self.needs_human(default)
         return default, False
 
+    async def _upload(self, attach_path: str) -> str:
+        """Stream the agent's file to the daemon (`upload`), as the agent's user; its id.
+
+        The daemon never reads an agent's path (§5.3). The file is checked before any frame:
+        a missing, non-regular or over-cap file fails the call loudly, and nothing is sent.
+        """
+        path = Path(attach_path).expanduser()
+        try:
+            st = path.stat()
+        except OSError as exc:
+            raise ShimError(f"attach_path {attach_path}: {exc.strerror or exc}") from exc
+        if not stat.S_ISREG(st.st_mode):
+            raise ShimError(f"attach_path {attach_path} is not a regular file")
+        if st.st_size > MAX_UPLOAD_BYTES:
+            raise ShimError(
+                f"attach_path {attach_path} is {st.st_size} bytes, over the "
+                f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MiB cap. Nothing was sent."
+            )
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ShimError(f"attach_path {attach_path}: {exc.strerror or exc}") from exc
+        name = path.name[:MAX_UPLOAD_NAME]
+        pieces = [data[i : i + UPLOAD_CHUNK_BYTES] for i in range(0, len(data), UPLOAD_CHUNK_BYTES)]
+        pieces = pieces or [b""]
+        result: dict[str, Any] = {}
+        for seq, piece in enumerate(pieces):
+            frame = {
+                "dev_name": self.dev_name,
+                "name": name,
+                "seq": seq,
+                "data_b64": base64.b64encode(piece).decode("ascii"),
+                "last": seq == len(pieces) - 1,
+            }
+            try:
+                result = await self._forward("upload", frame)
+            except DaemonError as exc:
+                raise ShimError(
+                    f"attach_path {attach_path}: the daemon refused it ({exc.error}). "
+                    "Nothing was sent."
+                ) from exc
+        upload_id = result.get("upload_id")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise ShimError(f"attach_path {attach_path}: the daemon returned no upload id")
+        return upload_id
+
+    async def _post_args(
+        self, name: Backend, off: bool, attach_path: str | None, embed: str | None
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {"dev_name": self.dev_name, "backend": name}
+        if attach_path:
+            args["attachments"] = [await self._upload(attach_path)]
+        if embed is not None:
+            args["embed"] = embed
+        if off:
+            args["off_default"] = True
+        return args
+
     # -- the tools ------------------------------------------------------------------------------
     async def chat_send(
-        self, to: str, text: str, thread: str | None = None, backend: str | None = None
+        self,
+        to: str,
+        text: str,
+        thread: str | None = None,
+        backend: str | None = None,
+        attach_path: str | None = None,
+        embed: str | None = None,
     ) -> dict[str, Any]:
         route = await self._route(backend, thread)
         if isinstance(route, dict):
             return route
         name, off = route
-        args: dict[str, Any] = {"dev_name": self.dev_name, "backend": name, "to": to, "text": text}
+        args = await self._post_args(name, off, attach_path, embed)
+        args.update({"to": to, "text": text})
         if thread:
             args["thread"] = thread
-        if off:
-            args["off_default"] = True
-        result = await self._forward("send", args)
-        self._remember(result.get("post_id"), name)
-        self._remember(result.get("thread"), name)
-        return result
+        return await self._forward("send", args)
 
-    async def chat_dm(self, to: str, text: str, backend: str | None = None) -> dict[str, Any]:
+    async def chat_dm(
+        self,
+        to: str,
+        text: str,
+        backend: str | None = None,
+        attach_path: str | None = None,
+        embed: str | None = None,
+    ) -> dict[str, Any]:
         route = await self._route(backend)
         if isinstance(route, dict):
             return route
         name, off = route
-        args: dict[str, Any] = {"dev_name": self.dev_name, "backend": name, "to": to, "text": text}
-        if off:
-            args["off_default"] = True
-        result = await self._forward("dm", args)
-        self._remember(result.get("post_id"), name)
-        return result
+        args = await self._post_args(name, off, attach_path, embed)
+        args.update({"to": to, "text": text})
+        return await self._forward("dm", args)
 
     async def chat_read(
         self,
@@ -525,6 +609,17 @@ class Shim:
         since: float | None = None,
         limit: int | None = None,
         backend: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._read(channel, since=since, limit=limit, backend=backend)
+
+    async def _read(
+        self,
+        channel: str,
+        *,
+        since: float | None = None,
+        limit: int | None = None,
+        backend: str | None = None,
+        post_id: str | None = None,
     ) -> dict[str, Any]:
         route = await self._route(backend)
         if isinstance(route, dict):
@@ -535,11 +630,11 @@ class Shim:
             args["since"] = since
         if limit is not None:
             args["limit"] = limit
+        if post_id is not None:
+            args["post_id"] = post_id
         if off:
             args["off_default"] = True
-        result = await self._forward("read", args)
-        self._remember_messages(result, name)
-        return result
+        return await self._forward("read", args)
 
     async def chat_thread(self, post_id: str, backend: str | None = None) -> dict[str, Any]:
         route = await self._route(backend, post_id)
@@ -549,9 +644,7 @@ class Shim:
         args: dict[str, Any] = {"dev_name": self.dev_name, "backend": name, "post_id": post_id}
         if off:
             args["off_default"] = True
-        result = await self._forward("thread", args)
-        self._remember_messages(result, name)
-        return result
+        return await self._forward("thread", args)
 
     async def chat_react(
         self, post_id: str, emoji: str, backend: str | None = None
@@ -599,26 +692,69 @@ class Shim:
         channel_id: str,
         message: str | None = None,
         content: str | None = None,
+        attach_path: str | None = None,
+        embed: str | None = None,
         thread_id: str | None = None,
     ) -> dict[str, Any]:
         self.deprecated("disc_send", "chat_send")
         text = message if message is not None else content
         if not text:
             raise ShimError("disc_send needs message (or content)")
-        return await self.chat_send(channel_id, text, thread=thread_id, backend=DISCORD)
+        return await self.chat_send(
+            channel_id,
+            text,
+            thread=thread_id,
+            backend=DISCORD,
+            attach_path=attach_path,
+            embed=embed,
+        )
 
     async def disc_read(
-        self, channel_id: str, limit: int | None = None, message_id: str | None = None
+        self, channel_id: str, limit: int = DISC_READ_LIMIT, message_id: str | None = None
     ) -> dict[str, Any]:
+        """Today's disc_read: the recent `limit` (default 20), or the one `message_id`."""
         self.deprecated("disc_read", "chat_read")
-        result = await self.chat_read(
-            channel_id, limit=None if message_id else limit, backend=DISCORD
-        )
         if message_id:
-            msgs = result.get("messages") or []
-            found = [m for m in msgs if isinstance(m, dict) and m.get("post_id") == message_id]
-            result = {**result, "messages": found}
-        return result
+            return await self._read(channel_id, backend=DISCORD, post_id=message_id)
+        return await self._read(channel_id, limit=limit, backend=DISCORD)
+
+    async def _discord_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        """A Discord-only op (Story 2.4c), with `backend="discord"`."""
+        route = await self._route(DISCORD)
+        if isinstance(route, dict):  # pragma: no cover - a named backend never asks
+            return route
+        name, off = route
+        frame: dict[str, Any] = {"dev_name": self.dev_name, "backend": name, **args}
+        if off:
+            frame["off_default"] = True
+        return await self._forward(op, frame)
+
+    async def disc_list(self, guild_id: str, type: str = "text") -> dict[str, Any]:
+        self.deprecated("disc_list", "list_channels")
+        return await self._discord_op("list_channels", {"guild_id": guild_id, "type": type})
+
+    async def disc_resolve(self, guild_id: str, name: str, type: str = "channel") -> dict[str, Any]:
+        self.deprecated("disc_resolve", "resolve")
+        return await self._discord_op(
+            "resolve", {"guild_id": guild_id, "name": name, "type": type}
+        )
+
+    async def disc_create_channel(
+        self, guild_id: str, name: str, type: str = "text"
+    ) -> dict[str, Any]:
+        self.deprecated("disc_create_channel", "create_channel")
+        return await self._discord_op(
+            "create_channel", {"guild_id": guild_id, "name": name, "type": type}
+        )
+
+    async def disc_create_thread(
+        self, channel_id: str, name: str, message: str | None = None
+    ) -> dict[str, Any]:
+        self.deprecated("disc_create_thread", "create_thread")
+        args: dict[str, Any] = {"channel": channel_id, "name": name}
+        if message is not None:
+            args["message"] = message
+        return await self._discord_op("create_thread", args)
 
     async def disc_thread(self, thread_id: str) -> dict[str, Any]:
         self.deprecated("disc_thread", "chat_thread")
@@ -637,18 +773,49 @@ class Shim:
 
 
 # -- MCP ----------------------------------------------------------------------------------------
-ALIASES = ("disc_send", "disc_read", "disc_thread", "disc_dm", "disc_react")
+# Each alias, and what it is now: a `chat_*` tool or a Discord-only daemon op.
+ALIAS_TARGETS: dict[str, str] = {
+    "disc_send": "chat_send",
+    "disc_read": "chat_read",
+    "disc_list": "list_channels",
+    "disc_resolve": "resolve",
+    "disc_create_channel": "create_channel",
+    "disc_create_thread": "create_thread",
+    # Not in today's kit; kept from Story 2.4, harmless.
+    "disc_thread": "chat_thread",
+    "disc_dm": "chat_dm",
+    "disc_react": "chat_react",
+}
+ALIASES = tuple(ALIAS_TARGETS)
+ALIAS_HELP: dict[str, str] = {
+    "disc_send": "Send `message` (or `content`) to `channel_id` (an ID, `name` or `#name`); "
+    "`attach_path` attaches a local file, `embed` is `title:body`.",
+    "disc_read": "Recent messages in `channel_id` (at most `limit`, default 20), or the one "
+    "message `message_id`.",
+    "disc_list": "The guild's channels of `type` (text, voice or category).",
+    "disc_resolve": "The ID of the channel, user or role `name` (`type`).",
+    "disc_create_channel": "Create a channel `name` of `type` in the guild.",
+    "disc_create_thread": "Create a thread `name` in `channel_id`, with an optional first "
+    "`message`.",
+    "disc_thread": "Every message in the thread `thread_id`.",
+    "disc_dm": "A direct message to the user `user_id`.",
+    "disc_react": "Add `emoji` to `message_id` (in `channel_id`).",
+}
 TOOLS: dict[str, str] = {
     "chat_send": "Send `text` to channel `to`. With `thread`, it replies on that thread's "
-    "backend. `backend` (mattermost:<server-id> or discord) overrides the default.",
+    "backend. `backend` (mattermost:<server-id> or discord) overrides the default. "
+    "`attach_path` attaches a local file (at most 8 MiB); `embed` is `title:body`.",
     "chat_read": "Recent messages in `channel` (`since` epoch seconds, at most `limit`).",
     "chat_thread": "Every message in the thread `post_id` belongs to.",
-    "chat_dm": "A direct message to the user `to`.",
+    "chat_dm": "A direct message to the user `to`; `attach_path` and `embed` as chat_send.",
     "chat_react": "Add the reaction `emoji` to the post `post_id`.",
     "chat_health": "Each configured backend's state.",
     "chat_set_default": "Record the human partner's answer: `key` (the repo's forge org, or its "
     "path) uses `backend` (mattermost:<server-id> or discord) by default. Local only.",
-    **{a: f'Deprecated: {a} is chat_{a[5:]}(backend="discord").' for a in ALIASES},
+    **{
+        a: f'Deprecated: {a} is {t}(backend="discord"). {ALIAS_HELP[a]}'
+        for a, t in ALIAS_TARGETS.items()
+    },
 }
 
 

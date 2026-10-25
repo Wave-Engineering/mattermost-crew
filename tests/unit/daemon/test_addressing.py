@@ -193,9 +193,9 @@ def test_unaddressed_message() -> None:
 def test_my_threads_bounded_and_forget() -> None:
     threads = MyThreads(limit=2)
     for root in ("a", "b", "a", "c"):
-        threads.add("kessel", root)
+        threads.add("kessel", root, MM)
     assert threads.roots("kessel") == {"a", "c"}  # "a" was refreshed, so "b" aged out
-    threads.add("kessel", "")
+    threads.add("kessel", "", MM)
     assert threads.roots("kessel") == {"a", "c"}
     threads.forget("kessel")
     assert threads.roots("kessel") == set()
