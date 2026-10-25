@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "The per-crew broker: creates bot accounts and mints, rotates and revokes their tokens."
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.28",
+    "httpx>=0.28,<1",  # below the next major, for installs without uv.lock (#73)
     # The broker account's websocket, for the partner's switch DMs (Story 3.1).
-    "websockets>=15",
+    "websockets>=15,<18",  # the daemon's bound (#73)
 ]
 
 [project.scripts]
