@@ -39,7 +39,8 @@ printf 'key_set=%s\n' "${ANTHROPIC_API_KEY:+yes}"
 printf 'arg=[%s]\n' "$@"
 printf 'prompt=%s\n' "$prompt"
 EOF
-$SUDO install -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-run" /usr/local/libexec/crewkiosk-run
+# -D: a stock Ubuntu /usr/local has no libexec (GitHub's hosted image did; the ephemeral pool's doesn't).
+$SUDO install -D -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-run" /usr/local/libexec/crewkiosk-run
 $SUDO install -d -m 0750 -o root -g crewkiosk /etc/crewkiosk
 echo "sk-ci-dummy-kiosk-key" | $SUDO install -m 0600 -o crewkiosk -g crewkiosk /dev/stdin \
   /etc/crewkiosk/model.credential
