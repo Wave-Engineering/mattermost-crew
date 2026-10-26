@@ -1,6 +1,6 @@
 [project]
 name = "crewchat-clients"
-version = "0.2.1"
+version = "0.2.2"
 description = "Thin clients of the crewchat daemon: the MCP shim and the doorbell."
 requires-python = ">=3.12"
 dependencies = [
