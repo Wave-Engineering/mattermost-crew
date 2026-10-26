@@ -242,7 +242,9 @@ def build_handlers(
 
     `health` names every backend in the one form (§5.4): `mattermost:<server_id>`, and
     `discord`. A backend in `health_sources` answers for itself; any other reports
-    `configured`, from the daemon's start.
+    `configured`, from the daemon's start. With `dev_name`, an agent the registry doesn't
+    hold gets `not_registered`, so the shim's retry re-registers it after a restart (#112);
+    without it, `health` is the daemon's liveness check.
     """
     started = datetime.now(UTC).isoformat()
     sources = dict(health_sources or {})
@@ -261,7 +263,13 @@ def build_handlers(
         )
         return reg.result()
 
-    async def health(_args: dict[str, Any]) -> dict[str, Any]:
+    async def health(args: dict[str, Any]) -> dict[str, Any]:
+        dev_name = args.get("dev_name")
+        if dev_name is not None:
+            if not isinstance(dev_name, str):
+                raise OpError("bad_request", "dev_name is a string")
+            if registry.get(dev_name) is None:
+                raise OpError("not_registered", dev_name)
         names = [mattermost_backend(s.id) for s in config.mattermost]
         if config.discord_enabled:
             names.append("discord")

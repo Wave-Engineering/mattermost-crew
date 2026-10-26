@@ -10,7 +10,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -20,7 +19,6 @@ from typing import Any
 import pytest
 from crewchat_clients import mcp_shim
 from crewchat_clients.mcp_shim import (
-    ALIASES,
     DaemonError,
     Shim,
     ShimError,
@@ -323,6 +321,23 @@ def test_not_registered_reregisters_and_retries_once(tmp_path: Path) -> None:
     assert len(daemon.of("register")) == 2 and len(daemon.of("send")) == 2
 
 
+def test_chat_health_reregisters_after_daemon_restart(tmp_path: Path) -> None:
+    """`chat_health` names the agent, so a restarted daemon's `not_registered` re-registers
+    it, as any other call does (#112)."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon, home_backend="discord")
+
+    async def scenario() -> dict[str, Any]:
+        await shim.start()
+        daemon.forget_next = True
+        return await shim.chat_health()
+
+    result = asyncio.run(scenario())
+    assert set(result["backends"]) == {"mattermost:ci", "discord"}
+    assert len(daemon.of("register")) == 2
+    assert daemon.of("health") == [{"dev_name": DEV}] * 2
+
+
 # -- pushes ----------------------------------------------------------------------------------
 def test_pushes_brief_on_mtime_change(tmp_path: Path) -> None:
     daemon = FakeDaemon()
@@ -597,45 +612,38 @@ def test_every_chat_tool_forwards_one_frame(tmp_path: Path) -> None:
     }
 
 
-# -- aliases (R-15) --------------------------------------------------------------------------
-def test_disc_alias_maps_and_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+# -- Discord's guild ops (D-108) ---------------------------------------------------------------
+GUILD = "900000000000000001"
+
+
+def test_guild_tools_forward_discord_ops(tmp_path: Path) -> None:
+    """Each guild tool sends its daemon op on Discord with today's args, whatever the default
+    is, and logs no deprecation; `chat_read(post_id)` reads the one message."""
     daemon = FakeDaemon()
     shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
-    caplog.set_level(logging.WARNING, logger="crewchat_clients.mcp_shim")
 
     async def scenario() -> None:
         await shim.start()
-        await shim.disc_send("123", "one")
-        await shim.disc_send("123", content="two")
-        await shim.disc_read("123", limit=5)
-        got = await shim.disc_read("123", message_id=R2)
+        await shim.chat_list_channels(GUILD)
+        await shim.chat_resolve(GUILD, "agent-ops")
+        await shim.chat_create_channel(GUILD, "new-room", type="voice")
+        await shim.chat_create_thread("#agent-ops", "a thread", message="first")
+        await shim.chat_list_channels(GUILD, type="category")
+        got = await shim.chat_read("123", backend="discord", post_id=R2)
         assert [m["post_id"] for m in got["messages"]] == [R2]
-        await shim.disc_thread("456")
-        await shim.disc_dm("789", "hi")
-        await shim.disc_react("111", "👍", channel_id="123")
-        await shim.disc_list("900000000000000001")
-        await shim.disc_resolve("900000000000000001", "agent-ops")
-        await shim.disc_create_channel("900000000000000001", "new-room", type="voice")
-        await shim.disc_create_thread("#agent-ops", "a thread", message="first")
-        await shim.disc_list("900000000000000001", type="category")
 
     asyncio.run(scenario())
-    ops = ("send", "read", "thread", "dm", "react")
-    for op in (*ops, "list_channels", "resolve", "create_channel", "create_thread"):
+    for op in ("list_channels", "resolve", "create_channel", "create_thread"):
         assert daemon.of(op) and all(a["backend"] == "discord" for a in daemon.of(op)), op
         assert all(a["off_default"] is True for a in daemon.of(op))  # the default is Mattermost
-    assert [a["text"] for a in daemon.of("send")] == ["one", "two"]
-    assert daemon.of("react")[0]["post_id"] == "123/111"
-    # disc_read: today's default limit is 20; with message_id the daemon reads that one post.
-    reads = daemon.of("read")
-    assert reads[0]["limit"] == 5 and reads[1]["post_id"] == R2 and "limit" not in reads[1]
     assert daemon.of("list_channels")[0] == {
         "dev_name": DEV,
         "backend": "discord",
-        "guild_id": "900000000000000001",
+        "guild_id": GUILD,
         "type": "text",
         "off_default": True,
     }
+    assert daemon.of("list_channels")[1]["type"] == "category"
     assert daemon.of("resolve")[0]["type"] == "channel"
     assert daemon.of("create_channel")[0]["type"] == "voice"
     assert daemon.of("create_thread")[0] == {
@@ -646,43 +654,37 @@ def test_disc_alias_maps_and_warns(tmp_path: Path, caplog: pytest.LogCaptureFixt
         "message": "first",
         "off_default": True,
     }
-    warnings = [r.getMessage() for r in caplog.records if "deprecated" in r.getMessage()]
-    assert len(warnings) == 9  # one per alias, though some ran twice
-    assert sorted(w.split()[1] for w in warnings) == sorted(ALIASES)
+    (read,) = daemon.of("read")
+    assert read["post_id"] == R2 and "limit" not in read
 
 
-def test_every_kit_disc_tool_has_alias(tmp_path: Path) -> None:
-    """`ALIASES` holds all nine, and each of today's six kit tools takes today's arg names."""
+def test_guild_tools_take_todays_args(tmp_path: Path) -> None:
+    """The four guild tools keep today's `disc_*` argument names and defaults, and the MCP
+    server offers each with them."""
     import inspect
 
-    kit = {
-        "disc_send": {"channel_id", "message", "content", "attach_path", "embed"},
-        "disc_read": {"channel_id", "limit", "message_id"},
-        "disc_list": {"guild_id", "type"},
-        "disc_resolve": {"guild_id", "name", "type"},
-        "disc_create_channel": {"guild_id", "name", "type"},
-        "disc_create_thread": {"channel_id", "name", "message"},
+    guild = {
+        "chat_list_channels": {"guild_id", "type"},
+        "chat_resolve": {"guild_id", "name", "type"},
+        "chat_create_channel": {"guild_id", "name", "type"},
+        "chat_create_thread": {"channel_id", "name", "message"},
     }
-    assert set(ALIASES) == set(kit) | {"disc_thread", "disc_dm", "disc_react"}
-    assert len(ALIASES) == 9
     shim = make_shim(tmp_path, FakeDaemon(), home_backend="discord")
-    for alias, args in kit.items():
-        params = set(inspect.signature(getattr(shim, alias)).parameters)
-        assert args <= params, (alias, args - params)
-    sig = inspect.signature(shim.disc_read).parameters
-    assert sig["limit"].default == 20  # today's default
-    assert inspect.signature(shim.disc_list).parameters["type"].default == "text"
-    assert inspect.signature(shim.disc_resolve).parameters["type"].default == "channel"
-    # And the MCP server offers every one with those argument names.
+    for tool, args in guild.items():
+        assert set(inspect.signature(getattr(shim, tool)).parameters) == args, tool
+    assert inspect.signature(shim.chat_list_channels).parameters["type"].default == "text"
+    assert inspect.signature(shim.chat_resolve).parameters["type"].default == "channel"
+    assert inspect.signature(shim.chat_create_channel).parameters["type"].default == "text"
     server = build_server(shim, timers=False)
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    for alias, args in kit.items():
-        assert args <= set(tools[alias].inputSchema["properties"]), alias
+    for tool, args in guild.items():
+        assert args <= set(tools[tool].inputSchema["properties"]), tool
+    assert "post_id" in tools["chat_read"].inputSchema["properties"]
 
 
-def test_disc_send_carries_attach_and_embed(tmp_path: Path) -> None:
-    """`disc_send(attach_path, embed)` streams an `upload`, then a `send` with `attachments`
-    and `embed`; neither is dropped."""
+def test_chat_send_to_discord_carries_attach_and_embed(tmp_path: Path) -> None:
+    """`chat_send(attach_path, embed)` on Discord streams an `upload`, then a `send` with
+    `attachments` and `embed`; neither is dropped."""
     daemon = FakeDaemon()
     shim = make_shim(tmp_path, daemon, home_backend="discord")
     report = tmp_path / "report.txt"
@@ -690,7 +692,7 @@ def test_disc_send_carries_attach_and_embed(tmp_path: Path) -> None:
 
     async def scenario() -> dict[str, Any]:
         await shim.start()
-        return await shim.disc_send("agent-ops", "see attached", attach_path=str(report),
+        return await shim.chat_send("agent-ops", "see attached", attach_path=str(report),
                                     embed="Build:green")
 
     asyncio.run(scenario())
@@ -763,7 +765,9 @@ def test_mcp_server_lists_every_tool(tmp_path: Path) -> None:
     server = build_server(make_shim(tmp_path, FakeDaemon()), timers=False)
     names = {t.name for t in asyncio.run(server.list_tools())}
     chat = {"chat_send", "chat_read", "chat_thread", "chat_dm", "chat_react", "chat_health"}
-    assert names == chat | {"chat_set_default"} | set(ALIASES)
+    guild = {"chat_list_channels", "chat_resolve", "chat_create_channel", "chat_create_thread"}
+    assert names == chat | {"chat_set_default"} | guild
+    assert not any(n.startswith("disc_") for n in names)  # removed before the first deploy
 
 
 # -- no credentials (R-08) ---------------------------------------------------------------------

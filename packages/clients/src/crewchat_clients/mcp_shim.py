@@ -37,12 +37,12 @@ and the daemon acts on the agent's behalf with what it holds itself.
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
   squawk records, at start and whenever they change.
-- **Aliases (R-15).** Every `disc_*` tool in today's kit takes today's args and maps to
-  `backend="discord"`: `disc_send` (with `attach_path` and `embed`) and `disc_read` (with
-  `message_id`) to `chat_send` and `chat_read`; `disc_list`, `disc_resolve`,
-  `disc_create_channel` and `disc_create_thread` to the daemon's Discord ops. `disc_thread`,
-  `disc_dm` and `disc_react` stay from Story 2.4. Each logs one deprecation warning per
-  session.
+- **Discord's guild ops (D-108).** `chat_list_channels`, `chat_resolve`,
+  `chat_create_channel` and `chat_create_thread` take today's `disc_*` argument shapes and
+  always send `backend="discord"`. `chat_read` with `post_id` reads one message. There are
+  no `disc_*` aliases: they were removed before the first deploy.
+- **Health (#112).** `chat_health` sends `dev_name`, so a restarted daemon answers
+  `not_registered` and the call re-registers, as any other call does.
 """
 
 from __future__ import annotations
@@ -89,7 +89,6 @@ DISCORD = "discord"
 # A Discord snowflake, used with `fullmatch` (#62): the one shape a `<channel>/<message>` part
 # may have, since it ends up in a REST path that carries the bot credential.
 SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
-DISC_READ_LIMIT = 20  # today's disc_read default
 # An attachment goes to the daemon in `upload` chunks (§5.4). The daemon's frames are at most
 # 64 KiB; 45 KiB of raw bytes is 60 KiB of base64, leaving room for the frame around it.
 UPLOAD_CHUNK_BYTES = 45 * 1024
@@ -338,7 +337,6 @@ class Shim:
         self.registration: dict[str, Any] = {}
         self._brief = _FileState()
         self._squawks = _FileState()
-        self._warned: set[str] = set()
         self._squawked: set[str] = set()
         self._lock = asyncio.Lock()
 
@@ -672,8 +670,11 @@ class Shim:
         since: float | None = None,
         limit: int | None = None,
         backend: str | None = None,
+        post_id: str | None = None,
     ) -> dict[str, Any]:
-        return await self._read(channel, since=since, limit=limit, backend=backend)
+        return await self._read(
+            channel, since=since, limit=limit, backend=backend, post_id=post_id
+        )
 
     async def _read(
         self,
@@ -732,7 +733,9 @@ class Shim:
         return await self._forward("react", args)
 
     async def chat_health(self) -> dict[str, Any]:
-        return await self._forward("health", {})
+        # With `dev_name`, a restarted daemon answers `not_registered` and `_forward`
+        # re-registers (#112).
+        return await self._forward("health", {"dev_name": self.dev_name})
 
     async def chat_set_default(self, key: str, backend: str) -> dict[str, Any]:
         """Local only: record the human's answer in the defaults file. No frame is sent."""
@@ -743,49 +746,7 @@ class Shim:
         self._squawked.discard(key)
         return {"key": key, "backend": backend, "file": str(self.defaults_file)}
 
-    # -- the deprecated aliases (R-15) ----------------------------------------------------------
-    def deprecated(self, alias: str, target: str) -> None:
-        if alias in self._warned:
-            return
-        self._warned.add(alias)
-        log.warning(
-            'deprecated: %s is %s(backend="discord"); it will be removed after one kit minor '
-            "version",
-            alias,
-            target,
-        )
-
-    async def disc_send(
-        self,
-        channel_id: str,
-        message: str | None = None,
-        content: str | None = None,
-        attach_path: str | None = None,
-        embed: str | None = None,
-        thread_id: str | None = None,
-    ) -> dict[str, Any]:
-        self.deprecated("disc_send", "chat_send")
-        text = message if message is not None else content
-        if not text:
-            raise ShimError("disc_send needs message (or content)")
-        return await self.chat_send(
-            channel_id,
-            text,
-            thread=thread_id,
-            backend=DISCORD,
-            attach_path=attach_path,
-            embed=embed,
-        )
-
-    async def disc_read(
-        self, channel_id: str, limit: int = DISC_READ_LIMIT, message_id: str | None = None
-    ) -> dict[str, Any]:
-        """Today's disc_read: the recent `limit` (default 20), or the one `message_id`."""
-        self.deprecated("disc_read", "chat_read")
-        if message_id:
-            return await self._read(channel_id, backend=DISCORD, post_id=message_id)
-        return await self._read(channel_id, limit=limit, backend=DISCORD)
-
+    # -- Discord's guild ops (D-108) ---------------------------------------------------------
     async def _discord_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
         """A Discord-only op (Story 2.4c), with `backend="discord"`."""
         route = await self._route(DISCORD)
@@ -797,98 +758,55 @@ class Shim:
             frame["off_default"] = True
         return await self._forward(op, frame)
 
-    async def disc_list(self, guild_id: str, type: str = "text") -> dict[str, Any]:
-        self.deprecated("disc_list", "list_channels")
+    async def chat_list_channels(self, guild_id: str, type: str = "text") -> dict[str, Any]:
         return await self._discord_op("list_channels", {"guild_id": guild_id, "type": type})
 
-    async def disc_resolve(self, guild_id: str, name: str, type: str = "channel") -> dict[str, Any]:
-        self.deprecated("disc_resolve", "resolve")
+    async def chat_resolve(self, guild_id: str, name: str, type: str = "channel") -> dict[str, Any]:
         return await self._discord_op(
             "resolve", {"guild_id": guild_id, "name": name, "type": type}
         )
 
-    async def disc_create_channel(
+    async def chat_create_channel(
         self, guild_id: str, name: str, type: str = "text"
     ) -> dict[str, Any]:
-        self.deprecated("disc_create_channel", "create_channel")
         return await self._discord_op(
             "create_channel", {"guild_id": guild_id, "name": name, "type": type}
         )
 
-    async def disc_create_thread(
+    async def chat_create_thread(
         self, channel_id: str, name: str, message: str | None = None
     ) -> dict[str, Any]:
-        self.deprecated("disc_create_thread", "create_thread")
         args: dict[str, Any] = {"channel": channel_id, "name": name}
         if message is not None:
             args["message"] = message
         return await self._discord_op("create_thread", args)
 
-    async def disc_thread(self, thread_id: str) -> dict[str, Any]:
-        self.deprecated("disc_thread", "chat_thread")
-        return await self.chat_thread(thread_id, backend=DISCORD)
-
-    async def disc_dm(self, user_id: str, message: str) -> dict[str, Any]:
-        self.deprecated("disc_dm", "chat_dm")
-        return await self.chat_dm(user_id, message, backend=DISCORD)
-
-    async def disc_react(
-        self, message_id: str, emoji: str, channel_id: str | None = None
-    ) -> dict[str, Any]:
-        self.deprecated("disc_react", "chat_react")
-        post = f"{channel_id}/{message_id}" if channel_id else message_id
-        return await self.chat_react(post, emoji, backend=DISCORD)
-
 
 # -- MCP ----------------------------------------------------------------------------------------
-# Each alias, and what it is now: a `chat_*` tool or a Discord-only daemon op.
-ALIAS_TARGETS: dict[str, str] = {
-    "disc_send": "chat_send",
-    "disc_read": "chat_read",
-    "disc_list": "list_channels",
-    "disc_resolve": "resolve",
-    "disc_create_channel": "create_channel",
-    "disc_create_thread": "create_thread",
-    # Not in today's kit; kept from Story 2.4, harmless.
-    "disc_thread": "chat_thread",
-    "disc_dm": "chat_dm",
-    "disc_react": "chat_react",
-}
-ALIASES = tuple(ALIAS_TARGETS)
-ALIAS_HELP: dict[str, str] = {
-    "disc_send": "Send `message` (or `content`) to `channel_id` (an ID, `name` or `#name`); "
-    "`attach_path` attaches a local file, `embed` is `title:body`.",
-    "disc_read": "Recent messages in `channel_id` (at most `limit`, default 20), or the one "
-    "message `message_id`.",
-    "disc_list": "The guild's channels of `type` (text, voice or category).",
-    "disc_resolve": "The ID of the channel, user or role `name` (`type`).",
-    "disc_create_channel": "Create a channel `name` of `type` in the guild.",
-    "disc_create_thread": "Create a thread `name` in `channel_id`, with an optional first "
-    "`message`.",
-    "disc_thread": "Every message in the thread `thread_id`.",
-    "disc_dm": "A direct message to the user `user_id`.",
-    "disc_react": "Add `emoji` to `message_id` (in `channel_id`).",
-}
 TOOLS: dict[str, str] = {
     "chat_send": "Send `text` to channel `to`. With `thread`, it replies on that thread's "
     "backend. `backend` (mattermost:<server-id> or discord) overrides the default. "
     "`attach_path` attaches a local file (at most 8 MiB); `embed` is `title:body`.",
-    "chat_read": "Recent messages in `channel` (`since` epoch seconds, at most `limit`).",
+    "chat_read": "Recent messages in `channel` (`since` epoch seconds, at most `limit`), or "
+    "the one message `post_id`.",
     "chat_thread": "Every message in the thread `post_id` belongs to.",
     "chat_dm": "A direct message to the user `to`; `attach_path` and `embed` as chat_send.",
     "chat_react": "Add the reaction `emoji` to the post `post_id`.",
     "chat_health": "Each configured backend's state.",
     "chat_set_default": "Record the human partner's answer: `key` (the repo's forge org, or its "
     "path) uses `backend` (mattermost:<server-id> or discord) by default. Local only.",
-    **{
-        a: f'Deprecated: {a} is {t}(backend="discord"). {ALIAS_HELP[a]}'
-        for a, t in ALIAS_TARGETS.items()
-    },
+    # Discord only (D-108).
+    "chat_list_channels": "Discord only: the guild's channels of `type` (text, voice or "
+    "category).",
+    "chat_resolve": "Discord only: the ID of the channel, user or role `name` (`type`).",
+    "chat_create_channel": "Discord only: create a channel `name` of `type` in the guild.",
+    "chat_create_thread": "Discord only: create a thread `name` in `channel_id`, with an "
+    "optional first `message`.",
 }
 
 
 def build_server(shim: Shim, *, timers: bool = True) -> Any:
-    """The FastMCP server with the `chat_*` tools and the `disc_*` aliases."""
+    """The FastMCP server with the `chat_*` tools."""
     from mcp.server.fastmcp import FastMCP
 
     @contextlib.asynccontextmanager

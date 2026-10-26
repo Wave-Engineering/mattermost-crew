@@ -6,6 +6,29 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+## [0.2.2] — 2026-10-26
+
+The first fleet deploy, pinned by kit 8.18.0.
+
+### Added
+
+- `chat_list_channels`, `chat_resolve`, `chat_create_channel` and `chat_create_thread`, the
+  Discord guild ops with today's `disc_*` argument shapes (#113, D-108). They always send
+  `backend="discord"`; on Mattermost the daemon answers `unsupported`.
+- `chat_read` takes `post_id` and reads that one message, as `disc_read(message_id)` did.
+- The daemon's `health` op takes an optional `dev_name` (#112). With it, an agent the daemon
+  doesn't hold gets `not_registered`. `chat_health()` sends it, so after a daemon restart
+  the call re-registers, as every other call does. Without `dev_name`, `health` is the
+  liveness check it was, as `verify-install` uses it.
+
+### Removed
+
+- The nine deprecated `disc_*` MCP aliases (#113, D-108, which supersedes D-057's "one kit
+  minor"). No host had run the daemon, and the kit calls no `mcp__crewchat__disc_*` name.
+  `disc_send`, `disc_read`, `disc_thread`, `disc_dm` and `disc_react` are `chat_send`,
+  `chat_read`, `chat_thread`, `chat_dm` and `chat_react` (a reaction's post is
+  `<channel>/<message>`); the other four are the guild tools above.
+
 ## [0.2.1] — 2026-10-25
 
 What K-2 (the kit's doorbell wiring) pins.
