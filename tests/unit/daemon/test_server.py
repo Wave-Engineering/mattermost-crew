@@ -223,3 +223,32 @@ def test_health_reports_a_backend_that_answers_for_itself(daemon: Any) -> None:
     backends = call(server, "health")["result"]["backends"]
     assert backends["discord"]["state"] == "degraded"
     assert backends["mattermost:dev"]["state"] == "configured"
+
+
+def test_health_with_unknown_dev_name_is_not_registered(daemon: Any) -> None:
+    """#112: an agent the registry doesn't hold (the daemon restarted) gets `not_registered`,
+    the code the shim's retry re-registers on."""
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    got = call(server, "health", dev_name="babel")
+    assert got["ok"] is False and got["error"] == "not_registered: babel"
+
+
+def test_health_with_registered_dev_name_answers(daemon: Any) -> None:
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    assert call(server, "register", dev_name="babel", session_id="s1")["ok"] is True
+    got = call(server, "health", dev_name="babel")
+    assert got["ok"] is True
+    assert set(got["result"]["backends"]) == {"mattermost:dev", "discord"}
+
+
+def test_health_without_dev_name_is_liveness(daemon: Any) -> None:
+    """No `dev_name`: the daemon's liveness check, as `verify-install` asks it."""
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    got = call(server, "health")
+    assert got["ok"] is True and set(got["result"]["backends"]) == {"mattermost:dev", "discord"}
+
+
+def test_health_dev_name_not_a_string_is_bad_request(daemon: Any) -> None:
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    got = call(server, "health", dev_name=3)
+    assert got["ok"] is False and got["error"].startswith("bad_request")

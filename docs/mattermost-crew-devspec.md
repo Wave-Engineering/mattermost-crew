@@ -343,7 +343,7 @@ JSON lines over the unix socket. Every frame carries `"proto": 1` (D-056). Reque
 | `kiosk_brief` | `dev_name, text` | `{}`. The shim pushes the extracted `## Kiosk` section whenever the seed's mtime changes (R-32). |
 | `squawk_ids` | `dev_name, ids` | `{}`. The shim pushes the ids from `.claude/sqtk-mine.json` (R-26). |
 | `subscribe` | `dev_name` | stream of events; the thin one-shot exits on the first |
-| `health` | — | `{backends:{name:{state, since}}}`, keyed by backend name. Discord's entry is `ok`, or `degraded` while scream-hole is unhealthy (D-106). |
+| `health` | `dev_name?` | `{backends:{name:{state, since}}}`, keyed by backend name. Discord's entry is `ok`, or `degraded` while scream-hole is unhealthy (D-106). With `dev_name`, an agent the daemon doesn't hold gets `not_registered`, so the shim re-registers after a daemon restart (#112). Without it, `health` is the daemon's liveness check. |
 
 Every chat frame (`send`, `dm`, `read`, `thread`, `react`, and the Discord ops) names the agent it acts as (`dev_name`) and the backend it goes to (`backend`), because one daemon per host serves N backends. `off_default: true` marks a call that named a backend other than the agent's default, and is logged (R-13).
 
@@ -355,21 +355,20 @@ Unknown ops, and frames with a `proto` higher than the daemon supports, get `ok:
 
 ### 5.5 MCP Tool Contract
 
-The tools are `chat_send(to, text, thread?, backend?, attach_path?, embed?)`, `chat_read(channel, since?, limit?)`, `chat_thread(post_id)`, `chat_dm(to, text, backend?, attach_path?, embed?)`, `chat_react(post_id, emoji)`, `chat_health()` and `chat_set_default(key, backend)` (D-057). `chat_set_default` records the human partner's answer to the R-11 question in `~/.claude/chat-defaults.json`, under `key` (§5.10). It is the **one local-only tool**: it writes that file as the agent's user and sends nothing to the daemon. Every other tool forwards one frame to the socket, except that an `attach_path` is first streamed as `upload` frames (§5.4). `attach_path` is a local file of at most 8 MiB, read by the shim as the agent's user; `embed` is `"title:body"`, split on the first colon. On Discord the embed is a rich embed `{title, description}`, as today; on Mattermost it is a message attachment (`props.attachments: [{title, text}]`) and the file goes through `POST /api/v4/files` with the agent's token (CT-01). Neither is ever silently dropped: each is delivered, or the call fails loudly.
+The tools are `chat_send(to, text, thread?, backend?, attach_path?, embed?)`, `chat_read(channel, since?, limit?, post_id?)`, `chat_thread(post_id)`, `chat_dm(to, text, backend?, attach_path?, embed?)`, `chat_react(post_id, emoji)`, `chat_health()` and `chat_set_default(key, backend)` (D-057), plus Discord's four guild tools below (D-108). `chat_read` with `post_id` reads that one message. `chat_health()` sends the agent's `dev_name` (#112). `chat_set_default` records the human partner's answer to the R-11 question in `~/.claude/chat-defaults.json`, under `key` (§5.10). It is the **one local-only tool**: it writes that file as the agent's user and sends nothing to the daemon. Every other tool forwards one frame to the socket, except that an `attach_path` is first streamed as `upload` frames (§5.4). `attach_path` is a local file of at most 8 MiB, read by the shim as the agent's user; `embed` is `"title:body"`, split on the first colon. On Discord the embed is a rich embed `{title, description}`, as today; on Mattermost it is a message attachment (`props.attachments: [{title, text}]`) and the file goes through `POST /api/v4/files` with the agent's token (CT-01). Neither is ever silently dropped: each is delivered, or the call fails loudly.
 
 A call on a post (`chat_send` with `thread`, `chat_thread`, `chat_react`) that names no backend asks the daemon's `thread_backend` where the post is (R-12). The shim keeps no thread-to-backend map, so a reply follows its thread across a restart of either side; `not_found` fails loudly and never falls back to the default backend.
 
-The old `disc_*` names stay as deprecated aliases for one kit minor version, then are removed. Each alias takes today's argument names and shapes exactly, maps to `backend="discord"`, and logs one deprecation line per session:
+**Discord's guild tools** (D-108). They take today's `disc_*` argument shapes, always send `backend="discord"`, and log nothing; on a Mattermost backend the daemon answers `unsupported`:
 
-| alias | today's args | maps to |
+| tool | args | daemon op |
 |---|---|---|
-| `disc_send` | `channel_id` (ID, `name` or `#name`), `message` (alias `content`), `attach_path?`, `embed?` | `chat_send(backend="discord")` |
-| `disc_read` | `channel_id` (ID or name), `limit?` (default 20), `message_id?` (one message; `limit` ignored) | `read`, with `post_id` for `message_id` |
-| `disc_list` | `guild_id`, `type?` (`text` \| `voice` \| `category`, default `text`) | `list_channels` |
-| `disc_resolve` | `guild_id`, `name`, `type?` (`channel` \| `user` \| `role`) | `resolve` |
-| `disc_create_channel` | `guild_id`, `name`, `type?` (`text` \| `voice` \| `category`, default `text`) | `create_channel` |
-| `disc_create_thread` | `channel_id` (ID or name), `name`, `message?` (initial message) | `create_thread` |
-| `disc_thread`, `disc_dm`, `disc_react` | not in today's kit; kept from Story 2.4, harmless | `chat_thread`, `chat_dm`, `chat_react` |
+| `chat_list_channels` | `guild_id`, `type?` (`text` \| `voice` \| `category`, default `text`) | `list_channels` |
+| `chat_resolve` | `guild_id`, `name`, `type?` (`channel` \| `user` \| `role`, default `channel`) | `resolve` |
+| `chat_create_channel` | `guild_id`, `name`, `type?` (`text` \| `voice` \| `category`, default `text`) | `create_channel` |
+| `chat_create_thread` | `channel_id` (ID or name), `name`, `message?` (initial message) | `create_thread` |
+
+There are **no `disc_*` aliases.** D-057 kept them for one kit minor version. D-108 removed them in v0.2.2, before any host ran the daemon, because the kit calls no `mcp__crewchat__disc_*` name. Each old name's replacement: `disc_send` is `chat_send` (a channel `name` or `#name` resolves); `disc_read` is `chat_read`, with `post_id` for `message_id`; `disc_thread`, `disc_dm` and `disc_react` are `chat_thread`, `chat_dm` and `chat_react` (`<channel>/<message>`); the other four are the guild tools above.
 
 ### 5.6 Broker
 
@@ -609,7 +608,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-12 | doorbell | One backend down: a `backend.down` event, and the others keep flowing | R-27 |
 | IT-13 | doorbell | Reconnect replays from the cursor, queuing each missed event exactly once | R-28 |
 | IT-14 | Mattermost adapter | Server mention markers are used; echo is filtered by user ID | R-04, R-29 |
-| IT-15 | Discord adapter | Today's `disc_*` behaviours, through `chat_*` and through each of the nine deprecated aliases, through the shim against the scream-hole and Discord REST fakes: `disc_send` (by ID, `name` and `#name`, with an attachment and an embed), `disc_read` (with `limit`, and with `message_id` returning one message), `disc_list`, `disc_resolve`, `disc_create_channel`, `disc_create_thread` (with an initial message), `disc_thread`, `disc_dm` and `disc_react`. Each forwards and logs one deprecation warning | R-15 |
+| IT-15 | Discord adapter | Today's `disc_*` behaviours, through `chat_*`, through the shim against the scream-hole and Discord REST fakes (D-108): `chat_send` (by ID, `name` and `#name`, with an attachment and an embed), `chat_read` (with `limit`, and with `post_id` returning one message), `chat_thread`, `chat_dm`, `chat_react` (with `<channel>/<message>`), and the guild tools `chat_list_channels`, `chat_resolve`, `chat_create_channel` and `chat_create_thread` (with an initial message). No `disc_*` tool remains, and none logs a deprecation | R-15 |
 | IT-16 | daemon | One contract across N configured Mattermost servers plus Discord: one agent registered on **two** Mattermost servers, each with its own (crew, server) broker and token, sends and receives on both | R-09, R-10 |
 | IT-17 | broker | Account naming fits CT-05; the crew defaults to the partner's username and can be overridden | R-01, R-02 |
 | IT-18 | broker ↔ Mattermost | A test user standing in for the human partner DMs `social 2h`, `crew` and `kiosk off`; the state, expiry and lapse notice change | R-23, R-24, R-34 |
@@ -619,7 +618,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-22 | daemon ↔ working agent | Engaging social delivers the kiosk transcript since the cursor, marked as outsider content; the cursor advances once it is handed over; an agent registering while social is on gets it then | R-33 |
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
 | IT-24 | daemon ↔ Mattermost | An agent posts a new root through the daemon's `send`, the daemon restarts, and a human's reply in that thread is addressed to the agent (`addressed_to` true through the persisted `MyThreads`) (D-104) | R-17, R-19 |
-| IT-25 | daemon ↔ scream-hole | With the scream-hole fake failing its health check, `chat_read` and `disc_read` on Discord answer `unavailable: scream-hole unhealthy`, and the Discord REST fake sees no read; `chat_send` still posts, through the direct fallback. Once the fake is healthy again, the next read is served through scream-hole (D-106) | R-15 |
+| IT-25 | daemon ↔ scream-hole | With the scream-hole fake failing its health check, `chat_read`, with and without `post_id`, on Discord answers `unavailable: scream-hole unhealthy`, and the Discord REST fake sees no read; `chat_send` still posts, through the direct fallback. Once the fake is healthy again, the next read is served through scream-hole (D-106) | R-15 |
 
 ### 6.3 End-to-End Tests (Automated)
 
@@ -1021,7 +1020,7 @@ Delivers the chat daemon's process, socket protocol and registration, holding to
 #### Phase 2 Definition of Done
 
 - [ ] IT-02, IT-04 to IT-07, IT-14 to IT-16, IT-24 and IT-25, pass on all three CI legs. [R-04, R-05, R-07, R-09 to R-19, R-29]
-- [ ] Every `disc_*` alias is covered by IT-15. [R-15]
+- [ ] IT-15 covers today's `disc_*` behaviours, through `chat_*` (D-108). [R-15]
 - [ ] A `mattermost-crew` release is tagged, ready for IP-2 (K-1).
 - [ ] All Phase 2 unit tests pass.
 
@@ -1197,7 +1196,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
    - **interactive:** the tool returns a structured question for the agent to ask its human. A follow-up tool `chat_set_default(key, backend)` writes `chat-defaults.json` atomically.
    - **headless** (`CLAUDE_CODE_ENTRYPOINT` is not interactive, or `--print`): the send fails with a loud error, and the shim runs `sqtk add <needs-list> "<question>"`, where `<needs-list>` is the crew's human partner's needs list, returned by `register` from `/etc/crewchat/servers.toml` (`bj:needs` for crews partnered with BJ) (R-11, CP-02). The question is the shim's own text, never message content.
 4. A backend named in the call is used, and the daemon logs `off-default: <dev> <backend>` (R-13). The shim always sends the resolved `backend` in the `send` and `dm` frames; the daemon does no resolution.
-5. Aliases: `disc_send` maps to `chat_send(backend="discord")`, and likewise for each `disc_*` tool. Each alias logs one deprecation warning per session.
+5. Aliases: `disc_send` maps to `chat_send(backend="discord")`, and likewise for each `disc_*` tool. Each alias logs one deprecation warning per session. *(Superseded by D-108 (v0.2.2): the aliases are removed; see §5.5.)*
 6. `chat_send` with `thread` replies on that thread's backend, whatever the default is (R-12).
 
 **Test Procedures:**
@@ -1214,7 +1213,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 | `test_headless_fails_loud_and_squawks` | Headless + no default → an error and a squawk | `tests/unit/clients/test_mcp_shim.py` |
 | `test_set_default_atomic_write` | `chat_set_default(key, backend)` writes atomically, and sends no frame to the daemon | `tests/unit/clients/test_mcp_shim.py` |
 | `test_reply_follows_thread_backend` | A reply goes to the thread's backend | `tests/unit/clients/test_mcp_shim.py` |
-| `test_disc_alias_maps_and_warns` | The alias forwards with `backend=discord` and warns once | `tests/unit/clients/test_mcp_shim.py` |
+| `test_guild_tools_forward_discord_ops` | Each guild tool forwards its daemon op with `backend=discord` and today's args, and `chat_read(post_id)` reads one message (D-108; was `test_disc_alias_maps_and_warns`) | `tests/unit/clients/test_mcp_shim.py` |
 | `test_shim_holds_no_credentials` | The shim's environment and files contain no token | `tests/unit/clients/test_mcp_shim.py` |
 | `test_shim_reregisters_daily` | With an injected clock, the shim sends `register` again after 24 h, and before a call when its last `register` is older than 24 h | `tests/unit/clients/test_mcp_shim.py` |
 
@@ -1228,7 +1227,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
 - [ ] IT-04, IT-05, IT-15 and IT-16 pass on all three CI legs. [R-09, R-10, R-11, R-12, R-13, R-15]
 - [ ] A headless send with no default fails, and leaves a squawk on the crew's configured needs list; there is no Discord fallback. [R-11]
 - [ ] `grep -rn "token" packages/clients/` finds no credential handling. [R-08]
-- [ ] Every `disc_*` alias forwards and warns. [R-15]
+- [ ] Every `disc_*` alias forwards and warns. [R-15] *(Superseded by D-108 (v0.2.2).)*
 - [ ] No daemon module opens a path under an agent's home or repo; a test asserts the daemon package has no reference to `agent-identity.json`, `chat-defaults.json`, `reseed-revive.md` or `sqtk-mine.json`. [R-11, R-32]
 
 ---
@@ -1298,7 +1297,7 @@ Closes R-15 for Phase 2: every `disc_*` tool in today's kit gets a working alias
 
 **Implementation Steps:**
 
-1. **Aliases for every kit tool** (`crewchat_clients/mcp_shim.py`): all nine `disc_*` aliases take today's argument names and shapes exactly (§5.5), map to `backend="discord"`, and log one deprecation line per session. Channel names (`agent-ops`, `#agent-ops`) resolve against the guild's text channels from scream-hole; an unknown name is `bad_request` naming it. A `guild_id` other than `[discord] guild_id` is `bad_request`, with no call.
+1. **Aliases for every kit tool** (`crewchat_clients/mcp_shim.py`): all nine `disc_*` aliases take today's argument names and shapes exactly (§5.5), map to `backend="discord"`, and log one deprecation line per session. Channel names (`agent-ops`, `#agent-ops`) resolve against the guild's text channels from scream-hole; an unknown name is `bad_request` naming it. A `guild_id` other than `[discord] guild_id` is `bad_request`, with no call. *(Superseded by D-108 (v0.2.2): the aliases are removed, and the four guild ops are `chat_*` tools; see §5.5.)*
 2. **New daemon ops** (`crewchat/chat.py`, §5.4): `list_channels`, `resolve`, `create_channel`, `create_thread`, and `read`'s `post_id`. `DiscordBackend` implements them; Mattermost answers `unsupported`. All Discord REST goes through `<screamhole_url>/api/v10`; while scream-hole is unhealthy, reads answer `unavailable: scream-hole unhealthy` and never reach `discord.com`, writes alone fall back, and health is re-checked on a backoff capped at 60 s (D-106, Story 2.2).
 3. **`attach_path`** (`crewchat/uploads.py`): the shim reads the file as the agent's user and streams it in `upload` frames that each fit `MAX_FRAME_BYTES`. The daemon holds it under `/run/crewchat/uploads/` (`0600`, directory `0700`), at most 8 MiB (`too_large`), deleted after use or after 10 minutes. `send`/`dm` take `attachments`: multipart on Discord, `POST /api/v4/files` with the agent's token and `file_ids` on Mattermost (CT-01).
 4. **`embed`**: `"title:body"`, split on the first colon. A rich embed `{title, description}` on Discord, and `props.attachments: [{title, text}]` on Mattermost. A malformed embed is `bad_request`; neither it nor an attachment is ever silently dropped.
@@ -1312,8 +1311,8 @@ Closes R-15 for Phase 2: every `disc_*` tool in today's kit gets a working alias
 
 | Test Name | Purpose | File Location |
 |-----------|---------|---------------|
-| `test_every_kit_disc_tool_has_alias` | `ALIASES` holds all nine, and each of the six kit tools accepts today's arg names | `tests/unit/clients/test_mcp_shim.py` |
-| `test_disc_send_carries_attach_and_embed` | `disc_send(attach_path, embed)` produces an `upload` stream and a `send` with `attachments` and `embed` | `tests/unit/clients/test_mcp_shim.py` |
+| `test_guild_tools_take_todays_args` | The four guild tools take today's `disc_*` arg names and defaults, and the MCP server offers each with them (D-108; was `test_every_kit_disc_tool_has_alias`) | `tests/unit/clients/test_mcp_shim.py` |
+| `test_chat_send_to_discord_carries_attach_and_embed` | `chat_send(attach_path, embed)` on Discord produces an `upload` stream and a `send` with `attachments` and `embed` (D-108; was `test_disc_send_carries_attach_and_embed`) | `tests/unit/clients/test_mcp_shim.py` |
 | `test_upload_chunks_fit_frame` | Every `upload` frame is under `MAX_FRAME_BYTES`; a file over 8 MiB fails loudly and sends no `send` | `tests/unit/clients/test_mcp_shim.py` |
 | `test_upload_store_mode_and_expiry` | The upload file is `0600`, deleted after use, and expired after 10 minutes (injected clock) | `tests/unit/daemon/test_chat.py` |
 | `test_embed_mattermost_attachment` | On Mattermost, `embed` becomes `props.attachments[0] = {title, text}`; a malformed embed is `bad_request` | `tests/unit/daemon/test_adapter_mattermost.py` |
@@ -1326,7 +1325,7 @@ Closes R-15 for Phase 2: every `disc_*` tool in today's kit gets a working alias
 
 *Integration/E2E Coverage:*
 
-- IT-15, extended to each of the nine aliases.
+- IT-15, extended to each of the nine aliases. *(Superseded by D-108 (v0.2.2): IT-15 runs through `chat_*`.)*
 - IT-25 is new and runnable (`tests/integration/test_chat_contract.py`).
 - IT-05, extended: `chat_send` with `attach_path` and `embed` on Mattermost.
 - IT-04, IT-05 and IT-16 still pass with the single backend-name form.
@@ -1334,7 +1333,7 @@ Closes R-15 for Phase 2: every `disc_*` tool in today's kit gets a working alias
 **Acceptance Criteria:**
 
 - [ ] IT-04, IT-05, IT-15 and IT-16 pass on all three CI legs. [R-09, R-12, R-15]
-- [ ] Every `disc_*` tool in today's kit (`send`, `read`, `list`, `resolve`, `create_channel`, `create_thread`) has an alias taking today's args, covered by IT-15. [R-15]
+- [ ] Every `disc_*` tool in today's kit (`send`, `read`, `list`, `resolve`, `create_channel`, `create_thread`) has an alias taking today's args, covered by IT-15. [R-15] *(Superseded by D-108 (v0.2.2).)*
 - [ ] `attach_path` and `embed` are delivered on Discord and on Mattermost, or refused loudly; neither is ever silently dropped. [R-15]
 - [ ] No Discord read ever reaches `discord.com`, healthy or not; IT-25 passes on all three CI legs. Writes fall back only while scream-hole is unhealthy. [D-106]
 - [ ] One backend-name form on the socket and in every file; no bare-id translation is left in the shim or the daemon. [§5.4]

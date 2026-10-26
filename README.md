@@ -55,6 +55,9 @@ share. Fleet broadcasts are `@agents` (S-24).
   doorbell wiring to the chat daemon.
 - **2026-10-25:** `v0.2.1`, what K-2 pins: `crewchat-doorbell` drops a repeat event (#109),
   and a replaced kiosk transcript restarts its review under a new `event_id` (#110).
+- **2026-10-26:** `v0.2.2`, the first fleet deploy (kit 8.18.0): `chat_health()` re-registers
+  after a daemon restart (#112), and the `disc_*` aliases are gone, with Discord's guild ops
+  as `chat_*` tools (#113, D-108).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
