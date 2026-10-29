@@ -6,8 +6,9 @@
 #
 # It installs packaging/crewkiosk-run at /usr/local/libexec/crewkiosk-run (0755, root), the two
 # units in /etc/systemd/system, a dummy model credential at /etc/crewkiosk/model.credential
-# (0600, crewkiosk), and, because CI has no Claude Code, a stub /usr/local/bin/claude that answers
-# with what it was run as, so a test can assert the user, the empty HOME, the flags and the
+# (0600, crewkiosk), a model.conf naming a generic gateway (0640, root:crewkiosk), and, because
+# CI has no Claude Code, a stub /usr/local/bin/claude that answers with what it was run as, so a
+# test can assert the user, the empty HOME, the gateway, the pinned model, the flags and the
 # prompt. It refuses to replace a real claude. It starts crewkiosk.socket and exports
 # CREWKIOSK_SOCKET (into $GITHUB_ENV under Actions). It needs root or sudo and systemd: never
 # run it on a workstation.
@@ -36,6 +37,8 @@ printf 'user=%s\n' "$(id -un)"
 printf 'home_entries=%s\n' "$(ls -A "$HOME" | wc -l)"
 printf 'work_entries=%s\n' "$(ls -A . | wc -l)"
 printf 'key_set=%s\n' "${ANTHROPIC_API_KEY:+yes}"
+printf 'base_url=%s\n' "${ANTHROPIC_BASE_URL:-}"
+printf 'model_env=%s\n' "${ANTHROPIC_MODEL:-}"
 printf 'arg=[%s]\n' "$@"
 printf 'prompt=%s\n' "$prompt"
 EOF
@@ -44,6 +47,9 @@ $SUDO install -D -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-run" /usr/
 $SUDO install -d -m 0750 -o root -g crewkiosk /etc/crewkiosk
 echo "sk-ci-dummy-kiosk-key" | $SUDO install -m 0600 -o crewkiosk -g crewkiosk /dev/stdin \
   /etc/crewkiosk/model.credential
+# A generic gateway: the stub never calls it, it only reports what the runner exported.
+printf '%s\n' 'base_url=https://llm.example.lan' 'model=haiku-latest' \
+  | $SUDO install -m 0640 -o root -g crewkiosk /dev/stdin /etc/crewkiosk/model.conf
 $SUDO install -m 0644 -o root -g root "${ROOT}/packaging/crewkiosk.socket" \
   "${ROOT}/packaging/crewkiosk@.service" /etc/systemd/system/
 $SUDO systemctl daemon-reload

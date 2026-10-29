@@ -161,7 +161,8 @@ def test_kiosk_answers_through_the_socket(installed: dict[str, Any]) -> None:
     """D-107: the daemon's user, with no new privileges (as crewchat.service runs it), gets
     an answer from `crewkiosk` through `crewkiosk.socket`. CI's stub `claude`
     (scripts/ci/kiosk-up.sh) reports what it ran as: `crewkiosk`, an empty HOME and working
-    directory, the kiosk's own key, exactly the fixed flags, and the prompt on stdin. Under
+    directory, the kiosk's own key, the gateway and model from model.conf, exactly the fixed
+    flags and the pinned model, and the prompt on stdin. Under
     the same flag, the old `sudo -u crewkiosk` path cannot work at all."""
     sock = os.environ.get("CREWKIOSK_SOCKET", "").strip()
     if not sock:
@@ -177,6 +178,8 @@ def test_kiosk_answers_through_the_socket(installed: dict[str, Any]) -> None:
     assert "user=crewkiosk" in lines
     assert "home_entries=0" in lines and "work_entries=0" in lines
     assert "key_set=yes" in lines
+    # kiosk-up.sh's model.conf: the gateway is exported and the model pinned (#116).
+    assert "base_url=https://llm.example.lan" in lines and "model_env=haiku-latest" in lines
     args = [line[len("arg=[") : -1] for line in lines if line.startswith("arg=[")]
     assert args == [
         "-p",
@@ -186,6 +189,10 @@ def test_kiosk_answers_through_the_socket(installed: dict[str, Any]) -> None:
         "",
         "--disallowedTools",
         "mcp__*",
+        "--settings",
+        '{"switchModelsOnFlag":false}',
+        "--model",
+        "haiku-latest",
     ]
     assert "prompt=WHAT-DO-YOU-BUILD" in lines
     # The superseded path: sudo can't gain privileges once NoNewPrivs is set.

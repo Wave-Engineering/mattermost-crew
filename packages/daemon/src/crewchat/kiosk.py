@@ -83,7 +83,8 @@ KIOSK_SUBDIR = "kiosk"  # /var/lib/crewchat/kiosk
 KIOSK_USER = "crewkiosk"
 KIOSK_RUN = "/usr/local/libexec/crewkiosk-run"  # packaging/crewkiosk-run, root-owned
 KIOSK_SOCKET = "/run/crewkiosk/kiosk.sock"  # packaging/crewkiosk.socket (D-107)
-# What packaging/crewkiosk-run runs; test_kiosk_runner holds the wrapper to exactly this.
+# What packaging/crewkiosk-run runs; test_kiosk_runner holds the wrapper to exactly this,
+# followed by `--model <pin>` from /etc/crewkiosk/model.conf (#116).
 CLAUDE_FLAGS = (
     "-p",
     "--restricted",
@@ -92,6 +93,9 @@ CLAUDE_FLAGS = (
     "",
     "--disallowedTools",
     "mcp__*",
+    # A flagged request ends as an error, never re-run on a model the gateway may not allow.
+    "--settings",
+    '{"switchModelsOnFlag":false}',
 )
 RUNNER_TIMEOUT_S = 120.0
 MAX_ANSWER_CHARS = 16_000  # under Mattermost's 16383-character post limit

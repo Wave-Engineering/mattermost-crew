@@ -33,6 +33,18 @@ All notable changes to this project are recorded here. The format follows
   boundary. The shim's `register` sends `project_key`, its `repo_key()` and never a remote URL.
   An older shim sends none, and gets no account where an allowlist is set, unless a `name:`
   entry names it.
+- The kiosk runner reads `/etc/crewkiosk/model.conf` (0640, `root:crewkiosk`; optional,
+  parsed, never sourced), whose only keys are `base_url`, an https model gateway exported as
+  `ANTHROPIC_BASE_URL`, and `model` (#116). It always pins the model, default
+  `claude-haiku-5-5`: it passes `--model` and sets `ANTHROPIC_MODEL`,
+  `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+  `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_FABLE_MODEL` and
+  `ANTHROPIC_SMALL_FAST_MODEL` to it, and passes `--settings '{"switchModelsOnFlag":false}'`
+  so a flagged request ends as an error instead of re-running on another model. An unknown key
+  (reported by line number, never its text), a non-https `base_url`, an unsafe `model`, a bare
+  Claude Code alias such as `haiku` as `model` with no `base_url` (Claude Code would send it to
+  the API as a model ID), or an unreadable file exits 66 before the CLI runs. `verify-install`
+  checks the file's mode.
 
 ### Fixed
 
@@ -45,6 +57,12 @@ All notable changes to this project are recorded here. The format follows
 - The broker block sets `/etc/crewbroker` to 0755 before starting any instance, so a directory
   that already existed at 0700 no longer leaves `crewbroker` crash-looping on its credential
   (#115).
+- The kiosk's model credential is the key alone, one line, as the runner always read it; the
+  spike 1.2 doc said `ANTHROPIC_API_KEY=<key>`, which the runner sent as the key itself (#116).
+  That form is now accepted too, and any other first line holding an `=` exits 65, so a key
+  that itself contains `=` (base64 padding, say) is refused too. So does a key with whitespace
+  in it (a CRLF line ending, padding), and an empty, missing or unreadable credential, which
+  exited 1 before.
 
 ## [0.2.2] — 2026-10-26
 
