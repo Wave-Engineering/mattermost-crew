@@ -6,6 +6,13 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+## [0.2.3] — 2026-10-29
+
+What a second server's broker needs before it goes live: the kiosk off by default, a daily
+kiosk cap and an agent allowlist per server, the kiosk through a model gateway, and the socket
+ACL in packaging. **Upgrading:** the kiosk stops answering on every server until `kiosk = true`
+is set on the servers that should have one.
+
 ### Changed
 
 - **The kiosk is now off on every server unless `servers.toml` turns it on** (#117). Each
