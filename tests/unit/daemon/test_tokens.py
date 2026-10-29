@@ -21,6 +21,7 @@ from crewchat.tokens import (
     RETRY_FIRST_S,
     RETRY_MAX_S,
     BrokerClient,
+    BrokerError,
     BrokerUnavailable,
     Rotator,
     TokenStore,
@@ -116,6 +117,41 @@ def test_401_twice_is_not_retried_again(daemon: Any) -> None:
         asyncio.run(daemon.store.call_with_refresh("babel", "dev", request))
     assert len(calls) == 2
     assert len(daemon.broker().ops("remint")) == 1
+
+
+def test_deactivated_account_retires_its_token(daemon: Any, clock: Any) -> None:
+    """#130 review: a remint the broker refuses as `deactivated` (the prune, or verify's canary
+    `deactivate`) drops the token and revokes it, so neither the next 401 nor the daily
+    rotation tries the dead login against the server again."""
+    register(daemon)
+    old = daemon.store.agent("babel").servers["dev"]
+    broker = daemon.broker()
+    broker.fail["remint"] = BrokerError("remint", "deactivated: babel.oaw was pruned")
+    with pytest.raises(BrokerError):
+        asyncio.run(daemon.store.refresh("babel", "dev", old.token))
+    assert daemon.store.token_for("babel", "dev") is None
+    assert broker.ops("revoke") == [{"token_id": old.token_id}]
+    assert daemon.store.agent("babel").pending_revoke["dev"] == []
+    # The next 401 on the dead token has nothing to remint.
+    asyncio.run(daemon.store.refresh("babel", "dev", old.token))
+    clock.now += timedelta(days=1)
+    report = asyncio.run(Rotator(daemon.store, sleep=NoSleep()).run_daily(clock.now))
+    assert report.rotated == [] and report.failed == []
+    assert len(broker.ops("remint")) == 1
+    # A register mints again, as for any pruned account.
+    del broker.fail["remint"]
+    register(daemon)
+    assert daemon.store.token_for("babel", "dev") is not None
+
+
+def test_other_remint_errors_keep_the_token(daemon: Any) -> None:
+    register(daemon)
+    old = daemon.store.agent("babel").servers["dev"]
+    daemon.broker().fail["remint"] = BrokerError("remint", "upstream: GET /bots failed")
+    with pytest.raises(BrokerError):
+        asyncio.run(daemon.store.refresh("babel", "dev", old.token))
+    assert daemon.store.agent("babel").servers["dev"] == old
+    assert daemon.broker().ops("revoke") == []
 
 
 def test_concurrent_401s_remint_once(daemon: Any) -> None:

@@ -353,9 +353,12 @@ class TokenStore:
         agent = self._agents.get(dev_name)
         if agent is None or agent.crew != crew:
             return
+        await self._retire_server_locked(agent, server_id, "no longer allowed there")
+
+    async def _retire_server_locked(self, agent: AgentTokens, server_id: str, why: str) -> None:
         tok = agent.servers.pop(server_id, None)
         if tok is not None:
-            log.info("retiring %s's token on %s: no longer allowed there", dev_name, server_id)
+            log.info("retiring %s's token on %s: %s", agent.dev_name, server_id, why)
             # Recorded before the revoke is tried, as in `_swap`, so a crash mid-revoke keeps it.
             agent.pending_revoke.setdefault(server_id, []).append(tok.token_id)
             self._persist(agent)
@@ -374,7 +377,15 @@ class TokenStore:
             raise KeyError(f"{dev_name} holds no token on {server_id}")
         client = self._client(agent, server_id)
         held = agent.servers[server_id]
-        result = await client.remint(dev_name, agent.crew, held.token_id)
+        try:
+            result = await client.remint(dev_name, agent.crew, held.token_id)
+        except BrokerError as exc:
+            if exc.code == "deactivated":
+                # Pruned, or `verify-install`'s canary `deactivate` (#127): no remint succeeds
+                # until a `register` mints again. Drop the token, or every reconnect and daily
+                # rotation tries the dead login against the server again.
+                await self._retire_server_locked(agent, server_id, "its account is deactivated")
+            raise
         await self._swap(agent, server_id, _server_token(result, held.account))
 
     async def refresh(self, dev_name: str, server_id: str, failed_token: str) -> None:
