@@ -67,6 +67,8 @@ share. Fleet broadcasts are `@agents` (S-24).
   section (#123). `verify-install` deactivates its canary bot when it is done (#127), the kiosk
   block restarts its socket (#128), and `crewchat-doorbell` waits through a daemon restart
   (#129).
+- **2026-10-29:** `v0.2.5`: the broker adds each bot it mints to its crew's team and default
+  channels, named by URL name or display name in the broker's config (#132).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production

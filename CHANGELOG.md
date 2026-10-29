@@ -4,7 +4,23 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.5] — 2026-10-29
+
+The broker puts every bot it mints into its crew's team and default channels, so an agent shows
+up where people can find it and address it.
+
+**Upgrading:**
+
+- To turn it on, the broker account needs no new role. It must be **a member of the team and of
+  every default channel**. A channel admin adds it to each one, and on a private channel that's
+  the only way. On a partner's server, adding it and setting the keys is the human partner's
+  step (CP-03). See the runbook's prerequisites and Configure.
+- A client older than v0.2.3 sends no `project_key`. Under `agents_allow` it then matches only
+  a `name:` entry, and forge-key and path entries refuse it (#117). The client is loaded once
+  when the session starts, so a session started before its client was upgraded needs a restart,
+  or `/mcp reconnect crewchat`.
+- Rolling back to v0.2.4 needs no config edit. Its broker ignores `team` and
+  `default_channels`, and the memberships it already made stay.
 
 ### Added
 
@@ -21,11 +37,6 @@ All notable changes to this project are recorded here. The format follows
   remaining adds are deferred so they don't hold up the token: each is reported as `deferred`
   and tried again at the next `register`. With neither key set nothing changes: no membership
   call, and no `membership` key in the answer.
-
-**Upgrading:** to turn it on, the broker account needs no new role. It must be **a member of the
-team and of every default channel**. A channel admin adds it to each
-one, and on a private channel that's the only way. On a partner's server, adding it and setting
-the keys is the human partner's step (CP-03). See the runbook's prerequisites and Configure.
 
 ## [0.2.4] — 2026-10-29
 
