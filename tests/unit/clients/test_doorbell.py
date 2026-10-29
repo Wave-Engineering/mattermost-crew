@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
 import stat
 import subprocess
@@ -89,6 +90,15 @@ def ok(event: Any) -> Responder:
 
 def fail(error: str) -> Responder:
     return lambda frame: {"id": frame["id"], "ok": False, "error": error}
+
+
+GRACE_S = 0.3  # the restart grace in these tests, for a 60 s RESTART_GRACE_S
+
+
+@pytest.fixture(autouse=True)
+def short_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doorbell, "RESTART_GRACE_S", GRACE_S)
+    monkeypatch.setattr(doorbell, "RESTART_BACKOFF_S", (0.02, 0.05))
 
 
 @pytest.fixture
@@ -182,6 +192,8 @@ def test_cut_short_or_malformed_reply_is_unreachable(
     finally:
         fake.close()
     assert (code, out) == (EXIT_UNREACHABLE, "")
+    # A hang-up is a restart's first sign, retried through the grace (#129); a bad reply is not.
+    assert (len(fake.frames) > 1) == (reply == b"")
 
 
 def test_refused_socket_is_unreachable(repo: Path, short_dir: Path) -> None:
@@ -386,3 +398,107 @@ def test_event_without_id_is_printed_not_recorded(repo: Path, short_dir: Path) -
         fake.close()
     assert code == EXIT_EVENT and json.loads(out) == EVENT
     assert not seen_file(repo).exists()
+
+
+# -- a daemon restart (#129) -----------------------------------------------------------------
+def scripted(*replies: bytes | str | dict[str, Any]) -> Responder:
+    """One reply per `subscribe`, in order: raw bytes, `"nr"` for `not_registered`, or an
+    event. After the last, it holds the connection open."""
+    pending = list(replies)
+
+    def respond(frame: dict[str, Any]) -> dict[str, Any] | bytes | None:
+        if not pending:
+            return None
+        reply = pending.pop(0)
+        if reply == "nr":
+            return {"id": frame["id"], "ok": False, "error": f"not_registered: {DEV}"}
+        if isinstance(reply, bytes):
+            return reply
+        return {"id": frame["id"], "ok": True, "result": reply}
+
+    return respond
+
+
+def test_waits_through_a_daemon_restart(
+    repo: Path, short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restart as it happens: no socket while systemd restarts the daemon, then a socket
+    whose first answer is a hang-up, then `not_registered` until the shim's ping registers
+    again, then the event. The one-shot rides it out and exits 0 with the event."""
+    monkeypatch.setattr(doorbell, "RESTART_GRACE_S", 5.0)
+    path = short_dir / "d.sock"
+    fakes: list[FakeDaemon] = []
+
+    def come_back() -> None:
+        time.sleep(0.3)
+        fakes.append(FakeDaemon(path, scripted(b"", "nr", "nr", with_id("mattermost:p1"))))
+
+    starter = threading.Thread(target=come_back)
+    starter.start()
+    try:
+        code, out, err = ring(repo, path)
+    finally:
+        starter.join()
+        for fake in fakes:
+            fake.close()
+    assert code == EXIT_EVENT, err
+    assert json.loads(out) == with_id("mattermost:p1")
+    assert len(fakes[0].frames) == 4
+
+
+@pytest.mark.parametrize(
+    ("replies", "want"),
+    [((), EXIT_UNREACHABLE), (("nr",) * 1000, EXIT_NOT_REGISTERED)],
+    ids=["down", "unregistered"],
+)
+def test_an_outage_past_the_grace_exits(
+    repo: Path, short_dir: Path, replies: tuple[str, ...], want: int
+) -> None:
+    """A daemon still down after the grace is 4, an agent still unregistered is 2, as before
+    #129; only the wait is new."""
+    fake = FakeDaemon(short_dir / "d.sock", scripted(*replies)) if replies else None
+    path = fake.path if fake else short_dir / "absent.sock"
+    start = time.monotonic()
+    try:
+        code, out, err = ring(repo, path)
+    finally:
+        if fake:
+            fake.close()
+    elapsed = time.monotonic() - start
+    assert (code, out) == (want, "")
+    assert GRACE_S <= elapsed < GRACE_S + 2
+    assert f"for {GRACE_S:.0f} s" in err
+
+
+@pytest.mark.parametrize("replies", [(), ("nr",) * 1000], ids=["down", "unregistered"])
+def test_a_timeout_inside_an_outage_reports_the_outage(
+    repo: Path, short_dir: Path, monkeypatch: pytest.MonkeyPatch, replies: tuple[str, ...]
+) -> None:
+    """The timeout ends first, mid-outage: the exit says what is wrong (4 or 2), not 3."""
+    monkeypatch.setattr(doorbell, "RESTART_GRACE_S", 30.0)
+    fake = FakeDaemon(short_dir / "d.sock", scripted(*replies)) if replies else None
+    path = fake.path if fake else short_dir / "absent.sock"
+    start = time.monotonic()
+    try:
+        code, out, _ = ring(repo, path, {"CREWCHAT_DOORBELL_TIMEOUT": "0.3"})
+    finally:
+        if fake:
+            fake.close()
+    assert (code, out) == ((EXIT_NOT_REGISTERED if replies else EXIT_UNREACHABLE), "")
+    assert time.monotonic() - start < 2
+
+
+def test_no_permission_is_unreachable_at_once(repo: Path, short_dir: Path) -> None:
+    """A socket the agent may not open is a broken host, not a restart: no grace."""
+    if os.geteuid() == 0:
+        pytest.skip("root opens any socket")
+    fake = FakeDaemon(short_dir / "d.sock", ok(EVENT))
+    fake.path.chmod(0)
+    start = time.monotonic()
+    try:
+        code, out, err = ring(repo, fake.path)
+    finally:
+        fake.close()
+    assert (code, out) == (EXIT_UNREACHABLE, ""), err
+    assert "PermissionError" in err and fake.frames == []
+    assert time.monotonic() - start < GRACE_S

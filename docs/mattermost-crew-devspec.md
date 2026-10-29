@@ -344,6 +344,7 @@ JSON lines over the unix socket. Every frame carries `"proto": 1` (D-056). Reque
 | `squawk_ids` | `dev_name, ids` | `{}`. The shim pushes the ids from `.claude/sqtk-mine.json` (R-26). |
 | `subscribe` | `dev_name` | stream of events; the thin one-shot exits on the first |
 | `health` | `dev_name?` | `{backends:{name:{state, since}}}`, keyed by backend name. Discord's entry is `ok`, or `degraded` while scream-hole is unhealthy (D-106). With `dev_name`, an agent the daemon doesn't hold gets `not_registered`, so the shim re-registers after a daemon restart (#112). Without it, `health` is the daemon's liveness check. |
+| `ping` | `dev_name` | `{}`, or `not_registered` for an agent the daemon doesn't hold (#129). The shim's timer asks it every 15 s, so an idle session re-registers after a daemon restart without waiting for a tool call. It touches no backend, unlike `health`. A daemon older than `ping` answers `unsupported`, and the shim stops asking. |
 
 Every chat frame (`send`, `dm`, `read`, `thread`, `react`, and the Discord ops) names the agent it acts as (`dev_name`) and the backend it goes to (`backend`), because one daemon per host serves N backends. `off_default: true` marks a call that named a backend other than the agent's default, and is logged (R-13).
 
@@ -428,9 +429,11 @@ One-shot exit codes:
 | code | meaning |
 |---|---|
 | 0 | an event |
-| 2 | not registered |
+| 2 | not registered, for longer than the restart grace |
 | 3 | timeout |
-| 4 | daemon unreachable |
+| 4 | daemon unreachable: down for longer than the restart grace, or at once for no permission, a connect timeout, or an oversized, malformed or mismatched reply |
+
+**The one-shot waits through a daemon restart** (#129). A restart closes the one-shot's connection, then the socket refuses or is missing until the new daemon listens, and the new daemon answers `not_registered` until the shim's `ping` registers the agent again. Each of those (a missing or refused socket, a connection closed or reset before the reply, `not_registered`) is retried, with a backoff of at most 2 s, for 60 s from the first failure (`RESTART_GRACE_S`). Only an outage that lasts longer exits, with 4 or 2. The retries spend the same `CREWCHAT_DOORBELL_TIMEOUT`, and a timeout that ends inside an outage exits with the outage's code, not 3. The event a `subscribe` held when the daemon stopped stays held (shutdown above) and comes from the new daemon, and a repeat is dropped by the seen set.
 
 ### 5.9 Switch and Loop Guard Placement
 
@@ -1186,6 +1189,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
    - It defines the §5.5 tools. `chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react` and `chat_health` each forward one frame to `/run/crewchat/crewchat.sock`. `chat_set_default(key, backend)` is the one local-only tool: it writes `~/.claude/chat-defaults.json` and sends nothing to the daemon.
    - On start it sends `register` with the Dev-Name and `crew` from `<repo_root>/.claude/agent-identity.json`; `crew` is omitted when the file has none. The result includes the crew's `needs_list` (§5.4), which the daemon takes from `[crews.<crew>] needs_list` in `servers.toml`.
    - It **re-registers** every 24 hours on a timer, and before any call if its last `register` is older than 24 h. The shim lives as long as the session, so a session that stays up for weeks never ages out under R-30.
+   - The same timer sends `ping{dev_name}` every 15 s (#129). A `not_registered` answer means the daemon restarted and lost the registration: the shim registers again and pushes its files, with no tool call, so the agent's doorbell can arm. A daemon that answers `unsupported` is not asked again; one that is down is asked again on the next tick.
    - It runs as the agent's user, so it reads the agent's files; the daemon never does (§5.3).
      - It pushes `kiosk_brief{dev_name, text}`, where `text` is `crewchat_clients.brief.extract_brief` of `<repo_root>/.claude/reseed-revive.md`, at start and whenever that file's mtime changes.
      - It pushes `squawk_ids{dev_name, ids}` from `<repo_root>/.claude/sqtk-mine.json` at start and on change.

@@ -35,6 +35,10 @@ and the daemon acts on the agent's behalf with what it holds itself.
   24 hours, and before any call when the last one is older than that, so a long-lived session
   never ages out (R-30). A daemon that answers
   `not_registered` (it restarted) gets a fresh `register` and the call is retried once.
+- **Ping (#129).** The timer sends `ping{dev_name}` every `PING_EVERY` (15 s). A
+  `not_registered` answer re-registers and force-pushes, so an idle session comes back after a
+  daemon restart with no tool call, and its doorbell, waiting through the restart, delivers.
+  A daemon without the op (`unsupported`) is not asked again.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
@@ -87,6 +91,9 @@ PROTO = 1
 MAX_FRAME_BYTES = 1024 * 1024
 CALL_TIMEOUT_S = 30.0
 REGISTER_EVERY = timedelta(hours=24)
+# How often the timer asks the daemon whether it still holds the agent (#129). Well inside the
+# doorbell's restart grace, so a one-shot waiting through a restart sees the re-register.
+PING_EVERY = timedelta(seconds=15)
 POLL_INTERVAL_S = 5.0
 DISCORD = "discord"
 # A Discord snowflake, used with `fullmatch` (#62): the one shape a `<channel>/<message>` part
@@ -338,6 +345,8 @@ class Shim:
         self.dev_name: str = dev_name
         self.registered_at: datetime | None = None
         self.registration: dict[str, Any] = {}
+        self.pinged_at: datetime | None = None
+        self.ping_supported = True
         self._brief = _FileState()
         self._squawks = _FileState()
         self._squawked: set[str] = set()
@@ -414,6 +423,35 @@ class Shim:
         if self.register_due():
             await self.register()
 
+    async def ping(self) -> None:
+        """Every `PING_EVERY`, ask the daemon whether it still holds the agent, and register
+        again when it doesn't (#129). A restarted daemon has lost every registration, and
+        without this an idle session stays unregistered until its next tool call, so its
+        doorbell can't arm. A daemon older than `ping` answers `unsupported` and is never
+        asked again; one that is down is asked again on the next tick."""
+        if not self.ping_supported or self.registered_at is None:
+            return  # unregistered: `ensure_registered` retries the register itself
+        now = self.clock()
+        if self.pinged_at is not None and now - self.pinged_at < PING_EVERY:
+            return
+        self.pinged_at = now
+        try:
+            await self.transport("ping", {"dev_name": self.dev_name})
+            return
+        except DaemonUnreachable as exc:
+            log.debug("ping: %s", exc)
+            return
+        except DaemonError as exc:
+            if exc.code == "unsupported":
+                self.ping_supported = False
+                log.info("ping: the daemon has no ping op; relying on calls to re-register")
+                return
+            if exc.code != "not_registered":
+                raise
+        log.info("ping: the daemon no longer holds %s (it restarted); registering", self.dev_name)
+        await self.register()
+        await self.sync_files(force=True)
+
     # -- pushes ---------------------------------------------------------------------------------
     async def sync_files(self, *, force: bool = False) -> None:
         """Push the brief when the seed's mtime changed, and the squawk ids when they changed."""
@@ -441,10 +479,11 @@ class Shim:
             log.error("start: %s (retried before the next call)", exc)
 
     async def tick(self) -> None:
-        """The timer's work: the daily re-register, and the file pushes."""
+        """The timer's work: the daily re-register, the ping, and the file pushes."""
         async with self._lock:
             try:
                 await self.ensure_registered()
+                await self.ping()
                 await self.sync_files()
             except ShimError as exc:
                 log.error("tick: %s", exc)

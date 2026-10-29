@@ -24,15 +24,22 @@ is no Monitor primitive on Bedrock, so a task's exit is the only wake-up there i
   warned about and treated as empty: a repeat is tolerable, a one-shot that stops delivering
   is not.
 
+- **A daemon restart** (#129). The restart closes the connection, the socket is missing or
+  refuses while the daemon starts, and the new daemon answers `not_registered` until the
+  shim's `ping` registers the agent again. Each is retried for `RESTART_GRACE_S` (60 s) from
+  the first failure, and only an outage that lasts longer exits, with 4 or 2. A timeout that
+  ends inside an outage exits with the outage's code.
+
 Exit codes (§5.8). It **never** exits 0 without printing an event:
 
 | code | meaning |
 |---|---|
 | 0 | an event, printed as one JSON line |
 | 1 | a usage error: no identity, a bad timeout, or a daemon error other than the ones below |
-| 2 | not registered |
+| 2 | not registered, past the restart grace |
 | 3 | timeout |
-| 4 | daemon unreachable: no socket, refused, or the reply was cut short or malformed |
+| 4 | daemon unreachable: down past the restart grace; or at once for no permission, a connect |
+|   | timeout, or a reply that is oversized, malformed or mismatched |
 """
 
 from __future__ import annotations
@@ -79,6 +86,12 @@ EVENT_ID_RE = re.compile(r"[^\s]{1,512}")
 # How long to pause before subscribing again after the same repeat came back twice running:
 # the daemon acks a repeat as it writes it, so a third in a row is a daemon fault, not a race.
 REPEAT_BACKOFF_S = (0.0, 0.05, 0.2, 1.0)
+# How long a daemon restart may last before the one-shot gives up (#129): the daemon going away
+# and coming back, then the shim's ping (every 15 s) registering the agent again.
+RESTART_GRACE_S = 60.0
+RESTART_BACKOFF_S = (0.25, 0.5, 1.0, 2.0)
+# A connect that fails like this is a daemon that is stopped or starting, not a broken host.
+DOWN_ERRORS = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError)
 
 
 class DoorbellExit(Exception):
@@ -87,7 +100,12 @@ class DoorbellExit(Exception):
     code = EXIT_ERROR
 
 
-class NotRegistered(DoorbellExit):
+class Restarting(DoorbellExit):
+    """What a daemon restart looks like from here (#129): retried for `RESTART_GRACE_S`, and
+    only an outage that lasts longer ends the one-shot."""
+
+
+class NotRegistered(Restarting):
     code = EXIT_NOT_REGISTERED
 
 
@@ -97,6 +115,10 @@ class TimedOut(DoorbellExit):
 
 class Unreachable(DoorbellExit):
     code = EXIT_UNREACHABLE
+
+
+class Down(Unreachable, Restarting):
+    """No socket, a refused connect, or a connection closed before the reply."""
 
 
 def read_dev_name(repo_root: Path) -> str:
@@ -201,7 +223,9 @@ def subscribe(sock_path: Path, dev_name: str, timeout_s: float | None) -> dict[s
             sock.settimeout(CONNECT_TIMEOUT_S)
             sock.connect(str(sock_path))
             sock.sendall(json.dumps(frame).encode() + b"\n")
-        except OSError as exc:  # absent, refused, no permission, or a connect timeout
+        except DOWN_ERRORS as exc:  # absent, or refused: stopped or starting
+            raise Down(f"crewchat daemon at {sock_path}: {exc!r}") from exc
+        except OSError as exc:  # no permission, or a connect timeout
             raise Unreachable(f"crewchat daemon at {sock_path}: {exc!r}") from exc
         buf = b""
         while not buf.endswith(b"\n"):
@@ -216,10 +240,12 @@ def subscribe(sock_path: Path, dev_name: str, timeout_s: float | None) -> dict[s
                 chunk = sock.recv(RECV_CHUNK)
             except TimeoutError as exc:
                 raise TimedOut(f"no event within {timeout_s:g} s") from exc
+            except DOWN_ERRORS as exc:
+                raise Down(f"crewchat daemon at {sock_path}: {exc!r}") from exc
             except OSError as exc:
                 raise Unreachable(f"crewchat daemon at {sock_path}: {exc!r}") from exc
-            if not chunk:
-                raise Unreachable(f"crewchat daemon at {sock_path} closed without a reply")
+            if not chunk:  # a stop closes every connection: the restart's first sign
+                raise Down(f"crewchat daemon at {sock_path} closed without a reply")
             buf += chunk
             if len(buf) > MAX_FRAME_BYTES:
                 raise Unreachable(f"crewchat daemon at {sock_path} sent an oversized reply")
@@ -266,22 +292,53 @@ def run(
 
 
 def wait_for_new(
-    sock_path: Path, dev_name: str, timeout_s: float | None, seen: SeenSet | None
+    sock_path: Path,
+    dev_name: str,
+    timeout_s: float | None,
+    seen: SeenSet | None,
+    *,
+    grace_s: float | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """The first event whose `event_id` isn't in `seen`, and that ID (None for an event from
     a daemon that gives none). A repeat's reply was written, so the daemon has acked it, and
     the next `subscribe`, on a fresh connection, waits for the event after it. One timeout
-    spans them all."""
+    spans them all.
+
+    A daemon restart (#129) is waited through: while `subscribe` fails as `Restarting` (the
+    daemon down, then not yet holding the agent again), it is retried until the outage has
+    lasted `grace_s` (default `RESTART_GRACE_S`), and only then raised. A timeout that ends
+    inside an outage raises the outage, not `TimedOut`: the agent should hear that the daemon
+    is down."""
+    grace_s = RESTART_GRACE_S if grace_s is None else grace_s
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
     last, again = None, 0
+    outage: float | None = None  # when the current run of `Restarting` failures began
+    failure: Restarting | None = None  # its latest
+    tries = 0
     while True:
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
+            if failure is not None:
+                raise failure
             raise TimedOut(f"no new event within {timeout_s:g} s")
         try:
             event = subscribe(sock_path, dev_name, remaining)
         except TimedOut as exc:
             raise TimedOut(f"no new event within {timeout_s:g} s") from exc
+        except Restarting as exc:
+            now = time.monotonic()
+            outage = now if outage is None else outage
+            failure = exc
+            if now - outage >= grace_s:
+                raise type(exc)(f"{exc}, for {now - outage:.0f} s") from exc
+            pause = RESTART_BACKOFF_S[min(tries, len(RESTART_BACKOFF_S) - 1)]
+            pause = min(pause, outage + grace_s - now)
+            if deadline is not None:
+                pause = min(pause, deadline - now)
+            tries += 1
+            time.sleep(max(pause, 0.0))
+            continue
+        outage, failure, tries = None, None, 0
         event_id = event.get("event_id")
         if not isinstance(event_id, str) or not EVENT_ID_RE.fullmatch(event_id):
             return event, None

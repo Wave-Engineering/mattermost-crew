@@ -34,6 +34,13 @@ All notable changes to this project are recorded here. The format follows
   last check deactivates the canary on every broker instance and reads the server's `delete_at`
   back. Before, each verify's `mint` re-enabled a canary an admin had deactivated, so every
   verify against a shared server needed a cleanup.
+- A daemon restart no longer kills every agent's `crewchat-doorbell` (#129). It exited 4,
+  "closed without a reply", and the `/disc` rule then sent each agent back to the one-shots.
+  The one-shot now waits through the restart: a missing or refused socket, a connection closed
+  before its reply, and `not_registered` are retried for 60 s, and only a longer outage exits
+  4 or 2. The shim's timer now `ping`s the daemon every 15 s and registers again when it has
+  been forgotten, so an idle session no longer needs a `chat_health()` call before its doorbell
+  will arm.
 
 ### Added
 
@@ -44,6 +51,8 @@ All notable changes to this project are recorded here. The format follows
 - Verify's description names the kiosk's `model.conf` mode check.
 - The broker's `deactivate{dev_name, crew}` op disables an account's bot now, as the 30-day prune
   does, and answers `{account, delete_at}` read back from the server (#127).
+- The daemon's `ping{dev_name}` op answers `{}`, or `not_registered` for an agent it doesn't
+  hold, and touches no backend (#129).
 
 ## [0.2.3] — 2026-10-29
 
