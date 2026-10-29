@@ -9,9 +9,16 @@ All notable changes to this project are recorded here. The format follows
 ## [0.2.3] — 2026-10-29
 
 What a second server's broker needs before it goes live: the kiosk off by default, a daily
-kiosk cap and an agent allowlist per server, the kiosk through a model gateway, and the socket
-ACL in packaging. **Upgrading:** the kiosk stops answering on every server until `kiosk = true`
-is set on the servers that should have one.
+kiosk cap and an agent allowlist per server, the kiosk's model always pinned (optionally through
+a model gateway), and the socket ACL drop-in, installed by the runbook's daemon block.
+
+**Upgrading:**
+
+- Install `acl` first, then re-run the daemon block, which installs
+  `crewchat.service.d/agent-acl.conf`. Without `/usr/bin/setfacl` the daemon block refuses
+  ("install acl"), and `verify-install` fails a socket without the ACL.
+- The kiosk stops answering on every server until `kiosk = true` is set on the servers that
+  should have one.
 
 ### Changed
 

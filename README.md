@@ -59,8 +59,9 @@ share. Fleet broadcasts are `@agents` (S-24).
   after a daemon restart (#112), and the `disc_*` aliases are gone, with Discord's guild ops
   as `chat_*` tools (#113, D-108).
 - **2026-10-29:** `v0.2.3`, ahead of a second server: a per-server kiosk flag (default off),
-  daily kiosk cap and agent allowlist (#117), the kiosk through a model gateway with the model
-  always pinned (#116), and the socket ACL drop-in in packaging (#115).
+  daily kiosk cap and agent allowlist (#117), the kiosk's model always pinned, optionally
+  through a model gateway (#116), and the socket ACL drop-in from the runbook's daemon block,
+  which needs `acl` installed (#115).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
