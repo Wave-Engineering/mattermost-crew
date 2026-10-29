@@ -29,7 +29,7 @@ if [[ -e /usr/local/bin/claude ]] && ! grep -q "$STUB_MARK" /usr/local/bin/claud
   die "/usr/local/bin/claude is a real install; kiosk-up.sh only runs on CI images"
 fi
 log "installing the stub claude, crewkiosk-run and the units"
-cat <<'EOF' | $SUDO install -m 0755 -o root -g root /dev/stdin /usr/local/bin/claude
+cat <<'EOF' | "${ROOT}/scripts/ci/put-file.sh" 0755 root:root /usr/local/bin/claude
 #!/usr/bin/env bash
 # crewkiosk-ci-stub: what the kiosk runner was run as, for tests/integration/test_daemon_installed.py.
 prompt="$(cat)"
@@ -45,11 +45,11 @@ EOF
 # -D: a stock Ubuntu /usr/local has no libexec (GitHub's hosted image did; the ephemeral pool's doesn't).
 $SUDO install -D -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-run" /usr/local/libexec/crewkiosk-run
 $SUDO install -d -m 0750 -o root -g crewkiosk /etc/crewkiosk
-echo "sk-ci-dummy-kiosk-key" | $SUDO install -m 0600 -o crewkiosk -g crewkiosk /dev/stdin \
-  /etc/crewkiosk/model.credential
+echo "sk-ci-dummy-kiosk-key" \
+  | "${ROOT}/scripts/ci/put-file.sh" 0600 crewkiosk:crewkiosk /etc/crewkiosk/model.credential
 # A generic gateway: the stub never calls it, it only reports what the runner exported.
 printf '%s\n' 'base_url=https://llm.example.lan' 'model=haiku-latest' \
-  | $SUDO install -m 0640 -o root -g crewkiosk /dev/stdin /etc/crewkiosk/model.conf
+  | "${ROOT}/scripts/ci/put-file.sh" 0640 root:crewkiosk /etc/crewkiosk/model.conf
 $SUDO install -m 0644 -o root -g root "${ROOT}/packaging/crewkiosk.socket" \
   "${ROOT}/packaging/crewkiosk@.service" /etc/systemd/system/
 $SUDO systemctl daemon-reload

@@ -1,15 +1,23 @@
-"""#115: what the runbook's install blocks do about access, checked without a host.
+"""#115, #123: what the runbook's install blocks do about access and file writes, checked
+without a host.
 
 IT-20 (`tests/integration/test_runbook.py`) runs these blocks for real on a fresh CI host. These
-tests pin, in the text IT-20 extracts (`tests/runbook_md.py`), the two fixes from the first real
-install: the daemon's ACL drop-in for live agent sessions, and `/etc/crewbroker`'s mode.
+tests pin, in the text IT-20 extracts (`tests/runbook_md.py`), the fixes from the first real
+installs: the daemon's ACL drop-in for live agent sessions, `/etc/crewbroker`'s mode, and file
+writes that work over an existing file on uutils coreutils.
 """
 
 from __future__ import annotations
 
+import getpass
+import grp
+import os
+import re
+import stat
 import subprocess
 from pathlib import Path
 
+from tests.runbook_md import ROOT as REPO
 from tests.runbook_md import RUNBOOK, runbook_blocks, sections
 
 DROPIN_DIR = "/etc/systemd/system/crewchat.service.d"
@@ -37,7 +45,9 @@ def test_daemon_block_writes_acl_dropin() -> None:
         "printf '[Service]\\nExecStartPre=+/usr/bin/setfacl -d -m u:%s:rw,g::rw /run/crewchat\\n'"
         ' "$AGENT_USER"'
     ) in script
-    assert f"/dev/stdin {DROPIN}" in script
+    # Mode and owner first, then the content: never `install /dev/stdin` (#123).
+    create = line_of(script, f"install -m 0644 -o root -g root /dev/null {DROPIN}")
+    assert create < line_of(script, f"sudo tee {DROPIN} >/dev/null")
     assert f"install -d -m 0755 -o root -g root {DROPIN_DIR}" in script
     # After the unit, before daemon-reload, so the first start already has it.
     unit = line_of(script, "packaging/crewchat.service /etc/systemd/system/crewchat.service")
@@ -67,6 +77,118 @@ def test_daemon_block_refuses_without_setfacl(tmp_path: Path) -> None:
     present.write_text("#!/bin/sh\n", encoding="utf-8")
     present.chmod(0o755)
     assert run(present).returncode == 0
+
+
+# `install` reading a pipe: /dev/stdin, a /dev/fd or /proc/self/fd path, or a process
+# substitution. Ubuntu's uutils `install` fails on it whenever the destination exists (#123).
+PIPE_INSTALL = re.compile(r"\binstall\b[^\n]*(/dev/stdin|/dev/fd/|/proc/self/fd/|<\()")
+SHELL_DIRS = ("scripts", "packaging")
+
+
+def commands(text: str) -> list[str]:
+    """`text`'s command lines: backslash continuations joined, so a split command is one line,
+    and comment lines dropped, since a comment may name the form it warns against."""
+    lines = text.replace("\\\n", " ").splitlines()
+    return [line for line in lines if not line.lstrip().startswith("#")]
+
+
+def fenced(markdown: str) -> str:
+    """Every fenced block's body in `markdown`, `text` blocks included, without the prose."""
+    out: list[str] = []
+    inside = False
+    for line in markdown.splitlines():
+        if line.startswith(("```", "~~~")):
+            inside = not inside
+        elif inside:
+            out.append(line)
+    return "\n".join(out)
+
+
+def test_no_install_from_a_pipe() -> None:
+    """GNU coreutils, which CI runs, accepts `install /dev/stdin` over an existing file, so no
+    behaviour test in CI can catch it: this lint does, in every runbook block, fenced `text`
+    included (an operator runs those too), and every shell script."""
+    sources = {"docs/runbook.md": fenced(RUNBOOK.read_text(encoding="utf-8"))}
+    for top in SHELL_DIRS:
+        for path in sorted((REPO / top).rglob("*")):
+            if path.is_file() and path.read_bytes().startswith(b"#!/usr/bin/env bash"):
+                sources[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8")
+    assert len(sources) > 5  # the scripts were found
+    hits = [
+        f"{name}: {line.strip()}"
+        for name, text in sources.items()
+        for line in commands(text)
+        if PIPE_INSTALL.search(line)
+    ]
+    assert hits == [], "write in two steps: install … /dev/null <dest>, then tee <dest>"
+
+
+def test_lint_catches_a_pipe_install() -> None:
+    """The lint itself: each pipe form is caught, split or not, and a comment is not."""
+    for bad in (
+        "printf x | sudo install -m 0644 -o root -g root /dev/stdin /etc/x",
+        "echo k | install -m 0600 /dev/stdin \\\n  /etc/x",
+        "install -m 0644 <(printf x) /etc/x",
+        "install -m 0644 /proc/self/fd/0 /etc/x",
+    ):
+        assert any(PIPE_INSTALL.search(line) for line in commands(bad)), bad
+    for good in ("# never `install /dev/stdin`", "sudo install -m 0644 /dev/null /etc/x"):
+        assert not any(PIPE_INSTALL.search(line) for line in commands(good)), good
+
+
+def test_two_step_write_over_an_existing_file(tmp_path: Path) -> None:
+    """The daemon block's own drop-in write, run with this host's `install` onto a new file and
+    then over it, as an upgrade does. On a uutils host this is the #123 regression test."""
+    lines = block("Install the daemon").splitlines()
+    first = line_of("\n".join(lines), f"/dev/null {DROPIN}")
+    last = line_of("\n".join(lines), f"sudo tee {DROPIN}")
+    assert 0 < last - first <= 2  # the two steps, the content's printf between them
+    dest = tmp_path / "agent-acl.conf"
+    steps = "\n".join(lines[first : last + 1]).replace("sudo ", "")
+    steps = steps.replace("-o root -g root ", "").replace(DROPIN, str(dest))
+    for agent in ("first", "second"):  # a fresh install, then an upgrade over it
+        proc = subprocess.run(
+            ["bash", "-c", f"set -euo pipefail\nAGENT_USER={agent}\n{steps}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert f"u:{agent}:rw" in dest.read_text(encoding="utf-8")
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o644
+
+
+def test_ci_put_file_over_an_existing_file(tmp_path: Path) -> None:
+    """`scripts/ci/put-file.sh`, the CI scripts' one way to write a file, with this host's
+    `install`: a new file, then over it. A pass-through `sudo`, and this user as the owner, so
+    it needs no root."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_sudo = bin_dir / "sudo"
+    fake_sudo.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    fake_sudo.chmod(0o755)
+    owner = f"{getpass.getuser()}:{grp.getgrgid(os.getgid()).gr_name}"
+    dest = tmp_path / "servers.toml"
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    for content, mode in (("first\n", 0o644), ("second, longer than the first\n", 0o600)):
+        proc = subprocess.run(
+            [str(REPO / "scripts/ci/put-file.sh"), f"{mode:04o}", owner, str(dest)],
+            input=content,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert dest.read_text(encoding="utf-8") == content
+        assert stat.S_IMODE(dest.stat().st_mode) == mode
+    bad = subprocess.run(
+        [str(REPO / "scripts/ci/put-file.sh"), "0644", str(dest)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad.returncode == 2 and "usage" in bad.stderr
 
 
 def test_broker_block_sets_crewbroker_mode() -> None:

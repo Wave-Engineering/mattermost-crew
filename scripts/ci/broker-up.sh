@@ -69,9 +69,9 @@ log "writing /etc/crewbroker/${INSTANCE}.toml and .credential"
 $SUDO install -d -m 0755 /etc/crewbroker
 printf 'crew = "%s"\nserver_id = "%s"\nserver_url = "%s"\nhuman_user_ids = ["%s"]\ntrusted = []\n' \
   "$CREW" "$SERVER_ID" "$MM_URL" "$partner_id" \
-  | $SUDO install -m 0644 -o root -g root /dev/stdin "/etc/crewbroker/${INSTANCE}.toml"
+  | "${ROOT}/scripts/ci/put-file.sh" 0644 root:root "/etc/crewbroker/${INSTANCE}.toml"
 printf '%s\n' "$credential" \
-  | $SUDO install -m 0600 -o crewbroker -g crewbroker /dev/stdin "/etc/crewbroker/${INSTANCE}.credential"
+  | "${ROOT}/scripts/ci/put-file.sh" 0600 crewbroker:crewbroker "/etc/crewbroker/${INSTANCE}.credential"
 
 log "creating /run/crewbroker and the state directory"
 $SUDO install -m 0644 "${ROOT}/packaging/crewbroker.tmpfiles.conf" /etc/tmpfiles.d/crewbroker.conf

@@ -30,6 +30,7 @@ REQUIRED_SECTIONS = (
     "Install the broker",
     "Configure",
     VERIFY_HEADING,
+    "Upgrade",
     "Rollback",
 )
 
@@ -55,8 +56,9 @@ def test_runbook_blocks_are_the_install_and_verify_bash_blocks_in_order() -> Non
     assert all(h.startswith("Install ") for h in order[:-1])
     # The verify block runs `make verify-install`, and is the last thing IT-20 runs.
     assert "make verify-install" in blocks[-1][1]
-    # Nothing outside those sections is ever run: Configure and Rollback use `text`/`toml` fences.
-    for heading in ("Prerequisites", "Configure", "Rollback"):
+    # Nothing outside those sections is ever run: Configure, Upgrade and Rollback use
+    # `text`/`toml` fences.
+    for heading in ("Prerequisites", "Configure", "Upgrade", "Rollback"):
         assert fenced_blocks(runbook_sections()[heading], "bash") == [], heading
 
 

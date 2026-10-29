@@ -6,6 +6,34 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+**Upgrading:**
+
+- On a host whose `install` is Ubuntu's Rust coreutils (uutils, `install --version` says
+  `uutils coreutils`), v0.2.3's daemon block fails over the existing drop-in with
+  `install: No such file or directory`. Check out this release and re-run its blocks, which
+  write in two steps: the daemon's, then the broker's (from v0.2.2 or earlier, that also applies
+  v0.2.3's `/etc/crewbroker` 0755 fix), then "Verify the install". Install `acl` first if the
+  host doesn't have it.
+- Rewriting a Configure file by hand, use the two steps Configure now shows: never
+  `install … /dev/stdin` onto a file that exists.
+
+### Fixed
+
+- The runbook writes files in two steps, `install -m … -o … -g … /dev/null <dest>` for the mode
+  and owner, then `tee <dest>` for the content, so a block runs over an existing install (#123).
+  uutils `install` can't read a pipe (`/dev/stdin`, a process substitution) when the
+  destination exists, so every upgrade failed at the daemon block's `agent-acl.conf`, and so
+  would any rewrite of a credential with Configure's old example. The CI scripts write the same
+  way, through the new `scripts/ci/put-file.sh`.
+
+### Added
+
+- The runbook's Upgrade section: check out the tag, re-run the install blocks, verify. IT-20 now
+  runs every block a second time over the finished install, as an upgrade does, and a unit lint
+  fails on any `install` reading a pipe in the runbook's blocks or in a shell script: CI's GNU
+  coreutils accept it, so only the lint and a test on a uutils host can catch it (#123).
+- Verify's description names the kiosk's `model.conf` mode check.
+
 ## [0.2.3] — 2026-10-29
 
 What a second server's broker needs before it goes live: the kiosk off by default, a daily
