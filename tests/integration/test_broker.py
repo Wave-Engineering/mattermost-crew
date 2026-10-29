@@ -384,13 +384,14 @@ def test_mint_joins_the_team_and_default_channels(
 
     # A public channel the broker isn't in resolves, and its add is 403. A name nothing has
     # doesn't resolve. Both are reported, the other channel still joins, and the token works.
+    # Its own state, so its own bot: "joiner" is the first broker's, and this one would refuse it.
     mixed, _ = joiner("b", f"pub{run}", f"out{run}", f"nowhere{run}")
-    third = mixed.mint(args(mixed, "joiner"))
+    third = mixed.mint(args(mixed, "mixer"))
     assert third["membership"]["joined"] == [team_display.upper(), f"pub{run}"]
     refused, unknown = third["membership"]["failed"]
     assert refused["id"] == outside and "403" in refused["error"]
     assert unknown["id"] is None and "no channel has" in unknown["error"]
-    assert not is_member(mattermost, "channel", outside, bot_id)
+    assert not is_member(mattermost, "channel", outside, user_by_name(mattermost, third["account"]))
     assert token_works(mattermost, third["token"])
 
 
