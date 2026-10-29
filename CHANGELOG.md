@@ -4,7 +4,11 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.2.4] — 2026-10-29
+
+The runbook's blocks re-run over an existing install on a uutils host, so an upgrade is the
+runbook as written. `verify-install` leaves no active canary bot behind, a re-run applies a
+changed kiosk socket, and agents' doorbells ride out a daemon restart.
 
 **Upgrading:**
 
@@ -12,10 +16,19 @@ All notable changes to this project are recorded here. The format follows
   `uutils coreutils`), v0.2.3's daemon block fails over the existing drop-in with
   `install: No such file or directory`. Check out this release and re-run its blocks, which
   write in two steps: the daemon's, then the broker's (from v0.2.2 or earlier, that also applies
-  v0.2.3's `/etc/crewbroker` 0755 fix), then "Verify the install". Install `acl` first if the
-  host doesn't have it.
+  v0.2.3's `/etc/crewbroker` 0755 fix), then the kiosk runner's on a kiosk host, then "Verify
+  the install". Install `acl` first if the host doesn't have it.
 - Rewriting a Configure file by hand, use the two steps Configure now shows: never
   `install … /dev/stdin` onto a file that exists.
+- The daemon and broker blocks both matter: verify's last check needs the broker's new
+  `deactivate` op, and the shim's `ping` needs the new daemon. This upgrade's daemon restart
+  still ends the agents' running `crewchat-doorbell`s with exit 4: they run the old client.
+  Agents get the retrying doorbell and `ping` when they upgrade `crewchat-clients`. A new shim
+  against an older daemon falls back to registering on its next tool call.
+- **Known limit, rollback on uutils:** v0.2.3 and earlier still write with
+  `install … /dev/stdin`, so on a uutils host rolling back from 0.2.4 fails the same way, at the
+  first file the older block installs over. Move that file aside and re-run the block, as the
+  runbook's Rollback section says.
 
 ### Fixed
 
