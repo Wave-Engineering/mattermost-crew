@@ -64,7 +64,9 @@ share. Fleet broadcasts are `@agents` (S-24).
   which needs `acl` installed (#115).
 - **2026-10-29:** `v0.2.4`: the runbook and CI write files in two steps, so every block re-runs
   over an existing install on a host whose `install` is uutils, and the runbook gains an Upgrade
-  section (#123).
+  section (#123). `verify-install` deactivates its canary bot when it is done (#127), the kiosk
+  block restarts its socket (#128), and `crewchat-doorbell` waits through a daemon restart
+  (#129).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
