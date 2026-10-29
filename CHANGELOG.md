@@ -15,8 +15,8 @@ runbook as written.
   `uutils coreutils`), v0.2.3's daemon block fails over the existing drop-in with
   `install: No such file or directory`. Check out this release and re-run its blocks, which
   write in two steps: the daemon's, then the broker's (from v0.2.2 or earlier, that also applies
-  v0.2.3's `/etc/crewbroker` 0755 fix), then "Verify the install". Install `acl` first if the
-  host doesn't have it.
+  v0.2.3's `/etc/crewbroker` 0755 fix), then the kiosk runner's on a kiosk host, then "Verify
+  the install". Install `acl` first if the host doesn't have it.
 - Rewriting a Configure file by hand, use the two steps Configure now shows: never
   `install … /dev/stdin` onto a file that exists.
 
