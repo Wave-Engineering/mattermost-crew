@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from crewbroker.config import CrewConfig
+from crewbroker.membership import DEADLINE_RESERVE_S, DEFERRED
 from crewbroker.service import Broker, BrokerServer, OpError, call, handle_frame
 
 ALL_OPS: dict[str, dict[str, Any]] = {
@@ -343,15 +344,18 @@ def test_unknown_team_fails_every_target_and_adds_nothing(
     assert _adds(fake) == []
 
 
+@pytest.mark.parametrize("status", [503, 429], ids=["down", "rate-limited"])
 def test_lookup_that_failed_in_passing_is_retried_on_the_next_mint(
-    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any, status: int
 ) -> None:
-    """The server was down when the broker started: not final, so a mint resolves again."""
+    """The server was down or rate-limiting when the broker started: not final, so a mint
+    resolves again."""
     server.lookup_down = True
+    server.lookup_status = status
     built = joiner(server, crew_config, tmp_path / "b", clock)
     first = built.mint(BABEL)
     assert first["membership"]["joined"] == []
-    assert "503" in first["membership"]["failed"][0]["error"]
+    assert str(status) in first["membership"]["failed"][0]["error"]
 
     server.lookup_down = False
     second = built.mint(BABEL)
@@ -373,12 +377,66 @@ def test_membership_only_for_a_bot_this_broker_owns(joining: Broker, fake: Any) 
     fake.reassign(bot_id, "someone-else")
     with pytest.raises(OpError, match="squatted"):
         joining.mint(BABEL)
-    # And the guard on its own, as if the owner changed between the mint and the adds.
-    assert joining.membership is not None
-    answer = joining._membership(joining.membership, "babel.oaw", bot_id)
-    assert answer["joined"] == [] and len(answer["failed"]) == 3
-    assert "not owned" in answer["failed"][0]["error"]
     assert len(_adds(fake)) == before
+
+
+def test_deadline_near_defers_every_add(
+    joining: Broker, fake: Any, clock: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The token is the point of the mint: with less than the reserve left, nothing is added,
+    every target is reported as deferred, and the next register joins them."""
+    deadline = clock.now.timestamp() + DEADLINE_RESERVE_S / 2
+    with caplog.at_level(logging.WARNING, logger="crewbroker.membership"):
+        reply = joining.mint({**BABEL, "deadline": deadline})
+
+    assert fake.token_works(reply["token"])
+    assert reply["membership"]["joined"] == []
+    failed = reply["membership"]["failed"]
+    assert [(f["name"], f["error"]) for f in failed] == [
+        (TEAM, DEFERRED),
+        (PUBLIC, DEFERRED),
+        (PRIVATE, DEFERRED),
+    ]
+    assert _adds(fake) == []
+    [record] = [r for r in caplog.records if r.name == "crewbroker.membership"]
+    assert record.levelno == logging.WARNING
+    for part in ("babel.oaw", TEAM, PUBLIC, PRIVATE):
+        assert part in record.getMessage()
+
+    again = joining.mint(BABEL)
+    assert again["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
+
+
+def test_deadline_running_out_partway_defers_the_rest(
+    joining: Broker, fake: Any, clock: Any
+) -> None:
+    deadline = clock.now.timestamp() + 2
+
+    def slow(target: str) -> None:
+        if target == PUBLIC_ID:
+            clock.now += timedelta(seconds=1.8)
+
+    fake.on_add = slow
+    reply = joining.mint({**BABEL, "deadline": deadline})
+    assert fake.token_works(reply["token"])
+    assert reply["membership"] == {
+        "joined": [TEAM, PUBLIC],
+        "failed": [{"name": PRIVATE, "id": PRIVATE_ID, "error": DEFERRED}],
+    }
+    assert [target for _, target in _adds(fake)] == [TEAM_ID, PUBLIC_ID]
+
+
+def test_deadline_near_skips_a_pending_lookup(
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    """A name still to resolve is not looked up late: it is deferred like the adds."""
+    server.lookup_down = True
+    built = joiner(server, crew_config, tmp_path / "b", clock)
+    server.lookup_down = False
+    lookups = _lookups(server)
+    reply = built.mint({**BABEL, "deadline": clock.now.timestamp() + DEADLINE_RESERVE_S / 2})
+    assert [f["error"] for f in reply["membership"]["failed"]] == [DEFERRED] * 3
+    assert _lookups(server) == lookups
 
 
 def _args(held: str | None) -> dict[str, Any]:

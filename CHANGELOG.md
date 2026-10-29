@@ -17,7 +17,9 @@ All notable changes to this project are recorded here. The format follows
   team, then to each channel in order. A bot that's already a member counts as joined, so the
   daily `register` also repairs a missed add. A failed add never fails the mint. The broker
   logs it at ERROR and returns it in the answer's new `membership: {joined, failed}`, and the
-  daemon logs it at WARNING on `register`. With neither key set nothing changes: no membership
+  daemon logs it at WARNING on `register`. Once the daemon's deadline for the call is near, the
+  remaining adds are deferred so they don't hold up the token: each is reported as `deferred`
+  and tried again at the next `register`. With neither key set nothing changes: no membership
   call, and no `membership` key in the answer.
 
 **Upgrading:** to turn it on, the broker account needs no new role. It must be **a member of the

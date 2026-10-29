@@ -210,8 +210,9 @@ from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
 
 **Membership on mint** (#132). With `team` set, every successful `mint` adds the bot to that
 team and then to each of `default_channels`, in order. A bot that is already a member counts as
-joined. A failed add is logged at ERROR, and the bot still gets its token. Leave both keys out
-to manage no membership.
+joined. A failed add is logged at ERROR, and the bot still gets its token. The token comes
+first: when the daemon's deadline for the call is near, the remaining adds are deferred to the
+bot's next `register` and logged at WARNING. Leave both keys out to manage no membership.
 
 Write each entry as you see it in Mattermost: the **URL name** (the last part of the team's or
 channel's URL, such as `town-square`) or the **display name** (`Town Square`). The broker tries

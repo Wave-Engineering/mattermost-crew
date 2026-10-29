@@ -207,25 +207,13 @@ class Broker:
         log.info("mint: %s token %s", name, token.token_id)
         answer: dict[str, Any] = {"account": name, "token": token.token, "token_id": token.token_id}
         if self.membership is not None:
-            answer["membership"] = self._membership(self.membership, name, bot_id)
+            # Ensure the bot's team and default channels (#132, D-109); never raises. Only a
+            # bot this broker owns gets here: `ensure_bot` created it, or read its `owner_id`
+            # as this broker, earlier in this mint.
+            answer["membership"] = self.membership.ensure(
+                name, bot_id, deadline, lambda: self.clock().timestamp()
+            )
         return answer
-
-    def _membership(self, membership: Membership, name: str, bot_id: str) -> dict[str, list[Any]]:
-        """Ensure the minted bot's team and default channels (#132, D-109). Never raises.
-
-        Guarded as `deactivate` is: only a bot whose `owner_id` is this broker gets an add.
-        """
-        why = f"{name} is not owned by this broker"
-        try:
-            owner = self.client.get_bot(bot_id).get("owner_id")
-        except NotFound:
-            owner = None  # another owner's bot is 404 to this broker (D-100)
-        except MattermostError as exc:
-            owner, why = None, f"owner check failed: {exc}"
-        if owner != self.config.broker_user_id:
-            log.error("membership: skipped for %s (%s): %s", name, bot_id, why)
-            return {"joined": [], "failed": [t.failure(why) for t in membership.targets()]}
-        return membership.ensure(name, bot_id)
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""

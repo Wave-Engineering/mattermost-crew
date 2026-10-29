@@ -8,7 +8,7 @@ had gained that permission), when it lists every active bot on the server.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,7 +48,9 @@ class FakeMattermost:
         self.teams: dict[str, dict[str, Any]] = {}
         self.channels: dict[str, dict[str, Any]] = {}
         self.my_ids: set[str] = set()
-        self.lookup_down = False  # every name lookup answers 503, as if the server were down
+        self.lookup_down = False  # every name lookup answers `lookup_status`
+        self.lookup_status = 503  # as if the server were down; 429 is a rate limit
+        self.on_add: Callable[[str], None] | None = None  # called with each add's target
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
@@ -190,6 +192,8 @@ class FakeMattermost:
 
     def _add_member(self, call: str, kind: str, target: str, user_id: str) -> None:
         self.calls.append((call, (target, user_id)))
+        if self.on_add is not None:
+            self.on_add(target)
         path = f"/{kind}s/{target}/members"
         if target in self.add_fails:
             raise MattermostError("POST", path, 403, "no permission", "api.context.permissions")
@@ -204,7 +208,7 @@ class FakeMattermost:
     def _lookup(self, call: str, arg: Any, path: str) -> None:
         self.calls.append((call, arg))
         if self.lookup_down:
-            raise MattermostError("GET", path, 503, "unavailable")
+            raise MattermostError("GET", path, self.lookup_status, "unavailable")
 
     def get_team_by_name(self, name: str) -> dict[str, Any]:
         path = f"/teams/name/{name}"

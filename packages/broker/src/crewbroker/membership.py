@@ -12,8 +12,15 @@ is visible only to a member). Two or more matches is an error that names them.
 
 A name that doesn't resolve never stops the broker, because a typo must not cost every agent
 its token. It is logged at ERROR and reported in every mint's `membership.failed`. No match, an
-ambiguous match or a 4xx is final until the broker restarts with a corrected file. Any other
-failure, such as the server being unreachable at startup, is retried on the next mint.
+ambiguous match or a 4xx other than 429 is final until the broker restarts with a corrected file.
+Any other failure, such as a rate limit or the server being unreachable at startup, is retried on
+the next mint.
+
+The adds run after the token is minted and before the daemon has it, inside the daemon's
+deadline for the call. A reply past that deadline is a token the daemon never receives, so
+`ensure` stops adding once less than `DEADLINE_RESERVE_S` is left, and reports what it did not
+reach as deferred. The next register repeats it. A single call that sits in `_call`'s 429
+retries can still overrun; bounding that would need a deadline-aware `_call`.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -34,6 +42,9 @@ log = logging.getLogger(__name__)
 # be a display name, so it is never sent to a `/name/` endpoint.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 CHANNEL_TYPES = {"O", "P"}  # public and private; never a DM or group message
+# Time kept back before the caller's deadline for the reply to reach the daemon.
+DEADLINE_RESERVE_S = 0.5
+DEFERRED = "deferred: the caller's deadline is near"
 
 
 class Unresolved(Exception):
@@ -138,7 +149,8 @@ class Membership:
             if target.kind == "channel":
                 target.error += " (a private channel is visible only if the broker is a member)"
         except MattermostError as exc:
-            target.final = exc.status is not None and 400 <= exc.status < 500
+            status = exc.status
+            target.final = status is not None and 400 <= status < 500 and status != 429
             target.error = f"{target.kind} {target.name!r} did not resolve: {exc}"
         else:
             target.error = ""
@@ -146,19 +158,37 @@ class Membership:
             return
         log.error("membership: %s", target.error)
 
-    def ensure(self, account: str, bot_id: str) -> dict[str, list[Any]]:
+    def ensure(
+        self,
+        account: str,
+        bot_id: str,
+        deadline: float | None = None,
+        now: Callable[[], float] = time.time,
+    ) -> dict[str, list[Any]]:
         """Add bot `bot_id` to the team, then to each default channel in order.
 
         Idempotent: an existing member counts as joined. A failed add is logged at ERROR and
         reported, never raised, so the mint it follows still returns its token. A failed team
-        add skips the channels, which would fail the same way. The caller checks the owner.
+        add skips the channels, which would fail the same way. With `deadline` (epoch seconds),
+        nothing is looked up or added once less than `DEADLINE_RESERVE_S` is left: the rest is
+        reported as deferred and logged at WARNING. The caller checks the owner.
         """
-        if self._pending():
+
+        def late() -> bool:
+            return deadline is not None and deadline - now() < DEADLINE_RESERVE_S
+
+        if self._pending() and not late():
             self.resolve()
         joined: list[Any] = []
         failed: list[Any] = []
 
         def add(target: Target, call: Callable[[str, str], None]) -> bool:
+            if target.id is None and target.final:
+                failed.append(target.failure())
+                return False
+            if late():
+                failed.append(target.failure(DEFERRED))
+                return False
             if target.id is None:
                 failed.append(target.failure())
                 return False
@@ -183,9 +213,20 @@ class Membership:
         if add(self.team, self.client.add_team_member):
             for channel in self.channels:
                 add(channel, self.client.add_channel_member)
+        elif failed[-1]["error"] == DEFERRED:
+            failed.extend(c.failure(DEFERRED) for c in self.channels)
         elif self.team.id is None:  # unresolved: each channel says so for itself
             failed.extend(c.failure() for c in self.channels)
         else:
             skipped = f"skipped: the team {self.team.name!r} add failed"
             failed.extend(c.failure(skipped) for c in self.channels)
+        deferred = [f["name"] for f in failed if f["error"] == DEFERRED]
+        if deferred:
+            log.warning(
+                "membership: %s (%s): deferred to its next register, the caller's deadline is "
+                "near: %s",
+                account,
+                bot_id,
+                ", ".join(deferred),
+            )
         return {"joined": joined, "failed": failed}
