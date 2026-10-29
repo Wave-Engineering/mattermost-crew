@@ -10,6 +10,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ import pytest
 from crewchat_clients import mcp_shim
 from crewchat_clients.mcp_shim import (
     DaemonError,
+    DaemonUnreachable,
     Shim,
     ShimError,
     SocketTransport,
@@ -363,6 +365,110 @@ def test_chat_health_reregisters_after_daemon_restart(tmp_path: Path) -> None:
     assert set(result["backends"]) == {"mattermost:ci", "discord"}
     assert len(daemon.of("register")) == 2
     assert daemon.of("health") == [{"dev_name": DEV}] * 2
+
+
+class RestartingDaemon(FakeDaemon):
+    """`ping` as the real daemon answers it: `not_registered` after a `restart()`, until the
+    next `register`; `down` makes every frame unreachable; `pings` is `ping`'s own answer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.holds = False
+        self.down = False
+        self.pings: Exception | None = None
+
+    def restart(self) -> None:
+        self.holds = False
+
+    async def __call__(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self.down:
+            raise DaemonUnreachable("crewchat daemon at /run/crewchat/crewchat.sock: refused")
+        if op == "register":
+            self.holds = True
+        if op == "ping":
+            self.frames.append((op, dict(args)))
+            if self.pings is not None:
+                raise self.pings
+            if not self.holds:
+                raise DaemonError(op, f"not_registered: {args['dev_name']}")
+            return {}
+        return await super().__call__(op, args)
+
+
+def test_ping_reregisters_an_idle_session_after_a_daemon_restart(tmp_path: Path) -> None:
+    """#129: no tool call, only the timer: the ping finds the registration gone, registers
+    again and force-pushes the files, so the agent's doorbell can arm."""
+    daemon, clock = RestartingDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.tick()  # the first tick pings, and the daemon holds the agent
+        assert daemon.of("ping") == [{"dev_name": DEV}] and len(daemon.of("register")) == 1
+        pushes = len(daemon.of("kiosk_brief"))
+        daemon.restart()
+        clock.now += timedelta(seconds=5)
+        await shim.tick()  # inside PING_EVERY: no ping yet
+        assert len(daemon.of("ping")) == 1
+        clock.now += timedelta(seconds=10)
+        await shim.tick()  # at PING_EVERY: not_registered, so register and push
+        assert len(daemon.of("ping")) == 2 and len(daemon.of("register")) == 2
+        assert daemon.holds and len(daemon.of("kiosk_brief")) == pushes + 1
+
+    asyncio.run(scenario())
+
+
+def test_ping_survives_a_daemon_that_is_down(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon, clock = RestartingDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        daemon.down = True
+        daemon.restart()
+        with caplog.at_level(logging.ERROR, logger="crewchat_clients.mcp_shim"):
+            await shim.ping()  # unreachable: logged at debug, nothing raised
+        assert not [r for r in caplog.records if "ping" in r.getMessage()]
+        daemon.down = False
+        clock.now += mcp_shim.PING_EVERY
+        await shim.ping()  # back, without the agent: register again
+        assert daemon.holds and len(daemon.of("register")) == 2
+
+    asyncio.run(scenario())
+
+
+def test_ping_stops_on_a_daemon_without_the_op(tmp_path: Path) -> None:
+    """An older daemon answers `unsupported`: the shim stops asking, and falls back on its
+    calls' `not_registered` retry (#112)."""
+    daemon, clock = RestartingDaemon(), Clock()
+    daemon.pings = DaemonError("ping", "unsupported")
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        for _ in range(3):
+            await shim.ping()
+            clock.now += mcp_shim.PING_EVERY
+        assert len(daemon.of("ping")) == 1 and not shim.ping_supported
+
+    asyncio.run(scenario())
+
+
+def test_ping_other_daemon_error_is_raised_to_the_tick(tmp_path: Path) -> None:
+    daemon, clock = RestartingDaemon(), Clock()
+    daemon.pings = DaemonError("ping", "bad_request: dev_name is a required string")
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        with pytest.raises(DaemonError, match="bad_request"):
+            await shim.ping()
+        await shim.tick()  # the tick logs it and carries on
+
+    asyncio.run(scenario())
+    assert len(daemon.of("register")) == 1
 
 
 # -- pushes ----------------------------------------------------------------------------------

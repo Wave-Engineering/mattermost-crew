@@ -109,10 +109,7 @@ def test_no_install_from_a_pipe() -> None:
     behaviour test in CI can catch it: this lint does, in every runbook block, fenced `text`
     included (an operator runs those too), and every shell script."""
     sources = {"docs/runbook.md": fenced(RUNBOOK.read_text(encoding="utf-8"))}
-    for top in SHELL_DIRS:
-        for path in sorted((REPO / top).rglob("*")):
-            if path.is_file() and path.read_bytes().startswith(b"#!/usr/bin/env bash"):
-                sources[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8")
+    sources.update(shell_scripts())
     assert len(sources) > 5  # the scripts were found
     hits = [
         f"{name}: {line.strip()}"
@@ -189,6 +186,45 @@ def test_ci_put_file_over_an_existing_file(tmp_path: Path) -> None:
         check=False,
     )
     assert bad.returncode == 2 and "usage" in bad.stderr
+
+
+ENABLE_NOW = re.compile(r"\bsystemctl\s+enable\b[^\n]*--now\b")
+
+
+def shell_scripts() -> dict[str, str]:
+    """Every bash script under `SHELL_DIRS`, by its repo-relative path."""
+    found: dict[str, str] = {}
+    for top in SHELL_DIRS:
+        for path in sorted((REPO / top).rglob("*")):
+            if path.is_file() and path.read_bytes().startswith(b"#!/usr/bin/env bash"):
+                found[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8")
+    return found
+
+
+def test_no_enable_now_in_install_blocks() -> None:
+    """#128: `enable --now` starts a stopped unit and leaves an active one as it was, so a
+    re-run that installs a changed unit never applies it. Every block and script enables, then
+    restarts, as the Upgrade section's "restarts its units" says."""
+    # A list, not a dict: one section can hold several blocks.
+    sources = runbook_blocks(RUNBOOK.read_text(encoding="utf-8"))
+    sources += list(shell_scripts().items())
+    hits = [
+        f"{name}: {line.strip()}"
+        for name, text in sources
+        for line in commands(text)
+        if ENABLE_NOW.search(line)
+    ]
+    assert hits == [], "systemctl enable <unit>, then systemctl restart <unit>"
+    for bad in ("sudo systemctl enable --now crewkiosk.socket", "systemctl enable x --now"):
+        assert ENABLE_NOW.search(bad), bad
+    assert not ENABLE_NOW.search("sudo systemctl disable --now crewchat crewkiosk.socket")
+
+
+def test_kiosk_block_restarts_its_socket() -> None:
+    script = block("Install the kiosk runner")
+    installed = line_of(script, "packaging/crewkiosk.socket")
+    assert installed < line_of(script, "systemctl enable crewkiosk.socket")
+    assert installed < line_of(script, "systemctl restart crewkiosk.socket")
 
 
 def test_broker_block_sets_crewbroker_mode() -> None:

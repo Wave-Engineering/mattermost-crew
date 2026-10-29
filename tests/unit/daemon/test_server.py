@@ -252,3 +252,26 @@ def test_health_dev_name_not_a_string_is_bad_request(daemon: Any) -> None:
     server = DaemonServer(build_handlers(daemon.config, daemon.registry))
     got = call(server, "health", dev_name=3)
     assert got["ok"] is False and got["error"].startswith("bad_request")
+
+
+def test_ping_says_whether_the_agent_is_registered(daemon: Any) -> None:
+    """#129: the shim's timer asks `ping`; a restarted daemon answers `not_registered`, and it
+    touches no backend, unlike `health`."""
+
+    class Source:
+        calls = 0
+
+        async def health(self) -> dict[str, Any]:
+            Source.calls += 1
+            return {"state": "ok", "since": "t"}
+
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry, {"discord": Source()}))
+    got = call(server, "ping", dev_name="babel")
+    assert got["ok"] is False and got["error"] == "not_registered: babel"
+    assert call(server, "register", dev_name="babel", session_id="s1")["ok"] is True
+    got = call(server, "ping", dev_name="babel")
+    assert got["ok"] is True and got["result"] == {}
+    for bad in ({}, {"dev_name": ""}, {"dev_name": 3}):
+        got = call(server, "ping", **bad)
+        assert got["ok"] is False and got["error"].startswith("bad_request"), bad
+    assert Source.calls == 0

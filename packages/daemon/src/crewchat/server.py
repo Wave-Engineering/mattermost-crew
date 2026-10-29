@@ -238,7 +238,7 @@ def build_handlers(
     registry: Registry,
     health_sources: Mapping[str, HealthSource] | None = None,
 ) -> dict[str, Handler]:
-    """`register` and `health`; the chat ops are `crewchat.chat`'s.
+    """`register`, `health` and `ping`; the chat ops are `crewchat.chat`'s.
 
     `health` names every backend in the one form (§5.4): `mattermost:<server_id>`, and
     `discord`. A backend in `health_sources` answers for itself; any other reports
@@ -291,4 +291,14 @@ def build_handlers(
             )
         return {"backends": backends}
 
-    return {"register": register, "health": health}
+    async def ping(args: dict[str, Any]) -> dict[str, Any]:
+        """Whether the daemon still holds `dev_name`: the shim's timer asks, so an idle session
+        re-registers after a daemon restart (#129). Unlike `health`, it touches no backend."""
+        dev_name = args.get("dev_name")
+        if not isinstance(dev_name, str) or not dev_name:
+            raise OpError("bad_request", "dev_name is a required string")
+        if registry.get(dev_name) is None:
+            raise OpError("not_registered", dev_name)
+        return {}
+
+    return {"register": register, "health": health, "ping": ping}
