@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -71,6 +72,44 @@ def ensure_bot(
         client.enable_bot(user_id)
         accounts.clear_pruned(name)
     return user_id
+
+
+def _already_member(exc: MattermostError) -> bool:
+    # The #132 probe saw 201 for an existing member; this is for a server that answers 400.
+    return exc.error_id.endswith("save_member.exists.app_error")
+
+
+def ensure_membership(
+    client: MattermostAPI, name: str, bot_id: str, team_id: str, channel_ids: list[str]
+) -> dict[str, list[object]]:
+    """Add bot `bot_id` to `team_id`, then to each of `channel_ids` in order (#132, D-109).
+
+    Idempotent: an existing member counts as joined. A failed add is logged at ERROR and
+    reported, never raised, so the mint it follows still returns its token. A failed team add
+    skips the channels, which would fail the same way. The caller checks the bot's owner.
+    """
+    joined: list[object] = []
+    failed: list[object] = []
+
+    def add(kind: str, target: str, call: Callable[[str, str], None]) -> bool:
+        try:
+            call(target, bot_id)
+        except MattermostError as exc:
+            if not _already_member(exc):
+                log.error(
+                    "membership: %s (%s) to %s %s failed: %s", name, bot_id, kind, target, exc
+                )
+                failed.append({"id": target, "error": str(exc)})
+                return False
+        joined.append(target)
+        return True
+
+    if add("team", team_id, client.add_team_member):
+        for channel_id in channel_ids:
+            add("channel", channel_id, client.add_channel_member)
+    else:
+        failed.extend({"id": c, "error": "skipped: the team add failed"} for c in channel_ids)
+    return {"joined": joined, "failed": failed}
 
 
 # The capability probe's results, per server (R-07). Keyed by the server's URL.

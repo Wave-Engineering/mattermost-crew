@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
 import tempfile
 import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from crewbroker.config import CrewConfig
 from crewbroker.service import Broker, BrokerServer, OpError, call, handle_frame
 
 ALL_OPS: dict[str, dict[str, Any]] = {
@@ -120,6 +123,94 @@ def test_mint_after_deactivate_reenables(broker: Broker, fake: Any) -> None:
     assert acct is not None and acct.pruned_at is None
     assert not fake.bots[acct.bot_user_id]["delete_at"]
     assert fake.token_works(token)
+
+
+# -- membership on mint (#132, D-109) ---------------------------------------------------------
+TEAM, PUBLIC, PRIVATE = "team-oaw", "chan-public", "chan-private"
+BABEL = {"dev_name": "babel", "crew": "oaw"}
+ADDS = ("add_team_member", "add_channel_member")
+
+
+@pytest.fixture
+def joining(fake: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any) -> Broker:
+    config = replace(crew_config, team_id=TEAM, default_channel_ids=[PUBLIC, PRIVATE])
+    return Broker(config, fake, tmp_path / "joining", clock=clock)
+
+
+def _adds(fake: Any) -> list[tuple[str, Any]]:
+    return [(call, arg[0]) for call, arg in fake.calls if call in ADDS]
+
+
+def test_first_mint_joins_the_team_then_each_channel(joining: Broker, fake: Any) -> None:
+    reply = joining.mint(BABEL)
+    bot_id = joining.accounts.get("babel.oaw").bot_user_id  # type: ignore[union-attr]
+
+    assert reply["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
+    assert _adds(fake) == [
+        ("add_team_member", TEAM),
+        ("add_channel_member", PUBLIC),
+        ("add_channel_member", PRIVATE),
+    ]
+    assert all(fake.members[t] == [bot_id] for t in (TEAM, PUBLIC, PRIVATE))
+    assert fake.token_works(reply["token"])
+
+
+@pytest.mark.parametrize("exists_as_400", [False, True], ids=["201", "400-exists"])
+def test_second_mint_counts_existing_membership_as_joined(
+    joining: Broker, fake: Any, exists_as_400: bool
+) -> None:
+    joining.mint(BABEL)
+    fake.exists_as_400 = exists_as_400
+    again = joining.mint(BABEL)
+    assert again["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
+    assert all(len(fake.members[t]) == 1 for t in (TEAM, PUBLIC, PRIVATE))
+
+
+def test_failed_channel_add_still_returns_the_token(
+    joining: Broker, fake: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.add_fails.add(PUBLIC)
+    with caplog.at_level(logging.ERROR, logger="crewbroker.mint"):
+        reply = joining.mint(BABEL)
+    bot_id = joining.accounts.get("babel.oaw").bot_user_id  # type: ignore[union-attr]
+
+    assert fake.token_works(reply["token"])
+    assert reply["membership"]["joined"] == [TEAM, PRIVATE]  # the next channel is still tried
+    [failure] = reply["membership"]["failed"]
+    assert failure["id"] == PUBLIC and "403" in failure["error"]
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    for part in ("babel.oaw", bot_id, PUBLIC, "403"):
+        assert part in record.getMessage()
+
+
+def test_failed_team_add_skips_the_channels(joining: Broker, fake: Any) -> None:
+    fake.add_fails.add(TEAM)
+    reply = joining.mint(BABEL)
+    assert fake.token_works(reply["token"])
+    assert reply["membership"]["joined"] == []
+    assert [f["id"] for f in reply["membership"]["failed"]] == [TEAM, PUBLIC, PRIVATE]
+    assert _adds(fake) == [("add_team_member", TEAM)]
+
+
+def test_no_membership_config_makes_no_calls(broker: Broker, fake: Any) -> None:
+    reply = broker.mint(BABEL)
+    assert "membership" not in reply
+    assert _adds(fake) == []
+
+
+def test_membership_only_for_a_bot_this_broker_owns(joining: Broker, fake: Any) -> None:
+    joining.mint(BABEL)
+    bot_id = joining.accounts.get("babel.oaw").bot_user_id  # type: ignore[union-attr]
+    before = len(_adds(fake))
+    # A reassigned bot: the mint itself refuses it, so nothing is added.
+    fake.reassign(bot_id, "someone-else")
+    with pytest.raises(OpError, match="squatted"):
+        joining.mint(BABEL)
+    # And the guard on its own, as if the owner changed between the mint and the adds.
+    answer = joining._membership("babel.oaw", bot_id)
+    assert answer["joined"] == [] and len(answer["failed"]) == 3
+    assert "not owned" in answer["failed"][0]["error"]
+    assert len(_adds(fake)) == before
 
 
 def _args(held: str | None) -> dict[str, Any]:

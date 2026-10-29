@@ -4,6 +4,25 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **The broker adds each bot it mints to its crew's team and default channels** (#132, D-109).
+  Two optional keys in `/etc/crewbroker/<crew>-<server_id>.toml` turn it on: `team_id` and
+  `default_channel_ids`. Both take Mattermost IDs, and a name in either is refused when the
+  config loads. On every successful `mint` the broker adds its bot to the team, then to each
+  channel in order. A bot that's already a member counts as joined, so the daily `register`
+  also repairs a missed add. A failed add never fails the mint. The broker logs it at ERROR and
+  returns it in the answer's new `membership: {joined, failed}`, and the daemon logs it at
+  WARNING on `register`. With neither key set nothing changes: no membership call, and no
+  `membership` key in the answer.
+
+**Upgrading:** to turn it on, the broker account needs no new role. It must be on the team,
+which it already is, and **a member of every default channel**. A channel admin adds it to each
+one, and on a private channel that's the only way. On a partner's server, adding it and setting
+the keys is the human partner's step (CP-03). See the runbook's prerequisites and Configure.
+
 ## [0.2.4] — 2026-10-29
 
 The runbook's blocks re-run over an existing install on a uutils host, so an upgrade is the

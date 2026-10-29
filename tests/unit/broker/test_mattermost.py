@@ -76,3 +76,29 @@ def test_rate_limit_is_waited_out() -> None:
     with pytest.raises(MattermostError, match="429"):
         client.me()
     assert waits == [1.0] * 5
+
+
+def test_membership_adds_and_error_id() -> None:
+    """#132: the two adds' paths and bodies, and an error keeps Mattermost's `id`."""
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        if "/channels/denied/" in request.url.path:
+            return httpx.Response(
+                403, json={"id": "api.context.permissions.app_error", "message": "no permission"}
+            )
+        return httpx.Response(201, json={"user_id": "bot"})
+
+    client = MattermostClient("http://mm.invalid", "tok", transport=httpx.MockTransport(handler))
+    client.add_team_member("team", "bot")
+    client.add_channel_member("chan", "bot")
+    with pytest.raises(MattermostError) as caught:
+        client.add_channel_member("denied", "bot")
+    assert seen[:2] == [
+        ("/api/v4/teams/team/members", {"team_id": "team", "user_id": "bot"}),
+        ("/api/v4/channels/chan/members", {"user_id": "bot"}),
+    ]
+    assert caught.value.status == 403
+    assert caught.value.error_id == "api.context.permissions.app_error"
+    client.close()

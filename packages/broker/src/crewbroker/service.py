@@ -49,6 +49,7 @@ from crewbroker.mint import (
     SquattedAccount,
     account_name,
     ensure_bot,
+    ensure_membership,
     mint_token,
     native_expiry_supported,
     record_register,
@@ -198,7 +199,30 @@ class Broker:
             )
             self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
-        return {"account": name, "token": token.token, "token_id": token.token_id}
+        answer: dict[str, Any] = {"account": name, "token": token.token, "token_id": token.token_id}
+        if self.config.team_id:
+            answer["membership"] = self._membership(name, bot_id)
+        return answer
+
+    def _membership(self, name: str, bot_id: str) -> dict[str, list[object]]:
+        """Ensure the minted bot's team and default channels (#132, D-109). Never raises.
+
+        Guarded as `deactivate` is: only a bot whose `owner_id` is this broker gets an add.
+        """
+        targets = [self.config.team_id, *self.config.default_channel_ids]
+        why = f"{name} is not owned by this broker"
+        try:
+            owner = self.client.get_bot(bot_id).get("owner_id")
+        except NotFound:
+            owner = None  # another owner's bot is 404 to this broker (D-100)
+        except MattermostError as exc:
+            owner, why = None, f"owner check failed: {exc}"
+        if owner != self.config.broker_user_id:
+            log.error("membership: skipped for %s (%s): %s", name, bot_id, why)
+            return {"joined": [], "failed": [{"id": t, "error": why} for t in targets]}
+        return ensure_membership(
+            self.client, name, bot_id, self.config.team_id, self.config.default_channel_ids
+        )
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""

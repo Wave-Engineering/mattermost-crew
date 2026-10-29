@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -30,6 +31,23 @@ def test_register_returns_account_name(daemon: Any) -> None:
     # One registration per Dev-Name, taken at its word (D-055).
     assert daemon.registry.get("babel") is reg
     assert reg.session_id == "s1"
+
+
+def test_register_warns_on_failed_membership(daemon: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """#132: the broker's `membership.failed` is logged at WARNING; the register still works."""
+    failed = [{"id": "chan-x", "error": "POST /channels/chan-x/members -> 403: no permission"}]
+    daemon.broker().membership = {"joined": ["team-x"], "failed": failed}
+    with caplog.at_level(logging.WARNING, logger="crewchat.registry"):
+        reg = register(daemon)
+    assert reg.account == "babel.oaw"
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "babel.oaw" in record.getMessage() and "chan-x" in record.getMessage()
+
+    caplog.clear()
+    daemon.broker().membership = {"joined": ["team-x", "chan-x"], "failed": []}
+    with caplog.at_level(logging.WARNING, logger="crewchat.registry"):
+        register(daemon)
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 def test_register_defaults_crew(daemon: Any) -> None:

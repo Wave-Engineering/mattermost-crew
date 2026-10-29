@@ -50,6 +50,13 @@ The host needs:
 - **The Mattermost side:** a broker account per (crew, server), with the patched
   `system_user_access_token` role and no admin role (R-06). On a partner's production server the
   role patch is the human partner's yes-prod (CP-03).
+- **For membership on mint (optional, #132):** the broker account is a plain member
+  (`team_user`) of the crew's team, and **a member of each channel in `default_channel_ids`**.
+  No other role is needed, and none should be granted: measured on the OaW dev space, a
+  `team_user` adds its own bot to the team and to any channel it is in, public or private
+  (201), and gets 403 on a channel it is not in, public as well. A channel admin adds the broker
+  account to each default channel once, and on a private channel only they can. On a partner's
+  production server that is the human partner's step, with the role patch (CP-03).
 
 The install creates these OS users and groups. They are listed here so you can check a host
 before and after:
@@ -190,12 +197,31 @@ server_url = "https://mm.example.lan"
 human_user_ids = ["<the partner's user id>"]
 # Trusted crews, by name only. Each one's membership comes from its own broker on this host.
 trusted = []
+# Optional (#132): the team each minted bot joins, then its default channels, by ID.
+# team_id = "<team id>"
+# default_channel_ids = ["<channel id>", ...]
 ```
 
 Required: `server_id`, `server_url` and `human_user_ids`. `crew` defaults to the first human
 partner's username (R-02); set it. `trusted = ["<crew>", …]` is names only: a table, or any
 membership key, is refused. `broker_user_id` is never configured: the broker fills it at startup
 from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
+
+**Membership on mint** (#132). With `team_id` set, every successful `mint` adds the bot to that
+team and then to each of `default_channel_ids`, in order. A bot that is already a member counts
+as joined. A failed add is logged at ERROR, and the bot still gets its token. Both keys are
+Mattermost **IDs**: a team or channel name is refused at load, and `default_channel_ids` needs
+`team_id`. Leave both out to manage no membership. Find the IDs with an admin token:
+
+```text
+curl -s -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
+  "$MM_URL/api/v4/teams/name/<team name>" | jq -r .id
+curl -s -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
+  "$MM_URL/api/v4/teams/<team id>/channels/name/<channel name>" | jq -r .id
+```
+
+A private channel's lookup by name needs a member of it, or an admin. Before you set the keys,
+add the broker account to every channel in the list (see the prerequisites).
 
 ### The credentials
 

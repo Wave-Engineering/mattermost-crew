@@ -22,10 +22,13 @@ RATE_LIMIT_MAX_WAIT_S = 5.0
 class MattermostError(Exception):
     """A Mattermost API call failed."""
 
-    def __init__(self, method: str, path: str, status: int | None, detail: str) -> None:
+    def __init__(
+        self, method: str, path: str, status: int | None, detail: str, error_id: str = ""
+    ) -> None:
         self.method = method
         self.path = path
         self.status = status
+        self.error_id = error_id  # Mattermost's error `id`, such as `api.context.permissions…`
         code = status if status is not None else "error"
         super().__init__(f"{method} {path} -> {code}: {detail}")
 
@@ -64,6 +67,10 @@ class MattermostAPI(Protocol):
     def create_post(
         self, channel_id: str, message: str, props: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
+
+    def add_team_member(self, team_id: str, user_id: str) -> None: ...
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None: ...
 
 
 class MattermostClient:
@@ -110,9 +117,9 @@ class MattermostClient:
             attempt += 1
             self._sleep(_retry_after(resp))
         if resp.status_code == 404:
-            raise NotFound(method, path, 404, _detail(resp))
+            raise NotFound(method, path, 404, _detail(resp), _error_id(resp))
         if not resp.is_success:
-            raise MattermostError(method, path, resp.status_code, _detail(resp))
+            raise MattermostError(method, path, resp.status_code, _detail(resp), _error_id(resp))
         if not resp.content:
             return None
         return resp.json()
@@ -192,6 +199,17 @@ class MattermostClient:
         result: dict[str, Any] = self._call("POST", "/posts", json=body)
         return result
 
+    # Membership (#132). The broker account adds only bots it owns, as a plain `team_user` that
+    # is itself a member of each channel: no role beyond R-06's is needed (the #132 probe).
+    # An existing member is answered 201, the same as a new one.
+    def add_team_member(self, team_id: str, user_id: str) -> None:
+        self._call(
+            "POST", f"/teams/{team_id}/members", json={"team_id": team_id, "user_id": user_id}
+        )
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        self._call("POST", f"/channels/{channel_id}/members", json={"user_id": user_id})
+
 
 def _retry_after(resp: httpx.Response) -> float:
     """Seconds to wait after a 429: Retry-After, else Mattermost's X-RateLimit-Reset, else 1."""
@@ -202,6 +220,14 @@ def _retry_after(resp: httpx.Response) -> float:
             continue
         return min(max(wait, 0.1), RATE_LIMIT_MAX_WAIT_S)
     return 1.0
+
+
+def _error_id(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    return str(body.get("id") or "") if isinstance(body, dict) else ""
 
 
 def _detail(resp: httpx.Response) -> str:

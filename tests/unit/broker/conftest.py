@@ -40,6 +40,10 @@ class FakeMattermost:
         self.calls: list[tuple[str, Any]] = []
         self.posts: list[dict[str, Any]] = []
         self.post_fails = False
+        # Membership (#132): target (team or channel) id -> member user ids.
+        self.members: dict[str, list[str]] = {}
+        self.add_fails: set[str] = set()  # targets whose add answers 403
+        self.exists_as_400 = False  # an existing member answered 400 `…exists`, not 201
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
@@ -157,6 +161,25 @@ class FakeMattermost:
         post = {"channel_id": channel_id, "message": message, "props": dict(props or {})}
         self.posts.append(post)
         return post
+
+    def _add_member(self, call: str, kind: str, target: str, user_id: str) -> None:
+        self.calls.append((call, (target, user_id)))
+        path = f"/{kind}s/{target}/members"
+        if target in self.add_fails:
+            raise MattermostError("POST", path, 403, "no permission", "api.context.permissions")
+        members = self.members.setdefault(target, [])
+        if user_id in members:
+            if self.exists_as_400:
+                exists = f"store.sql_{kind}.save_member.exists.app_error"
+                raise MattermostError("POST", path, 400, "already a member", exists)
+            return  # 201, as the #132 probe saw
+        members.append(user_id)
+
+    def add_team_member(self, team_id: str, user_id: str) -> None:
+        self._add_member("add_team_member", "team", team_id, user_id)
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        self._add_member("add_channel_member", "channel", channel_id, user_id)
 
 
 class Clock:

@@ -62,6 +62,7 @@ class FakeBroker(BrokerClient):
         self.bots: list[str] = []
         self.fail: dict[str, BaseException] = {}
         self.on_revoke: Callable[[str], None] | None = None
+        self.membership: dict[str, Any] | None = None  # the mint answer's, when set (#132)
 
     def ops(self, op: str) -> list[dict[str, Any]]:
         return [e[3] for e in self.events if e[0] == "broker" and e[1] == self.name and e[2] == op]
@@ -79,7 +80,10 @@ class FakeBroker(BrokerClient):
             account = f"{args['dev_name']}.{args['crew']}"
             if account not in self.bots:
                 self.bots.append(account)
-            return {"account": account, **self._token(account)}
+            minted = {"account": account, **self._token(account)}
+            if self.membership is not None:
+                minted["membership"] = self.membership
+            return minted
         if op == "remint":
             account = f"{args['dev_name']}.{args['crew']}"
             if account not in self.bots:

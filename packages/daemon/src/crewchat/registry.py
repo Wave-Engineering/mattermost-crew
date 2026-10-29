@@ -193,6 +193,15 @@ class Registry:
                     )
                     unavailable.append(server.id)
                     continue
+                membership = minted.get("membership")
+                if isinstance(membership, dict) and membership.get("failed"):
+                    # The broker logged each at ERROR; the token is good, so register goes on.
+                    log.warning(
+                        "register %s on %s: membership adds failed: %s",
+                        account,
+                        server.id,
+                        membership["failed"],
+                    )
                 await self.store.install_minted(dev_name, crew, server.id, minted, now)
                 await self.cache.refresh(crew, server.id)
                 backends.append(mattermost_backend(server.id))

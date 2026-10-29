@@ -307,3 +307,78 @@ def test_it03_prune_counts_register_not_remint(
     assert user(mattermost, idle_id)["delete_at"] > 0
     assert user(mattermost, busy_id)["delete_at"] == 0
     assert token_works(mattermost, busy["token"])
+
+
+def mkchannel(mattermost: Any, team_id: str, name: str, kind: str) -> str:
+    resp = mm_request(
+        mattermost,
+        "POST",
+        "/channels",
+        json={"team_id": team_id, "name": name, "display_name": name, "type": kind},
+    )
+    assert resp.status_code == 201, resp.text
+    return str(resp.json()["id"])
+
+
+def is_member(mattermost: Any, kind: str, target: str, user_id: str) -> bool:
+    return mm_request(mattermost, "GET", f"/{kind}s/{target}/members/{user_id}").status_code == 200
+
+
+def test_mint_joins_the_team_and_default_channels(
+    mattermost: Any, broker: Broker, setup: dict[str, str]
+) -> None:
+    """#132 (D-109): as the probe found on oaw-dev, a broker that is a plain `team_user` and a
+    member of each channel adds its bot to the team, a public and a private channel. A channel
+    it is not in answers 403: reported, and the mint still returns its token."""
+    run = secrets.token_hex(3)
+    resp = mm_request(
+        mattermost,
+        "POST",
+        "/teams",
+        json={"name": f"join{run}", "display_name": f"join {run}", "type": "I"},
+    )
+    assert resp.status_code == 201, resp.text
+    team_id = str(resp.json()["id"])
+    public = mkchannel(mattermost, team_id, f"pub{run}", "O")
+    private = mkchannel(mattermost, team_id, f"priv{run}", "P")
+    outside = mkchannel(mattermost, team_id, f"out{run}", "O")  # the broker is never added
+    broker_id = setup["broker_id"]
+    resp = mm_request(
+        mattermost,
+        "POST",
+        f"/teams/{team_id}/members",
+        json={"team_id": team_id, "user_id": broker_id},
+    )
+    assert resp.status_code == 201, resp.text
+    for channel in (public, private):
+        resp = mm_request(
+            mattermost, "POST", f"/channels/{channel}/members", json={"user_id": broker_id}
+        )
+        assert resp.status_code == 201, resp.text
+
+    broker.config.team_id = team_id
+    broker.config.default_channel_ids = [public, private]
+    first = broker.mint(args(broker, "joiner"))
+    assert first["membership"] == {"joined": [team_id, public, private], "failed": []}
+    bot_id = user_by_name(mattermost, first["account"])
+    for kind, target in (("team", team_id), ("channel", public), ("channel", private)):
+        assert is_member(mattermost, kind, target, bot_id), (kind, target)
+
+    # Again: already a member everywhere, and clean.
+    second = broker.mint(args(broker, "joiner"))
+    assert second["membership"] == {"joined": [team_id, public, private], "failed": []}
+
+    # A default channel the broker isn't in: 403, reported, and the token still works.
+    broker.config.default_channel_ids = [public, outside]
+    third = broker.mint(args(broker, "joiner"))
+    assert third["membership"]["joined"] == [team_id, public]
+    [failure] = third["membership"]["failed"]
+    assert failure["id"] == outside and "403" in failure["error"]
+    assert not is_member(mattermost, "channel", outside, bot_id)
+    assert token_works(mattermost, third["token"])
+
+
+def user_by_name(mattermost: Any, username: str) -> str:
+    resp = mm_request(mattermost, "GET", f"/users/username/{username}")
+    assert resp.status_code == 200, resp.text
+    return str(resp.json()["id"])
