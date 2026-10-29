@@ -11,6 +11,8 @@
 # fresh VM per job (#83), never after two-user-setup.sh or on a workstation.
 set -euo pipefail
 
+"$(dirname "$0")/host-prereqs.sh"  # the runbook's Prerequisites, as an operator provides them
+
 export CREWCHAT_RUNBOOK_IT=1
 export CREWBROKER_INSTANCES="${CREWBROKER_INSTANCES:-ci:local}"
 

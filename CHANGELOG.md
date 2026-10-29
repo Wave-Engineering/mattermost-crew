@@ -12,6 +12,12 @@ All notable changes to this project are recorded here. The format follows
   `[[mattermost]]` entry takes `kiosk` (default `false`), a ceiling over the broker's `kiosk on`
   switch. A host upgrading with no new keys stops kiosk answers until `kiosk = true` is set on
   the servers that should have one.
+- `verify-install` passes run as root, which the operator who is the agents' user, with sudoers
+  granting `(root)` only, needs (#115). Run by an operator who cannot `sudo -u` the agents'
+  user, it prints the `sudo env AGENT_USER=… CREWBROKER_INSTANCES=… make verify-install` line
+  to re-run with and exits 1. It also checks the daemon socket's ACL, and that the agents' user
+  without the group and a uid with only the group's gid both get `health` while a uid with
+  neither is refused.
 
 ### Added
 
@@ -22,11 +28,23 @@ All notable changes to this project are recorded here. The format follows
 - `agents_allow` and `agents_deny` per `[crews.<crew>.<server_id>]`: which agents `register`
   mints an account for on that server, by forge key (`host/org`), absolute path or
   `name:<dev_name>`, with deny winning (#117). An agent taken off a server's list has the token
-  it holds there revoked at its next `register`, and that server leaves its daily rotation.
-  It's an accident guard, not a security boundary.
-  The shim's `register` sends `project_key`, its `repo_key()` and never a remote URL. An older
-  shim sends none, and gets no account where an allowlist is set, unless a `name:` entry names
-  it.
+  it holds there revoked at its next `register`, and that server leaves its daily rotation; a
+  revoke that fails is retried at each later `register`. It's an accident guard, not a security
+  boundary. The shim's `register` sends `project_key`, its `repo_key()` and never a remote URL.
+  An older shim sends none, and gets no account where an allowlist is set, unless a `name:`
+  entry names it.
+
+### Fixed
+
+- The agents' live sessions reach the daemon socket without a re-login (#115). The runbook's
+  daemon block installs `crewchat.service.d/agent-acl.conf`, whose `ExecStartPre` sets a default
+  ACL on `/run/crewchat` (`u:<AGENT_USER>:rw,g::rw`), so the socket comes out with
+  `user:<AGENT_USER>:rw-` and keeps `group::rw-` for gid-only clients such as containers. The
+  `crewchat-clients` group stays for containers and new logins. `acl` is a new prerequisite,
+  and Rollback removes the drop-in.
+- The broker block sets `/etc/crewbroker` to 0755 before starting any instance, so a directory
+  that already existed at 0700 no longer leaves `crewbroker` crash-looping on its credential
+  (#115).
 
 ## [0.2.2] — 2026-10-26
 

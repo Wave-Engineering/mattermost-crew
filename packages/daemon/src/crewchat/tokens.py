@@ -169,7 +169,8 @@ class AgentTokens:
     crew: str
     last_register: datetime | None = None
     servers: dict[str, ServerToken] = field(default_factory=dict)
-    # Tokens whose revoke failed, by server_id; retried before the next swap on that server.
+    # Tokens whose revoke failed, by server_id; retried before the next swap on that server, or,
+    # on a server the agent is no longer allowed on, at each `register` that skips it (#117).
     pending_revoke: dict[str, list[str]] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:

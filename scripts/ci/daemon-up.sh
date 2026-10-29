@@ -7,8 +7,9 @@
 #   scripts/ci/daemon-up.sh
 #
 # It writes /etc/crewchat/servers.toml (0644, root) naming the one Mattermost server and the
-# broker, creates /run/crewchat (0755, crewchat) and /var/lib/crewchat (0700, crewchat) as the
-# unit's RuntimeDirectory and StateDirectory would, and starts `crewchat serve` as crewchat.
+# broker, creates /run/crewchat (0755, crewchat, with the agents' default ACL) and
+# /var/lib/crewchat (0700, crewchat) as the unit's RuntimeDirectory, its agent-acl.conf drop-in
+# and its StateDirectory would, and starts `crewchat serve` as crewchat.
 # It exports CREWCHAT_BIN and CREWCHAT_SOCKET (into $GITHUB_ENV under Actions, and as export
 # lines on stdout). It needs root or sudo: never run it on a workstation.
 set -euo pipefail
@@ -61,6 +62,9 @@ EOF
 
 log "creating /run/crewchat and /var/lib/crewchat"
 $SUDO install -d -m 0755 -o crewchat -g crewchat /run/crewchat
+# The default ACL the runbook's agent-acl.conf drop-in sets in ExecStartPre (#115).
+"${ROOT}/scripts/ci/host-prereqs.sh"
+$SUDO setfacl -d -m "u:${AGENT_USER}:rw,g::rw" /run/crewchat
 $SUDO install -d -m 0700 -o crewchat -g crewchat /var/lib/crewchat
 
 log "starting crewchat serve; log in ${LOG}"

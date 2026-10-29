@@ -4,7 +4,10 @@ Every fenced `bash` block under the "Install …" headings and under "Verify the
 `docs/runbook.md` is extracted (`tests/runbook_md.py`) and run in document order, each in a new
 `bash` from the repository root, as the runbook tells an operator to. Every block must exit 0.
 Before them, `scripts/ci/runbook-configure.sh` does the runbook's Configure step with this CI
-host's values, as the operator would before installing.
+host's values, as the operator would before installing. It then sets `/etc/crewbroker` to 0700,
+as the first real host had it (#115): the broker block must fix the mode, or the broker can't
+reach its credential. After the blocks, the daemon is restarted and its socket must come back
+with the same ACL, which the unit's drop-in sets on every start.
 
 The blocks create OS users, install into `/opt/mattermost-crew` and start systemd units, so this
 test runs only where `CREWCHAT_RUNBOOK_IT=1` says the host is a fresh throwaway: the IT-20 job,
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -58,7 +62,16 @@ def fresh_host() -> dict[str, str]:
         check=False,
     )
     assert configure.returncode == 0, f"Configure failed:\n{configure.stdout}\n{configure.stderr}"
+    _sudo("chmod", "0700", "/etc/crewbroker")
     return env
+
+
+def _sudo(*argv: str) -> str:
+    proc = subprocess.run(
+        ["sudo", "-n", *argv], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert proc.returncode == 0, f"sudo {' '.join(argv)}: {proc.stdout}{proc.stderr}"
+    return proc.stdout
 
 
 def test_runbook_install_and_verify_blocks_run_clean(fresh_host: dict[str, str]) -> None:
@@ -79,3 +92,17 @@ def test_runbook_install_and_verify_blocks_run_clean(fresh_host: dict[str, str])
             f"runbook block {n} under '{heading}' exited {proc.returncode}\n"
             f"--- stdout\n{proc.stdout}\n--- stderr\n{proc.stderr}\n--- journal\n{_journal()}"
         )
+
+
+def test_socket_acl_survives_a_daemon_restart(fresh_host: dict[str, str]) -> None:
+    """Runs after the blocks: systemd recreates /run/crewchat on every start, and the drop-in's
+    ExecStartPre puts the default ACL back before the daemon makes its socket."""
+    sock = "/run/crewchat/crewchat.sock"
+    _sudo("systemctl", "restart", "crewchat")
+    for _ in range(30):
+        if subprocess.run(["sudo", "-n", "test", "-S", sock], check=False).returncode == 0:
+            break
+        time.sleep(1)
+    acl = _sudo("getfacl", "-p", sock).splitlines()
+    for want in (f"user:{fresh_host['AGENT_USER']}:rw-", "group::rw-", "mask::rw-"):
+        assert want in acl, f"{sock} lacks {want} after a restart:\n" + "\n".join(acl)
