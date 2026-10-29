@@ -53,7 +53,8 @@ printf '%s\n' 'base_url=https://llm.example.lan' 'model=haiku-latest' \
 $SUDO install -m 0644 -o root -g root "${ROOT}/packaging/crewkiosk.socket" \
   "${ROOT}/packaging/crewkiosk@.service" /etc/systemd/system/
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now crewkiosk.socket
+$SUDO systemctl enable crewkiosk.socket
+$SUDO systemctl restart crewkiosk.socket  # as the runbook's block: a re-run applies the unit (#128)
 $SUDO test -S "$SOCK" || die "no socket at $SOCK"
 log "crewkiosk.socket is listening on $SOCK"
 

@@ -25,6 +25,11 @@ All notable changes to this project are recorded here. The format follows
   destination exists, so every upgrade failed at the daemon block's `agent-acl.conf`, and so
   would any rewrite of a credential with Configure's old example. The CI scripts write the same
   way, through the new `scripts/ci/put-file.sh`.
+- The kiosk runner's block restarts `crewkiosk.socket` after installing it, where it ran
+  `enable --now`, which leaves an active socket on its old unit (#128). A re-run now applies a
+  changed `crewkiosk.socket`, as the Upgrade and Rollback sections say. A unit lint fails on
+  `systemctl enable --now` in any install block or shell script, and IT-20's re-run checks the
+  socket restarted.
 
 ### Added
 

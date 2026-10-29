@@ -356,9 +356,9 @@ done
 Only on a host that runs the kiosk's CLI runner (D-096, D-107). Creates `crewkiosk` with an empty
 HOME, installs `packaging/crewkiosk-run` at `/usr/local/libexec/crewkiosk-run`, hands the model
 credential to `crewkiosk`, makes `/etc/crewkiosk/model.conf` (when there is one) readable by its
-group, and starts `crewkiosk.socket`. The daemon connects to
-`/run/crewkiosk/kiosk.sock` and systemd runs one answer per connection as `crewkiosk`, so the
-daemon never changes user and keeps `NoNewPrivileges=yes`.
+group, and restarts `crewkiosk.socket`, so a re-run applies the unit it installs. The daemon
+connects to `/run/crewkiosk/kiosk.sock` and systemd runs one answer per connection as
+`crewkiosk`, so the daemon never changes user and keeps `NoNewPrivileges=yes`.
 
 ```bash
 set -euo pipefail
@@ -384,7 +384,10 @@ fi
 sudo install -D -m 0755 -o root -g root packaging/crewkiosk-run /usr/local/libexec/crewkiosk-run
 sudo install -m 0644 -o root -g root packaging/crewkiosk.socket packaging/crewkiosk@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now crewkiosk.socket
+# Restart, not `enable --now`: that leaves an active socket on its old unit. With Accept=yes an
+# answer in flight runs in its own crewkiosk@ instance, so the restart doesn't cut it off.
+sudo systemctl enable crewkiosk.socket
+sudo systemctl restart crewkiosk.socket
 sudo test -S /run/crewkiosk/kiosk.sock
 echo "crewkiosk.socket is listening on /run/crewkiosk/kiosk.sock"
 ```

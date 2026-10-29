@@ -107,9 +107,19 @@ def test_blocks_rerun_over_the_existing_install(fresh_host: dict[str, str]) -> N
     dropin = "/etc/systemd/system/crewchat.service.d/agent-acl.conf"
     before = _sudo("cat", dropin)
     assert f"u:{fresh_host['AGENT_USER']}:rw" in before
+    kiosk_started = _started("crewkiosk.socket")
     _run_blocks(fresh_host, "re-run")
     assert _sudo("cat", dropin) == before
     assert _sudo("stat", "-c", "%a %U:%G", dropin).strip() == "644 root:root"
+    # The kiosk block restarted its socket, so a changed unit is applied (#128).
+    assert _started("crewkiosk.socket") != kiosk_started
+
+
+def _started(unit: str) -> str:
+    """`unit`'s last start, in the monotonic clock: it changes on every restart."""
+    value = _sudo("systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", unit)
+    assert value.strip() not in ("", "0"), f"{unit} has never started"
+    return value.strip()
 
 
 def test_socket_acl_survives_a_daemon_restart(fresh_host: dict[str, str]) -> None:
