@@ -4,7 +4,10 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.5] — 2026-10-29
+
+The broker puts every bot it mints into its crew's team and default channels, so an agent shows
+up where people can find it and address it.
 
 ### Added
 
@@ -26,6 +29,14 @@ All notable changes to this project are recorded here. The format follows
 team and of every default channel**. A channel admin adds it to each
 one, and on a private channel that's the only way. On a partner's server, adding it and setting
 the keys is the human partner's step (CP-03). See the runbook's prerequisites and Configure.
+
+An agent reaches a server with an allowlist (#117) only from a session whose client is v0.2.3 or
+later. An older client sends no `project_key`, and the allowlist refuses it. The client is loaded
+once when the session starts, so a session started before its client was upgraded needs a
+restart.
+
+**Rolling back** to v0.2.4 needs no config edit. Its broker ignores `team` and
+`default_channels`, and the memberships it already made stay.
 
 ## [0.2.4] — 2026-10-29
 

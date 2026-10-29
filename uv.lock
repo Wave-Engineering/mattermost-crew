@@ -418,7 +418,7 @@ wheels = [
 
 [[package]]
 name = "crewbroker"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "packages/broker" }
 dependencies = [
     { name = "httpx" },
@@ -433,7 +433,7 @@ requires-dist = [
 
 [[package]]
 name = "crewchat"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "packages/daemon" }
 dependencies = [
     { name = "httpx" },
@@ -450,7 +450,7 @@ requires-dist = [
 
 [[package]]
 name = "crewchat-clients"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "packages/clients" }
 dependencies = [
     { name = "mcp" },
@@ -955,7 +955,7 @@ wheels = [
 
 [[package]]
 name = "mattermost-crew"
-version = "0.2.4"
+version = "0.2.5"
 source = { virtual = "." }
 dependencies = [
     { name = "crewbroker" },
