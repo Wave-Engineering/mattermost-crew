@@ -23,7 +23,9 @@ The variables every block reads:
 | `CREWBROKER_INSTANCES` | each broker on this host, as `<crew>:<server_id>`, space-separated | `oaw:oaw-dev` |
 | `AGENT_USER` | the agents' OS user (optional, default `agent`) | `agent` |
 
-Run every block as a user with `sudo`, from the root of a checkout of the release tag:
+Run every block as a user with `sudo` (the verify step needs `sudo -u` the agents' user too, or
+root; see [Verify the install](#verify-the-install)), from the root of a checkout of the release
+tag:
 
 ```text
 git clone --branch <tag> https://github.com/Wave-Engineering/mattermost-crew
@@ -353,7 +355,11 @@ echo "crewkiosk.socket is listening on /run/crewkiosk/kiosk.sock"
 socket's mode and group, a `mint` for a `verify-canary` bot account as the daemon's user (its
 token is revoked straight away and never printed), and that the agents' user cannot read the
 broker's credential or token ledger. It checks the daemon's socket, `health` and a `register` as
-the agents' user, whose reply must carry no token. Every known credential file is checked by name,
+the agents' user, whose reply must carry no token. It checks the daemon socket's ACL
+(`user:<AGENT_USER>:rw-`, `group::rw-` and `mask::rw-`, from the `agent-acl.conf` drop-in), and
+then three callers through `setpriv`, each with exactly the ids named. The agents' user without
+`crewchat-clients` must get `health` (the ACL), and so must a uid with only that group's gid (a
+container). A uid with neither must be refused. Every known credential file is checked by name,
 never by glob, with `test -e <file> && ! sudo -u agent test -r <file>`: each broker's
 `/etc/crewbroker/<crew>-<server_id>.credential` and `/var/lib/crewbroker/<crew>-<server_id>/tokens.json`,
 the daemon's `/var/lib/crewchat/tokens/verify-canary.json`, `/etc/crewchat/discord.credential`
@@ -369,6 +375,15 @@ make verify-install
 ```
 
 It prints one `PASS` or `FAIL` line per check and exits non-zero on any `FAIL`.
+
+Run it as root, or as an operator who may `sudo -u` both the agents' user and root. On a host
+whose sudoers grants the operator `(root)` only, typically an operator who is the agents' user,
+verify prints the line to re-run with and exits 1 before any check. Run that line as the same
+operator:
+
+```text
+sudo env AGENT_USER=<agents' user> CREWBROKER_INSTANCES="<crew>:<server_id> ..." make verify-install
+```
 
 ## Rollback
 
