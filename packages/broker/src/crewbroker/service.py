@@ -245,6 +245,36 @@ class Broker:
         log.info("revoke: token %s", token_id)
         return {}
 
+    def deactivate(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Disable an account's bot now, as the prune does after 30 idle days (#127).
+
+        `verify-install` retires its canary this way, so a check against a live server leaves no
+        active bot behind. The answer's `delete_at` is read back from the server after the
+        disable, never assumed. The next `mint` for the name re-enables the bot, as for any
+        pruned account.
+        """
+        name = self._name(args)
+        squatted = OpError("squatted", f"{name} is no longer owned by this broker")
+        with self._lock:
+            acct = self.accounts.get(name)
+            if acct is None:
+                raise OpError("not_found", f"{name} has never registered")
+            try:
+                if self.client.get_bot(acct.bot_user_id).get("owner_id") != (
+                    self.config.broker_user_id
+                ):
+                    raise squatted
+                self.client.disable_bot(acct.bot_user_id)
+                # Disabled: record it before the read-back, which may fail on its own.
+                self.accounts.mark_pruned(name, self.clock())
+                delete_at = self.client.get_bot(acct.bot_user_id).get("delete_at")
+            except NotFound as exc:
+                raise squatted from exc
+            except MattermostError as exc:
+                raise OpError("upstream", f"deactivating {name} failed: {exc}") from exc
+        log.info("deactivate: %s (%s), delete_at %s", name, acct.bot_user_id, delete_at)
+        return {"account": name, "delete_at": delete_at}
+
     def crew_info(self, args: dict[str, Any]) -> dict[str, Any]:
         """This broker's own fields only. `minted_bot_ids` is what it minted and still owns.
 
@@ -341,6 +371,7 @@ class Broker:
             "mint": self.mint,
             "remint": self.remint,
             "revoke": self.revoke,
+            "deactivate": self.deactivate,
             "crew_info": self.crew_info,
             "switch_state": self.switch_state,
         }

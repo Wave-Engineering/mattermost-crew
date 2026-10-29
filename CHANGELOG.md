@@ -30,6 +30,10 @@ All notable changes to this project are recorded here. The format follows
   changed `crewkiosk.socket`, as the Upgrade and Rollback sections say. A unit lint fails on
   `systemctl enable --now` in any install block or shell script, and IT-20's re-run checks the
   socket restarted.
+- `verify-install` no longer leaves its `verify-canary` bot active on the server (#127). Its
+  last check deactivates the canary on every broker instance and reads the server's `delete_at`
+  back. Before, each verify's `mint` re-enabled a canary an admin had deactivated, so every
+  verify against a shared server needed a cleanup.
 
 ### Added
 
@@ -38,6 +42,8 @@ All notable changes to this project are recorded here. The format follows
   fails on any `install` reading a pipe in the runbook's blocks or in a shell script: CI's GNU
   coreutils accept it, so only the lint and a test on a uutils host can catch it (#123).
 - Verify's description names the kiosk's `model.conf` mode check.
+- The broker's `deactivate{dev_name, crew}` op disables an account's bot now, as the 30-day prune
+  does, and answers `{account, delete_at}` read back from the server (#127).
 
 ## [0.2.3] — 2026-10-29
 

@@ -23,6 +23,9 @@
 #     /var/lib/crewchat/tokens/verify-canary.json, exists and the agent's user cannot read it.
 #     Never a glob: a shell that can't list the directory would pass vacuously (R-08).
 #
+# Last, the canary's bot is deactivated on every broker instance (the broker's `deactivate`),
+# and the server's `delete_at` read back must be > 0, so a verify leaves no active bot (#127).
+#
 # The kiosk (Story 3.5, D-107), on a host with the crewkiosk user:
 #   - its socket /run/crewkiosk/kiosk.sock exists, mode 0660, group crewchat;
 #   - its model config /etc/crewkiosk/model.conf, when present, is mode 0640, root:crewkiosk;
@@ -220,6 +223,22 @@ else
   fail "register for verify-canary: $(jq -c '.error // .' <<<"$reply" 2>/dev/null || echo "no reply")"
 fi
 no_agent_read "${CREWCHAT_TOKENS}/verify-canary.json"
+
+# Nothing mints the canary after this: deactivate its bot on every broker instance, so a verify
+# leaves no active bot on the server (#127). `delete_at` is the server's, read back after the
+# disable. The next verify's mint reactivates it.
+for entry in $CREWBROKER_INSTANCES; do
+  [[ "$entry" == *:* && -n "${entry%%:*}" && -n "${entry#*:}" ]] || continue  # failed above
+  crew="${entry%%:*}"
+  instance="${crew}-${entry#*:}"
+  reply="$(sudo -u "$DAEMON_USER" "$CREWBROKER_BIN" call "${RUN_DIR}/${instance}.sock" deactivate \
+    "{\"dev_name\": \"verify-canary\", \"crew\": \"${crew}\"}" 2>/dev/null || true)"
+  if jq -e '.ok and (.result.delete_at | type == "number" and . > 0)' <<<"$reply" >/dev/null 2>&1; then
+    pass "deactivated verify-canary.${crew} on ${instance} (delete_at $(jq -r .result.delete_at <<<"$reply"))"
+  else
+    fail "could not deactivate verify-canary.${crew} on ${instance}: $(jq -c '.error // .' <<<"$reply" 2>/dev/null || echo "no reply")"
+  fi
+done
 
 # The credentials servers.toml names (Discord when enabled, squawkie when configured), read
 # with the daemon's own interpreter, and the kiosk's model credential on a kiosk host. Each is

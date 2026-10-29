@@ -252,6 +252,23 @@ def test_pruned_agent_reactivated_on_register(
     assert broker.crew_info({})["minted_bot_ids"] == [bot_id]
 
 
+def test_deactivate_leaves_the_bot_deactivated(mattermost: Any, broker: Broker) -> None:
+    """#127: `deactivate` disables the bot on the server with the broker's own role, and the
+    `delete_at` it answers is the server's. The next mint reactivates it, as after a prune."""
+    first = broker.mint(args(broker, "canary"))
+    bot_id = broker.accounts.minted_bot_ids()[0]
+
+    reply = broker.deactivate(args(broker, "canary"))
+
+    assert reply["account"] == first["account"]
+    assert reply["delete_at"] > 0
+    assert user(mattermost, bot_id)["delete_at"] > 0
+    assert not token_works(mattermost, first["token"])
+    again = broker.mint(args(broker, "canary"))
+    assert user(mattermost, bot_id)["delete_at"] == 0
+    assert token_works(mattermost, again["token"])
+
+
 def test_mint_refuses_squatted_name(mattermost: Any, broker: Broker) -> None:
     """R-01, R-03: an existing account not owned by this broker → loud failure, no token."""
     crew = broker.config.crew

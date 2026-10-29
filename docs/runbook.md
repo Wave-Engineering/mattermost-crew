@@ -410,7 +410,10 @@ with Discord enabled, a configured squawkie credential, and the kiosk's
 `/etc/crewkiosk/model.credential`. On a host with `crewkiosk` it also checks the kiosk socket,
 that the daemon runs with no new privileges, that `/etc/crewkiosk/model.conf`, when there is
 one, is 0640 `root:crewkiosk`, and the same files with `crewkiosk` in place of the agents'
-user: `crewkiosk` may read its own model credential and nothing else (R-08).
+user: `crewkiosk` may read its own model credential and nothing else (R-08). Last, it
+deactivates the `verify-canary` bot on every broker instance with the broker's `deactivate`, and
+checks the server's `delete_at` came back above 0, so a verify leaves no active bot on the
+server. The next verify reactivates it.
 
 ```bash
 set -euo pipefail

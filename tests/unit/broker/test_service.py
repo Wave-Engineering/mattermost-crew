@@ -20,6 +20,7 @@ ALL_OPS: dict[str, dict[str, Any]] = {
     "mint": {"dev_name": "babel", "crew": "oaw"},
     "remint": {"dev_name": "babel", "crew": "oaw"},
     "revoke": {"token_id": "t1"},
+    "deactivate": {"dev_name": "babel", "crew": "oaw"},
     "crew_info": {},
     "switch_state": {},
 }
@@ -55,6 +56,70 @@ def test_remint_keeps_old_token_until_revoke(broker: Broker, fake: Any) -> None:
         broker.revoke({"token_id": first["token_id"]})
     with pytest.raises(OpError, match="not_found"):
         broker.remint({"dev_name": "never", "crew": "oaw"})
+
+
+CANARY = {"dev_name": "verify-canary", "crew": "oaw"}
+
+
+def test_deactivate_disables_and_reads_back(broker: Broker, fake: Any) -> None:
+    """#127: the bot is disabled, `pruned_at` recorded, and `delete_at` is the server's."""
+    token = broker.mint(CANARY)["token"]
+    acct = broker.accounts.get("verify-canary.oaw")
+    assert acct is not None
+    reads = fake.count("get_bot")
+
+    reply = broker.deactivate(CANARY)
+
+    assert reply == {"account": "verify-canary.oaw", "delete_at": 1}
+    assert fake.bots[acct.bot_user_id]["delete_at"]
+    assert fake.count("disable_bot") == 1
+    assert fake.count("get_bot") == reads + 2  # the owner check, then the read-back
+    pruned = broker.accounts.get("verify-canary.oaw")
+    assert pruned is not None and pruned.pruned_at is not None
+    assert not fake.token_works(token)
+    # Again: disabled again, and the same answer.
+    assert broker.deactivate(CANARY)["delete_at"] == 1
+
+
+def test_deactivate_refusals(broker: Broker, fake: Any) -> None:
+    with pytest.raises(OpError, match="not_found"):
+        broker.deactivate(CANARY)
+    with pytest.raises(OpError, match="bad_request"):
+        broker.deactivate({"dev_name": "verify-canary", "crew": "otter"})
+    with pytest.raises(OpError, match="bad_request"):
+        broker.deactivate({"dev_name": "verify-canary"})
+    broker.mint(CANARY)
+    acct = broker.accounts.get("verify-canary.oaw")
+    assert acct is not None
+    for owner in ("someone-else", None):  # reassigned: the owner check, or a 404
+        if owner is None:
+            del fake.bots[acct.bot_user_id]
+        else:
+            fake.reassign(acct.bot_user_id, owner)
+        with pytest.raises(OpError, match="squatted"):
+            broker.deactivate(CANARY)
+    assert fake.count("disable_bot") == 0
+
+
+def test_deactivate_upstream_failure_is_reported(broker: Broker, fake: Any) -> None:
+    broker.mint(CANARY)
+    acct = broker.accounts.get("verify-canary.oaw")
+    assert acct is not None
+    fake.disable_fails.add(acct.bot_user_id)
+    with pytest.raises(OpError, match="upstream"):
+        broker.deactivate(CANARY)
+    still = broker.accounts.get("verify-canary.oaw")
+    assert still is not None and still.pruned_at is None
+
+
+def test_mint_after_deactivate_reenables(broker: Broker, fake: Any) -> None:
+    broker.mint(CANARY)
+    broker.deactivate(CANARY)
+    token = broker.mint(CANARY)["token"]
+    acct = broker.accounts.get("verify-canary.oaw")
+    assert acct is not None and acct.pruned_at is None
+    assert not fake.bots[acct.bot_user_id]["delete_at"]
+    assert fake.token_works(token)
 
 
 def _args(held: str | None) -> dict[str, Any]:
