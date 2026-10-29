@@ -4,7 +4,10 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.2.4] — 2026-10-29
+
+The runbook's blocks re-run over an existing install on a uutils host, so an upgrade is the
+runbook as written.
 
 **Upgrading:**
 
