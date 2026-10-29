@@ -187,7 +187,13 @@ class Rig:
     """The daemon, wired as `serve()` wires it, for one test."""
 
     def __init__(
-        self, mattermost: Any, world: dict[str, Any], root: Path, *, loop_guard_window: int = 20
+        self,
+        mattermost: Any,
+        world: dict[str, Any],
+        root: Path,
+        *,
+        loop_guard_window: int = 20,
+        kiosk: bool = True,
     ) -> None:
         mint.clear_expiry_cache()
         self.mattermost = mattermost
@@ -224,7 +230,8 @@ class Rig:
         config = parse_config(
             {
                 "default_crew": crew,
-                "mattermost": [{"id": SID, "url": mattermost.url}],
+                # The kiosk is off on a server unless `servers.toml` turns it on (#117).
+                "mattermost": [{"id": SID, "url": mattermost.url, "kiosk": kiosk}],
                 "loop_guard_window": loop_guard_window,
                 # The unit tests hold the 2 s floor; here a test's back-to-back cache misses
                 # must each get their own round.
@@ -583,6 +590,32 @@ def test_it23_kiosk_off_drops_outsiders(
             assert [e.message.post_id for e in rig.kiosked() if e.message] == [ask]
         finally:
             rig.flip("kiosk on")
+            await rig.aclose()
+
+    run(scenario())
+
+
+def test_kiosk_server_flag_over_the_switch(
+    mattermost: Any, world: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#117: with `kiosk = false` on the server, an outsider's direct address is never
+    kiosked, though the broker's switch has the kiosk on: it is dropped as `kiosk_server_off`."""
+    caplog.set_level("DEBUG", logger="crewchat.doorbell")
+
+    async def scenario() -> None:
+        rig = Rig(mattermost, world, tmp_path, kiosk=False)
+        await rig.register("babel")
+        await rig.register("kessel")  # the sentinel's sender
+        assert "kiosk on" in rig.flip("kiosk on")
+        await rig.cache.refresh_all()
+        await rig.listen()
+        try:
+            rig.post_as(rig.outsider_token, "@babel is the kiosk here?")
+            await rig.dropped("kiosk server off")
+            assert rig.kiosked() == []
+            drops = [r.getMessage() for r in caplog.records if r.name == "crewchat.doorbell"]
+            assert any(m.endswith(": kiosk_server_off") for m in drops), drops
+        finally:
             await rig.aclose()
 
     run(scenario())

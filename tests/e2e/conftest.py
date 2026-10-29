@@ -395,6 +395,7 @@ def _write_servers_toml(path: Path, world_crews: list[tuple[str, Path, str]], ur
         "[[mattermost]]",
         f'id = "{SID}"',
         f'url = "{url}"',
+        "kiosk = true",  # E2E-02's kiosk Q&A: off on a server unless it's set (#117)
         "",
         "[discord]",
         "enabled = false",

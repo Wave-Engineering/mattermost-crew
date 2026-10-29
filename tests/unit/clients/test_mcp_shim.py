@@ -200,13 +200,40 @@ def test_register_sends_identity_and_omits_missing_crew(tmp_path: Path) -> None:
     shim = make_shim(tmp_path, daemon)
     asyncio.run(shim.start())
     ident = {"dev_name": DEV, "session_id": "s1", "dev_team": "oaw", "dev_avatar": "x"}
-    assert daemon.of("register") == [ident]
+    # No remote: the project key is the repo's path (#117).
+    key = str(shim.repo_root.resolve())
+    assert daemon.of("register") == [{**ident, "project_key": key}]
     assert shim.needs_list == "bj:needs"
 
     daemon2 = FakeDaemon()
     shim2 = make_shim(tmp_path / "b", daemon2, crew="wave")
     asyncio.run(shim2.start())
-    assert daemon2.of("register") == [{**ident, "crew": "wave"}]
+    key2 = str(shim2.repo_root.resolve())
+    assert daemon2.of("register") == [{**ident, "crew": "wave", "project_key": key2}]
+
+
+def test_shim_register_sends_project_key(tmp_path: Path) -> None:
+    """#117: `project_key` is `repo_key()`, the forge org, and never the remote URL, which
+    can carry a credential."""
+    daemon = FakeDaemon()
+    root = make_repo(tmp_path)
+    remote = "https://user:s3cret-token@gitlab.example.lan/partner-org/sub/repo.git"
+    shim = Shim(
+        root,
+        daemon,
+        clock=Clock(),
+        headless=False,
+        defaults_file=tmp_path / "home" / ".claude" / "chat-defaults.json",
+        squawk=Squawks(),
+        remote_for=lambda _root: remote,
+        session_id="s1",
+        environ={},
+        legacy_dir=tmp_path / "no-legacy",
+    )
+    asyncio.run(shim.start())
+    (frame,) = daemon.of("register")
+    assert frame["project_key"] == "gitlab.example.lan/partner-org"
+    assert "s3cret" not in json.dumps(frame) and "repo.git" not in json.dumps(frame)
 
 
 def test_shim_register_reads_identity(tmp_path: Path) -> None:

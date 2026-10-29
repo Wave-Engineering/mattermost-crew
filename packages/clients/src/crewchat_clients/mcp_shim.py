@@ -27,11 +27,13 @@ and the daemon acts on the agent's behalf with what it holds itself.
   (`title:body`). The shim reads the file as the agent's user and streams it to the daemon in
   `upload` chunks that each fit a frame, then names the upload in the post's `attachments`. A
   file over 8 MiB, or one the daemon refuses, fails the call loudly before anything is posted.
-- **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id}` from the
-  identity file (`crew` omitted when the file has none). `dev_team` and `dev_avatar` fall back
-  to the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). It
-  registers again every 24 hours, and before any call when the last one is older than that,
-  so a long-lived session never ages out (R-30). A daemon that answers
+- **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id,
+  project_key}` from the identity file (`crew` omitted when the file has none). `project_key`
+  is `repo_key()`, the same key `chat-defaults.json` uses, for the servers' allowlists (#117).
+  `dev_team` and `dev_avatar` fall back to the legacy
+  `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). It registers again every
+  24 hours, and before any call when the last one is older than that, so a long-lived session
+  never ages out (R-30). A daemon that answers
   `not_registered` (it restarted) gets a fresh `register` and the call is retried once.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
@@ -75,6 +77,7 @@ from crewchat_clients.defaults import (
     defaults_path,
     git_remote,
     is_backend,
+    repo_key,
     resolve_default,
     write_default,
 )
@@ -385,6 +388,9 @@ class Shim:
             "session_id": self.session_id,
             "dev_team": self.identity_field("dev_team"),
             "dev_avatar": self.identity_field("dev_avatar"),
+            # For the server allowlists (#117): `host/org` or the repo's path, never the
+            # remote URL, which can carry credentials.
+            "project_key": repo_key(self.repo_root, self.remote_for),
         }
         crew = self.identity.get("crew")
         if isinstance(crew, str) and crew:

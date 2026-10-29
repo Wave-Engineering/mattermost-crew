@@ -6,6 +6,28 @@ All notable changes to this project are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- **The kiosk is now off on every server unless `servers.toml` turns it on** (#117). Each
+  `[[mattermost]]` entry takes `kiosk` (default `false`), a ceiling over the broker's `kiosk on`
+  switch. A host upgrading with no new keys stops kiosk answers until `kiosk = true` is set on
+  the servers that should have one.
+
+### Added
+
+- `kiosk_daily_cap` per `[[mattermost]]` entry (default 25; 0 means none): kiosk answers per
+  server per UTC day, across every outsider and agent, on top of the per-outsider hourly rate
+  (#117). The count is persisted in `kiosk-daily.json` under the state directory, so a restart
+  doesn't reset it.
+- `agents_allow` and `agents_deny` per `[crews.<crew>.<server_id>]`: which agents `register`
+  mints an account for on that server, by forge key (`host/org`), absolute path or
+  `name:<dev_name>`, with deny winning (#117). An agent taken off a server's list has the token
+  it holds there revoked at its next `register`, and that server leaves its daily rotation.
+  It's an accident guard, not a security boundary.
+  The shim's `register` sends `project_key`, its `repo_key()` and never a remote URL. An older
+  shim sends none, and gets no account where an allowlist is set, unless a `name:` entry names
+  it.
+
 ## [0.2.2] — 2026-10-26
 
 The first fleet deploy, pinned by kit 8.18.0.

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
+import stat
 import time
 from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -148,6 +151,8 @@ class Rig:
         self.threads = MyThreads()
         self.reg = registration()
         self.registry = StubRegistry(self.reg, registration("kessel"))
+        # Both servers have the kiosk on, with a cap no test reaches unless it sets one (#117).
+        filter_kw.setdefault("kiosk_caps", {SID: 1000, SID2: 1000})
         self.filters = Filters(
             self.registry,  # type: ignore[arg-type]
             self.cache,
@@ -581,6 +586,90 @@ def test_kiosk_off_drops_outsiders(rig: Rig) -> None:
         return await rig.admit(mm(OUTSIDER, is_bot=False))
 
     assert run(scenario()).reason == "kiosk_off"
+
+
+def test_kiosk_server_off_drops() -> None:
+    """#117: a server without `kiosk = true` gives no kiosk, whatever the switch says."""
+
+    async def scenario() -> None:
+        rig = Rig(kiosk_caps={SID2: 10})  # the kiosk on dev2 only
+        rig.set_mode("crew", kiosk_on=True)
+        await rig.prime()
+        off = await rig.admit(mm(OUTSIDER, is_bot=False))
+        assert off.reason == "kiosk_server_off"
+        assert await rig.admit(mm(OUTSIDER, is_bot=False, backend=MM2)) == KIOSK
+        # The default: no server has the kiosk.
+        bare = Filters(rig.registry, rig.cache, rig.threads)  # type: ignore[arg-type]
+        assert (await bare.admit(mm("h-out3", is_bot=False), rig.reg, NOW, "push")).reason == (
+            "kiosk_server_off"
+        )
+
+    run(scenario())
+
+
+def test_kiosk_daily_cap(tmp_path: Path) -> None:
+    """#117: past the cap a server's kiosk drops for the rest of the UTC day; another server
+    is unaffected; a new UTC date starts over."""
+
+    async def scenario() -> None:
+        rig = Rig(kiosk_caps={SID: 2, SID2: 5}, state_dir=tmp_path)
+        await rig.prime()
+        got = [await rig.admit(mm(f"h-o{i}", is_bot=False)) for i in range(3)]
+        assert got[:2] == [KIOSK, KIOSK] and got[2].reason == "kiosk_daily_cap"
+        assert await rig.admit(mm("h-o9", is_bot=False, backend=MM2)) == KIOSK
+        rig.now = datetime(2026, 10, 25, 0, 0, 1, tzinfo=UTC)  # past midnight UTC
+        assert await rig.admit(mm("h-o10", is_bot=False)) == KIOSK
+
+    run(scenario())
+    saved = json.loads((tmp_path / "kiosk-daily.json").read_text())
+    assert saved == {
+        SID: {"date": "2026-10-25", "count": 1},
+        SID2: {"date": "2026-10-24", "count": 1},
+    }
+    assert stat.S_IMODE((tmp_path / "kiosk-daily.json").stat().st_mode) == 0o600
+
+
+def test_kiosk_daily_cap_zero_means_none() -> None:
+    async def scenario() -> Verdict:
+        rig = Rig(kiosk_caps={SID: 0})
+        await rig.prime()
+        return await rig.admit(mm(OUTSIDER, is_bot=False))
+
+    assert run(scenario()).reason == "kiosk_daily_cap"
+
+
+def test_kiosk_daily_cap_survives_restart(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The count is reloaded from `kiosk-daily.json`: a restart never resets the day."""
+    (tmp_path / "kiosk-daily.json").write_text(
+        json.dumps({SID: {"date": "2026-10-24", "count": 3}, SID2: {"date": "2026-10-23",
+                                                                      "count": 3}})
+    )
+    caplog.set_level(logging.WARNING, logger="crewchat.filters")
+
+    async def scenario() -> list[Verdict]:
+        rig = Rig(kiosk_caps={SID: 3, SID2: 3}, state_dir=tmp_path)
+        await rig.prime()
+        return [
+            await rig.admit(mm("h-a", is_bot=False)),
+            await rig.admit(mm("h-b", is_bot=False)),
+            await rig.admit(mm("h-c", is_bot=False, backend=MM2)),  # yesterday's count
+        ]
+
+    first, second, other = run(scenario())
+    assert first.reason == "kiosk_daily_cap" and second.reason == "kiosk_daily_cap"
+    assert other == KIOSK
+    capped = [r for r in caplog.records if "daily cap" in r.getMessage()]
+    assert len(capped) == 1  # once per server per day
+
+    # A file it can't read is logged and read as empty: the kiosk still answers.
+    (tmp_path / "kiosk-daily.json").write_text("not json")
+
+    async def again() -> Verdict:
+        rig = Rig(kiosk_caps={SID: 3}, state_dir=tmp_path)
+        await rig.prime()
+        return await rig.admit(mm("h-d", is_bot=False))
+
+    assert run(again()) == KIOSK
 
 
 def test_kiosk_rate_limit_per_outsider() -> None:

@@ -135,3 +135,61 @@ def test_config_filter_settings() -> None:
     ):
         with pytest.raises(ConfigError, match=key):
             parse_config({**raw, key: bad})
+
+
+# -- per-server controls (#117) --------------------------------------------------------------
+def test_server_kiosk_defaults_off() -> None:
+    (server,) = parse_config(_raw()).mattermost
+    assert server.kiosk is False and server.kiosk_daily_cap == 25
+    raw = _raw()
+    raw["mattermost"][0].update(kiosk=True, kiosk_daily_cap=0)
+    (server,) = parse_config(raw).mattermost
+    assert server.kiosk is True and server.kiosk_daily_cap == 0  # 0: no kiosk answers
+    broker = parse_config(_raw()).crews["oaw"].brokers["dev"]
+    assert broker.agents_allow is None and broker.agents_deny == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"kiosk": "yes"}, "kiosk must be true or false"),
+        ({"kiosk": 1}, "kiosk must be true or false"),
+        ({"kiosk_daily_cap": -1}, "kiosk_daily_cap"),
+        ({"kiosk_daily_cap": 2.5}, "kiosk_daily_cap"),
+        ({"kiosk_daily_cap": True}, "kiosk_daily_cap"),
+    ],
+)
+def test_server_kiosk_types_refused(change: dict[str, Any], message: str) -> None:
+    raw = _raw()
+    raw["mattermost"][0].update(change)
+    with pytest.raises(ConfigError, match=message):
+        parse_config(raw)
+
+
+def test_allowlist_entry_forms() -> None:
+    raw = _raw()
+    raw["crews"]["oaw"]["dev"].update(
+        agents_allow=["forge.example.lan/partner-org", "/home/agent/work", "name:helper"],
+        agents_deny=["name:scratch"],
+    )
+    broker = parse_config(raw).crews["oaw"].brokers["dev"]
+    want = ("forge.example.lan/partner-org", "/home/agent/work", "name:helper")
+    assert broker.agents_allow == want
+    assert broker.agents_deny == ("name:scratch",)
+    raw["crews"]["oaw"]["dev"]["agents_allow"] = []
+    assert parse_config(raw).crews["oaw"].brokers["dev"].agents_allow == ()  # nobody
+
+    for key, bad in (
+        ("agents_allow", ["https://forge.example.lan/partner-org"]),  # a URL, not a key
+        ("agents_allow", ["Forge.example.lan/partner-org"]),  # repo_key lowercases the host
+        ("agents_allow", ["forge.example.lan/partner-org/sub"]),  # only the top-level group
+        ("agents_allow", ["relative/path/x"]),
+        ("agents_allow", ["name:"]),
+        ("agents_allow", ["name:Bad Name"]),
+        ("agents_allow", "forge.example.lan/partner-org"),  # not an array
+        ("agents_deny", [3]),
+    ):
+        raw = _raw()
+        raw["crews"]["oaw"]["dev"][key] = bad
+        with pytest.raises(ConfigError, match=key):
+            parse_config(raw)

@@ -341,6 +341,27 @@ class TokenStore:
         agent.last_register = now
         await self._swap(agent, server_id, _server_token(minted, minted.get("account")))
 
+    async def retire_server(self, dev_name: str, crew: str, server_id: str) -> None:
+        """Revoke the one token `dev_name` holds in `crew` on `server_id`, and take that server
+        out of its rotation: the agent is no longer allowed there (#117). With no token held,
+        it retries any revoke still pending there: no swap or rotation runs on that server
+        again, so each `register` that skips it is what retries a failed one.
+
+        The caller (`Registry.register`) holds `lock(dev_name)`.
+        """
+        agent = self._agents.get(dev_name)
+        if agent is None or agent.crew != crew:
+            return
+        tok = agent.servers.pop(server_id, None)
+        if tok is not None:
+            log.info("retiring %s's token on %s: no longer allowed there", dev_name, server_id)
+            # Recorded before the revoke is tried, as in `_swap`, so a crash mid-revoke keeps it.
+            agent.pending_revoke.setdefault(server_id, []).append(tok.token_id)
+            self._persist(agent)
+        elif not agent.pending_revoke.get(server_id):
+            return
+        await self._revoke_pending(agent, server_id)
+
     async def rotate(self, dev_name: str, server_id: str) -> None:
         """The daily rotation for one agent on one server: remint, swap, reconnect, revoke."""
         async with self.lock(dev_name):
