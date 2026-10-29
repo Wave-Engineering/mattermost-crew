@@ -209,9 +209,15 @@ For example, for the broker's token, without it passing through the shell's hist
 
 ```text
 sudo install -d -m 0755 /etc/crewbroker
-sudo install -m 0600 -o root -g root /dev/stdin /etc/crewbroker/oaw-oaw-dev.credential
+sudo install -m 0600 -o root -g root /dev/null /etc/crewbroker/oaw-oaw-dev.credential
+sudo tee /etc/crewbroker/oaw-oaw-dev.credential >/dev/null
 <paste the token, then Enter and Ctrl-D>
 ```
+
+Write a file in two steps like this, never with `install … /dev/stdin`: `install` sets the mode
+and owner (and empties the file), then `tee` writes the content. Ubuntu's Rust coreutils
+`install` (uutils) can't install from a pipe over a file that already exists (`install: No such
+file or directory`), so a rewrite, or any upgrade, would fail (#123).
 
 ### `/etc/crewkiosk/model.conf`
 
@@ -275,8 +281,10 @@ sudo install -m 0644 -o root -g root packaging/crewchat.service /etc/systemd/sys
 # The agents' live sessions reach the socket by ACL, without a re-login; g::rw keeps the group's
 # access, which the default ACL would otherwise cap at the directory's r-x (Prerequisites).
 sudo install -d -m 0755 -o root -g root /etc/systemd/system/crewchat.service.d
+# Two steps, never `install /dev/stdin`, which fails over an existing file on uutils (#123).
+sudo install -m 0644 -o root -g root /dev/null /etc/systemd/system/crewchat.service.d/agent-acl.conf
 printf '[Service]\nExecStartPre=+/usr/bin/setfacl -d -m u:%s:rw,g::rw /run/crewchat\n' "$AGENT_USER" |
-  sudo install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/crewchat.service.d/agent-acl.conf
+  sudo tee /etc/systemd/system/crewchat.service.d/agent-acl.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable crewchat
 sudo systemctl restart crewchat
@@ -397,8 +405,9 @@ never by glob, with `test -e <file> && ! sudo -u agent test -r <file>`: each bro
 the daemon's `/var/lib/crewchat/tokens/verify-canary.json`, `/etc/crewchat/discord.credential`
 with Discord enabled, a configured squawkie credential, and the kiosk's
 `/etc/crewkiosk/model.credential`. On a host with `crewkiosk` it also checks the kiosk socket,
-that the daemon runs with no new privileges, and the same files with `crewkiosk` in place of the
-agents' user: `crewkiosk` may read its own model credential and nothing else (R-08).
+that the daemon runs with no new privileges, that `/etc/crewkiosk/model.conf`, when there is
+one, is 0640 `root:crewkiosk`, and the same files with `crewkiosk` in place of the agents'
+user: `crewkiosk` may read its own model credential and nothing else (R-08).
 
 ```bash
 set -euo pipefail
@@ -416,6 +425,17 @@ operator:
 ```text
 sudo env AGENT_USER=<agents' user> CREWBROKER_INSTANCES="<crew>:<server_id> ..." make verify-install
 ```
+
+## Upgrade
+
+Read the release's CHANGELOG entry first: an upgrade note there names any new prerequisite or
+step. Then check out the new release tag and run the install blocks again from that checkout,
+the daemon's and the broker's, and the kiosk runner's on a kiosk host, then "Verify the
+install". Each block is written to run over an existing install: it creates only what is
+missing, overwrites every file it installs, and restarts its units. Configure's files are
+yours and are kept; rewrite one only when the upgrade note says so, in two steps as Configure
+shows. CI runs every block twice in a row on a fresh host, so the second run is the upgrade
+(IT-20).
 
 ## Rollback
 

@@ -41,7 +41,7 @@ sudo -u "$AGENT_USER" test -x "$BIN" || die "$AGENT_USER cannot run $BIN"
 
 log "writing /etc/crewchat/servers.toml"
 $SUDO install -d -m 0755 /etc/crewchat
-cat <<EOF | $SUDO install -m 0644 -o root -g root /dev/stdin /etc/crewchat/servers.toml
+cat <<EOF | "${ROOT}/scripts/ci/put-file.sh" 0644 root:root /etc/crewchat/servers.toml
 default_crew = "${crew}"
 broker_timeout_s = 2
 

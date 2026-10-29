@@ -6,8 +6,9 @@ Every fenced `bash` block under the "Install …" headings and under "Verify the
 Before them, `scripts/ci/runbook-configure.sh` does the runbook's Configure step with this CI
 host's values, as the operator would before installing. It then sets `/etc/crewbroker` to 0700,
 as the first real host had it (#115): the broker block must fix the mode, or the broker can't
-reach its credential. After the blocks, the daemon is restarted and its socket must come back
-with the same ACL, which the unit's drop-in sets on every start.
+reach its credential. The blocks then run a second time over the finished install, as an upgrade
+does (#123). After that, the daemon is restarted and its socket must come back with the same ACL,
+which the unit's drop-in sets on every start.
 
 The blocks create OS users, install into `/opt/mattermost-crew` and start systemd units, so this
 test runs only where `CREWCHAT_RUNBOOK_IT=1` says the host is a fresh throwaway: the IT-20 job,
@@ -74,24 +75,41 @@ def _sudo(*argv: str) -> str:
     return proc.stdout
 
 
-def test_runbook_install_and_verify_blocks_run_clean(fresh_host: dict[str, str]) -> None:
+def _run_blocks(env: dict[str, str], label: str) -> None:
     blocks = runbook_blocks(RUNBOOK.read_text(encoding="utf-8"))
     assert blocks, "docs/runbook.md has no install or verify blocks"
     for n, (heading, script) in enumerate(blocks, 1):
         proc = subprocess.run(
             ["bash", "-c", script],
             cwd=ROOT,
-            env=fresh_host,
+            env=env,
             capture_output=True,
             text=True,
             timeout=BLOCK_TIMEOUT_S,
             check=False,
         )
-        print(f"--- block {n} ({heading}): exit {proc.returncode}\n{proc.stdout}{proc.stderr}")
+        print(f"--- {label} block {n} ({heading}): exit {proc.returncode}")
+        print(f"{proc.stdout}{proc.stderr}")
         assert proc.returncode == 0, (
-            f"runbook block {n} under '{heading}' exited {proc.returncode}\n"
+            f"{label}: runbook block {n} under '{heading}' exited {proc.returncode}\n"
             f"--- stdout\n{proc.stdout}\n--- stderr\n{proc.stderr}\n--- journal\n{_journal()}"
         )
+
+
+def test_runbook_install_and_verify_blocks_run_clean(fresh_host: dict[str, str]) -> None:
+    _run_blocks(fresh_host, "install")
+
+
+def test_blocks_rerun_over_the_existing_install(fresh_host: dict[str, str]) -> None:
+    """An upgrade re-runs the blocks over an install: every file they write already exists, the
+    daemon's drop-in included (#123). Each block must exit 0 again, and the drop-in come out the
+    same. Runs after the first pass, in file order."""
+    dropin = "/etc/systemd/system/crewchat.service.d/agent-acl.conf"
+    before = _sudo("cat", dropin)
+    assert f"u:{fresh_host['AGENT_USER']}:rw" in before
+    _run_blocks(fresh_host, "re-run")
+    assert _sudo("cat", dropin) == before
+    assert _sudo("stat", "-c", "%a %U:%G", dropin).strip() == "644 root:root"
 
 
 def test_socket_acl_survives_a_daemon_restart(fresh_host: dict[str, str]) -> None:

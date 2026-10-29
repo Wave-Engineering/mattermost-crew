@@ -76,9 +76,9 @@ log "writing /etc/crewbroker/${instance}.toml and .credential"
 $SUDO install -d -m 0755 -o root -g root /etc/crewbroker
 printf 'crew = "%s"\nserver_id = "%s"\nserver_url = "%s"\nhuman_user_ids = ["%s"]\ntrusted = []\n' \
   "$crew" "$server_id" "$MM_URL" "$partner_id" \
-  | $SUDO install -m 0644 -o root -g root /dev/stdin "/etc/crewbroker/${instance}.toml"
+  | "${ROOT}/scripts/ci/put-file.sh" 0644 root:root "/etc/crewbroker/${instance}.toml"
 printf '%s\n' "$credential" \
-  | $SUDO install -m 0600 -o root -g root /dev/stdin "/etc/crewbroker/${instance}.credential"
+  | "${ROOT}/scripts/ci/put-file.sh" 0600 root:root "/etc/crewbroker/${instance}.credential"
 
 log "writing /etc/crewchat/servers.toml"
 $SUDO install -d -m 0755 -o root -g root /etc/crewchat
@@ -102,11 +102,11 @@ printf '%s\n' \
   "[crews.${crew}.${server_id}]" \
   "broker_socket = \"/run/crewbroker/${instance}.sock\"" \
   "broker_user_id = \"${broker_id}\"" \
-  | $SUDO install -m 0644 -o root -g root /dev/stdin /etc/crewchat/servers.toml
+  | "${ROOT}/scripts/ci/put-file.sh" 0644 root:root /etc/crewchat/servers.toml
 
 log "writing a dummy /etc/crewkiosk/model.credential"
 $SUDO install -d -m 0755 -o root -g root /etc/crewkiosk
-echo "sk-ci-dummy-kiosk-key" | $SUDO install -m 0600 -o root -g root /dev/stdin \
-  /etc/crewkiosk/model.credential
+echo "sk-ci-dummy-kiosk-key" \
+  | "${ROOT}/scripts/ci/put-file.sh" 0600 root:root /etc/crewkiosk/model.credential
 
 log "configured ${instance} against ${MM_URL}"
