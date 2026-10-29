@@ -202,7 +202,7 @@ from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
 | File | What it is | Write it as | The install hands it to |
 |---|---|---|---|
 | `/etc/crewbroker/<crew>-<server_id>.credential` | the broker account's personal access token, one line | 0600, root | `crewbroker`, 0600 |
-| `/etc/crewkiosk/model.credential` | the kiosk's model API key, one line (kiosk hosts only) | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
+| `/etc/crewkiosk/model.credential` | the kiosk's model API key: the key alone, one line (kiosk hosts only). `ANTHROPIC_API_KEY=<key>` is also accepted; any other `NAME=` line is refused | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
 | `/etc/crewchat/discord.credential` | the Discord credential (only with Discord enabled) | 0600, root | `crewchat`, 0600 |
 
 For example, for the broker's token, without it passing through the shell's history:
@@ -212,6 +212,27 @@ sudo install -d -m 0755 /etc/crewbroker
 sudo install -m 0600 -o root -g root /dev/stdin /etc/crewbroker/oaw-oaw-dev.credential
 <paste the token, then Enter and Ctrl-D>
 ```
+
+### `/etc/crewkiosk/model.conf`
+
+Optional, kiosk hosts only, and not a secret. It names the model the kiosk runs on and,
+optionally, a model gateway that serves the Anthropic Messages API at `<base_url>/v1/messages`
+and takes the key as `x-api-key` (a LiteLLM proxy, for example). Write it as 0600, root, in
+`/etc/crewkiosk`; the kiosk install makes it 0640, `root:crewkiosk`.
+
+```text
+# The model gateway. Optional: without it the kiosk calls the Anthropic API directly.
+base_url=https://llm.example.lan
+# The pinned model. Optional, default haiku: an alias the gateway allowlists, or a model name.
+model=haiku-latest
+```
+
+Only `KEY=value` lines, blank lines and `#` comments, with no spaces around the `=`. The runner
+reads the file, never sources it, and refuses to run on an unknown key, a `base_url` that is not
+`https://` or holds a space, or a `model` outside `A-Z a-z 0-9 . _ : -`. With no file the model is
+`haiku` and there is no gateway. The runner always pins the model: it passes `--model <model>`
+and sets every model variable Claude Code reads to it, so the CLI never asks the gateway for a
+model it doesn't allow.
 
 ## Install the daemon
 
@@ -320,7 +341,8 @@ done
 
 Only on a host that runs the kiosk's CLI runner (D-096, D-107). Creates `crewkiosk` with an empty
 HOME, installs `packaging/crewkiosk-run` at `/usr/local/libexec/crewkiosk-run`, hands the model
-credential to `crewkiosk`, and starts `crewkiosk.socket`. The daemon connects to
+credential to `crewkiosk`, makes `/etc/crewkiosk/model.conf` (when there is one) readable by its
+group, and starts `crewkiosk.socket`. The daemon connects to
 `/run/crewkiosk/kiosk.sock` and systemd runs one answer per connection as `crewkiosk`, so the
 daemon never changes user and keeps `NoNewPrivileges=yes`.
 
@@ -341,6 +363,10 @@ fi
 sudo install -d -m 0750 -o root -g crewkiosk /etc/crewkiosk
 sudo chown crewkiosk:crewkiosk /etc/crewkiosk/model.credential
 sudo chmod 0600 /etc/crewkiosk/model.credential
+if sudo test -e /etc/crewkiosk/model.conf; then
+  sudo chown root:crewkiosk /etc/crewkiosk/model.conf
+  sudo chmod 0640 /etc/crewkiosk/model.conf
+fi
 sudo install -D -m 0755 -o root -g root packaging/crewkiosk-run /usr/local/libexec/crewkiosk-run
 sudo install -m 0644 -o root -g root packaging/crewkiosk.socket packaging/crewkiosk@.service /etc/systemd/system/
 sudo systemctl daemon-reload

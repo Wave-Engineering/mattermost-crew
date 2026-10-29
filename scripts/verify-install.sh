@@ -25,6 +25,7 @@
 #
 # The kiosk (Story 3.5, D-107), on a host with the crewkiosk user:
 #   - its socket /run/crewkiosk/kiosk.sock exists, mode 0660, group crewchat;
+#   - its model config /etc/crewkiosk/model.conf, when present, is mode 0640, root:crewkiosk;
 #   - the running daemon has NoNewPrivs set: it reaches the kiosk without changing user;
 #   - crewkiosk cannot read any of the known credential files above.
 #
@@ -49,6 +50,7 @@ DAEMON_USER=crewchat
 KIOSK_USER=crewkiosk
 KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
 KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
+KIOSK_MODEL_CONF=/etc/crewkiosk/model.conf
 SERVERS_TOML=/etc/crewchat/servers.toml
 # The daemon's own interpreter, which has tomllib (Python 3.12).
 CREWCHAT_PYTHON="$(dirname "$CREWCHAT_BIN")/python"
@@ -261,6 +263,15 @@ if id "$KIOSK_USER" >/dev/null 2>&1; then
       pass "$KIOSK_SOCKET is mode 0660, group $DAEMON_USER"
     else
       fail "$KIOSK_SOCKET is mode $mode, group $group (want 660, $DAEMON_USER)"
+    fi
+  fi
+  # The kiosk's model.conf, when there is one: root's, readable by crewkiosk's group only (#116).
+  if $SUDO test -e "$KIOSK_MODEL_CONF"; then
+    read -r mode owner group < <($SUDO stat -c '%a %U %G' "$KIOSK_MODEL_CONF")
+    if [[ "$mode" == 640 && "$owner" == root && "$group" == "$KIOSK_USER" ]]; then
+      pass "$KIOSK_MODEL_CONF is mode 0640, root:$KIOSK_USER"
+    else
+      fail "$KIOSK_MODEL_CONF is mode $mode, $owner:$group (want 640, root:$KIOSK_USER)"
     fi
   fi
   # The daemon must run with no new privileges: it reaches the kiosk without changing user.
