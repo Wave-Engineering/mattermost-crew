@@ -45,11 +45,11 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from crewbroker import config as cfg
 from crewbroker.config import CrewConfig
 from crewbroker.mattermost import MattermostAPI, MattermostClient, MattermostError, NotFound
+from crewbroker.membership import Membership
 from crewbroker.mint import (
     SquattedAccount,
     account_name,
     ensure_bot,
-    ensure_membership,
     mint_token,
     native_expiry_supported,
     record_register,
@@ -119,6 +119,12 @@ class Broker:
         self.server_key = server_key or config.server_url
         self.clock = clock
         self._lock = threading.Lock()
+        # Membership on mint (#132): the configured names resolve now, at startup. One that
+        # doesn't is logged and reported on each mint, and never stops the broker.
+        self.membership: Membership | None = None
+        if config.team:
+            self.membership = Membership(client, config.team, config.default_channels)
+            self.membership.resolve()
 
     def _name(self, args: dict[str, Any]) -> str:
         dev_name = args.get("dev_name")
@@ -200,16 +206,15 @@ class Broker:
             self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
         answer: dict[str, Any] = {"account": name, "token": token.token, "token_id": token.token_id}
-        if self.config.team_id:
-            answer["membership"] = self._membership(name, bot_id)
+        if self.membership is not None:
+            answer["membership"] = self._membership(self.membership, name, bot_id)
         return answer
 
-    def _membership(self, name: str, bot_id: str) -> dict[str, list[object]]:
+    def _membership(self, membership: Membership, name: str, bot_id: str) -> dict[str, list[Any]]:
         """Ensure the minted bot's team and default channels (#132, D-109). Never raises.
 
         Guarded as `deactivate` is: only a bot whose `owner_id` is this broker gets an add.
         """
-        targets = [self.config.team_id, *self.config.default_channel_ids]
         why = f"{name} is not owned by this broker"
         try:
             owner = self.client.get_bot(bot_id).get("owner_id")
@@ -219,10 +224,8 @@ class Broker:
             owner, why = None, f"owner check failed: {exc}"
         if owner != self.config.broker_user_id:
             log.error("membership: skipped for %s (%s): %s", name, bot_id, why)
-            return {"joined": [], "failed": [{"id": t, "error": why} for t in targets]}
-        return ensure_membership(
-            self.client, name, bot_id, self.config.team_id, self.config.default_channel_ids
-        )
+            return {"joined": [], "failed": [t.failure(why) for t in membership.targets()]}
+        return membership.ensure(name, bot_id)
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""

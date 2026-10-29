@@ -7,8 +7,10 @@ One instance serves one crew on one Mattermost server. The file names:
     server_url = "https://mm.example.lan"
     human_user_ids = ["<user id>"]   # the crew's human partners, by Mattermost user ID
     trusted = ["<crew>", ...]        # trusted crews, by name only
-    team_id = "<team id>"            # optional: the team each minted bot joins (#132)
-    default_channel_ids = ["<id>"]   # optional: channels in that team it joins, in order
+    team = "Oak and Wave"            # optional: the team each minted bot joins (#132)
+    default_channels = ["town-square", "Agent Ops"]  # optional: its channels there, in order
+
+`team` and `default_channels` take a URL name or a display name, as a person would type them.
 
 `trusted` is names only. Each trusted crew's membership (`broker_user_id`, `human_user_ids`,
 `minted_bot_ids`) comes from that crew's own broker, which the daemon calls directly; it is
@@ -31,8 +33,6 @@ STATE_ROOT = Path("/var/lib/crewbroker")
 RUN_DIR = Path("/run/crewbroker")
 
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
-# A Mattermost ID: 26 characters of lowercase base32. A team or channel *name* never matches.
-ID_RE = re.compile(r"^[a-z0-9]{26}$")
 # Membership data belongs to a crew's own broker, never to a config file.
 MEMBERSHIP_KEYS = ("broker_user_id", "human_user_ids", "minted_bot_ids")
 
@@ -49,9 +49,10 @@ class CrewConfig:
     human_user_ids: list[str]
     trusted: list[str] = field(default_factory=list)
     broker_user_id: str = ""  # filled at startup from /users/me
-    # Membership on mint (#132, D-109). Empty manages no membership.
-    team_id: str = ""
-    default_channel_ids: list[str] = field(default_factory=list)
+    # Membership on mint (#132, D-109): URL or display names, resolved at startup. Empty
+    # manages none.
+    team: str = ""
+    default_channels: list[str] = field(default_factory=list)
 
 
 def config_path(instance: str, config_dir: Path = CONFIG_DIR) -> Path:
@@ -112,7 +113,7 @@ def parse_config(
         raise ConfigError(f"{source}: human_user_ids must be a non-empty list of user IDs")
 
     trusted = _trusted(raw.get("trusted", []), source)
-    team_id, channel_ids = _membership(raw, source)
+    team, channels = _membership(raw, source)
 
     crew = raw.get("crew")
     if crew is not None and not isinstance(crew, str):
@@ -136,29 +137,36 @@ def parse_config(
         human_user_ids=list(humans),
         trusted=trusted,
         broker_user_id=broker_user_id,
-        team_id=team_id,
-        default_channel_ids=channel_ids,
+        team=team,
+        default_channels=channels,
     )
 
 
 def _membership(raw: dict[str, Any], source: str) -> tuple[str, list[str]]:
-    """`team_id` and `default_channel_ids`: IDs, never names, so a name fails here, at load."""
-    team_id = raw.get("team_id", "")
-    if not isinstance(team_id, str) or (team_id and not ID_RE.fullmatch(team_id)):
-        raise ConfigError(f"{source}: team_id must be a team ID (26 characters), not a name")
-    channels = raw.get("default_channel_ids", [])
+    """`team` and `default_channels`: URL names or display names, which a person edits (#132).
+
+    Only empty and duplicate entries are refused here. Whether a name exists is the server's
+    to say, at startup, and one it doesn't know never stops the broker
+    (`crewbroker.membership`). Display names match without regard to case, so duplicates do
+    too.
+    """
+    team = raw.get("team", "")
+    if not isinstance(team, str) or ("team" in raw and not team.strip()):
+        raise ConfigError(f"{source}: team must be a team's URL name or display name")
+    channels = raw.get("default_channels", [])
     if not isinstance(channels, list):
-        raise ConfigError(f"{source}: default_channel_ids must be a list of channel IDs")
+        raise ConfigError(f"{source}: default_channels must be a list of channel names")
+    seen: set[str] = set()
     for item in channels:
-        if not isinstance(item, str) or not ID_RE.fullmatch(item):
-            raise ConfigError(
-                f"{source}: default_channel_ids entry {item!r} is not a channel ID "
-                "(26 characters); give IDs, not names"
-            )
-    if channels and not team_id:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{source}: default_channels entry {item!r} is empty or not a name")
+        if item.casefold() in seen:
+            raise ConfigError(f"{source}: default_channels lists {item!r} twice")
+        seen.add(item.casefold())
+    if channels and not team:
         # A bot can join a team's channel only once it is on the team.
-        raise ConfigError(f"{source}: default_channel_ids needs team_id, the channels' team")
-    return team_id, list(channels)
+        raise ConfigError(f"{source}: default_channels needs team, the channels' team")
+    return team, list(channels)
 
 
 def _str(raw: dict[str, Any], key: str, source: str) -> str:

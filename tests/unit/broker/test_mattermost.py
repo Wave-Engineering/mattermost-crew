@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -79,26 +80,64 @@ def test_rate_limit_is_waited_out() -> None:
 
 
 def test_membership_adds_and_error_id() -> None:
-    """#132: the two adds' paths and bodies, and an error keeps Mattermost's `id`."""
-    seen: list[tuple[str, dict[str, str]]] = []
+    """#132: the name lookups, the two adds' paths and bodies, and an error keeps its `id`."""
+    seen: list[tuple[str, str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((request.url.path, json.loads(request.content)))
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
         if "/channels/denied/" in request.url.path:
             return httpx.Response(
                 403, json={"id": "api.context.permissions.app_error", "message": "no permission"}
             )
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "the-id"})
         return httpx.Response(201, json={"user_id": "bot"})
 
     client = MattermostClient("http://mm.invalid", "tok", transport=httpx.MockTransport(handler))
+    assert client.get_team_by_name("oaw")["id"] == "the-id"
+    assert client.get_channel_by_name("tid", "town-square")["id"] == "the-id"
     client.add_team_member("team", "bot")
     client.add_channel_member("chan", "bot")
     with pytest.raises(MattermostError) as caught:
         client.add_channel_member("denied", "bot")
-    assert seen[:2] == [
-        ("/api/v4/teams/team/members", {"team_id": "team", "user_id": "bot"}),
-        ("/api/v4/channels/chan/members", {"user_id": "bot"}),
+    assert seen[:4] == [
+        ("GET", "/api/v4/teams/name/oaw", None),
+        ("GET", "/api/v4/teams/tid/channels/name/town-square", None),
+        ("POST", "/api/v4/teams/team/members", {"team_id": "team", "user_id": "bot"}),
+        ("POST", "/api/v4/channels/chan/members", {"user_id": "bot"}),
     ]
     assert caught.value.status == 403
     assert caught.value.error_id == "api.context.permissions.app_error"
     client.close()
+
+
+def test_name_listings_for_display_name_matching() -> None:
+    """#132: the broker's teams, the team's public channels (every page), its own channels."""
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v4/teams/t/channels":
+            count = 200 if request.url.params["page"] == "0" else 1
+            return httpx.Response(200, json=[{"id": f"c{i}"} for i in range(count)])
+        return httpx.Response(200, json=[{"id": "x"}])
+
+    client = MattermostClient("http://mm.invalid", "tok", transport=httpx.MockTransport(handler))
+    assert client.list_my_teams() == [{"id": "x"}]
+    assert len(client.list_team_channels("t")) == 201
+    assert client.list_my_team_channels("t") == [{"id": "x"}]
+    assert [path for path, _ in seen] == [
+        "/api/v4/users/me/teams",
+        "/api/v4/teams/t/channels",
+        "/api/v4/teams/t/channels",
+        "/api/v4/users/me/teams/t/channels",
+    ]
+    assert [p.get("page") for _, p in seen[1:3]] == ["0", "1"]
+
+    def not_a_list(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "x"})
+
+    client = MattermostClient("http://mm.invalid", "tok", transport=httpx.MockTransport(not_a_list))
+    with pytest.raises(MattermostError, match="not a list"):
+        client.list_my_teams()

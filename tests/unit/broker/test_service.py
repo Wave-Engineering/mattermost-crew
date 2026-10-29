@@ -126,19 +126,130 @@ def test_mint_after_deactivate_reenables(broker: Broker, fake: Any) -> None:
 
 
 # -- membership on mint (#132, D-109) ---------------------------------------------------------
-TEAM, PUBLIC, PRIVATE = "team-oaw", "chan-public", "chan-private"
+TEAM, PUBLIC, PRIVATE = "oaw", "town-square", "crew-private"  # URL names, as configured
+TEAM_ID, PUBLIC_ID, PRIVATE_ID = "tid-oaw", "cid-town", "cid-private"
 BABEL = {"dev_name": "babel", "crew": "oaw"}
 ADDS = ("add_team_member", "add_channel_member")
+LOOKUPS = (
+    "get_team_by_name",
+    "get_channel_by_name",
+    "list_my_teams",
+    "list_team_channels",
+    "list_my_team_channels",
+)
 
 
 @pytest.fixture
-def joining(fake: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any) -> Broker:
-    config = replace(crew_config, team_id=TEAM, default_channel_ids=[PUBLIC, PRIVATE])
-    return Broker(config, fake, tmp_path / "joining", clock=clock)
+def server(fake: Any) -> Any:
+    """The names exist on the server, and the broker account is in all three, as on oaw-dev."""
+    fake.add_team(TEAM_ID, TEAM, "Oak and Wave")
+    fake.add_channel(PUBLIC_ID, TEAM_ID, PUBLIC, "Town Square")
+    fake.add_channel(PRIVATE_ID, TEAM_ID, PRIVATE, "Crew Private", "P")
+    return fake
+
+
+def joiner(fake: Any, crew_config: CrewConfig, path: Path, clock: Any, *channels: str) -> Broker:
+    config = replace(crew_config, team=TEAM, default_channels=list(channels or (PUBLIC, PRIVATE)))
+    return Broker(config, fake, path, clock=clock)
+
+
+@pytest.fixture
+def joining(server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any) -> Broker:
+    return joiner(server, crew_config, tmp_path / "joining", clock)
 
 
 def _adds(fake: Any) -> list[tuple[str, Any]]:
     return [(call, arg[0]) for call, arg in fake.calls if call in ADDS]
+
+
+def _lookups(fake: Any) -> int:
+    return sum(1 for call, _ in fake.calls if call in LOOKUPS)
+
+
+def test_names_resolve_at_startup_and_are_logged(
+    server: Any,
+    crew_config: CrewConfig,
+    tmp_path: Path,
+    clock: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="crewbroker.membership"):
+        built = joiner(server, crew_config, tmp_path / "b", clock)
+    assert built.membership is not None
+    assert [t.id for t in built.membership.targets()] == [TEAM_ID, PUBLIC_ID, PRIVATE_ID]
+    logged = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert logged == [
+        f"membership: team {TEAM} → {TEAM_ID}",
+        f"membership: channel {PUBLIC} → {PUBLIC_ID}",
+        f"membership: channel {PRIVATE} → {PRIVATE_ID}",
+    ]
+    # Resolved once: a mint asks the server for no names again.
+    before = _lookups(server)
+    built.mint(BABEL)
+    assert _lookups(server) == before
+
+
+def _resolved(
+    fake: Any, crew_config: CrewConfig, path: Path, clock: Any, team: str, *ch: str
+) -> Any:
+    config = replace(crew_config, team=team, default_channels=list(ch))
+    built = Broker(config, fake, path, clock=clock)
+    assert built.membership is not None
+    return built.membership
+
+
+def test_display_names_resolve_ignoring_case(
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    """What a person types: "Oak and Wave", "town square", a private channel the broker is in."""
+    m = _resolved(
+        server, crew_config, tmp_path, clock, "Oak and Wave", "town square", "CREW PRIVATE"
+    )
+    assert [t.id for t in m.targets()] == [TEAM_ID, PUBLIC_ID, PRIVATE_ID]
+    # A display name that is also slug-shaped is tried as a URL name first, then matched.
+    server.add_channel("cid-ops", TEAM_ID, "agent-ops-7", "ops")
+    m = _resolved(server, crew_config, tmp_path / "b", clock, TEAM, "ops")
+    assert m.channels[0].id == "cid-ops"
+    # An entry that can't be a URL name is never sent to a `/name/` endpoint.
+    assert not [a for c, a in server.calls if c == "get_team_by_name" and a == "Oak and Wave"]
+
+
+def test_display_name_sees_only_what_the_broker_can(
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    """A private channel the broker isn't in, a team it isn't on, a DM: none resolves."""
+    server.add_channel("cid-secret", TEAM_ID, "secret", "Secret", "P", mine=False)
+    server.add_channel("cid-dm", TEAM_ID, "a__b", "Secret", "D")
+    server.add_team("tid-other", "other", "Elsewhere", mine=False)
+    m = _resolved(server, crew_config, tmp_path, clock, TEAM, "Secret")
+    assert m.channels[0].id is None and m.channels[0].final
+    assert "visible only if the broker is a member" in m.channels[0].error
+    m = _resolved(server, crew_config, tmp_path / "b", clock, "Elsewhere")
+    assert m.team.id is None and m.team.final
+
+
+def test_ambiguous_display_name_names_its_candidates(
+    server: Any,
+    crew_config: CrewConfig,
+    tmp_path: Path,
+    clock: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server.add_channel("cid-gen1", TEAM_ID, "general", "General")
+    server.add_channel("cid-gen2", TEAM_ID, "general-2", "general")
+    with caplog.at_level(logging.ERROR, logger="crewbroker.membership"):
+        m = _resolved(server, crew_config, tmp_path, clock, TEAM, "GENERAL")
+    channel = m.channels[0]
+    assert channel.id is None and channel.final
+    for part in ("matches 2 channels", "cid-gen1", "cid-gen2", "general-2"):
+        assert part in channel.error
+    assert channel.error in caplog.text
+    # The same display name on a private channel the broker is in counts as a candidate too.
+    server.add_channel("cid-gen3", TEAM_ID, "gen-priv", "General", "P")
+    assert (
+        "matches 3 channels"
+        in _resolved(server, crew_config, tmp_path / "b", clock, TEAM, "General").channels[0].error
+    )
 
 
 def test_first_mint_joins_the_team_then_each_channel(joining: Broker, fake: Any) -> None:
@@ -147,11 +258,11 @@ def test_first_mint_joins_the_team_then_each_channel(joining: Broker, fake: Any)
 
     assert reply["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
     assert _adds(fake) == [
-        ("add_team_member", TEAM),
-        ("add_channel_member", PUBLIC),
-        ("add_channel_member", PRIVATE),
+        ("add_team_member", TEAM_ID),
+        ("add_channel_member", PUBLIC_ID),
+        ("add_channel_member", PRIVATE_ID),
     ]
-    assert all(fake.members[t] == [bot_id] for t in (TEAM, PUBLIC, PRIVATE))
+    assert all(fake.members[t] == [bot_id] for t in (TEAM_ID, PUBLIC_ID, PRIVATE_ID))
     assert fake.token_works(reply["token"])
 
 
@@ -163,39 +274,95 @@ def test_second_mint_counts_existing_membership_as_joined(
     fake.exists_as_400 = exists_as_400
     again = joining.mint(BABEL)
     assert again["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
-    assert all(len(fake.members[t]) == 1 for t in (TEAM, PUBLIC, PRIVATE))
+    assert all(len(fake.members[t]) == 1 for t in (TEAM_ID, PUBLIC_ID, PRIVATE_ID))
 
 
 def test_failed_channel_add_still_returns_the_token(
     joining: Broker, fake: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake.add_fails.add(PUBLIC)
-    with caplog.at_level(logging.ERROR, logger="crewbroker.mint"):
+    fake.add_fails.add(PUBLIC_ID)
+    with caplog.at_level(logging.ERROR, logger="crewbroker.membership"):
         reply = joining.mint(BABEL)
     bot_id = joining.accounts.get("babel.oaw").bot_user_id  # type: ignore[union-attr]
 
     assert fake.token_works(reply["token"])
     assert reply["membership"]["joined"] == [TEAM, PRIVATE]  # the next channel is still tried
     [failure] = reply["membership"]["failed"]
-    assert failure["id"] == PUBLIC and "403" in failure["error"]
+    assert failure["name"] == PUBLIC and failure["id"] == PUBLIC_ID
+    assert "403" in failure["error"]
     [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
-    for part in ("babel.oaw", bot_id, PUBLIC, "403"):
+    for part in ("babel.oaw", bot_id, PUBLIC, PUBLIC_ID, "403"):
         assert part in record.getMessage()
 
 
 def test_failed_team_add_skips_the_channels(joining: Broker, fake: Any) -> None:
-    fake.add_fails.add(TEAM)
+    fake.add_fails.add(TEAM_ID)
     reply = joining.mint(BABEL)
     assert fake.token_works(reply["token"])
     assert reply["membership"]["joined"] == []
-    assert [f["id"] for f in reply["membership"]["failed"]] == [TEAM, PUBLIC, PRIVATE]
-    assert _adds(fake) == [("add_team_member", TEAM)]
+    assert [f["name"] for f in reply["membership"]["failed"]] == [TEAM, PUBLIC, PRIVATE]
+    assert "skipped" in reply["membership"]["failed"][1]["error"]
+    assert _adds(fake) == [("add_team_member", TEAM_ID)]
+
+
+def test_unknown_channel_name_never_stops_the_broker(
+    server: Any,
+    crew_config: CrewConfig,
+    tmp_path: Path,
+    clock: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo is ERROR at startup and in every mint's `failed`; the broker starts and mints."""
+    with caplog.at_level(logging.ERROR, logger="crewbroker.membership"):
+        built = joiner(server, crew_config, tmp_path / "b", clock, PUBLIC, "town-sqaure")
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "no channel has the URL name or display name 'town-sqaure'" in record.getMessage()
+
+    for dev in ("babel", "kessel"):
+        reply = built.mint({"dev_name": dev, "crew": "oaw"})
+        assert server.token_works(reply["token"])
+        assert reply["membership"]["joined"] == [TEAM, PUBLIC]
+        [failure] = reply["membership"]["failed"]
+        assert failure["name"] == "town-sqaure" and failure["id"] is None
+    # A 404 is final until a restart: the name is not looked up on every mint.
+    assert (
+        sum(1 for c, a in server.calls if c == "get_channel_by_name" and a[1] == "town-sqaure") == 1
+    )
+
+
+def test_unknown_team_fails_every_target_and_adds_nothing(
+    fake: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    built = joiner(fake, crew_config, tmp_path / "b", clock)  # no team on the server at all
+    reply = built.mint(BABEL)
+    assert fake.token_works(reply["token"])
+    assert reply["membership"]["joined"] == []
+    failed = reply["membership"]["failed"]
+    assert [f["name"] for f in failed] == [TEAM, PUBLIC, PRIVATE]
+    assert "no team has" in failed[0]["error"] and "unresolved" in failed[1]["error"]
+    assert _adds(fake) == []
+
+
+def test_lookup_that_failed_in_passing_is_retried_on_the_next_mint(
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    """The server was down when the broker started: not final, so a mint resolves again."""
+    server.lookup_down = True
+    built = joiner(server, crew_config, tmp_path / "b", clock)
+    first = built.mint(BABEL)
+    assert first["membership"]["joined"] == []
+    assert "503" in first["membership"]["failed"][0]["error"]
+
+    server.lookup_down = False
+    second = built.mint(BABEL)
+    assert second["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE], "failed": []}
 
 
 def test_no_membership_config_makes_no_calls(broker: Broker, fake: Any) -> None:
     reply = broker.mint(BABEL)
     assert "membership" not in reply
-    assert _adds(fake) == []
+    assert _adds(fake) == [] and _lookups(fake) == 0
+    assert broker.membership is None
 
 
 def test_membership_only_for_a_bot_this_broker_owns(joining: Broker, fake: Any) -> None:
@@ -207,7 +374,8 @@ def test_membership_only_for_a_bot_this_broker_owns(joining: Broker, fake: Any) 
     with pytest.raises(OpError, match="squatted"):
         joining.mint(BABEL)
     # And the guard on its own, as if the owner changed between the mint and the adds.
-    answer = joining._membership("babel.oaw", bot_id)
+    assert joining.membership is not None
+    answer = joining._membership(joining.membership, "babel.oaw", bot_id)
     assert answer["joined"] == [] and len(answer["failed"]) == 3
     assert "not owned" in answer["failed"][0]["error"]
     assert len(_adds(fake)) == before

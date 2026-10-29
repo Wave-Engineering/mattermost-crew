@@ -51,7 +51,7 @@ The host needs:
   `system_user_access_token` role and no admin role (R-06). On a partner's production server the
   role patch is the human partner's yes-prod (CP-03).
 - **For membership on mint (optional, #132):** the broker account is a plain member
-  (`team_user`) of the crew's team, and **a member of each channel in `default_channel_ids`**.
+  (`team_user`) of the crew's team and **a member of each channel in `default_channels`**.
   No other role is needed, and none should be granted: measured on the OaW dev space, a
   `team_user` adds its own bot to the team and to any channel it is in, public or private
   (201), and gets 403 on a channel it is not in, public as well. A channel admin adds the broker
@@ -197,9 +197,10 @@ server_url = "https://mm.example.lan"
 human_user_ids = ["<the partner's user id>"]
 # Trusted crews, by name only. Each one's membership comes from its own broker on this host.
 trusted = []
-# Optional (#132): the team each minted bot joins, then its default channels, by ID.
-# team_id = "<team id>"
-# default_channel_ids = ["<channel id>", ...]
+# Optional (#132): the team each minted bot joins, then its default channels, in order.
+# Each is a URL name (the last part of its URL) or its display name.
+# team = "oaw"
+# default_channels = ["general", "agent-ops", "Roll Call"]
 ```
 
 Required: `server_id`, `server_url` and `human_user_ids`. `crew` defaults to the first human
@@ -207,21 +208,33 @@ partner's username (R-02); set it. `trusted = ["<crew>", …]` is names only: a 
 membership key, is refused. `broker_user_id` is never configured: the broker fills it at startup
 from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
 
-**Membership on mint** (#132). With `team_id` set, every successful `mint` adds the bot to that
-team and then to each of `default_channel_ids`, in order. A bot that is already a member counts
-as joined. A failed add is logged at ERROR, and the bot still gets its token. Both keys are
-Mattermost **IDs**: a team or channel name is refused at load, and `default_channel_ids` needs
-`team_id`. Leave both out to manage no membership. Find the IDs with an admin token:
+**Membership on mint** (#132). With `team` set, every successful `mint` adds the bot to that
+team and then to each of `default_channels`, in order. A bot that is already a member counts as
+joined. A failed add is logged at ERROR, and the bot still gets its token. Leave both keys out
+to manage no membership.
+
+Write each entry as you see it in Mattermost: the **URL name** (the last part of the team's or
+channel's URL, such as `town-square`) or the **display name** (`Town Square`). The broker tries
+the URL name first, then a display name, ignoring case. It matches against the teams the broker
+account is on, and against the team's public channels plus the channels the broker account is
+in. Only an empty or duplicate entry is refused at load, and `default_channels` needs `team`.
+Joining the team already puts the bot in Town Square, as it does for any new member, so you
+don't need to list it. Listing it is harmless: it counts as joined.
+
+The broker resolves the names when it starts, and logs each one at INFO as
+`membership: channel general → <id>`. Check that log after a change:
 
 ```text
-curl -s -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
-  "$MM_URL/api/v4/teams/name/<team name>" | jq -r .id
-curl -s -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
-  "$MM_URL/api/v4/teams/<team id>/channels/name/<channel name>" | jq -r .id
+sudo journalctl -u crewbroker@<crew>-<server_id> --since -5m | grep membership:
 ```
 
-A private channel's lookup by name needs a member of it, or an admin. Before you set the keys,
-add the broker account to every channel in the list (see the prerequisites).
+A name that matches nothing, or two display names that match one entry, is logged at ERROR and
+reported in every `mint`'s `membership.failed`. **The broker still starts and mints**, so a typo
+never stops an agent getting its token. Fix the file and restart that broker instance. Agents
+already registered join the new channels at their next daily `register`.
+
+Before you set the keys, add the broker account to every channel in the list (see the
+prerequisites). A private channel it isn't in can't be found by either name.
 
 ### The credentials
 

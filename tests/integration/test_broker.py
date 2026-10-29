@@ -11,6 +11,7 @@ import os
 import secrets
 import subprocess
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ import pytest
 from crewbroker import mint
 from crewbroker.config import CrewConfig, parse_config
 from crewbroker.mattermost import MattermostClient
+from crewbroker.membership import Membership
 from crewbroker.service import Broker, OpError
 from crewchat.registry import account_name as daemon_account_name
 
@@ -309,12 +311,12 @@ def test_it03_prune_counts_register_not_remint(
     assert token_works(mattermost, busy["token"])
 
 
-def mkchannel(mattermost: Any, team_id: str, name: str, kind: str) -> str:
+def mkchannel(mattermost: Any, team_id: str, name: str, kind: str, display: str = "") -> str:
     resp = mm_request(
         mattermost,
         "POST",
         "/channels",
-        json={"team_id": team_id, "name": name, "display_name": name, "type": kind},
+        json={"team_id": team_id, "name": name, "display_name": display or name, "type": kind},
     )
     assert resp.status_code == 201, resp.text
     return str(resp.json()["id"])
@@ -325,22 +327,24 @@ def is_member(mattermost: Any, kind: str, target: str, user_id: str) -> bool:
 
 
 def test_mint_joins_the_team_and_default_channels(
-    mattermost: Any, broker: Broker, setup: dict[str, str]
+    mattermost: Any, broker: Broker, setup: dict[str, str], tmp_path: Path
 ) -> None:
-    """#132 (D-109): as the probe found on oaw-dev, a broker that is a plain `team_user` and a
-    member of each channel adds its bot to the team, a public and a private channel. A channel
-    it is not in answers 403: reported, and the mint still returns its token."""
+    """#132 (D-109): names resolve at startup, by URL name or display name, and as the probe
+    found on oaw-dev, a broker that is a plain `team_user` and a member of each channel adds its
+    bot to the team, a public and a private channel. A channel it is not in answers 403, and a
+    name nothing has is unresolved: both are reported, and the mint still returns its token."""
     run = secrets.token_hex(3)
+    team_display = f"Join Crew {run}"
     resp = mm_request(
         mattermost,
         "POST",
         "/teams",
-        json={"name": f"join{run}", "display_name": f"join {run}", "type": "I"},
+        json={"name": f"join{run}", "display_name": team_display, "type": "I"},
     )
     assert resp.status_code == 201, resp.text
     team_id = str(resp.json()["id"])
     public = mkchannel(mattermost, team_id, f"pub{run}", "O")
-    private = mkchannel(mattermost, team_id, f"priv{run}", "P")
+    private = mkchannel(mattermost, team_id, f"priv{run}", "P", f"Crew Private {run}")
     outside = mkchannel(mattermost, team_id, f"out{run}", "O")  # the broker is never added
     broker_id = setup["broker_id"]
     resp = mm_request(
@@ -356,24 +360,36 @@ def test_mint_joins_the_team_and_default_channels(
         )
         assert resp.status_code == 201, resp.text
 
-    broker.config.team_id = team_id
-    broker.config.default_channel_ids = [public, private]
-    first = broker.mint(args(broker, "joiner"))
-    assert first["membership"] == {"joined": [team_id, public, private], "failed": []}
+    def joiner(state: str, *channels: str) -> tuple[Broker, Membership]:
+        # As a person writes the file: the team by display name in another case, a channel by
+        # URL name, the private one by display name.
+        config = replace(broker.config, team=team_display.upper(), default_channels=list(channels))
+        built = Broker(config, broker.client, tmp_path / state, clock=broker.clock)
+        assert built.membership is not None
+        return built, built.membership
+
+    names = (f"pub{run}", f"crew private {run}")
+    joining, membership = joiner("a", *names)
+    assert [t.id for t in membership.targets()] == [team_id, public, private]
+    joined = [team_display.upper(), *names]
+    first = joining.mint(args(joining, "joiner"))
+    assert first["membership"] == {"joined": joined, "failed": []}
     bot_id = user_by_name(mattermost, first["account"])
     for kind, target in (("team", team_id), ("channel", public), ("channel", private)):
         assert is_member(mattermost, kind, target, bot_id), (kind, target)
 
     # Again: already a member everywhere, and clean.
-    second = broker.mint(args(broker, "joiner"))
-    assert second["membership"] == {"joined": [team_id, public, private], "failed": []}
+    second = joining.mint(args(joining, "joiner"))
+    assert second["membership"] == {"joined": joined, "failed": []}
 
-    # A default channel the broker isn't in: 403, reported, and the token still works.
-    broker.config.default_channel_ids = [public, outside]
-    third = broker.mint(args(broker, "joiner"))
-    assert third["membership"]["joined"] == [team_id, public]
-    [failure] = third["membership"]["failed"]
-    assert failure["id"] == outside and "403" in failure["error"]
+    # A public channel the broker isn't in resolves, and its add is 403. A name nothing has
+    # doesn't resolve. Both are reported, the other channel still joins, and the token works.
+    mixed, _ = joiner("b", f"pub{run}", f"out{run}", f"nowhere{run}")
+    third = mixed.mint(args(mixed, "joiner"))
+    assert third["membership"]["joined"] == [team_display.upper(), f"pub{run}"]
+    refused, unknown = third["membership"]["failed"]
+    assert refused["id"] == outside and "403" in refused["error"]
+    assert unknown["id"] is None and "no channel has" in unknown["error"]
     assert not is_member(mattermost, "channel", outside, bot_id)
     assert token_works(mattermost, third["token"])
 
