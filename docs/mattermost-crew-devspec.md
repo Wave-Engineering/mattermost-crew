@@ -388,7 +388,8 @@ The configuration names:
 - the crew;
 - the one server it serves (`server_id` and URL);
 - the crew's human partner user IDs;
-- the trusted crews, **by name only** (`trusted = ["<crew>", …]`). The list lives with the broker because it is the human partner's setting, next to the switch.
+- the trusted crews, **by name only** (`trusted = ["<crew>", …]`). The list lives with the broker because it is the human partner's setting, next to the switch;
+- optionally, the team each minted bot joins and that team's default channels, by name (`team`, `default_channels`; #132, D-109). Each entry is a URL name or a display name, as the person editing the file types it, and the broker resolves them at startup. Both default to empty, which manages no membership. Only an empty or duplicate entry is refused at load. A name that doesn't resolve never stops the broker. `human_user_ids` stay IDs, because they decide trust (CP-02).
 
 **Trusted crews in this Plan are crews whose broker for this server is on this host.** **No broker ever calls another broker.** The daemon already holds a broker client for every (crew, server) on its host, so it builds trusted membership itself: for each name in our `crew_info.trusted`, it calls that crew's own broker (`[crews.<name>.<server_id>] broker_socket` in `servers.toml`) for its `crew_info`. There is no hand-copied list. Trust across hosts is deferred (§5.N, item 7).
 
@@ -396,7 +397,7 @@ It serves the daemon over its socket, using the same frame shape (D-058). Every 
 
 | op | What it does |
 |---|---|
-| `mint{dev_name, crew, current_token_id, deadline}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. |
+| `mint{dev_name, crew, current_token_id, deadline}` | Called **only** in response to a daemon `register`. Creates the bot account if it is missing (R-03), records `last_register` for the account, mints a token, sets native expiry when the server supports it (R-07), and returns `{account, token, token_id}` to the daemon only. With `team` configured, it then ensures the bot's membership of the team and of each default channel, in order, only for a bot whose `owner_id` is this broker, and adds `membership: {joined: [<name>…], failed: [{name, id, error}]}` to the answer (D-109). `id` is null for a name that didn't resolve. An existing member counts as joined. A failed add or an unresolved name is logged at ERROR and never fails the mint. Once less than 0.5 s of the call's `deadline` is left, the remaining lookups and adds are skipped and reported with the error `deferred: …` at WARNING, for the next `register` to repeat. |
 | `remint{dev_name, crew, current_token_id, deadline}` | Mints a fresh token for an existing account and returns it, **without** revoking the token the daemon holds, and without touching `last_register`. Used by daily rotation and by the daemon's 401 refresh. |
 | `revoke{token_id}` | Revokes a token. The daemon calls it after it has swapped in the new token and reconnected. |
 | `deactivate{dev_name, crew}` | Disables the account's bot now, as the 30-day prune does (`manage_bots`, R-06), records `pruned_at`, and returns `{account, delete_at}`, with `delete_at` read back from the server. `not_found` for an account that never registered, `squatted` for a bot this broker no longer owns. The next `mint` reactivates it (R-03). `verify-install` calls it last, for its canary, so a verify leaves no active bot (#127). |
@@ -1841,6 +1842,7 @@ The sketchbook (`docs/SKETCHBOOK.md`) holds the shaping decisions. Plan #3's `[l
 | — | Pre-kickoff amendments: one Plan per phase (#26, #27, #28), the spike without CI, the 11.8 floor (CT-11), the S-NN citation rule | D-089 (supersedes D-065 in part), D-090, D-091, D-092 |
 | — | Spike 1.2 answers to §5.N (`docs/spikes/2026-10-spike-1.2.md`) | D-093 to D-101; D-096 resolves D-071 (the kiosk is the CLI runner); D-100 supersedes D-079 and D-087 in part (bot ownership is checked in the broker) |
 | — | P2W1 flight findings (Story 2.4b): `register` carries team and avatar, per-backend team scope; persisted my-threads | D-103, D-104 |
+| — | Membership on mint: the broker adds each bot it mints to its crew's team and default channels, not a greeter bot (#132) | D-109 |
 
 ### Appendix V: Verification Requirements Traceability Matrix (VRTM)
 

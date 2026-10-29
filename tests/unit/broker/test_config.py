@@ -66,6 +66,41 @@ def test_crew_defaults_to_partner_username(tmp_path: Path, fake: Any) -> None:
     assert load_config("oaw-dev", config_dir=tmp_path, client=fake).crew == "oaw"
 
 
+def test_membership_keys_default_empty(tmp_path: Path) -> None:
+    """#132: neither key set is today's behaviour, so an existing config is unchanged."""
+    write(tmp_path, 'crew = "oaw"\n' + BASE)
+    config = load_config("oaw-dev", config_dir=tmp_path)
+    assert config.team == "" and config.default_channels == []
+
+    write(tmp_path, 'crew = "oaw"\nteam = "oaw"\n' + BASE)
+    assert load_config("oaw-dev", config_dir=tmp_path).default_channels == []
+    # URL names and display names alike: whether they exist is the server's to say.
+    body = 'crew = "oaw"\nteam = "Oak and Wave"\ndefault_channels = ["town-square", "Agent Ops"]\n'
+    write(tmp_path, body + BASE)
+    config = load_config("oaw-dev", config_dir=tmp_path)
+    assert config.team == "Oak and Wave"
+    assert config.default_channels == ["town-square", "Agent Ops"]
+
+
+def test_membership_keys_refuse_empty_and_duplicate_entries(tmp_path: Path) -> None:
+    team = 'team = "oaw"\n'
+    bad = {
+        'team = ""\n': "team",
+        'team = "  "\n': "team",
+        "team = 7\n": "team",
+        team + 'default_channels = [""]\n': "default_channels",
+        team + 'default_channels = ["town-square", 7]\n': "default_channels",
+        team + 'default_channels = "town-square"\n': "default_channels",
+        team + 'default_channels = ["General", "general"]\n': "twice",
+        # Channels need their team: a bot joins a channel only once it is on the team.
+        'default_channels = ["town-square"]\n': "needs team",
+    }
+    for body, named in bad.items():
+        write(tmp_path, 'crew = "oaw"\n' + body + BASE)
+        with pytest.raises(ConfigError, match=named):
+            load_config("oaw-dev", config_dir=tmp_path)
+
+
 def test_config_errors(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="no such file"):
         load_config("nope-dev", config_dir=tmp_path)

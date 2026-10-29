@@ -15,6 +15,7 @@ import httpx
 
 DEFAULT_TIMEOUT_S = 10.0
 BOTS_PAGE_SIZE = 200
+CHANNELS_PAGE_SIZE = 200
 RATE_LIMIT_RETRIES = 5
 RATE_LIMIT_MAX_WAIT_S = 5.0
 
@@ -22,10 +23,13 @@ RATE_LIMIT_MAX_WAIT_S = 5.0
 class MattermostError(Exception):
     """A Mattermost API call failed."""
 
-    def __init__(self, method: str, path: str, status: int | None, detail: str) -> None:
+    def __init__(
+        self, method: str, path: str, status: int | None, detail: str, error_id: str = ""
+    ) -> None:
         self.method = method
         self.path = path
         self.status = status
+        self.error_id = error_id  # Mattermost's error `id`, such as `api.context.permissions…`
         code = status if status is not None else "error"
         super().__init__(f"{method} {path} -> {code}: {detail}")
 
@@ -64,6 +68,20 @@ class MattermostAPI(Protocol):
     def create_post(
         self, channel_id: str, message: str, props: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
+
+    def get_team_by_name(self, name: str) -> dict[str, Any]: ...
+
+    def get_channel_by_name(self, team_id: str, name: str) -> dict[str, Any]: ...
+
+    def list_my_teams(self) -> list[dict[str, Any]]: ...
+
+    def list_team_channels(self, team_id: str) -> list[dict[str, Any]]: ...
+
+    def list_my_team_channels(self, team_id: str) -> list[dict[str, Any]]: ...
+
+    def add_team_member(self, team_id: str, user_id: str) -> None: ...
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None: ...
 
 
 class MattermostClient:
@@ -110,9 +128,9 @@ class MattermostClient:
             attempt += 1
             self._sleep(_retry_after(resp))
         if resp.status_code == 404:
-            raise NotFound(method, path, 404, _detail(resp))
+            raise NotFound(method, path, 404, _detail(resp), _error_id(resp))
         if not resp.is_success:
-            raise MattermostError(method, path, resp.status_code, _detail(resp))
+            raise MattermostError(method, path, resp.status_code, _detail(resp), _error_id(resp))
         if not resp.content:
             return None
         return resp.json()
@@ -192,6 +210,54 @@ class MattermostClient:
         result: dict[str, Any] = self._call("POST", "/posts", json=body)
         return result
 
+    # Membership (#132). The broker account adds only bots it owns, as a plain `team_user` that
+    # is itself a member of each channel: no role beyond R-06's is needed (the #132 probe).
+    # An existing member is answered 201, the same as a new one. The config names the team and
+    # channels by URL name or display name: the `get_*_by_name` calls resolve a URL name, and the
+    # listings are what a display name is matched against. A private channel is seen only by a
+    # member.
+    def get_team_by_name(self, name: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("GET", f"/teams/name/{name}")
+        return result
+
+    def get_channel_by_name(self, team_id: str, name: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("GET", f"/teams/{team_id}/channels/name/{name}")
+        return result
+
+    def list_my_teams(self) -> list[dict[str, Any]]:
+        return self._list("/users/me/teams")
+
+    def list_team_channels(self, team_id: str) -> list[dict[str, Any]]:
+        """The team's public channels, every page."""
+        channels: list[dict[str, Any]] = []
+        page = 0
+        while True:
+            batch = self._list(
+                f"/teams/{team_id}/channels", params={"page": page, "per_page": CHANNELS_PAGE_SIZE}
+            )
+            channels.extend(batch)
+            if len(batch) < CHANNELS_PAGE_SIZE:
+                return channels
+            page += 1
+
+    def list_my_team_channels(self, team_id: str) -> list[dict[str, Any]]:
+        """The broker account's own channels in the team, private ones included."""
+        return self._list(f"/users/me/teams/{team_id}/channels")
+
+    def _list(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        result = self._call("GET", path, params=params)
+        if not isinstance(result, list):
+            raise MattermostError("GET", path, 200, "response is not a list")
+        return result
+
+    def add_team_member(self, team_id: str, user_id: str) -> None:
+        self._call(
+            "POST", f"/teams/{team_id}/members", json={"team_id": team_id, "user_id": user_id}
+        )
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        self._call("POST", f"/channels/{channel_id}/members", json={"user_id": user_id})
+
 
 def _retry_after(resp: httpx.Response) -> float:
     """Seconds to wait after a 429: Retry-After, else Mattermost's X-RateLimit-Reset, else 1."""
@@ -202,6 +268,14 @@ def _retry_after(resp: httpx.Response) -> float:
             continue
         return min(max(wait, 0.1), RATE_LIMIT_MAX_WAIT_S)
     return 1.0
+
+
+def _error_id(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    return str(body.get("id") or "") if isinstance(body, dict) else ""
 
 
 def _detail(resp: httpx.Response) -> str:

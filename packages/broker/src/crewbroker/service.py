@@ -45,6 +45,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from crewbroker import config as cfg
 from crewbroker.config import CrewConfig
 from crewbroker.mattermost import MattermostAPI, MattermostClient, MattermostError, NotFound
+from crewbroker.membership import Membership
 from crewbroker.mint import (
     SquattedAccount,
     account_name,
@@ -118,6 +119,12 @@ class Broker:
         self.server_key = server_key or config.server_url
         self.clock = clock
         self._lock = threading.Lock()
+        # Membership on mint (#132): the configured names resolve now, at startup. One that
+        # doesn't is logged and reported on each mint, and never stops the broker.
+        self.membership: Membership | None = None
+        if config.team:
+            self.membership = Membership(client, config.team, config.default_channels)
+            self.membership.resolve()
 
     def _name(self, args: dict[str, Any]) -> str:
         dev_name = args.get("dev_name")
@@ -198,7 +205,15 @@ class Broker:
             )
             self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
-        return {"account": name, "token": token.token, "token_id": token.token_id}
+        answer: dict[str, Any] = {"account": name, "token": token.token, "token_id": token.token_id}
+        if self.membership is not None:
+            # Ensure the bot's team and default channels (#132, D-109); never raises. Only a
+            # bot this broker owns gets here: `ensure_bot` created it, or read its `owner_id`
+            # as this broker, earlier in this mint.
+            answer["membership"] = self.membership.ensure(
+                name, bot_id, deadline, lambda: self.clock().timestamp()
+            )
+        return answer
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""

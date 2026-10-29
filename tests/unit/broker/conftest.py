@@ -8,7 +8,7 @@ had gained that permission), when it lists every active bot on the server.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,17 @@ class FakeMattermost:
         self.calls: list[tuple[str, Any]] = []
         self.posts: list[dict[str, Any]] = []
         self.post_fails = False
+        # Membership (#132): target (team or channel) id -> member user ids.
+        self.members: dict[str, list[str]] = {}
+        self.add_fails: set[str] = set()  # targets whose add answers 403
+        self.exists_as_400 = False  # an existing member answered 400 `…exists`, not 201
+        # Teams and channels by id, and which of them the broker account belongs to.
+        self.teams: dict[str, dict[str, Any]] = {}
+        self.channels: dict[str, dict[str, Any]] = {}
+        self.my_ids: set[str] = set()
+        self.lookup_down = False  # every name lookup answers `lookup_status`
+        self.lookup_status = 503  # as if the server were down; 429 is a rate limit
+        self.on_add: Callable[[str], None] | None = None  # called with each add's target
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
@@ -49,6 +60,27 @@ class FakeMattermost:
         if is_bot:
             self.bots[uid] = {"user_id": uid, "owner_id": owner_id, "delete_at": 0}
         return uid
+
+    def add_team(self, tid: str, name: str, display: str, *, mine: bool = True) -> str:
+        self.teams[tid] = {"id": tid, "name": name, "display_name": display}
+        if mine:
+            self.my_ids.add(tid)
+        return tid
+
+    def add_channel(
+        self, cid: str, team_id: str, name: str, display: str, kind: str = "O", *, mine: bool = True
+    ) -> str:
+        self.channels[cid] = {
+            "id": cid,
+            "team_id": team_id,
+            "name": name,
+            "display_name": display,
+            "type": kind,
+            "delete_at": 0,
+        }
+        if mine:
+            self.my_ids.add(cid)
+        return cid
 
     def reassign(self, bot_id: str, owner_id: str) -> None:
         self.bots[bot_id]["owner_id"] = owner_id
@@ -157,6 +189,68 @@ class FakeMattermost:
         post = {"channel_id": channel_id, "message": message, "props": dict(props or {})}
         self.posts.append(post)
         return post
+
+    def _add_member(self, call: str, kind: str, target: str, user_id: str) -> None:
+        self.calls.append((call, (target, user_id)))
+        if self.on_add is not None:
+            self.on_add(target)
+        path = f"/{kind}s/{target}/members"
+        if target in self.add_fails:
+            raise MattermostError("POST", path, 403, "no permission", "api.context.permissions")
+        members = self.members.setdefault(target, [])
+        if user_id in members:
+            if self.exists_as_400:
+                exists = f"store.sql_{kind}.save_member.exists.app_error"
+                raise MattermostError("POST", path, 400, "already a member", exists)
+            return  # 201, as the #132 probe saw
+        members.append(user_id)
+
+    def _lookup(self, call: str, arg: Any, path: str) -> None:
+        self.calls.append((call, arg))
+        if self.lookup_down:
+            raise MattermostError("GET", path, self.lookup_status, "unavailable")
+
+    def get_team_by_name(self, name: str) -> dict[str, Any]:
+        path = f"/teams/name/{name}"
+        self._lookup("get_team_by_name", name, path)
+        for team in self.teams.values():
+            if team["name"] == name:
+                return dict(team)
+        raise NotFound("GET", path, 404, "not found", "app.team.get_by_name.missing.app_error")
+
+    def get_channel_by_name(self, team_id: str, name: str) -> dict[str, Any]:
+        path = f"/teams/{team_id}/channels/name/{name}"
+        self._lookup("get_channel_by_name", (team_id, name), path)
+        for ch in self.channels.values():
+            # A private channel is visible only to a member, as on the server.
+            visible = ch["type"] == "O" or ch["id"] in self.my_ids
+            if ch["team_id"] == team_id and ch["name"] == name and visible:
+                return dict(ch)
+        raise NotFound("GET", path, 404, "not found", "app.channel.get_by_name.missing")
+
+    def list_my_teams(self) -> list[dict[str, Any]]:
+        self._lookup("list_my_teams", None, "/users/me/teams")
+        return [dict(t) for tid, t in self.teams.items() if tid in self.my_ids]
+
+    def list_team_channels(self, team_id: str) -> list[dict[str, Any]]:
+        self._lookup("list_team_channels", team_id, f"/teams/{team_id}/channels")
+        return [
+            dict(c) for c in self.channels.values() if c["team_id"] == team_id and c["type"] == "O"
+        ]
+
+    def list_my_team_channels(self, team_id: str) -> list[dict[str, Any]]:
+        self._lookup("list_my_team_channels", team_id, f"/users/me/teams/{team_id}/channels")
+        return [
+            dict(c)
+            for cid, c in self.channels.items()
+            if c["team_id"] == team_id and cid in self.my_ids
+        ]
+
+    def add_team_member(self, team_id: str, user_id: str) -> None:
+        self._add_member("add_team_member", "team", team_id, user_id)
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        self._add_member("add_channel_member", "channel", channel_id, user_id)
 
 
 class Clock:
