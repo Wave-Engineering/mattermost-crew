@@ -63,6 +63,7 @@ EOF
 log "creating /run/crewchat and /var/lib/crewchat"
 $SUDO install -d -m 0755 -o crewchat -g crewchat /run/crewchat
 # The default ACL the runbook's agent-acl.conf drop-in sets in ExecStartPre (#115).
+"${ROOT}/scripts/ci/host-prereqs.sh"
 $SUDO setfacl -d -m "u:${AGENT_USER}:rw,g::rw" /run/crewchat
 $SUDO install -d -m 0700 -o crewchat -g crewchat /var/lib/crewchat
 
