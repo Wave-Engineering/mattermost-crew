@@ -451,6 +451,12 @@ again from that checkout. The configuration and the state are kept: `/etc/crewch
 touched by an install. Then run "Verify the install". If a release changed a unit, the older
 release's unit replaces it, because each block installs its unit afresh.
 
+Rolling back to v0.2.3 or earlier on a host whose `install` is uutils fails over the existing
+files: those releases' blocks write with `install … /dev/stdin`, which uutils refuses when the
+destination exists (`install: No such file or directory`). Move the file the block names aside
+(`sudo mv <file> <file>.v0.2.4`) and re-run the block, once per file it stops on. Only the
+blocks' own files are involved, never Configure's.
+
 **A single broker instance.** Stop it with `sudo systemctl disable --now crewbroker@<crew>-<server_id>`.
 The daemon then treats that crew's Mattermost traffic as unresolvable and drops it (R-22), and
 Discord and squawkie keep flowing. Its agents keep their current tokens until they expire or are

@@ -25,6 +25,10 @@ changed kiosk socket, and agents' doorbells ride out a daemon restart.
   still ends the agents' running `crewchat-doorbell`s with exit 4: they run the old client.
   Agents get the retrying doorbell and `ping` when they upgrade `crewchat-clients`. A new shim
   against an older daemon falls back to registering on its next tool call.
+- **Known limit, rollback on uutils:** v0.2.3 and earlier still write with
+  `install … /dev/stdin`, so on a uutils host rolling back from 0.2.4 fails the same way, at the
+  first file the older block installs over. Move that file aside and re-run the block, as the
+  runbook's Rollback section says.
 
 ### Fixed
 
