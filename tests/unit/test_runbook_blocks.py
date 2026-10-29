@@ -7,6 +7,9 @@ install: the daemon's ACL drop-in for live agent sessions, and `/etc/crewbroker`
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from tests.runbook_md import RUNBOOK, runbook_blocks, sections
 
 DROPIN_DIR = "/etc/systemd/system/crewchat.service.d"
@@ -44,6 +47,26 @@ def test_daemon_block_writes_acl_dropin() -> None:
     assert 'usermod -aG crewchat-clients "$AGENT_USER"' in script
     # setfacl is checked up front, not discovered by a failed ExecStartPre.
     assert line_of(script, "[[ -x /usr/bin/setfacl ]]") < line_of(script, "systemctl restart")
+
+
+def test_daemon_block_refuses_without_setfacl(tmp_path: Path) -> None:
+    """The setfacl check's refusal branch, which IT-20 never takes: its runners get `acl` first
+    (`scripts/ci/host-prereqs.sh`). The runbook's own line runs, with only the path swapped."""
+    script = block("Install the daemon")
+    check = script.splitlines()[line_of(script, "[[ -x /usr/bin/setfacl ]]")]
+    assert "/usr/bin/setfacl" in check and "exit 1" in check
+
+    def run(path: Path) -> subprocess.CompletedProcess[str]:
+        line = check.replace("/usr/bin/setfacl", str(path))
+        return subprocess.run(["bash", "-c", line], capture_output=True, text=True, check=False)
+
+    missing = run(tmp_path / "setfacl")
+    assert missing.returncode == 1
+    assert "install acl (Prerequisites)" in missing.stderr
+    present = tmp_path / "present"
+    present.write_text("#!/bin/sh\n", encoding="utf-8")
+    present.chmod(0o755)
+    assert run(present).returncode == 0
 
 
 def test_broker_block_sets_crewbroker_mode() -> None:
