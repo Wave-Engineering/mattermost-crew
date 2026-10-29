@@ -202,7 +202,7 @@ from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
 | File | What it is | Write it as | The install hands it to |
 |---|---|---|---|
 | `/etc/crewbroker/<crew>-<server_id>.credential` | the broker account's personal access token, one line | 0600, root | `crewbroker`, 0600 |
-| `/etc/crewkiosk/model.credential` | the kiosk's model API key: the key alone, one line (kiosk hosts only). `ANTHROPIC_API_KEY=<key>` is also accepted; any other `NAME=` line is refused | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
+| `/etc/crewkiosk/model.credential` | the kiosk's model API key: the key alone, one line (kiosk hosts only). `ANTHROPIC_API_KEY=<key>` is also accepted; any other line holding an `=` is refused, so a key that itself contains `=` can't be used | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
 | `/etc/crewchat/discord.credential` | the Discord credential (only with Discord enabled) | 0600, root | `crewchat`, 0600 |
 
 For example, for the broker's token, without it passing through the shell's history:

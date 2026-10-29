@@ -54,7 +54,8 @@ All notable changes to this project are recorded here. The format follows
   (#115).
 - The kiosk's model credential is the key alone, one line, as the runner always read it; the
   spike 1.2 doc said `ANTHROPIC_API_KEY=<key>`, which the runner sent as the key itself (#116).
-  That form is now accepted too, and any other `NAME=` first line exits 65.
+  That form is now accepted too, and any other first line holding an `=` exits 65, so a key
+  that itself contains `=` (base64 padding, say) is refused too.
 
 ## [0.2.2] — 2026-10-26
 
