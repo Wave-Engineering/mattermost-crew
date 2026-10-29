@@ -35,12 +35,13 @@ export CREWBROKER_INSTANCES="oaw:oaw-dev"
 
 The host needs:
 
-- **Linux with systemd**, `sudo`, `git`, `tar` and `jq` (the verify step uses `jq`).
+- **Linux with systemd**, `sudo`, `git`, `tar`, `jq` (the verify step uses `jq`) and `acl`
+  (`setfacl` at `/usr/bin/setfacl`, and `getfacl`; the daemon's unit sets the socket's ACL).
 - **Python 3.12** and **uv**. The install uses the system `python3.12` when there is one;
   otherwise uv downloads 3.12 into `/opt/mattermost-crew/python`, which every service user can
   reach. `uv` must be on the installing user's `PATH`.
-- **The agents' OS user** (`AGENT_USER`, default `agent`). The install adds it to
-  `crewchat-clients`, which is the only thing that lets it reach the daemon.
+- **The agents' OS user** (`AGENT_USER`, default `agent`). The install gives it two ways to
+  reach the daemon, described below.
 - **Claude Code at `/usr/local/bin/claude`**, only on a host that runs the kiosk's CLI runner,
   with **no managed Claude Code settings** on the host, local or org-pushed: they still apply
   under `--restricted` (§5.11, spike 1.2).
@@ -57,6 +58,19 @@ before and after:
 | `crewchat-clients` (group) | who may connect to the daemon socket | `crewchat` and the agents' user |
 | `crewbroker` (user and group) | every broker instance | **never in `crewchat`**. The broker sockets get the `crewchat` group from the setgid directory `/run/crewbroker`, made by `packaging/crewbroker.tmpfiles.conf` |
 | `crewkiosk` (user and group) | the kiosk's CLI runner, only if it is used | an **empty HOME** (`/home/crewkiosk`, mode 0700); in no other group; holds only the kiosk's model credential |
+
+**Two ways onto the daemon socket.** The install adds `AGENT_USER` to `crewchat-clients`, but a
+process keeps the groups it started with. On a workstation with lingering on (`Linger=yes`), whose
+desktop starts apps as systemd scopes, even a new login keeps the boot-time group list, so the
+agents' live sessions would not get the group until a reboot. So the daemon's unit also sets a
+default ACL on `/run/crewchat` (the drop-in
+`/etc/systemd/system/crewchat.service.d/agent-acl.conf`), and the socket comes out with
+`user:<AGENT_USER>:rw-`: the ACL serves `AGENT_USER`'s sessions at once, without a re-login, and
+the group serves containers and new logins. The same ACL sets `group::rw-`; without it the socket
+inherits the directory's `r-x` for its group, and every client that has only the group, such as a
+container on `--group-add`, is refused. Don't use `sg crewchat-clients` as a workaround: it makes
+the group the primary gid, and an ssh `KnownHostsCommand` that calls `setresgid` then fails, so
+git over SSH breaks.
 
 **The socket mount into containers.** A host has one daemon socket,
 `/run/crewchat/crewchat.sock` (mode 0660, `crewchat:crewchat-clients`). Agents in containers on
@@ -200,7 +214,8 @@ sudo install -m 0600 -o root -g root /dev/stdin /etc/crewbroker/oaw-oaw-dev.cred
 ## Install the daemon
 
 Creates `crewchat-clients` and `crewchat`, puts the agents' user in `crewchat-clients`, installs
-the code into `/opt/mattermost-crew`, then installs and starts `crewchat.service`.
+the code into `/opt/mattermost-crew`, then installs `crewchat.service` with the drop-in that
+gives the agents' user its ACL on the socket (Prerequisites), and starts it.
 
 ```bash
 set -euo pipefail
@@ -208,6 +223,7 @@ AGENT_USER="${AGENT_USER:-agent}"
 UV="$(command -v uv)"
 sudo test -r /etc/crewchat/servers.toml || { echo "write /etc/crewchat/servers.toml first (Configure)" >&2; exit 1; }
 id "$AGENT_USER" >/dev/null || { echo "no user $AGENT_USER (Prerequisites)" >&2; exit 1; }
+[[ -x /usr/bin/setfacl ]] || { echo "no /usr/bin/setfacl: install acl (Prerequisites)" >&2; exit 1; }
 
 getent group crewchat-clients >/dev/null || sudo groupadd --system crewchat-clients
 getent passwd crewchat >/dev/null || sudo useradd --system --user-group --no-create-home \
@@ -227,6 +243,11 @@ sudo env UV_PYTHON_INSTALL_DIR=/opt/mattermost-crew/python UV_LINK_MODE=copy \
   --package crewchat --inexact
 
 sudo install -m 0644 -o root -g root packaging/crewchat.service /etc/systemd/system/crewchat.service
+# The agents' live sessions reach the socket by ACL, without a re-login; g::rw keeps the group's
+# access, which the default ACL would otherwise cap at the directory's r-x (Prerequisites).
+sudo install -d -m 0755 -o root -g root /etc/systemd/system/crewchat.service.d
+printf '[Service]\nExecStartPre=+/usr/bin/setfacl -d -m u:%s:rw,g::rw /run/crewchat\n' "$AGENT_USER" |
+  sudo install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/crewchat.service.d/agent-acl.conf
 sudo systemctl daemon-reload
 sudo systemctl enable crewchat
 sudo systemctl restart crewchat
@@ -269,6 +290,9 @@ sudo install -m 0644 -o root -g root packaging/crewbroker@.service /etc/systemd/
 sudo install -m 0644 -o root -g root packaging/crewbroker.tmpfiles.conf /etc/tmpfiles.d/crewbroker.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/crewbroker.conf
 sudo systemctl daemon-reload
+# crewbroker must traverse /etc/crewbroker to reach its credential; this also fixes a directory
+# that already exists at 0700.
+sudo install -d -m 0755 -o root -g root /etc/crewbroker
 
 for entry in $CREWBROKER_INSTANCES; do
   instance="${entry%%:*}-${entry#*:}"
@@ -369,6 +393,7 @@ done
 sudo rm -f /etc/systemd/system/crewchat.service /etc/systemd/system/crewbroker@.service \
   /etc/systemd/system/crewkiosk.socket /etc/systemd/system/crewkiosk@.service \
   /etc/tmpfiles.d/crewbroker.conf /usr/local/libexec/crewkiosk-run
+sudo rm -rf /etc/systemd/system/crewchat.service.d
 sudo systemctl daemon-reload
 sudo rm -rf /opt/mattermost-crew
 ```

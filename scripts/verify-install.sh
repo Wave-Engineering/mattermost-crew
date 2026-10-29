@@ -13,6 +13,10 @@
 #
 # The daemon (Story 1.4):
 #   - its socket /run/crewchat/crewchat.sock exists, mode 0660, group crewchat-clients;
+#   - its ACL (the unit's agent-acl.conf drop-in, #115) holds user:<agent>:rw-, group::rw- and
+#     mask::rw-, and three callers prove it: the agent's user WITHOUT crewchat-clients gets
+#     `health` (the ACL), a uid with only the crewchat-clients gid gets it (a container's
+#     --group-add), and a uid with neither is refused;
 #   - `health` answers, asked as the agent's user (who reaches the socket through that group);
 #   - a `register` for verify-canary, as the agent's user, succeeds and its reply holds no token;
 #   - the daemon's token file for the canary, the KNOWN name
@@ -31,7 +35,8 @@
 #
 # CREWBROKER_BIN is the installed broker CLI (default /opt/mattermost-crew/.venv/bin/crewbroker),
 # CREWCHAT_BIN the daemon's (default /opt/mattermost-crew/.venv/bin/crewchat).
-# AGENT_USER is the agents' OS user (default agent). It needs sudo.
+# AGENT_USER is the agents' OS user (default agent). Run it as root, or as an operator who may
+# `sudo -u` both the agents' user and root; otherwise it says to re-run as root and exits 1.
 set -euo pipefail
 
 CREWBROKER_BIN="${CREWBROKER_BIN:-/opt/mattermost-crew/.venv/bin/crewbroker}"
@@ -63,9 +68,16 @@ if [[ -z "${CREWBROKER_INSTANCES:-}" ]]; then
   exit 1
 fi
 
-# The R-08 checks below read a refused sudo as "cannot read", so prove sudo works first.
+# The R-08 checks below read a refused sudo as "cannot read", so prove sudo works first. Root
+# may always switch users; an operator who is the agents' user, with sudoers granting (root)
+# only, may not, so it is told to re-run as root.
 if ! sudo -n -u "$AGENT_USER" true; then
-  echo "verify-install: FAIL cannot run commands as $AGENT_USER (sudo -n -u $AGENT_USER)" >&2
+  if [[ "$(id -u)" -ne 0 ]]; then
+    printf 'verify-install: re-run as root: sudo env AGENT_USER=%q CREWBROKER_INSTANCES=%q make verify-install\n' \
+      "$AGENT_USER" "$CREWBROKER_INSTANCES" >&2
+  else
+    echo "verify-install: FAIL cannot run commands as $AGENT_USER (sudo -n -u $AGENT_USER)" >&2
+  fi
   exit 1
 fi
 
@@ -136,6 +148,53 @@ else
     pass "$CREWCHAT_SOCKET is mode 0660, group $CLIENTS_GROUP"
   else
     fail "$CREWCHAT_SOCKET is mode $mode, group $group (want 660, $CLIENTS_GROUP)"
+  fi
+fi
+
+# The socket's ACL: the agents' user by name, and the group's rw kept. getfacl prints
+# `#effective:` after an entry the mask cuts down, so each line must match exactly.
+if acl="$($SUDO getfacl -p "$CREWCHAT_SOCKET" 2>&1)"; then
+  missing=()
+  for want in "user:${AGENT_USER}:rw-" "group::rw-" "mask::rw-"; do
+    grep -qxF "$want" <<<"$acl" || missing+=("$want")
+  done
+  if ((${#missing[@]} == 0)); then
+    pass "$CREWCHAT_SOCKET has user:${AGENT_USER}:rw-, group::rw- and mask::rw-"
+  else
+    fail "$CREWCHAT_SOCKET lacks ${missing[*]} (is crewchat.service.d/agent-acl.conf installed?): $(tr '\n' ' ' <<<"$acl")"
+  fi
+else
+  fail "getfacl $CREWCHAT_SOCKET: $acl"
+fi
+
+# Three callers, each with exactly the ids named: the agents' user without the group (the ACL),
+# a uid with only the group's gid (a container on --group-add), and a uid with neither.
+# health_as ARGS...: `health` through setpriv with ARGS; prints the reply, or the error.
+health_as() { $SUDO setpriv "$@" -- "$CREWCHAT_BIN" call "$CREWCHAT_SOCKET" health 2>&1; }
+if ! command -v setpriv >/dev/null; then
+  fail "no setpriv: cannot check who may reach $CREWCHAT_SOCKET"
+else
+  clients_gid="$(getent group "$CLIENTS_GROUP" | cut -d: -f3)"
+  nobody_gid="$(id -g nobody)"
+  reply="$(health_as --reuid="$AGENT_USER" --regid="$(id -g "$AGENT_USER")" --clear-groups || true)"
+  if jq -e '.ok' <<<"$reply" >/dev/null 2>&1; then
+    pass "daemon health answers $AGENT_USER without $CLIENTS_GROUP (the ACL)"
+  else
+    fail "daemon health as $AGENT_USER without $CLIENTS_GROUP: $reply"
+  fi
+  reply="$(health_as --reuid=nobody --regid="$nobody_gid" --groups="$clients_gid" || true)"
+  if jq -e '.ok' <<<"$reply" >/dev/null 2>&1; then
+    pass "daemon health answers a uid with only the $CLIENTS_GROUP gid"
+  else
+    fail "daemon health as nobody with only the $CLIENTS_GROUP gid: $reply"
+  fi
+  # Refused means the connect itself failed, not that setpriv or the CLI broke.
+  if reply="$(health_as --reuid=nobody --regid="$nobody_gid" --clear-groups)"; then
+    fail "daemon health answers nobody, with neither the ACL nor $CLIENTS_GROUP: $reply"
+  elif grep -q 'Permission denied' <<<"$reply"; then
+    pass "a uid with neither the ACL nor $CLIENTS_GROUP is refused"
+  else
+    fail "daemon health as nobody failed, but not with Permission denied: $reply"
   fi
 fi
 
