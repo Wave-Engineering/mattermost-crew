@@ -258,8 +258,16 @@ def build_handlers(
         dev_team, dev_avatar = args.get("dev_team", ""), args.get("dev_avatar", "")
         if not isinstance(dev_team, str) or not isinstance(dev_avatar, str):
             raise OpError("bad_request", "dev_team and dev_avatar are strings")
+        project_key = args.get("project_key", "")  # the shim's repo_key(), for the allowlist
+        if not isinstance(project_key, str):
+            raise OpError("bad_request", "project_key is a string")
         reg = await registry.register(
-            dev_name, crew, session_id, dev_team=dev_team, dev_avatar=dev_avatar
+            dev_name,
+            crew,
+            session_id,
+            dev_team=dev_team,
+            dev_avatar=dev_avatar,
+            project_key=project_key,
         )
         return reg.result()
 

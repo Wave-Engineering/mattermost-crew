@@ -126,6 +126,21 @@ def test_runbook_configure_examples_load_through_the_real_parsers() -> None:
     assert crew.server_id == parsed.mattermost[0].id
 
 
+def test_runbook_partner_server_example_loads() -> None:
+    """#117: the per-server controls example, added to the servers.toml example, loads
+    through the real parser, with the allowlist it shows."""
+    body = runbook_sections()["Configure"]
+    (servers_block,) = fenced_blocks(body, "toml")[:1]
+    example = next(b for b in fenced_blocks(body, "text") if 'id = "partner"' in b)
+    parsed = daemon_config.parse_config(tomllib.loads(servers_block + "\n" + example))
+    partner = next(s for s in parsed.mattermost if s.id == "partner")
+    assert partner.kiosk is False
+    entry = parsed.crews["oaw"].brokers["partner"]
+    assert entry.agents_allow == ("gitlab.com/partner-org", "name:helper")
+    assert entry.agents_deny == ("name:scratch",)
+    assert "accident guard, not a security boundary" in body
+
+
 def test_runbook_configure_lists_every_required_field() -> None:
     servers, broker = _toml_blocks()
     assert set(servers) >= {
@@ -144,7 +159,11 @@ def test_runbook_configure_lists_every_required_field() -> None:
     assert servers["loop_guard_window"] == daemon_config.DEFAULT_LOOP_GUARD_WINDOW
     assert servers["my_threads_retention_days"] == daemon_config.DEFAULT_MY_THREADS_RETENTION_DAYS
     mattermost = servers["mattermost"]
-    assert isinstance(mattermost, list) and set(mattermost[0]) == {"id", "url"}
+    assert isinstance(mattermost, list)
+    assert set(mattermost[0]) == {"id", "url", "kiosk", "kiosk_daily_cap"}
+    # The per-server kiosk keys at their defaults (#117): off, and 25 a day.
+    assert mattermost[0]["kiosk"] is False
+    assert mattermost[0]["kiosk_daily_cap"] == daemon_config.DEFAULT_KIOSK_DAILY_CAP
     assert servers["discord"] == {"enabled": False}
     crews = servers["crews"]
     assert isinstance(crews, dict)

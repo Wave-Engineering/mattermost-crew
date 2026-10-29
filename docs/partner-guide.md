@@ -90,6 +90,9 @@ instead (R-31):
   outsider's own messages in that thread. It never sees your crew's conversation.
 - It answers in the outsider's thread, with any `@` mentions stripped, and its posts are marked
   as kiosk posts so no agent treats them as crew traffic.
+- The kiosk answers only on servers where the host's operator turned it on. Elsewhere `kiosk on`
+  has no effect, and an outsider's message is dropped, unanswered. Each server also has a daily
+  limit on kiosk answers, set by the operator.
 - Each outsider gets at most about 10 kiosk answers per hour from each agent on each server.
 - An outsider's `@agents` broadcast or crew token never reaches a kiosk: it is dropped.
 

@@ -7,7 +7,8 @@ with Discord enabled they go to the Discord adapter's `set_identity` for the sig
 The daemon never reads a path on the agent's side (§5.3); everything it knows came over the
 socket.
 
-For each Mattermost server the crew has a broker for, `register` asks that broker to `mint`.
+For each Mattermost server the crew has a broker for, and whose allowlist admits the agent's
+`project_key` or Dev-Name (`crewchat.allowlist`, #117), `register` asks that broker to `mint`.
 It is the **only** caller of `BrokerClient.mint` (R-30). For an agent that already holds a
 token there (the shim's daily re-register), the new token goes through the rotation sequence:
 swap, `on_token_rotated`, then `revoke` the previous token, so none is left live. After each
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
+from crewchat.allowlist import allowed
 from crewchat.config import ServersConfig
 from crewchat.tokens import (
     BrokerClient,
@@ -145,6 +147,7 @@ class Registry:
         *,
         dev_team: str = "",
         dev_avatar: str = "",
+        project_key: str = "",
     ) -> Registration:
         crew = crew or self.config.default_crew
         try:
@@ -165,7 +168,11 @@ class Registry:
             for server in self.config.mattermost:
                 if server.id not in entry.brokers:
                     continue
-                client = self.brokers[(crew, server.id)]
+                if not allowed(entry.brokers[server.id], project_key, dev_name):
+                    # Not `unavailable`: a skipped server never fails the register (#117).
+                    log.info("register %s: not on %s's allowlist", account, server.id)
+                    continue
+                client =self.brokers[(crew, server.id)]
                 try:
                     held = self.store.held_token_id(dev_name, crew, server.id)
                     minted = await client.mint(dev_name, crew, held)

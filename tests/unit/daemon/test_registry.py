@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -142,6 +143,72 @@ def test_register_keeps_the_servers_that_answered(
     assert reg.unavailable == ["prod"]  # the server ids whose broker didn't mint (log only)
     assert daemon.store.token_for("babel", "dev") is not None
     assert daemon.store.token_for("babel", "prod") is None
+
+
+def test_register_skips_disallowed_server(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """#117: with an allowlist on one server, `register` mints there only for an agent it
+    admits, and a skipped server is neither minted nor `unavailable`."""
+    raw = _two_servers(servers_toml)
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["gitlab.com/partner-org", "name:helper"]
+    daemon = make_daemon(raw)
+
+    reg = asyncio.run(daemon.registry.register("babel", "oaw", "s1", project_key="github.com/x"))
+    assert reg.backends == ["mattermost:dev", "discord"]
+    assert reg.unavailable == []
+    assert daemon.broker("oaw", "prod").ops("mint") == []
+    assert daemon.store.token_for("babel", "prod") is None
+
+    reg = asyncio.run(
+        daemon.registry.register("kessel", "oaw", "s1", project_key="gitlab.com/partner-org")
+    )
+    assert reg.backends == ["mattermost:dev", "mattermost:prod", "discord"]
+    reg = asyncio.run(daemon.registry.register("helper", "oaw", "s1"))  # by name, no key
+    assert "mattermost:prod" in reg.backends
+
+    # Deny wins over allow.
+    raw["crews"]["oaw"]["prod"]["agents_deny"] = ["name:kessel"]
+    daemon = make_daemon(raw)
+    reg = asyncio.run(
+        daemon.registry.register("kessel", "oaw", "s1", project_key="gitlab.com/partner-org")
+    )
+    assert reg.backends == ["mattermost:dev", "discord"]
+
+
+def test_register_disallowed_everywhere_keeps_discord(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """No Mattermost server admits the agent: it still registers, on Discord. An old shim's
+    empty `project_key` fails closed under an allowlist."""
+    raw = _two_servers(servers_toml)
+    for sid in ("dev", "prod"):
+        raw["crews"]["oaw"][sid]["agents_allow"] = ["gitlab.com/partner-org"]
+    daemon = make_daemon(raw)
+    reg = register(daemon)  # sends no project_key
+    assert reg.backends == ["discord"] and reg.unavailable == []
+    assert daemon.store.agent("babel") is None
+
+
+def test_register_project_key_over_the_socket(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """The socket's `register` passes `project_key` through; a non-string is `bad_request`."""
+    from crewchat.server import DaemonServer, build_handlers
+
+    raw = _two_servers(servers_toml)
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["gitlab.com/partner-org"]
+    daemon = make_daemon(raw)
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+
+    def call(**args: Any) -> dict[str, Any]:
+        frame = {"proto": 1, "id": "x", "op": "register", "args": args}
+        return asyncio.run(server.handle_line(json.dumps(frame).encode()))
+
+    got = call(dev_name="babel", session_id="s1", project_key="gitlab.com/partner-org")
+    assert got["result"]["backends"] == ["mattermost:dev", "mattermost:prod", "discord"]
+    bad = call(dev_name="babel", session_id="s1", project_key=["gitlab.com/partner-org"])
+    assert bad["ok"] is False and bad["error"].startswith("bad_request")
 
 
 def test_register_sets_discord_identity(daemon: Any, tmp_path: Path) -> None:

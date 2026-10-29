@@ -42,9 +42,11 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
   `social`, and an outsider under `crew`. A post tagged `props.crew_kiosk=1` is an outsider's
   whoever wrote it. An outsider under `social` (checked against `now`, every delivery) is
   `DELIVER_MARKED_OUTSIDER`. Under `crew` or `trusted`, on push, an outsider is `KIOSK` only
-  with the kiosk on, a direct address (`is_direct_address`), a post that is not a kiosk post,
-  and within `kiosk_rate_per_hour` per outsider, per expert, per server; otherwise `DROP`. On
-  pull it is omitted, so pull never gives `KIOSK` (R-21, R-31, R-34).
+  on a server with `kiosk = true` in `servers.toml` (#117), with the switch's kiosk on, a
+  direct address (`is_direct_address`), a post that is not a kiosk post, within
+  `kiosk_rate_per_hour` per outsider, per expert, per server, and within the server's
+  `kiosk_daily_cap` for the UTC day (`KioskDaily`); otherwise `DROP`. On pull it is omitted,
+  so pull never gives `KIOSK` (R-21, R-31, R-34).
 
 **`LoopGuard.admit(msg, reg)`** (R-25). A bot account's message needs an opted-in conversation
 (the agent started it or posted in it, per `MyThreads`; or it was mentioned into it; or it is
@@ -60,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import time
 from collections import OrderedDict, deque
@@ -67,6 +70,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from crewchat.adapters.base import InboundMessage
@@ -88,7 +92,13 @@ from crewchat.config import (
 )
 from crewchat.registry import Registration, Registry
 from crewchat.threads import MyThreads
-from crewchat.tokens import BrokerClient, BrokerError, BrokerKey, BrokerUnavailable
+from crewchat.tokens import (
+    BrokerClient,
+    BrokerError,
+    BrokerKey,
+    BrokerUnavailable,
+    write_private_json,
+)
 
 if TYPE_CHECKING:
     from crewchat.doorbell import DoorbellEvent
@@ -99,6 +109,7 @@ LOOP_GUARD_WINDOW_S = 3600.0  # the loop guard's sliding window
 KIOSK_RATE_WINDOW_S = 3600.0
 TRACKED_MAX = 10_000  # conversations and senders each table remembers
 KIOSK_QUEUE_MAX = 1000
+KIOSK_DAILY_FILE = "kiosk-daily.json"  # under the state dir (#117)
 MATTERMOST_PREFIX = "mattermost:"
 SQUAWKIE = "squawkie"
 
@@ -474,6 +485,80 @@ class KioskQueue:
 Class = Literal["crew", "trusted", "outsider"]
 
 
+class KioskDaily:
+    """Which servers have the kiosk at all, and each one's answers per UTC day (#117).
+
+    `caps` holds only the servers with `kiosk = true`, each with its `kiosk_daily_cap`. The
+    count is `KIOSK` verdicts, persisted in `<state_dir>/kiosk-daily.json` as `{server_id:
+    {date, count}}`, so a daemon restart never resets a server's day. A bad file is logged and
+    read as empty; a failed write is logged, and the count in memory still holds.
+    """
+
+    def __init__(
+        self,
+        caps: Mapping[str, int],
+        state_dir: Path | None = None,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self.caps = dict(caps)
+        self.path = None if state_dir is None else state_dir / KIOSK_DAILY_FILE
+        self.clock = clock
+        self._counts: dict[str, tuple[str, int]] = self._load()
+        self._warned: set[tuple[str, str]] = set()  # (server_id, date) the cap was logged
+
+    def server_on(self, server_id: str) -> bool:
+        return server_id in self.caps
+
+    def take(self, server_id: str) -> bool:
+        """Count one kiosk answer on `server_id` today, or False at the day's cap."""
+        today = self.clock().astimezone(UTC).date().isoformat()
+        date, count = self._counts.get(server_id, (today, 0))
+        if date != today:
+            count = 0
+        if count >= self.caps.get(server_id, 0):
+            if (server_id, today) not in self._warned:
+                self._warned.add((server_id, today))
+                log.warning(
+                    "kiosk: %s reached its daily cap of %d for %s",
+                    server_id,
+                    self.caps.get(server_id, 0),
+                    today,
+                )
+            return False
+        self._counts[server_id] = (today, count + 1)
+        self._save()
+        return True
+
+    def _load(self) -> dict[str, tuple[str, int]]:
+        if self.path is None:
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            log.error("ignoring unreadable kiosk count %s: %s", self.path, exc)
+            return {}
+        counts: dict[str, tuple[str, int]] = {}
+        for sid, entry in raw.items() if isinstance(raw, dict) else ():
+            date = entry.get("date") if isinstance(entry, dict) else None
+            count = entry.get("count") if isinstance(entry, dict) else None
+            if isinstance(date, str) and isinstance(count, int) and not isinstance(count, bool):
+                counts[str(sid)] = (date, count)
+        return counts
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        data = {sid: {"date": d, "count": c} for sid, (d, c) in self._counts.items()}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_private_json(self.path, data)
+        except OSError as exc:
+            log.error("cannot save the kiosk count at %s: %s", self.path, exc)
+
+
 def server_of(backend: str) -> str | None:
     return backend[len(MATTERMOST_PREFIX) :] if backend.startswith(MATTERMOST_PREFIX) else None
 
@@ -492,6 +577,8 @@ class Filters:
         *,
         kiosk_rate_per_hour: int = DEFAULT_KIOSK_RATE_PER_HOUR,
         loop_guard_window: int = DEFAULT_LOOP_GUARD_WINDOW,
+        kiosk_caps: Mapping[str, int] | None = None,
+        state_dir: Path | None = None,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Monotonic = time.monotonic,
     ) -> None:
@@ -504,6 +591,8 @@ class Filters:
         self.clock = clock
         self._mono = monotonic
         self._kiosk_hits = _Bounded()  # (outsider, expert, backend) -> deque of times
+        # The servers with `kiosk = true`, each with its daily cap (#117). Absent: no kiosk.
+        self.kiosk_daily = KioskDaily(kiosk_caps or {}, state_dir, clock=clock)
         self._skipped: set[tuple[str, str]] = set()  # trusted names logged as skipped
 
     @classmethod
@@ -521,6 +610,7 @@ class Filters:
             threads,
             kiosk_rate_per_hour=config.kiosk_rate_per_hour,
             loop_guard_window=config.loop_guard_window,
+            kiosk_caps={s.id: s.kiosk_daily_cap for s in config.mattermost if s.kiosk},
             **kwargs,
         )
 
@@ -622,12 +712,16 @@ class Filters:
             return DROP("outsider")  # omitted, never enqueued (R-21)
         if msg.kiosk:
             return DROP("kiosk_post")
+        if not self.kiosk_daily.server_on(server_id):
+            return DROP("kiosk_server_off")  # the operator's ceiling, over the switch (#117)
         if not state.kiosk_on:
             return DROP("kiosk_off")
         if not is_direct_address(msg, reg, self.threads.roots(reg.dev_name)):
             return DROP("not_direct")
         if not self._kiosk_rate_ok(msg.author_id, reg.dev_name, msg.backend):
             return DROP("kiosk_rate")
+        if not self.kiosk_daily.take(server_id):
+            return DROP("kiosk_daily_cap")
         return KIOSK
 
     def _kiosk_rate_ok(self, outsider: str, expert: str, backend: str) -> bool:

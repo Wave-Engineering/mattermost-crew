@@ -143,7 +143,7 @@ async def serve(
     # restart.
     threads = MyThreads.load(state_dir, config.my_threads_retention_days)
     # Membership, addressing, the loop guard and the switch, on push and pull (Story 3.3).
-    filters = Filters.from_config(registry, cache, threads, config)
+    filters = Filters.from_config(registry, cache, threads, config, state_dir=state_dir)
     kiosk = KioskQueue()  # push KIOSK verdicts, for Story 3.5's kiosk
     # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
     uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)

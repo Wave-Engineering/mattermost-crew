@@ -99,6 +99,12 @@ my_threads_retention_days = 90
 [[mattermost]]
 id = "oaw-dev"
 url = "https://mm.example.lan"
+# The kiosk answers outsiders on this server only when this is true. Optional, default false,
+# whatever the broker's `kiosk on` switch says (#117).
+kiosk = false
+# Kiosk answers on this server per UTC day, across every outsider and agent; 0 means none.
+# Optional, default 25. The count survives a daemon restart.
+kiosk_daily_cap = 25
 
 # Discord. With `enabled = true`, also set `screamhole_url`, and install the Discord credential
 # at /etc/crewchat/discord.credential (mode 0600).
@@ -122,6 +128,35 @@ and `url`, `[discord] enabled`, each `[crews.<crew>] needs_list`, and each
 `[crews.<crew>.<server_id>]` table's `broker_socket` and `broker_user_id`. A trusted crew is
 reached only through its own `[crews.<crew>.<server_id>]` table here; a trusted crew with no
 table on this host is skipped, and its senders are outsiders.
+
+**Per-server controls** (#117). Before the daemon joins a second server, such as a partner's,
+decide on it three things: whether the kiosk answers there, its daily kiosk cap, and which
+agents get an account there. For example, a second server where only one forge org's repos and
+one named agent appear, with no kiosk:
+
+```text
+[[mattermost]]
+id = "partner"
+url = "https://chat.example.lan"
+kiosk = false
+
+[crews.oaw.partner]
+broker_socket = "/run/crewbroker/oaw-partner.sock"
+broker_user_id = "<the broker account's user id on that server>"
+agents_allow = ["gitlab.com/partner-org", "name:helper"]
+agents_deny = ["name:scratch"]
+```
+
+- `agents_allow` (optional) lists who `register` mints an account for on that server. Without
+  it, every agent on the host gets one, as before. Each entry is a forge key `host/org` (the
+  agent's repo origin, reduced to its host and top-level group, compared exactly), an absolute
+  path (an agent whose repo is that directory or under it), or `name:<dev_name>`. An agent whose
+  shim sends no project key (one older than v0.2.3) matches only a `name:` entry.
+- `agents_deny` (optional) takes the same forms and always wins over `agents_allow`.
+- The allowlist is an accident guard, not a security boundary: an agent's project key and
+  Dev-Name are its own word, taken inside the host's trust boundary.
+- Taking an agent off a list later stops new mints, but doesn't revoke the account it already
+  has on that server. Revoke it through that server's broker, as in Rollback.
 
 ### `/etc/crewbroker/<crew>-<server_id>.toml`
 

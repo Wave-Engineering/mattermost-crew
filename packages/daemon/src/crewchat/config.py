@@ -11,6 +11,8 @@
     [[mattermost]]
     id = "oaw-dev"
     url = "https://mm.example.lan"
+    kiosk = true                         # optional; the kiosk is off on a server unless set
+    kiosk_daily_cap = 25                 # optional; kiosk answers per server per UTC day
 
     [discord]
     enabled = true
@@ -28,6 +30,8 @@
     [crews.oaw.oaw-dev]                  # one table per crew and Mattermost server
     broker_socket = "/run/crewbroker/oaw-oaw-dev.sock"
     broker_user_id = "<the broker account's user id>"
+    agents_allow = ["gitlab.com/partner-org", "/home/agent/work", "name:helper"]  # optional
+    agents_deny = ["name:scratch"]       # optional; always wins over agents_allow
 
 The `broker_user_id` entries are the configured broker list: the only accounts that may hold
 the patched role (R-06). IT-01 asserts against them.
@@ -50,6 +54,11 @@ DEFAULT_CREW_INFO_MAX_AGE_S = 300.0
 DEFAULT_REFETCH_MIN_INTERVAL_S = 2.0
 DEFAULT_KIOSK_RATE_PER_HOUR = 10
 DEFAULT_LOOP_GUARD_WINDOW = 20
+DEFAULT_KIOSK_DAILY_CAP = 25
+# An allowlist entry (#117): a forge key `host/org`, as `repo_key` gives it; an absolute path;
+# or `name:<dev_name>`.
+FORGE_ENTRY_RE = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9._-]+$")
+NAME_ENTRY_PREFIX = "name:"
 DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 CREW_KEYS = {"needs_list"}
@@ -63,16 +72,23 @@ class ConfigError(ValueError):
 class MattermostServer:
     id: str
     url: str
+    # The operator's ceiling on the kiosk for this server (#117): off unless turned on, whatever
+    # the broker's switch says. `kiosk_daily_cap` bounds its answers per UTC day.
+    kiosk: bool = False
+    kiosk_daily_cap: int = DEFAULT_KIOSK_DAILY_CAP
 
 
 @dataclass(frozen=True)
 class BrokerEntry:
-    """`[crews.<crew>.<server_id>]`: where that crew's broker for that server listens."""
+    """`[crews.<crew>.<server_id>]`: where that crew's broker for that server listens, and
+    which agents `register` mints an account for there (`crewchat.allowlist`, #117)."""
 
     crew: str
     server_id: str
     broker_socket: Path
     broker_user_id: str
+    agents_allow: tuple[str, ...] | None = None  # None: every agent (today's behaviour)
+    agents_deny: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,8 +237,40 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
             raise ConfigError(f"{source}: mattermost {sid} needs a url")
         if any(s.id == sid for s in servers):
             raise ConfigError(f"{source}: mattermost id {sid} is listed twice")
-        servers.append(MattermostServer(id=sid, url=url))
+        kiosk = item.get("kiosk", False)
+        if not isinstance(kiosk, bool):
+            raise ConfigError(f"{source}: mattermost {sid}.kiosk must be true or false")
+        cap = item.get("kiosk_daily_cap", DEFAULT_KIOSK_DAILY_CAP)
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+            # 0 is allowed: no kiosk answers on that server.
+            raise ConfigError(
+                f"{source}: mattermost {sid}.kiosk_daily_cap must be an integer of at least 0"
+            )
+        servers.append(MattermostServer(id=sid, url=url, kiosk=kiosk, kiosk_daily_cap=cap))
     return servers
+
+
+def _agents(value: Any, where: str, source: str) -> tuple[str, ...]:
+    """An `agents_allow` or `agents_deny` list; each entry in one of the three forms."""
+    if not isinstance(value, list):
+        raise ConfigError(f"{source}: {where} must be an array of strings")
+    entries: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ConfigError(f"{source}: {where} entries are strings")
+        if entry.startswith(NAME_ENTRY_PREFIX):
+            ok = NAME_RE.fullmatch(entry[len(NAME_ENTRY_PREFIX) :]) is not None
+        elif entry.startswith("/"):
+            ok = "\x00" not in entry
+        else:
+            ok = FORGE_ENTRY_RE.fullmatch(entry) is not None
+        if not ok:
+            raise ConfigError(
+                f"{source}: {where} entry {entry!r} is not host/org, an absolute path, "
+                "or name:<dev_name>"
+            )
+        entries.append(entry)
+    return tuple(entries)
 
 
 def _crew(name: str, value: Any, server_ids: set[str], source: str) -> CrewEntry:
@@ -246,7 +294,14 @@ def _crew(name: str, value: Any, server_ids: set[str], source: str) -> CrewEntry
             raise ConfigError(f"{source}: crews.{name}.{key}.broker_socket must be absolute")
         if not isinstance(broker_id, str) or not broker_id:
             raise ConfigError(f"{source}: crews.{name}.{key}.broker_user_id is required")
+        where = f"crews.{name}.{key}"
+        allow = table.get("agents_allow")
         brokers[key] = BrokerEntry(
-            crew=name, server_id=key, broker_socket=Path(sock), broker_user_id=broker_id
+            crew=name,
+            server_id=key,
+            broker_socket=Path(sock),
+            broker_user_id=broker_id,
+            agents_allow=None if allow is None else _agents(allow, f"{where}.agents_allow", source),
+            agents_deny=_agents(table.get("agents_deny", []), f"{where}.agents_deny", source),
         )
     return CrewEntry(name=name, needs_list=needs_list, brokers=brokers)

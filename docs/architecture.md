@@ -127,7 +127,9 @@ the kiosk; under social it is returned marked. Pull never gives a `KIOSK` verdic
 1. An outsider's post that is **directly** addressed (`@<dev>`, `@<dev>.<crew>`, a DM, or a reply
    in the agent's own thread) arrives while social is off and the kiosk is on: `KIOSK`. An
    outsider's broadcast or crew token is `DROP`, and so is anything past
-   `kiosk_rate_per_hour` per outsider, per expert, per server.
+   `kiosk_rate_per_hour` per outsider, per expert, per server. The operator's `servers.toml`
+   sits above the switch: a server without `kiosk = true` never kiosks, and each server's
+   kiosk answers are capped per UTC day by `kiosk_daily_cap`, a count that survives a restart.
 2. The daemon's kiosk session for that expert on that server (one per expert per server, started
    lazily) builds the prompt: a fixed header, the brief (the `## Kiosk` section the shim pushed,
    R-32), and **only the asker's own posts in the thread and the kiosk's own earlier answers**.
