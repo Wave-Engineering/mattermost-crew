@@ -204,6 +204,39 @@ def test_register_retires_token_on_newly_disallowed_server(
     assert "prod" not in on_disk["servers"] and not on_disk["pending_revoke"]
 
 
+def test_register_retries_failed_retire_revoke(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """#117: a retire whose revoke fails is retried by the next `register` that skips the
+    server, though no token is held there any more; nothing else reaches that server."""
+    raw = _two_servers(servers_toml)
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/partner-org"]
+    daemon = make_daemon(raw)
+    asyncio.run(
+        daemon.registry.register("babel", "oaw", "s1", project_key="forge.example.lan/partner-org")
+    )
+    held = daemon.store.held_token_id("babel", "oaw", "prod")
+    assert held is not None
+    prod = daemon.broker("oaw", "prod")
+
+    # The same daemon, an excluded repo: the retire's revoke fails.
+    prod.fail["revoke"] = BrokerUnavailable("timeout")
+    other = "forge.example.lan/other"
+    asyncio.run(daemon.registry.register("babel", "oaw", "s2", project_key=other))
+    assert daemon.store.token_for("babel", "prod") is None
+    assert held in prod.live
+    assert daemon.store.agent("babel").pending_revoke["prod"] == [held]
+
+    del prod.fail["revoke"]
+    asyncio.run(daemon.registry.register("babel", "oaw", "s3", project_key=other))
+    assert [a["token_id"] for a in prod.ops("revoke")] == [held, held]
+    assert held not in prod.live
+    assert not daemon.store.agent("babel").pending_revoke["prod"]
+    on_disk = json.loads(daemon.store.path_for("babel").read_text(encoding="utf-8"))
+    assert not on_disk["pending_revoke"]
+    assert len(prod.ops("mint")) == 1  # only the first register minted there
+
+
 def test_register_disallowed_everywhere_keeps_discord(
     make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
 ) -> None:

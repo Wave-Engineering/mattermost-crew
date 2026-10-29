@@ -159,8 +159,8 @@ agents_deny = ["name:scratch"]
   Dev-Name are its own word, taken inside the host's trust boundary.
 - Taking an agent off a list later (and restarting the daemon) stops new mints, and the agent's
   next `register` revokes the token it holds on that server and takes that server out of its
-  daily rotation. Its bot account stays, inactive once the broker's 30-day idle sweep reaches
-  it.
+  daily rotation; a revoke that fails is retried at each later `register`. Its bot account
+  stays, inactive once the broker's 30-day idle sweep reaches it.
 
 ### `/etc/crewbroker/<crew>-<server_id>.toml`
 

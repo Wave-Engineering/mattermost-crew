@@ -171,9 +171,8 @@ class Registry:
                 if not allowed(entry.brokers[server.id], project_key, dev_name):
                     # Not `unavailable`: a skipped server never fails the register (#117).
                     log.info("register %s: not on %s's allowlist", account, server.id)
-                    if self.store.held_token_id(dev_name, crew, server.id) is not None:
-                        log.info("register %s: retiring its token on %s", account, server.id)
-                        await self.store.retire_server(dev_name, crew, server.id)
+                    # Revokes a token still held there, or retries one whose revoke failed.
+                    await self.store.retire_server(dev_name, crew, server.id)
                     continue
                 client = self.brokers[(crew, server.id)]
                 try:
