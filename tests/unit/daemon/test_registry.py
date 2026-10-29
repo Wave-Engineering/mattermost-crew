@@ -151,17 +151,19 @@ def test_register_skips_disallowed_server(
     """#117: with an allowlist on one server, `register` mints there only for an agent it
     admits, and a skipped server is neither minted nor `unavailable`."""
     raw = _two_servers(servers_toml)
-    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["gitlab.com/partner-org", "name:helper"]
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/partner-org", "name:helper"]
     daemon = make_daemon(raw)
 
-    reg = asyncio.run(daemon.registry.register("babel", "oaw", "s1", project_key="github.com/x"))
+    reg = asyncio.run(
+        daemon.registry.register("babel", "oaw", "s1", project_key="forge.example.lan/other")
+    )
     assert reg.backends == ["mattermost:dev", "discord"]
     assert reg.unavailable == []
     assert daemon.broker("oaw", "prod").ops("mint") == []
     assert daemon.store.token_for("babel", "prod") is None
 
     reg = asyncio.run(
-        daemon.registry.register("kessel", "oaw", "s1", project_key="gitlab.com/partner-org")
+        daemon.registry.register("kessel", "oaw", "s1", project_key="forge.example.lan/partner-org")
     )
     assert reg.backends == ["mattermost:dev", "mattermost:prod", "discord"]
     reg = asyncio.run(daemon.registry.register("helper", "oaw", "s1"))  # by name, no key
@@ -171,9 +173,35 @@ def test_register_skips_disallowed_server(
     raw["crews"]["oaw"]["prod"]["agents_deny"] = ["name:kessel"]
     daemon = make_daemon(raw)
     reg = asyncio.run(
-        daemon.registry.register("kessel", "oaw", "s1", project_key="gitlab.com/partner-org")
+        daemon.registry.register("kessel", "oaw", "s1", project_key="forge.example.lan/partner-org")
     )
     assert reg.backends == ["mattermost:dev", "discord"]
+
+
+def test_register_retires_token_on_newly_disallowed_server(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """#117: an agent taken off a server's allowlist has its token there revoked by its next
+    `register`, and that server leaves its rotation; its other servers are untouched."""
+    raw = _two_servers(servers_toml)
+    daemon = make_daemon(raw)
+    register(daemon)
+    held = daemon.store.held_token_id("babel", "oaw", "prod")
+    assert held is not None
+
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["name:helper"]
+    restarted = make_daemon(raw)  # the same token directory, as after a daemon restart
+    restarted.store.load()
+    prod = restarted.broker("oaw", "prod")
+    prod.live[held] = "babel.oaw"  # the real broker still holds it
+    reg = register(restarted)
+    assert reg.backends == ["mattermost:dev", "discord"]
+    assert restarted.store.token_for("babel", "prod") is None
+    assert restarted.store.token_for("babel", "dev") is not None
+    assert [a["token_id"] for a in prod.ops("revoke")] == [held]
+    assert held not in prod.live and prod.ops("mint") == []
+    on_disk = json.loads(restarted.store.path_for("babel").read_text(encoding="utf-8"))
+    assert "prod" not in on_disk["servers"] and not on_disk["pending_revoke"]
 
 
 def test_register_disallowed_everywhere_keeps_discord(
@@ -183,7 +211,7 @@ def test_register_disallowed_everywhere_keeps_discord(
     empty `project_key` fails closed under an allowlist."""
     raw = _two_servers(servers_toml)
     for sid in ("dev", "prod"):
-        raw["crews"]["oaw"][sid]["agents_allow"] = ["gitlab.com/partner-org"]
+        raw["crews"]["oaw"][sid]["agents_allow"] = ["forge.example.lan/partner-org"]
     daemon = make_daemon(raw)
     reg = register(daemon)  # sends no project_key
     assert reg.backends == ["discord"] and reg.unavailable == []
@@ -197,7 +225,7 @@ def test_register_project_key_over_the_socket(
     from crewchat.server import DaemonServer, build_handlers
 
     raw = _two_servers(servers_toml)
-    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["gitlab.com/partner-org"]
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/partner-org"]
     daemon = make_daemon(raw)
     server = DaemonServer(build_handlers(daemon.config, daemon.registry))
 
@@ -205,9 +233,9 @@ def test_register_project_key_over_the_socket(
         frame = {"proto": 1, "id": "x", "op": "register", "args": args}
         return asyncio.run(server.handle_line(json.dumps(frame).encode()))
 
-    got = call(dev_name="babel", session_id="s1", project_key="gitlab.com/partner-org")
+    got = call(dev_name="babel", session_id="s1", project_key="forge.example.lan/partner-org")
     assert got["result"]["backends"] == ["mattermost:dev", "mattermost:prod", "discord"]
-    bad = call(dev_name="babel", session_id="s1", project_key=["gitlab.com/partner-org"])
+    bad = call(dev_name="babel", session_id="s1", project_key=["forge.example.lan/partner-org"])
     assert bad["ok"] is False and bad["error"].startswith("bad_request")
 
 

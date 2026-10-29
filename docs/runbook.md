@@ -143,7 +143,7 @@ kiosk = false
 [crews.oaw.partner]
 broker_socket = "/run/crewbroker/oaw-partner.sock"
 broker_user_id = "<the broker account's user id on that server>"
-agents_allow = ["gitlab.com/partner-org", "name:helper"]
+agents_allow = ["forge.example.lan/partner-org", "name:helper"]
 agents_deny = ["name:scratch"]
 ```
 
@@ -152,11 +152,15 @@ agents_deny = ["name:scratch"]
   agent's repo origin, reduced to its host and top-level group, compared exactly), an absolute
   path (an agent whose repo is that directory or under it), or `name:<dev_name>`. An agent whose
   shim sends no project key (one older than v0.2.3) matches only a `name:` entry.
-- `agents_deny` (optional) takes the same forms and always wins over `agents_allow`.
+- `agents_deny` (optional) takes the same forms and always wins over `agents_allow`. A forge key
+  or path in it never matches an older shim, so a deny-only list lets those agents through; to
+  keep one out, deny it by `name:` too.
 - The allowlist is an accident guard, not a security boundary: an agent's project key and
   Dev-Name are its own word, taken inside the host's trust boundary.
-- Taking an agent off a list later stops new mints, but doesn't revoke the account it already
-  has on that server. Revoke it through that server's broker, as in Rollback.
+- Taking an agent off a list later (and restarting the daemon) stops new mints, and the agent's
+  next `register` revokes the token it holds on that server and takes that server out of its
+  daily rotation. Its bot account stays, inactive once the broker's 30-day idle sweep reaches
+  it.
 
 ### `/etc/crewbroker/<crew>-<server_id>.toml`
 

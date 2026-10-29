@@ -7,7 +7,7 @@ from pathlib import Path
 from crewchat.allowlist import allowed, matches
 from crewchat.config import BrokerEntry
 
-FORGE = "gitlab.com/partner-org"
+FORGE = "forge.example.lan/partner-org"
 
 
 def entry(allow: tuple[str, ...] | None = None, deny: tuple[str, ...] = ()) -> BrokerEntry:
@@ -28,16 +28,16 @@ def test_allowed_rules() -> None:
     # Allowlisted by forge key (exact), by path or by name.
     allow = entry(allow=(FORGE, "/home/agent/work", "name:helper"))
     assert allowed(allow, FORGE, "babel")
-    assert not allowed(allow, "gitlab.com/partner-org2", "babel")
-    assert not allowed(allow, "github.com/partner-org", "babel")
+    assert not allowed(allow, "forge.example.lan/partner-org2", "babel")
+    assert not allowed(allow, "other.example.lan/partner-org", "babel")
     assert allowed(allow, "/home/agent/work/repo", "babel")
     assert allowed(allow, "/home/agent/work", "babel")
-    assert allowed(allow, "github.com/elsewhere", "helper")
-    assert not allowed(allow, "github.com/elsewhere", "babel")
+    assert allowed(allow, "forge.example.lan/elsewhere", "helper")
+    assert not allowed(allow, "forge.example.lan/elsewhere", "babel")
     # Deny beats allow, by any form.
     assert not allowed(entry(allow=(FORGE,), deny=("name:babel",)), FORGE, "babel")
     assert not allowed(entry(deny=(FORGE,)), FORGE, "babel")
-    assert allowed(entry(deny=(FORGE,)), "github.com/other", "babel")
+    assert allowed(entry(deny=(FORGE,)), "forge.example.lan/other", "babel")
     # An empty allowlist admits nobody.
     assert not allowed(entry(allow=()), FORGE, "babel")
 
@@ -55,5 +55,5 @@ def test_path_matches_by_component() -> None:
     assert matches("/a/b/", "/a/b/c", "x")
     assert not matches("/a/b", "/a/bc", "x")
     assert not matches("/a/b", "/a", "x")
-    assert not matches("/a/b", "gitlab.com/a", "x")  # a forge key is never under a path
-    assert not matches(FORGE, "/gitlab.com/partner-org", "x")
+    assert not matches("/a/b", "forge.example.lan/a", "x")  # a forge key is never under a path
+    assert not matches(FORGE, "/forge.example.lan/partner-org", "x")

@@ -30,7 +30,7 @@
     [crews.oaw.oaw-dev]                  # one table per crew and Mattermost server
     broker_socket = "/run/crewbroker/oaw-oaw-dev.sock"
     broker_user_id = "<the broker account's user id>"
-    agents_allow = ["gitlab.com/partner-org", "/home/agent/work", "name:helper"]  # optional
+    agents_allow = ["forge.example.lan/partner-org", "/home/agent/work", "name:helper"]  # optional
     agents_deny = ["name:scratch"]       # optional; always wins over agents_allow
 
 The `broker_user_id` entries are the configured broker list: the only accounts that may hold

@@ -171,8 +171,11 @@ class Registry:
                 if not allowed(entry.brokers[server.id], project_key, dev_name):
                     # Not `unavailable`: a skipped server never fails the register (#117).
                     log.info("register %s: not on %s's allowlist", account, server.id)
+                    if self.store.held_token_id(dev_name, crew, server.id) is not None:
+                        log.info("register %s: retiring its token on %s", account, server.id)
+                        await self.store.retire_server(dev_name, crew, server.id)
                     continue
-                client =self.brokers[(crew, server.id)]
+                client = self.brokers[(crew, server.id)]
                 try:
                     held = self.store.held_token_id(dev_name, crew, server.id)
                     minted = await client.mint(dev_name, crew, held)

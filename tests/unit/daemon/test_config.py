@@ -169,23 +169,24 @@ def test_server_kiosk_types_refused(change: dict[str, Any], message: str) -> Non
 def test_allowlist_entry_forms() -> None:
     raw = _raw()
     raw["crews"]["oaw"]["dev"].update(
-        agents_allow=["gitlab.com/partner-org", "/home/agent/work", "name:helper"],
+        agents_allow=["forge.example.lan/partner-org", "/home/agent/work", "name:helper"],
         agents_deny=["name:scratch"],
     )
     broker = parse_config(raw).crews["oaw"].brokers["dev"]
-    assert broker.agents_allow == ("gitlab.com/partner-org", "/home/agent/work", "name:helper")
+    want = ("forge.example.lan/partner-org", "/home/agent/work", "name:helper")
+    assert broker.agents_allow == want
     assert broker.agents_deny == ("name:scratch",)
     raw["crews"]["oaw"]["dev"]["agents_allow"] = []
     assert parse_config(raw).crews["oaw"].brokers["dev"].agents_allow == ()  # nobody
 
     for key, bad in (
-        ("agents_allow", ["https://gitlab.com/partner-org"]),  # a URL, not a key
-        ("agents_allow", ["GitLab.com/partner-org"]),  # repo_key lowercases the host
-        ("agents_allow", ["gitlab.com/partner-org/sub"]),  # only the top-level group
+        ("agents_allow", ["https://forge.example.lan/partner-org"]),  # a URL, not a key
+        ("agents_allow", ["Forge.example.lan/partner-org"]),  # repo_key lowercases the host
+        ("agents_allow", ["forge.example.lan/partner-org/sub"]),  # only the top-level group
         ("agents_allow", ["relative/path/x"]),
         ("agents_allow", ["name:"]),
         ("agents_allow", ["name:Bad Name"]),
-        ("agents_allow", "gitlab.com/partner-org"),  # not an array
+        ("agents_allow", "forge.example.lan/partner-org"),  # not an array
         ("agents_deny", [3]),
     ):
         raw = _raw()

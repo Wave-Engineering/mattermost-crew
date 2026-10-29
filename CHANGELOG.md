@@ -21,7 +21,9 @@ All notable changes to this project are recorded here. The format follows
   doesn't reset it.
 - `agents_allow` and `agents_deny` per `[crews.<crew>.<server_id>]`: which agents `register`
   mints an account for on that server, by forge key (`host/org`), absolute path or
-  `name:<dev_name>`, with deny winning (#117). It's an accident guard, not a security boundary.
+  `name:<dev_name>`, with deny winning (#117). An agent taken off a server's list has the token
+  it holds there revoked at its next `register`, and that server leaves its daily rotation.
+  It's an accident guard, not a security boundary.
   The shim's `register` sends `project_key`, its `repo_key()` and never a remote URL. An older
   shim sends none, and gets no account where an allowlist is set, unless a `name:` entry names
   it.

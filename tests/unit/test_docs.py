@@ -136,7 +136,7 @@ def test_runbook_partner_server_example_loads() -> None:
     partner = next(s for s in parsed.mattermost if s.id == "partner")
     assert partner.kiosk is False
     entry = parsed.crews["oaw"].brokers["partner"]
-    assert entry.agents_allow == ("gitlab.com/partner-org", "name:helper")
+    assert entry.agents_allow == ("forge.example.lan/partner-org", "name:helper")
     assert entry.agents_deny == ("name:scratch",)
     assert "accident guard, not a security boundary" in body
 

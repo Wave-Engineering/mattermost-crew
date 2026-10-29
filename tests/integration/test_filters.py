@@ -596,10 +596,11 @@ def test_it23_kiosk_off_drops_outsiders(
 
 
 def test_kiosk_server_flag_over_the_switch(
-    mattermost: Any, world: dict[str, Any], tmp_path: Path
+    mattermost: Any, world: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """#117: with `kiosk = false` on the server, an outsider's direct address is never
-    kiosked, though the broker's switch has the kiosk on."""
+    kiosked, though the broker's switch has the kiosk on: it is dropped as `kiosk_server_off`."""
+    caplog.set_level("DEBUG", logger="crewchat.doorbell")
 
     async def scenario() -> None:
         rig = Rig(mattermost, world, tmp_path, kiosk=False)
@@ -612,6 +613,8 @@ def test_kiosk_server_flag_over_the_switch(
             rig.post_as(rig.outsider_token, "@babel is the kiosk here?")
             await rig.dropped("kiosk server off")
             assert rig.kiosked() == []
+            drops = [r.getMessage() for r in caplog.records if r.name == "crewchat.doorbell"]
+            assert any(m.endswith(": kiosk_server_off") for m in drops), drops
         finally:
             await rig.aclose()
 
