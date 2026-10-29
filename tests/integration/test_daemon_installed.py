@@ -189,6 +189,8 @@ def test_kiosk_answers_through_the_socket(installed: dict[str, Any]) -> None:
         "",
         "--disallowedTools",
         "mcp__*",
+        "--settings",
+        '{"switchModelsOnFlag":false}',
         "--model",
         "haiku-latest",
     ]

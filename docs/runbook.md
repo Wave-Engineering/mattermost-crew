@@ -202,7 +202,7 @@ from `/users/me`, and so is `minted_bot_ids`, which only the broker records.
 | File | What it is | Write it as | The install hands it to |
 |---|---|---|---|
 | `/etc/crewbroker/<crew>-<server_id>.credential` | the broker account's personal access token, one line | 0600, root | `crewbroker`, 0600 |
-| `/etc/crewkiosk/model.credential` | the kiosk's model API key: the key alone, one line (kiosk hosts only). `ANTHROPIC_API_KEY=<key>` is also accepted; any other line holding an `=` is refused, so a key that itself contains `=` can't be used | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
+| `/etc/crewkiosk/model.credential` | the kiosk's model API key: the key alone, one line (kiosk hosts only). `ANTHROPIC_API_KEY=<key>` is also accepted; any other line holding an `=` is refused, so a key that itself contains `=` can't be used, and so is one with whitespace in it: write it with Unix line endings, and no padding | 0600, root, in `/etc/crewkiosk` | `crewkiosk`, 0600 |
 | `/etc/crewchat/discord.credential` | the Discord credential (only with Discord enabled) | 0600, root | `crewchat`, 0600 |
 
 For example, for the broker's token, without it passing through the shell's history:
@@ -223,16 +223,22 @@ and takes the key as `x-api-key` (a LiteLLM proxy, for example). Write it as 060
 ```text
 # The model gateway. Optional: without it the kiosk calls the Anthropic API directly.
 base_url=https://llm.example.lan
-# The pinned model. Optional, default haiku: an alias the gateway allowlists, or a model name.
+# The pinned model. Optional, default claude-haiku-5-5: a full model name, or with base_url
+# set, the gateway's name for one.
 model=haiku-latest
 ```
 
 Only `KEY=value` lines, blank lines and `#` comments, with no spaces around the `=`. The runner
-reads the file, never sources it, and refuses to run on an unknown key, a `base_url` that is not
-`https://` or holds a space, or a `model` outside `A-Z a-z 0-9 . _ : -`. With no file the model is
-`haiku` and there is no gateway. The runner always pins the model: it passes `--model <model>`
-and sets every model variable Claude Code reads to it, so the CLI never asks the gateway for a
-model it doesn't allow.
+reads the file, never sources it, and refuses to run on an unknown key (it reports the line's
+number, never its text), a `base_url` that is not `https://` or holds a space, or a `model`
+outside `A-Z a-z 0-9 . _ : -`. With no file the model is `claude-haiku-5-5` and there is no
+gateway. The runner always pins the model: it passes `--model <model>` and sets every model
+variable Claude Code reads to it, so the CLI never asks the gateway for a model it doesn't allow.
+Claude Code sends those variables' values as model IDs, so with no `base_url` the runner refuses
+one of Claude Code's own aliases (`haiku`, `sonnet`, `opus`, `fable`, `opusplan`, `default`,
+`best`) as `model`; behind a gateway the value is the gateway's name, whatever it is. The runner
+also turns off Claude Code's model switch on a flagged request (`switchModelsOnFlag`), so a
+request the safety classifiers flag ends as an error, not a re-run on another model.
 
 ## Install the daemon
 

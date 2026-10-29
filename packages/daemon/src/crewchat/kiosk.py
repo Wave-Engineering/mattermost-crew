@@ -93,6 +93,9 @@ CLAUDE_FLAGS = (
     "",
     "--disallowedTools",
     "mcp__*",
+    # A flagged request ends as an error, never re-run on a model the gateway may not allow.
+    "--settings",
+    '{"switchModelsOnFlag":false}',
 )
 RUNNER_TIMEOUT_S = 120.0
 MAX_ANSWER_CHARS = 16_000  # under Mattermost's 16383-character post limit

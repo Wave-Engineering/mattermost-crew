@@ -117,6 +117,8 @@ def test_runner_has_no_tools(tmp_path: Path) -> None:
         "",
         "--disallowedTools",
         "mcp__*",
+        "--settings",
+        '{"switchModelsOnFlag":false}',
     )
     assert re.search(r"^KIOSK_USER=crewkiosk$", WRAPPER.read_text(), re.M)
     assert re.search(r"^CREDENTIAL=/etc/crewkiosk/model.credential$", WRAPPER.read_text(), re.M)
@@ -213,8 +215,8 @@ def test_wrapper_runs_claude_bare(tmp_path: Path) -> None:
     assert proc.stdout == b"ok\nthe answer\n"  # framed: a socket carries no exit status
     assert parse_reply(proc.stdout) == "the answer"
     argv = (record / "argv").read_text().split("\n")[:-1]
-    assert tuple(argv) == (*CLAUDE_FLAGS, "--model", "haiku")
-    assert (record / "argc").read_text().strip() == "9"
+    assert tuple(argv) == (*CLAUDE_FLAGS, "--model", "claude-haiku-5-5")
+    assert (record / "argc").read_text().strip() == "11"
     assert (record / "stdin").read_bytes() == b"THE-PROMPT"
     # An empty HOME and an empty working directory, both fresh and gone afterwards.
     assert (record / "home").read_text() == "" and (record / "work").read_text() == ""
@@ -235,6 +237,7 @@ MODEL_VARS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
 )
 BASH_OWN = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -257,15 +260,32 @@ def run_wrapper(script: Path, **env: str) -> subprocess.CompletedProcess[bytes]:
 
 
 def test_wrapper_pins_default_model(tmp_path: Path) -> None:
-    """No model.conf: the pin is `haiku`, on the command line and in all five variables."""
+    """No model.conf: the pin is the full Haiku model name, on the command line and in all six
+    variables. A variable's value is sent as a model ID, never resolved again as an alias."""
     script, record, _key = sandboxed_wrapper(tmp_path, getpass.getuser())
     proc = run_wrapper(script, ANTHROPIC_MODEL="opus", ANTHROPIC_SMALL_FAST_MODEL="opus")
     assert proc.returncode == 0, proc.stderr
     argv = (record / "argv").read_text().split("\n")[:-1]
-    assert argv[-2:] == ["--model", "haiku"]
+    assert argv[-2:] == ["--model", "claude-haiku-5-5"]
     env_out = recorded_env(record)
-    assert {name: env_out.get(name) for name in MODEL_VARS} == dict.fromkeys(MODEL_VARS, "haiku")
+    pinned = dict.fromkeys(MODEL_VARS, "claude-haiku-5-5")
+    assert {name: env_out.get(name) for name in MODEL_VARS} == pinned
     assert "ANTHROPIC_BASE_URL" not in env_out
+
+
+def test_wrapper_refuses_bare_alias_without_gateway(tmp_path: Path) -> None:
+    """With no base_url, a Claude Code alias would reach the API as a model ID: refused. Behind
+    a gateway the same word is the gateway's own name for a model, and passes."""
+    script, record, _key = sandboxed_wrapper(tmp_path, getpass.getuser())
+    for alias in ("haiku", "sonnet", "opus", "fable", "opusplan", "default", "best", "Haiku"):
+        (tmp_path / "model.conf").write_text(f"model={alias}\n")
+        proc = run_wrapper(script)
+        assert proc.returncode == 66 and b"full model name" in proc.stderr, alias
+        assert proc.stdout == b"" and not (record / "argv").exists()
+    for conf in ("model=claude-sonnet-5-5\n", "base_url=https://llm.example.lan\nmodel=haiku\n"):
+        (tmp_path / "model.conf").write_text(conf)
+        proc = run_wrapper(script)
+        assert proc.returncode == 0, (conf, proc.stderr)
 
 
 def test_wrapper_uses_gateway_conf(tmp_path: Path) -> None:
@@ -284,10 +304,19 @@ def test_wrapper_uses_gateway_conf(tmp_path: Path) -> None:
 
 def test_wrapper_refuses_unknown_conf_key(tmp_path: Path) -> None:
     script, record, _key = sandboxed_wrapper(tmp_path, getpass.getuser())
-    for conf in ("api_key=sk-sneaky\n", "model=haiku\nPATH=/tmp\n", "base_url = https://a.lan\n"):
+    for conf, line in (
+        ("api_key=sk-sneaky\n", 1),
+        ("model=claude-haiku-5-5\nPATH=/tmp\n", 2),
+        ("base_url = https://a.lan\n", 1),
+        ("# a comment\n\nsk-ant-pasted-by-mistake\n", 3),  # no `=`: the whole line is the key
+    ):
         (tmp_path / "model.conf").write_text(conf)
         proc = run_wrapper(script)
         assert proc.returncode == 66 and b"unknown key" in proc.stderr, conf
+        assert f"line {line}:".encode() in proc.stderr, conf
+        # Never the line's text: it may be a key pasted into the wrong file.
+        for secret in (b"sneaky", b"pasted-by-mistake", b"PATH", b"a.lan"):
+            assert secret not in proc.stderr, conf
         assert proc.stdout == b"" and not (record / "argv").exists()
 
 
@@ -330,10 +359,18 @@ def test_wrapper_accepts_prefixed_credential(tmp_path: Path) -> None:
 
 def test_wrapper_refuses_other_assignment(tmp_path: Path) -> None:
     script, record, key = sandboxed_wrapper(tmp_path, getpass.getuser())
-    for line in ("FOO=k\n", "ANTHROPIC_API_KEY=a=b\n", "export ANTHROPIC_API_KEY=k\n"):
+    for line in (
+        "FOO=k\n",
+        "ANTHROPIC_API_KEY=a=b\n",
+        "export ANTHROPIC_API_KEY=k\n",
+        "k\r\n",  # a CRLF line ending: the \r would be sent as part of the key
+        " k\n",
+        "k \n",
+        "ANTHROPIC_API_KEY=k\r\n",
+    ):
         key.write_text(line)
         proc = run_wrapper(script)
-        assert proc.returncode == 65 and str(key).encode() in proc.stderr, line
+        assert proc.returncode == 65 and str(key).encode() in proc.stderr, repr(line)
         assert proc.stdout == b"" and not (record / "argv").exists()
     key.write_text("ANTHROPIC_API_KEY=\n")
     proc = run_wrapper(script)
@@ -341,7 +378,7 @@ def test_wrapper_refuses_other_assignment(tmp_path: Path) -> None:
 
 
 def test_wrapper_env_is_exact(tmp_path: Path) -> None:
-    """The CLI's environment is the allowlist: the key, the gateway when set, the five model
+    """The CLI's environment is the allowlist: the key, the gateway when set, the six model
     variables, HOME and PATH, and what bash adds."""
     allowed = {"ANTHROPIC_API_KEY", *MODEL_VARS, "HOME", "PATH"}
     script, record, _key = sandboxed_wrapper(tmp_path, getpass.getuser())
@@ -376,10 +413,18 @@ def test_wrapper_refuses_another_user(tmp_path: Path) -> None:
 
 
 def test_wrapper_needs_its_credential(tmp_path: Path) -> None:
+    """An empty, missing or unreadable credential is exit 65, the credential's own code."""
     script, record, key = sandboxed_wrapper(tmp_path, getpass.getuser())
     key.write_text("")
     proc = subprocess.run([str(script)], input=b"x", capture_output=True, timeout=30)
-    assert proc.returncode != 0 and not (record / "argv").exists()
+    assert proc.returncode == 65 and not (record / "argv").exists()
+    if os.geteuid() != 0:  # root reads a mode-0000 file
+        key.write_text("k\n")
+        key.chmod(0)
+        proc = subprocess.run([str(script)], input=b"x", capture_output=True, timeout=30)
+        assert proc.returncode == 65 and b"cannot read" in proc.stderr
+        assert not (record / "argv").exists()
     key.unlink()
     proc = subprocess.run([str(script)], input=b"x", capture_output=True, timeout=30)
-    assert proc.returncode != 0 and not (record / "argv").exists()
+    assert proc.returncode == 65 and b"cannot read" in proc.stderr
+    assert not (record / "argv").exists()
