@@ -8,6 +8,14 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **The shim's logging can be turned up and kept in a file** (#144). Claude Code doesn't keep
+  an MCP server's stderr after it connects, so the shim's own lines couldn't be seen in the
+  field. `CREWCHAT_SHIM_LOG` sets the level (`debug`, `info` or `warning`; `info` by default),
+  and `CREWCHAT_SHIM_LOG_FILE`, an absolute path, appends the same lines to a file created
+  0600. `debug` shows the timer's `tick` and `ping:` lines. Set them in the MCP server's
+  environment for one session, then remove them: the file never rotates. A bad level or path
+  logs one WARNING, and the shim starts on stderr as before.
+
 - **The kiosk's corpus pool, per server** (#139, the first part of #136). A `[[mattermost]]`
   server can set `kiosk_research = true`, with `corpus_extra`, `corpus_exclude` (full repos,
   `host/group/.../repo`) and `corpus_refresh_minutes`. The shim now sends its repo's full forge

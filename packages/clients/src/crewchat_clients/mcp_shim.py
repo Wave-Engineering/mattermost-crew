@@ -42,6 +42,12 @@ and the daemon acts on the agent's behalf with what it holds itself.
   daemon restart with no tool call, and its doorbell, waiting through the restart, delivers.
   A daemon without the op (`unsupported`) is asked again every `PING_EVERY` too: the upgrade
   that brings the op is itself a restart, and a shim that stopped asking missed it (#137).
+- **Logging (#144).** INFO on stderr by default. Claude Code doesn't keep an MCP server's
+  stderr after it connects, so a field check needs a file: `CREWCHAT_SHIM_LOG` sets the level
+  (`debug`, `info` or `warning`, any case), and `CREWCHAT_SHIM_LOG_FILE`, an absolute path,
+  appends the same lines to that file, created 0600 and never rotated. `debug` shows the
+  timer's `tick` and `ping:` lines. Turn both on for a session, then remove them. A bad level
+  or path logs one WARNING and the shim starts anyway, on stderr.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
@@ -903,14 +909,45 @@ def find_repo_root(start: Path) -> Path:
     return Path(top) if proc.returncode == 0 and top else start
 
 
+LOG_FORMAT = "%(asctime)s %(name)s %(message)s"
+LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
+
+
+def configure_logging(environ: Mapping[str, str]) -> None:
+    """The root logger: stderr always, at `CREWCHAT_SHIM_LOG` (`info` by default), plus the
+    file `CREWCHAT_SHIM_LOG_FILE` names (#144). A bad level or path logs one WARNING and
+    leaves stderr alone: the shim never fails to start over its logging."""
+    root = logging.getLogger()
+    stderr = logging.StreamHandler(sys.stderr)
+    stderr.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(stderr)
+    wanted = environ.get("CREWCHAT_SHIM_LOG", "info")
+    level = LOG_LEVELS.get(wanted.lower())
+    root.setLevel(level or logging.INFO)
+    if level is None:
+        log.warning("CREWCHAT_SHIM_LOG=%r is not debug, info or warning: using info", wanted)
+    path = environ.get("CREWCHAT_SHIM_LOG_FILE")
+    if not path:
+        return
+    if not os.path.isabs(path):
+        log.warning("CREWCHAT_SHIM_LOG_FILE=%r is not an absolute path: stderr only", path)
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError as exc:
+        log.warning("CREWCHAT_SHIM_LOG_FILE=%r can't be opened (%s): stderr only", path, exc)
+        return
+    to_file = logging.StreamHandler(os.fdopen(fd, "a", buffering=1, encoding="utf-8"))
+    to_file.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(to_file)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crewchat-mcp")
     parser.add_argument("--socket", type=Path, default=SOCKET_PATH)
     parser.add_argument("--repo-root", type=Path, default=None)
     ns = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(message)s"
-    )
+    configure_logging(os.environ)
     root = ns.repo_root or find_repo_root(Path.cwd())
     try:
         shim = Shim(root, SocketTransport(ns.socket))

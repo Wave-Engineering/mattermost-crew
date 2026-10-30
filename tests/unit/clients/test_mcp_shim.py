@@ -1075,3 +1075,91 @@ def test_socket_transport(tmp_path: Path) -> None:
     finally:
         sock.unlink(missing_ok=True)
         short.rmdir()
+
+
+# -- logging (#144) ---------------------------------------------------------------------------
+@pytest.fixture
+def root_logger() -> Iterator[logging.Logger]:
+    """The root logger, put back as it was: `configure_logging` adds handlers to it."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield root
+    for handler in root.handlers:
+        if handler not in handlers:
+            handler.close()
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
+
+def added(root: logging.Logger, before: list[logging.Handler]) -> list[logging.Handler]:
+    return [h for h in root.handlers if h not in before]
+
+
+def shim_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "crewchat_clients.mcp_shim" and r.levelno == logging.WARNING
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "level", "warned"),
+    [
+        (None, logging.INFO, False),
+        ("debug", logging.DEBUG, False),
+        ("INFO", logging.INFO, False),
+        ("Warning", logging.WARNING, False),
+        ("loud", logging.INFO, True),
+    ],
+)
+def test_shim_log_level_switch(
+    root_logger: logging.Logger,
+    caplog: pytest.LogCaptureFixture,
+    value: str | None,
+    level: int,
+    warned: bool,
+) -> None:
+    """`CREWCHAT_SHIM_LOG` sets the root level, in any case; unset is today's INFO on stderr,
+    and an unknown value is INFO with one WARNING."""
+    before = list(root_logger.handlers)
+    mcp_shim.configure_logging({} if value is None else {"CREWCHAT_SHIM_LOG": value})
+    assert root_logger.level == level
+    (stderr,) = added(root_logger, before)
+    assert isinstance(stderr, logging.StreamHandler) and stderr.stream is mcp_shim.sys.stderr
+    assert len(shim_warnings(caplog)) == (1 if warned else 0)
+
+
+def test_shim_log_file(
+    tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file gets the timer's DEBUG `ping:` line, at mode 0600, beside stderr."""
+    path = tmp_path / "shim.log"
+    before = list(root_logger.handlers)
+    env = {"CREWCHAT_SHIM_LOG": "debug", "CREWCHAT_SHIM_LOG_FILE": str(path)}
+    mcp_shim.configure_logging(env)
+    assert len(added(root_logger, before)) == 2 and not shim_warnings(caplog)
+    daemon, clock = RestartingDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.tick()
+
+    asyncio.run(scenario())
+    assert f"ping: the daemon holds {DEV}" in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("where", ["relative", "unopenable"])
+def test_shim_log_file_bad_path_falls_back(
+    tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture, where: str
+) -> None:
+    """A relative path, or one that can't be opened, logs one WARNING and keeps stderr only."""
+    path = "shim.log" if where == "relative" else str(tmp_path / "missing" / "shim.log")
+    before = list(root_logger.handlers)
+    mcp_shim.configure_logging({"CREWCHAT_SHIM_LOG_FILE": path})
+    (stderr,) = added(root_logger, before)
+    assert isinstance(stderr, logging.StreamHandler) and stderr.stream is mcp_shim.sys.stderr
+    assert len(shim_warnings(caplog)) == 1
+    assert not Path(path).exists()
