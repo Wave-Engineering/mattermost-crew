@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import re
 import ssl
 import time
@@ -31,6 +32,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-haiku-5-5"
@@ -46,6 +49,7 @@ RESPONSE_TIMEOUT_S = 300
 TURNS_TTL_S = 24 * 60 * 60
 REQUEST_TIMEOUT_S = 30  # to read a request's head and body
 MAX_CONNECTIONS = 64  # per server's model socket
+MAX_PER_ANSWER = 4  # of those, at once, for one answer
 HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
 HEADER_VALUE_RE = re.compile(r"[\x20-\x7e\t]*")
 PATH_RE = re.compile(
@@ -57,6 +61,49 @@ PASS_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "content-type",
 
 class ConfError(Exception):
     pass
+
+
+class Slots:
+    """One socket's connections: a cap on all of them, a smaller one per answer, so one
+    answer can't hold every slot and lock the others out, and the open writers, so a stop
+    can close them (on 3.12 a server's wait_closed() waits for every connection)."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.total = 0
+        self.per: dict[str, int] = {}
+        self.clients: set[asyncio.StreamWriter] = set()
+        self.saturated = False
+
+    def admit(self, writer: asyncio.StreamWriter, limit: int) -> bool:
+        if self.total >= limit:
+            if not self.saturated:  # once per saturation, never once per refusal
+                log.warning("%s: %d connections, refusing more", self.label, self.total)
+                self.saturated = True
+            return False
+        self.saturated = False
+        self.total += 1
+        self.clients.add(writer)
+        return True
+
+    def bind(self, answer_id: str, limit: int) -> bool:
+        if self.per.get(answer_id, 0) >= limit:
+            return False
+        self.per[answer_id] = self.per.get(answer_id, 0) + 1
+        return True
+
+    def unbind(self, answer_id: str) -> None:
+        self.per[answer_id] -= 1
+        if not self.per[answer_id]:
+            del self.per[answer_id]
+
+    def release(self, writer: asyncio.StreamWriter) -> None:
+        self.total -= 1
+        self.clients.discard(writer)
+
+    def close_all(self) -> None:
+        for writer in list(self.clients):
+            writer.close()
 
 
 @dataclass(frozen=True)
@@ -275,19 +322,18 @@ class ModelProxy:
         # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
         # that went quiet must not get its cap back.
         self.turns: dict[str, tuple[int, float]] = {}
-        self.active = 0
+        self.slots = Slots("model proxy")
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         start = time.monotonic()
         try:
-            if self.active >= MAX_CONNECTIONS:
+            if not self.slots.admit(writer, MAX_CONNECTIONS):
                 writer.write(_error(503, "overloaded_error", "too many connections"))
                 return
-            self.active += 1
             try:
                 await self._serve(reader, writer, start)
             finally:
-                self.active -= 1
+                self.slots.release(writer)
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
             pass
         finally:
@@ -303,6 +349,24 @@ class ModelProxy:
         if request is None:
             return
         answer_id, path, query, headers, body = request
+        if not self.slots.bind(answer_id, MAX_PER_ANSWER):
+            writer.write(_error(429, "rate_limit_error", "too many calls at once for this answer"))
+            return
+        try:
+            await self._call(writer, answer_id, path, query, headers, body, start)
+        finally:
+            self.slots.unbind(answer_id)
+
+    async def _call(
+        self,
+        writer: asyncio.StreamWriter,
+        answer_id: str,
+        path: str,
+        query: str | None,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        start: float,
+    ) -> None:
         body["model"] = self.model
 
         turn: int | None = None

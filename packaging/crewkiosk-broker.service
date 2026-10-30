@@ -28,6 +28,9 @@ SupplementaryGroups=crewcorpus crewkiosk
 ExecStart=/opt/mattermost-crew/.venv/bin/crewkiosk-broker
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+# Each server's two sockets hold at most 64 connections each, plus 64 upstream: room for
+# about 40 research servers.
+LimitNOFILE=8192
 RuntimeDirectory=crewkiosk-broker
 RuntimeDirectoryMode=0755
 # control.sock lives here too, made by the socket unit: a stop must not remove it.
