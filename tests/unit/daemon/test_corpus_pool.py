@@ -69,6 +69,7 @@ def test_pool_membership(
     got = manifest(tmp_path)
     assert got["repos"] == [f"{ORG}/docs", REPO_B, REPO_A]
     assert got["server"] == "dev" and got["refresh_minutes"] == 15
+    assert got["max_turns"] == 8  # kiosk_max_turns, for #141's model proxy
     assert got["exclude"] == [f"{ORG}/secret-infra"]  # for #140's check on canonical paths
     assert got["generated_at"] == "2026-10-30T00:00:00+00:00"
     assert daemon.pool.health() == {"dev": {"pool_repos": 3}}

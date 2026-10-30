@@ -1,0 +1,64 @@
+# crewkiosk-broker, the research kiosk's only door (#141; D-111, D-112): the typed corpus ops
+# and the model proxy, one pair of sockets per research server, and the daemon's control socket.
+#
+#   systemctl enable --now crewkiosk-broker-control.socket crewkiosk-broker.service
+#   systemctl reload crewkiosk-broker      # re-read the pool manifests, model.conf and the key
+#
+# Needs:
+#   - the crewkiosk-broker user (its primary group is crewkiosk-broker, which owns each
+#     /var/lib/crewcorpus/<server> directory), a member of crewcorpus (the pool manifests) and
+#     crewkiosk (model.conf, and the socket group the kiosk connects with);
+#   - packaging/crewcorpus.tmpfiles.conf and packaging/crewchat-pool.tmpfiles.conf;
+#   - rg (ripgrep) on PATH;
+#   - the broker's own model key, /etc/crewkiosk/broker-model.credential, 0600
+#     crewkiosk-broker:crewkiosk-broker, never the runner's model.credential. Its first line is
+#     the key alone, or ANTHROPIC_API_KEY=<key> (crewkiosk-run's rules). Without it the ops are
+#     served and every model call is refused.
+[Unit]
+Description=mattermost-crew kiosk broker
+Wants=network-online.target
+After=network-online.target crewkiosk-broker-control.socket
+Requires=crewkiosk-broker-control.socket
+
+[Service]
+Type=simple
+User=crewkiosk-broker
+Group=crewkiosk-broker
+SupplementaryGroups=crewcorpus crewkiosk
+ExecStart=/opt/mattermost-crew/.venv/bin/crewkiosk-broker
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+# Each server's two sockets hold at most 64 connections each, plus 64 upstream: room for
+# about 40 research servers.
+LimitNOFILE=8192
+# At most 4 ops at once across every server (OPS_AT_ONCE), a search reading at most 4 MiB of
+# rg's output a line at a time, and the proxy's bodies capped at 1 MiB. The ledger is held
+# to half of this by its caps: a unit test reads MemoryMax and LimitNOFILE from this file.
+MemoryMax=512M
+# rg runs in this unit's cgroup, and the kiosk chooses the queries. The default policy (stop)
+# would end the whole broker, every server's sessions with it, whenever the kernel kills a
+# process here. The kernel kills the largest: if that is an rg, with continue, that search
+# fails and nothing else does. If it is the broker, the unit fails and Restart= brings it back.
+OOMPolicy=continue
+# The per-server sockets only. The control socket has its own directory, made by its socket
+# unit: this one is chowned to crewkiosk-broker at every start.
+RuntimeDirectory=crewkiosk-broker
+RuntimeDirectoryMode=0755
+StateDirectory=crewkiosk-broker
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/var/lib/crewcorpus /var/lib/crewchat-pool
+# No chat or broker state or config, and not the runner's model key. The corpus tokens,
+# /etc/crewkiosk/corpus-<server>@<host>.credential, aren't listed: InaccessiblePaths= can't
+# glob. Their mode keeps them from the broker instead: 0600 crewcorpus, and the broker's
+# crewcorpus membership is a group, which 0600 grants nothing.
+InaccessiblePaths=-/etc/crewchat -/var/lib/crewchat -/etc/crewbroker -/var/lib/crewbroker -/etc/crewkiosk/model.credential
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

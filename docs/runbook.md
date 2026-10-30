@@ -137,6 +137,8 @@ kiosk_daily_cap = 25
 # corpus_extra = ["forge.example.lan/org/handbook"]
 # corpus_exclude = ["forge.example.lan/org/secret-infra"]
 # corpus_refresh_minutes = 15
+# Model calls per research answer; crewkiosk-broker refuses the next one (#141).
+# kiosk_max_turns = 8
 
 # Discord. With `enabled = true`, also set `screamhole_url`, and install the Discord credential
 # at /etc/crewchat/discord.credential (mode 0600).

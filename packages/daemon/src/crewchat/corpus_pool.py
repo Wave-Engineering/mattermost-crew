@@ -19,9 +19,10 @@ An exclude covers the repo's wiki too (`<repo>.wiki`, a repo of its own on GitHu
 A renamed or transferred repo whose old path still redirects is beyond the daemon's sight: the
 corpus builder resolves each repo's canonical path and checks the excludes again (#140).
 
-The file is `{"server", "generated_at", "refresh_minutes", "repos", "exclude"}`, where
-`exclude` is `corpus_exclude` canonicalized (casefolded, no `.git`), for the builder's own check
-on each repo's canonical path, since it can't read the daemon's config. Written atomically, mode
+The file is `{"server", "generated_at", "refresh_minutes", "max_turns", "repos", "exclude"}`,
+where `exclude` is `corpus_exclude` canonicalized (casefolded, no `.git`), for the builder's own
+check on each repo's canonical path, since it can't read the daemon's config. `max_turns` is
+`kiosk_max_turns`, which crewkiosk-broker's model proxy enforces (#141). Written atomically, mode
 0640, into a directory the corpus user's group can read (`packaging/crewchat-pool.tmpfiles.conf`).
 It is rewritten only when its contents other than `generated_at` change. The daemon writes it
 at start and after each `register`; an agent that loses its token another way (a deactivated
@@ -145,6 +146,7 @@ class PoolManifest:
             body = {
                 "server": server.id,
                 "refresh_minutes": server.corpus_refresh_minutes,
+                "max_turns": server.kiosk_max_turns,
                 "exclude": exclude_keys(server),
                 "repos": repos,
             }

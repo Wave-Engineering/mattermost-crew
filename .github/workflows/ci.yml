@@ -22,6 +22,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+      - name: ripgrep (#141 corpus_search)
+        run: ./scripts/ci/rg-install.sh
       - name: lint and unit tests
         run: ./scripts/ci/unit.sh
       - name: Upload reports
@@ -101,6 +103,8 @@ jobs:
         run: ./scripts/ci/mattermost-up.sh
       - name: gitleaks (IT-29)
         run: ./scripts/ci/gitleaks-install.sh
+      - name: ripgrep (IT-30)
+        run: ./scripts/ci/rg-install.sh
       - name: make ci
         run: ./scripts/ci/ci.sh
       - name: Start broker
