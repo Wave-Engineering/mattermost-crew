@@ -85,7 +85,7 @@ def _remote_parts(remote: str) -> tuple[str, str] | None:
         if m.group("scheme").lower() == "file":
             return None
         authority, _, path = m.group("rest").partition("/")
-        # A query or fragment can carry a token (`?private_token=`): it never leaves the shim.
+        # A query or fragment can carry a credential: it never leaves the shim.
         path = re.split(r"[?#]", path, maxsplit=1)[0]
         host = authority.rpartition("@")[2]
         # An IPv6 literal keeps its brackets; the port after it, or after a name, goes.
