@@ -13,6 +13,10 @@
     url = "https://mm.example.lan"
     kiosk = true                         # optional; the kiosk is off on a server unless set
     kiosk_daily_cap = 25                 # optional; kiosk answers per server per UTC day
+    kiosk_research = true                # optional; research over the corpus pool (D-112)
+    corpus_extra = ["forge.example.lan/partner-org/docs"]    # optional; full repos
+    corpus_exclude = ["forge.example.lan/partner-org/infra"] # optional; always wins
+    corpus_refresh_minutes = 15          # optional; how often the corpus is rebuilt
 
     [discord]
     enabled = true
@@ -55,6 +59,9 @@ DEFAULT_REFETCH_MIN_INTERVAL_S = 2.0
 DEFAULT_KIOSK_RATE_PER_HOUR = 10
 DEFAULT_LOOP_GUARD_WINDOW = 20
 DEFAULT_KIOSK_DAILY_CAP = 25
+DEFAULT_CORPUS_REFRESH_MINUTES = 15
+# A full repo, as the shim's `repo_ref()` gives it: `host/group[/subgroup...]/repo`, no `.git`.
+REPO_ENTRY_RE = re.compile(r"^[a-z0-9.-]+(/[A-Za-z0-9._-]+){2,}$")
 # An allowlist entry (#117): a forge key `host/org`, as `repo_key` gives it; an absolute path;
 # or `name:<dev_name>`.
 FORGE_ENTRY_RE = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9._-]+$")
@@ -76,6 +83,13 @@ class MattermostServer:
     # the broker's switch says. `kiosk_daily_cap` bounds its answers per UTC day.
     kiosk: bool = False
     kiosk_daily_cap: int = DEFAULT_KIOSK_DAILY_CAP
+    # Kiosk research over this server's corpus pool (#136, D-110 to D-112): off unless set, and
+    # then only with `kiosk` on and an explicit `agents_allow` on every crew here. The extra and
+    # exclude entries are full repos, `host/group/.../repo`.
+    kiosk_research: bool = False
+    corpus_extra: tuple[str, ...] = ()
+    corpus_exclude: tuple[str, ...] = ()
+    corpus_refresh_minutes: int = DEFAULT_CORPUS_REFRESH_MINUTES
 
 
 @dataclass(frozen=True)
@@ -185,6 +199,7 @@ def parse_config(raw: dict[str, Any], *, source: str = "<servers.toml>") -> Serv
     if not isinstance(crews_raw, dict):
         raise ConfigError(f"{source}: crews must be a table")
     crews = {name: _crew(name, value, server_ids, source) for name, value in crews_raw.items()}
+    _research_rules(servers, crews, source)
 
     default_crew = raw.get("default_crew")
     if not isinstance(default_crew, str) or default_crew not in crews:
@@ -246,8 +261,68 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
             raise ConfigError(
                 f"{source}: mattermost {sid}.kiosk_daily_cap must be an integer of at least 0"
             )
-        servers.append(MattermostServer(id=sid, url=url, kiosk=kiosk, kiosk_daily_cap=cap))
+        research = item.get("kiosk_research", False)
+        if not isinstance(research, bool):
+            raise ConfigError(f"{source}: mattermost {sid}.kiosk_research must be true or false")
+        refresh = item.get("corpus_refresh_minutes", DEFAULT_CORPUS_REFRESH_MINUTES)
+        if isinstance(refresh, bool) or not isinstance(refresh, int) or refresh < 1:
+            raise ConfigError(
+                f"{source}: mattermost {sid}.corpus_refresh_minutes must be an integer "
+                "of at least 1"
+            )
+        servers.append(
+            MattermostServer(
+                id=sid,
+                url=url,
+                kiosk=kiosk,
+                kiosk_daily_cap=cap,
+                kiosk_research=research,
+                corpus_extra=_repos(item.get("corpus_extra", []), f"{sid}.corpus_extra", source),
+                corpus_exclude=_repos(
+                    item.get("corpus_exclude", []), f"{sid}.corpus_exclude", source
+                ),
+                corpus_refresh_minutes=refresh,
+            )
+        )
     return servers
+
+
+def is_repo(value: str) -> bool:
+    """A full repo, `host/group/.../repo`, with no `.` or `..` segment."""
+    return REPO_ENTRY_RE.fullmatch(value) is not None and not any(
+        part in {".", ".."} for part in value.split("/")
+    )
+
+
+def _repos(value: Any, where: str, source: str) -> tuple[str, ...]:
+    """A `corpus_extra` or `corpus_exclude` list of full repos."""
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError(f"{source}: mattermost {where} must be an array of strings")
+    for entry in value:
+        if not is_repo(entry):
+            raise ConfigError(
+                f"{source}: mattermost {where} entry {entry!r} is not host/group/.../repo"
+            )
+    return tuple(value)
+
+
+def _research_rules(
+    servers: list[MattermostServer], crews: dict[str, CrewEntry], source: str
+) -> None:
+    """D-112: research needs the kiosk on, and an explicit allowlist on every crew there,
+    because an absent `agents_allow` admits every agent and the pool would follow."""
+    for server in servers:
+        if not server.kiosk_research:
+            continue
+        if not server.kiosk:
+            raise ConfigError(f"{source}: mattermost {server.id}.kiosk_research needs kiosk = true")
+        for crew in crews.values():
+            entry = crew.brokers.get(server.id)
+            if entry is not None and entry.agents_allow is None:
+                raise ConfigError(
+                    f"{source}: mattermost {server.id}.kiosk_research needs agents_allow on "
+                    f"crews.{crew.name}.{server.id} (D-112)"
+                )
 
 
 def _agents(value: Any, where: str, source: str) -> tuple[str, ...]:

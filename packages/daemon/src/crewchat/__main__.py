@@ -32,6 +32,7 @@ from crewchat.adapters.mattermost import MattermostBackend
 from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
+from crewchat.corpus_pool import PoolManifest
 from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
 from crewchat.filters import Filters, KioskQueue, SwitchCache
 from crewchat.kiosk import ClaudeCliRunner, Kiosk
@@ -137,7 +138,10 @@ async def serve(
         )
         chat_backends[discord.name] = discord
     cache = SwitchCache.from_config(brokers, config)
-    registry = Registry(config, brokers, store, cache, identity_sink=discord)
+    # The kiosk's corpus pool manifests (#139): written now, and after each register.
+    pool = PoolManifest(config, store.agents)
+    pool.refresh()
+    registry = Registry(config, brokers, store, cache, identity_sink=discord, pool=pool)
     # The one persisted "my threads" set (D-104): every send and dm records into it, and
     # the filters' addressing and loop guard read the same instance, so replies survive a
     # restart.

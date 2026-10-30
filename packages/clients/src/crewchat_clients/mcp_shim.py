@@ -28,8 +28,10 @@ and the daemon acts on the agent's behalf with what it holds itself.
   `upload` chunks that each fit a frame, then names the upload in the post's `attachments`. A
   file over 8 MiB, or one the daemon refuses, fails the call loudly before anything is posted.
 - **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id,
-  project_key}` from the identity file (`crew` omitted when the file has none). `project_key`
-  is `repo_key()`, the same key `chat-defaults.json` uses, for the servers' allowlists (#117).
+  project_key, repo}` from the identity file (`crew` omitted when the file has none).
+  `project_key` is `repo_key()`, the same key `chat-defaults.json` uses, for the servers'
+  allowlists (#117); `repo` is `repo_ref()`, the full forge path, for the kiosk's corpus pool
+  (#139).
   `dev_team` and `dev_avatar` fall back to the legacy
   `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). It registers again every
   24 hours, and before any call when the last one is older than that, so a long-lived session
@@ -83,6 +85,7 @@ from crewchat_clients.defaults import (
     git_remote,
     is_backend,
     repo_key,
+    repo_ref,
     resolve_default,
     write_default,
 )
@@ -401,6 +404,8 @@ class Shim:
             # For the server allowlists (#117): `host/org` or the repo's path, never the
             # remote URL, which can carry credentials.
             "project_key": repo_key(self.repo_root, self.remote_for),
+            # For the kiosk's corpus pool (#139, D-112): `host/group/.../repo`, or "".
+            "repo": repo_ref(self.repo_root, self.remote_for),
         }
         crew = self.identity.get("crew")
         if isinstance(crew, str) and crew:

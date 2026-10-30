@@ -14,6 +14,9 @@ token there (the shim's daily re-register), the new token goes through the rotat
 swap, `on_token_rotated`, then `revoke` the previous token, so none is left live. After each
 `mint`, that broker's `crew_info` and `switch_state` are refreshed, so the new bot account is
 in `minted_bot_ids` before its first post (§5.9).
+
+The agent's `repo` (its full forge path, #139) is recorded beside its tokens, and every
+`register` refreshes the kiosk's corpus pool manifests (`crewchat.corpus_pool`, D-112).
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from crewchat.tokens import (
 )
 
 if TYPE_CHECKING:
+    from crewchat.corpus_pool import PoolManifest
     from crewchat.filters import SwitchCache
 
 ACCOUNT_NAME_MAX = 64  # Mattermost's UserNameMaxLength (CT-05)
@@ -117,6 +121,7 @@ class Registry:
         *,
         clock: Clock = utc_now,
         identity_sink: IdentitySink | None = None,
+        pool: PoolManifest | None = None,
     ) -> None:
         self.config = config
         self.brokers = brokers
@@ -125,6 +130,8 @@ class Registry:
         self.clock = clock
         # The Discord adapter, when Discord is enabled: `set_identity` after each register.
         self.identity_sink = identity_sink
+        # The kiosk's corpus pool manifests (#139): refreshed after each register.
+        self.pool = pool
         self._registrations: dict[str, Registration] = {}
 
     def get(self, dev_name: str) -> Registration | None:
@@ -148,6 +155,7 @@ class Registry:
         dev_team: str = "",
         dev_avatar: str = "",
         project_key: str = "",
+        repo: str = "",
     ) -> Registration:
         crew = crew or self.config.default_crew
         try:
@@ -202,10 +210,13 @@ class Registry:
                         server.id,
                         membership["failed"],
                     )
-                await self.store.install_minted(dev_name, crew, server.id, minted, now)
+                await self.store.install_minted(dev_name, crew, server.id, minted, now, repo)
                 await self.cache.refresh(crew, server.id)
                 backends.append(mattermost_backend(server.id))
 
+        if self.pool is not None:
+            # After the lock: a mint or a retire may have changed a server's pool.
+            self.pool.refresh()
         if unavailable and not backends:
             if squatted == unavailable:
                 # Every broker refused the name itself: a retry won't help, so say why.

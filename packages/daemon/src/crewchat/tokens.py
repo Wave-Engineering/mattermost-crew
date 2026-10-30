@@ -172,6 +172,9 @@ class AgentTokens:
     # Tokens whose revoke failed, by server_id; retried before the next swap on that server, or,
     # on a server the agent is no longer allowed on, at each `register` that skips it (#117).
     pending_revoke: dict[str, list[str]] = field(default_factory=dict)
+    # The agent's full forge repo from its last `register`, "" for none: every server it holds
+    # a token on pools it for kiosk research (#139, D-112).
+    repo: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -183,6 +186,7 @@ class AgentTokens:
                 for sid, t in self.servers.items()
             },
             "pending_revoke": {sid: ids for sid, ids in self.pending_revoke.items() if ids},
+            "repo": self.repo,
         }
 
     @classmethod
@@ -200,6 +204,7 @@ class AgentTokens:
                 sid: [str(i) for i in ids]
                 for sid, ids in dict(data.get("pending_revoke", {})).items()
             },
+            repo=str(data.get("repo", "")),  # absent before #139
         )
 
 
@@ -326,9 +331,16 @@ class TokenStore:
         self._persist(agent)
 
     async def install_minted(
-        self, dev_name: str, crew: str, server_id: str, minted: dict[str, Any], now: datetime
+        self,
+        dev_name: str,
+        crew: str,
+        server_id: str,
+        minted: dict[str, Any],
+        now: datetime,
+        repo: str = "",
     ) -> None:
-        """A `register`-driven `mint`'s token: record `last_register`, then the swap sequence.
+        """A `register`-driven `mint`'s token: record `last_register` and the agent's `repo`
+        (#139), then the swap sequence, which persists both.
 
         The caller (`Registry.register`) holds `lock(dev_name)`.
         """
@@ -340,6 +352,7 @@ class TokenStore:
             agent = AgentTokens(dev_name=dev_name, crew=crew)
             self._agents[dev_name] = agent
         agent.last_register = now
+        agent.repo = repo
         await self._swap(agent, server_id, _server_token(minted, minted.get("account")))
 
     async def retire_server(self, dev_name: str, crew: str, server_id: str) -> None:

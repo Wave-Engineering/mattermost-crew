@@ -31,6 +31,9 @@ RuntimeDirectoryMode=0755
 StateDirectory=crewchat
 StateDirectoryMode=0700
 ReadWritePaths=/var/lib/crewchat /run/crewchat
+# The kiosk's corpus pool manifests (#139), only on a host with kiosk research: `-`, so a host
+# without packaging/crewchat-pool.tmpfiles.conf still starts.
+ReadWritePaths=-/var/lib/crewchat-pool
 NoNewPrivileges=yes
 PrivateTmp=yes
 

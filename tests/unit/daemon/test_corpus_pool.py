@@ -1,0 +1,193 @@
+"""#139: the kiosk's corpus pool manifest, per research server (D-112)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import stat
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+from crewchat.corpus_pool import PoolManifest, pool_repos
+
+ORG = "forge.example.lan/partner-org"
+REPO_A = f"{ORG}/site-manifests"
+REPO_B = f"{ORG}/group/service"
+FOREIGN = "github.com/elsewhere/repo"
+
+
+def research(raw: dict[str, Any], **server: Any) -> dict[str, Any]:
+    """Research on for `dev`, with an allowlist that admits ORG's agents and repos."""
+    raw["mattermost"][0].update(kiosk=True, kiosk_research=True, **server)
+    raw["crews"]["oaw"]["dev"]["agents_allow"] = [ORG, "name:helper", "/home/agent/work"]
+    return raw
+
+
+def wired(make_daemon: Callable[[dict[str, Any]], Any], raw: dict[str, Any], root: Path) -> Any:
+    daemon = make_daemon(raw)
+    daemon.pool = PoolManifest(
+        daemon.config, daemon.store.agents, root, clock=lambda: datetime(2026, 10, 30, tzinfo=UTC)
+    )
+    daemon.registry.pool = daemon.pool
+    return daemon
+
+
+def manifest(root: Path, server: str = "dev") -> dict[str, Any]:
+    return json.loads((root / f"{server}.json").read_text())
+
+
+def register(daemon: Any, dev: str, key: str = ORG, repo: str = "") -> Any:
+    return asyncio.run(daemon.registry.register(dev, "oaw", "s1", project_key=key, repo=repo))
+
+
+def test_pool_membership(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """admitted(agent repos + corpus_extra) - corpus_exclude, admitted by host/org only."""
+    raw = research(
+        servers_toml,
+        corpus_extra=[f"{ORG}/docs", FOREIGN],
+        corpus_exclude=[f"{ORG}/secret-infra"],
+    )
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    register(daemon, "kessel", repo=REPO_B)
+    register(daemon, "infra", repo=f"{ORG}/secret-infra")
+    # Admitted by name and by path, but their repos' orgs are on no forge allow entry.
+    register(daemon, "helper", key="", repo=FOREIGN)
+    register(daemon, "local", key="/home/agent/work/x", repo="other.lan/org/repo")
+    register(daemon, "nore", repo="")  # a path-keyed repo: no forge remote, nothing pooled
+
+    got = manifest(tmp_path)
+    assert got["repos"] == [f"{ORG}/docs", REPO_B, REPO_A]
+    assert got["server"] == "dev" and got["refresh_minutes"] == 15
+    assert got["generated_at"] == "2026-10-30T00:00:00+00:00"
+    assert daemon.pool.health() == {"dev": {"pool_repos": 3}}
+
+
+def test_deny_wins_for_repos(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    raw = research(servers_toml, corpus_extra=[REPO_A])
+    raw["crews"]["oaw"]["dev"]["agents_deny"] = [ORG]
+    daemon = make_daemon(raw)
+    assert pool_repos(daemon.config, daemon.store.agents(), "dev") == []
+
+
+def test_pool_follows_retire(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """An agent that no longer holds a token on the server leaves its pool."""
+    raw = research(servers_toml)
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    assert manifest(tmp_path)["repos"] == [REPO_A]
+    # Its project_key falls off the allowlist: register retires its token on dev.
+    register(daemon, "babel", key="forge.example.lan/other", repo=REPO_A)
+    assert daemon.store.token_for("babel", "dev") is None
+    assert manifest(tmp_path)["repos"] == []
+
+
+def test_repo_persists_with_tokens(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """The repo is stored beside the tokens, so a restarted daemon pools the same repos."""
+    raw = research(servers_toml)
+    daemon = wired(make_daemon, raw, tmp_path / "pool")
+    register(daemon, "babel", repo=REPO_A)
+    path = daemon.store.path_for("babel")
+    assert json.loads(path.read_text())["repo"] == REPO_A
+    again = make_daemon(raw)
+    again.store.load()
+    assert pool_repos(again.config, again.store.agents(), "dev") == [REPO_A]
+    # A token file from before #139 has no `repo`, and loads with none.
+    data = json.loads(path.read_text())
+    del data["repo"]
+    path.write_text(json.dumps(data))
+    again = make_daemon(raw)
+    again.store.load()
+    assert again.store.agent("babel").repo == ""
+
+
+def test_manifest_atomic_and_unchanged(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = research(servers_toml)
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    path = tmp_path / "dev.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]  # no temp file left
+    before = path.stat().st_mtime_ns
+    path.touch()
+    touched = path.stat().st_mtime_ns
+    daemon.pool.clock = lambda: datetime(2026, 10, 31, tzinfo=UTC)
+    register(daemon, "babel", repo=REPO_A)  # same list: not rewritten
+    assert path.stat().st_mtime_ns == touched and touched >= before
+    assert manifest(tmp_path)["generated_at"].startswith("2026-10-30")
+
+    # A write that fails is logged; register still succeeds.
+    daemon.pool.root = tmp_path / "missing"
+    with caplog.at_level(logging.ERROR, logger="crewchat.corpus_pool"):
+        reg = register(daemon, "kessel", repo=REPO_B)
+    assert "mattermost:dev" in reg.backends
+    assert "cannot write" in caplog.text
+
+
+def test_research_off_has_no_manifest(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """Research off: no manifest, an old one is removed, and health adds nothing."""
+    (tmp_path / "dev.json").write_text("{}")
+    daemon = wired(make_daemon, servers_toml, tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    assert not (tmp_path / "dev.json").exists()
+    assert daemon.pool.health() == {}
+
+
+def test_health_reports_pool(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    from crewchat.server import build_handlers
+
+    daemon = wired(make_daemon, research(servers_toml), tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    health = build_handlers(daemon.config, daemon.registry)["health"]
+    assert asyncio.run(health({}))["kiosk_research"] == {"dev": {"pool_repos": 1}}
+    plain = make_daemon(servers_toml)
+    assert "kiosk_research" not in asyncio.run(
+        build_handlers(plain.config, plain.registry)["health"]({})
+    )
+
+
+def test_register_repo_over_the_socket(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`repo` is passed through; a non-string is bad_request; a malformed one is dropped."""
+    from crewchat.server import DaemonServer, build_handlers
+
+    daemon = wired(make_daemon, research(servers_toml), tmp_path)
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+
+    def call(**args: Any) -> dict[str, Any]:
+        frame = {"proto": 1, "id": "x", "op": "register", "args": args}
+        return asyncio.run(server.handle_line(json.dumps(frame).encode()))
+
+    assert call(dev_name="babel", session_id="s1", project_key=ORG, repo=REPO_A)["ok"]
+    assert daemon.store.agent("babel").repo == REPO_A
+    bad = call(dev_name="babel", session_id="s1", project_key=ORG, repo=[REPO_A])
+    assert bad["ok"] is False and bad["error"].startswith("bad_request")
+    with caplog.at_level(logging.WARNING, logger="crewchat.server"):
+        got = call(dev_name="babel", session_id="s1", project_key=ORG, repo=f"{ORG}/../x")
+    assert got["ok"] and daemon.store.agent("babel").repo == ""
+    assert "dropping malformed repo" in caplog.text
