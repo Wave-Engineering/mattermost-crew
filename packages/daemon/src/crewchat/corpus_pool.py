@@ -50,10 +50,18 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
     entries = [
         crew.brokers[server_id] for crew in config.crews.values() if server_id in crew.brokers
     ]
-    held = {a.repo for a in agents if server_id in a.servers and a.repo and is_repo(a.repo)}
-    candidates = held | set(server.corpus_extra)
-    admitted = {r for r in candidates if any(admits_repo(e, r) for e in entries)}
-    return sorted(admitted - set(server.corpus_exclude))
+    held = [a.repo for a in agents if server_id in a.servers and a.repo and is_repo(a.repo)]
+    # Forges resolve paths without regard to case, so one repo spelled two ways is one repo,
+    # and an exclude matches it however it is spelled: an exclude always wins.
+    excluded = {r.casefold() for r in server.corpus_exclude}
+    pool: dict[str, str] = {}
+    for repo in sorted([*server.corpus_extra, *held]):
+        key = repo.casefold()
+        if key in excluded or key in pool:
+            continue
+        if any(admits_repo(e, repo) for e in entries):
+            pool[key] = repo
+    return sorted(pool.values())
 
 
 def _server(config: ServersConfig, server_id: str) -> MattermostServer:

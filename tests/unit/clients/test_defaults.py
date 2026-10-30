@@ -87,6 +87,9 @@ def test_forge_key_from_remote(remote: str, key: str | None) -> None:
         ),
         ("https://user:tok@GitLab.com/example-group/repo", "gitlab.com/example-group/repo"),
         ("http://git.lan:8080/org/repo/", "git.lan/org/repo"),
+        # A query or fragment can carry a token, and never leaves the shim.
+        ("https://git.lan/org/repo.git?private_token=abc", "git.lan/org/repo"),
+        ("https://git.lan/org/repo#tok", "git.lan/org/repo"),
         ("/srv/git/repo.git", None),
         ("file:///srv/git/repo.git", None),
         ("", None),

@@ -190,4 +190,40 @@ def test_register_repo_over_the_socket(
     with caplog.at_level(logging.WARNING, logger="crewchat.server"):
         got = call(dev_name="babel", session_id="s1", project_key=ORG, repo=f"{ORG}/../x")
     assert got["ok"] and daemon.store.agent("babel").repo == ""
-    assert "dropping malformed repo" in caplog.text
+    assert "dropping a malformed repo" in caplog.text
+    assert "/../x" not in caplog.text  # never the value: it may hold part of a credential
+
+
+def test_exclude_and_dedupe_ignore_case(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """Forges resolve paths without regard to case: an exclude wins however the repo is
+    spelled, and one repo spelled two ways is pooled once."""
+    raw = research(servers_toml, corpus_exclude=[f"{ORG}/secret-infra"], corpus_extra=[REPO_A])
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "infra", repo=f"{ORG}/Secret-Infra")
+    register(daemon, "babel", repo=f"{ORG}/Site-Manifests")
+    assert manifest(tmp_path)["repos"] == [f"{ORG}/Site-Manifests"]
+
+
+def test_pool_dir_is_setgid_crewcorpus() -> None:
+    """Each manifest must get the crewcorpus group, which the daemon isn't in: the directory
+    is setgid, so a file created there takes its group."""
+    conf = Path(__file__).parents[3] / "packaging" / "crewchat-pool.tmpfiles.conf"
+    (line,) = [ln for ln in conf.read_text().splitlines() if ln.startswith("d ")]
+    assert line.split() == ["d", "/var/lib/crewchat-pool", "2750", "crewchat", "crewcorpus", "-"]
+
+
+def test_manifest_takes_the_directory_group(tmp_path: Path) -> None:
+    """In a setgid directory owned by another of our groups, the manifest gets that group."""
+    import os
+
+    from crewchat.corpus_pool import _write
+
+    others = [g for g in os.getgroups() if g != os.getegid()]
+    if not others:
+        pytest.skip("this user has no second group to test setgid with")
+    os.chown(tmp_path, -1, others[0])
+    os.chmod(tmp_path, 0o2750)
+    _write(tmp_path / "dev.json", {"repos": []})
+    assert (tmp_path / "dev.json").stat().st_gid == others[0]

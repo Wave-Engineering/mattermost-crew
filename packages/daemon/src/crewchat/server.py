@@ -267,7 +267,8 @@ def build_handlers(
             raise OpError("bad_request", "repo is a string")
         if repo and not is_repo(repo):
             # Never fails the register: that agent just adds nothing to any pool.
-            log.warning("register %s: dropping malformed repo %r", dev_name, repo)
+            # Never the value: a malformed one may still hold part of a remote's credential.
+            log.warning("register %s: dropping a malformed repo", dev_name)
             repo = ""
         reg = await registry.register(
             dev_name,
