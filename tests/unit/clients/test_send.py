@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from crewchat_clients.send import (
+    DAEMON_MAX_FRAME_BYTES,
     EXIT_ERROR,
     EXIT_NO_DEFAULT,
     EXIT_NOT_REGISTERED,
@@ -163,6 +164,63 @@ def test_send_named_backend_is_marked_off_default(
     assert send(repo, sock, ["precheck", "--backend", MM])[0] == EXIT_SENT
     assert "off_default" not in fake.frames[-1]["args"]
     assert send(repo, sock, ["precheck", "--backend", "slack"])[0] == EXIT_USAGE
+
+
+def test_send_malformed_default_spares_a_named_backend_and_a_thread(
+    repo: Path, short_dir: Path
+) -> None:
+    def respond(frame: dict[str, Any]) -> dict[str, Any]:
+        if frame["op"] == "thread_backend":
+            return {"id": frame["id"], "ok": True, "result": {"backend": MM}}
+        return posted(frame)
+
+    write_identity(repo, {"dev_name": DEV, "home_backend": "slack"})  # DefaultsError
+    sock = short_dir / "m.sock"
+    fake = FakeDaemon(sock, respond)
+    try:
+        assert send(repo, sock, ["precheck", "--backend", "discord"])[0] == EXIT_SENT
+        assert fake.frames[-1]["args"]["backend"] == "discord"
+        assert fake.frames[-1]["args"]["off_default"] is True
+        assert send(repo, sock, ["precheck", "--thread", POST_ID])[0] == EXIT_SENT
+        assert fake.frames[-1]["args"]["backend"] == MM
+        code, _, err = send(repo, sock, ["precheck"])  # only the default path needs it
+    finally:
+        fake.close()
+    assert code == EXIT_USAGE
+    assert "home_backend 'slack'" in err
+
+
+def test_send_ok_without_post_id_is_an_error(repo: Path, short_dir: Path) -> None:
+    sock = short_dir / "o.sock"
+    fake = FakeDaemon(sock, lambda f: {"id": f["id"], "ok": True, "result": {}})
+    try:
+        code, out, err = send(repo, sock, ["precheck"])
+    finally:
+        fake.close()
+    assert (code, out) == (EXIT_ERROR, "")
+    assert "no post ID" in err
+
+
+def test_send_mismatched_reply_is_unreachable(repo: Path, short_dir: Path) -> None:
+    sock = short_dir / "i.sock"
+    fake = FakeDaemon(sock, lambda f: {**posted(f), "id": "someone-else"})
+    try:
+        code, out, err = send(repo, sock, ["precheck"])
+    finally:
+        fake.close()
+    assert (code, out) == (EXIT_UNREACHABLE, "")
+    assert "mismatched" in err
+
+
+def test_send_refuses_a_frame_over_the_daemon_limit(
+    repo: Path, daemon: tuple[Path, FakeDaemon]
+) -> None:
+    sock, fake = daemon
+    code, out, err = send(repo, sock, ["precheck"], stdin="x" * DAEMON_MAX_FRAME_BYTES)
+    assert (code, out) == (EXIT_USAGE, "")
+    assert "message too large" in err
+    assert fake.frames == []  # nothing reached the socket
+    assert send(repo, sock, ["precheck"], stdin="x" * 60_000)[0] == EXIT_SENT
 
 
 def test_send_dm_flag_uses_dm_op(repo: Path, daemon: tuple[Path, FakeDaemon]) -> None:

@@ -25,7 +25,7 @@ Exit codes. A caller branches on non-zero to fall back:
 |---|---|
 | 0 | sent: the post's ID on stdout |
 | 1 | the daemon refused it (its error on stderr), or it answered with no post ID |
-| 2 | a usage error: no identity, text in argv, an empty message, a bad backend or thread |
+| 2 | usage: no identity, text in argv, an empty or too-large message, a bad backend or thread |
 | 3 | no default backend for this repo, and no `--backend` |
 | 4 | not registered: no live session for this agent on this host |
 | 5 | daemon unreachable: no socket, a refused or timed-out connect, or a bad reply |
@@ -71,11 +71,14 @@ EXIT_UNREACHABLE = 5
 CONNECT_TIMEOUT_S = 10.0
 REPLY_TIMEOUT_S = 30.0  # a Discord post through scream-hole can take seconds
 RECV_CHUNK = 65536
+# The daemon's request limit (`crewchat.protocol.MAX_FRAME_BYTES`); the shim's is for replies.
+DAEMON_MAX_FRAME_BYTES = 64 * 1024
 
 EXIT_CODES_HELP = """exit codes:
   0  sent: the post's ID on stdout
   1  the daemon refused it, or answered with no post ID
-  2  usage: no identity, text in argv, an empty message, a bad backend or thread
+  2  usage: no identity, text in argv, an empty or too-large message, a bad backend
+     or thread
   3  no default backend for this repo, and no --backend
   4  not registered: no live session for this agent on this host
   5  daemon unreachable"""
@@ -93,13 +96,20 @@ def request(sock_path: Path, op: str, args: dict[str, Any]) -> dict[str, Any]:
     """One `op` frame and its `result`, or a `SendExit`."""
     req_id = str(uuid.uuid4())
     frame = {"proto": PROTO, "id": req_id, "op": op, "args": args}
+    wire = json.dumps(frame).encode() + b"\n"
+    if len(wire) > DAEMON_MAX_FRAME_BYTES:
+        raise SendExit(
+            EXIT_USAGE,
+            f"message too large: a {op} frame of {len(wire)} bytes is over the daemon's "
+            f"{DAEMON_MAX_FRAME_BYTES}",
+        )
     buf = b""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         try:
             sock.settimeout(CONNECT_TIMEOUT_S)
             sock.connect(str(sock_path))
             sock.settimeout(REPLY_TIMEOUT_S)
-            sock.sendall(json.dumps(frame).encode() + b"\n")
+            sock.sendall(wire)
             while not buf.endswith(b"\n"):
                 chunk = sock.recv(RECV_CHUNK)
                 if not chunk:
@@ -150,16 +160,22 @@ def resolve_backend(
     dev_name: str,
     defaults_file: Path | None,
 ) -> tuple[str, bool]:
-    """The backend, and whether it is off the agent's default (the shim's `off_default`)."""
-    try:
-        default = resolve_default(identity, repo_root, path=defaults_file)
-    except DefaultsError as exc:
-        raise SendExit(EXIT_USAGE, f"default backend: {exc}") from exc
+    """The backend, and whether it is off the agent's default (the shim's `off_default`).
+
+    As the shim's `_route`: a named backend needs the default only to compare against, so a
+    malformed one leaves it off-default; a thread never reads the default at all.
+    """
     if named is not None:
         if not is_backend(named):
             raise SendExit(
                 EXIT_USAGE, f"backend {named!r} is not mattermost:<server-id> or discord"
             )
+        try:
+            default: str | NeedsHuman | None = resolve_default(
+                identity, repo_root, path=defaults_file
+            )
+        except DefaultsError:
+            default = None
         return named, named != default
     if thread:
         pair = discord_ref(thread)
@@ -169,6 +185,10 @@ def resolve_backend(
         if not is_backend(backend):
             raise SendExit(EXIT_ERROR, f"crewchat thread_backend answered {backend!r}")
         return str(backend), False
+    try:
+        default = resolve_default(identity, repo_root, path=defaults_file)
+    except DefaultsError as exc:
+        raise SendExit(EXIT_USAGE, f"default backend: {exc}") from exc
     if isinstance(default, NeedsHuman):
         raise SendExit(
             EXIT_NO_DEFAULT,
