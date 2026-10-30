@@ -167,7 +167,7 @@ def test_units_run_the_kiosk_as_crewkiosk() -> None:
     hidden = {p.lstrip("-") for p in svc["InaccessiblePaths"].split()}
     # The pool manifests name the repos the operator excluded.
     state = {"/var/lib/crewchat", "/etc/crewchat", "/etc/crewbroker", "/var/lib/crewbroker"}
-    state |= {"/var/lib/crewchat-pool"}
+    state |= {"/var/lib/crewchat-pool", "/var/lib/crewcorpus"}  # and the corpus (D-111)
     assert state <= hidden
     # The daemon keeps NoNewPrivileges, and no sudo rule ships (D-107).
     assert unit("crewchat.service")["Service"]["NoNewPrivileges"] == "yes"

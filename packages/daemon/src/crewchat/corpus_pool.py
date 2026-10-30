@@ -49,6 +49,11 @@ log = logging.getLogger(__name__)
 
 POOL_DIR = Path("/var/lib/crewchat-pool")
 MANIFEST_MODE = 0o640
+# crewkiosk-corpus's per-server build status (#140), which `health` reports.
+CORPUS_STATUS_DIR = Path("/var/lib/crewcorpus/status")
+# Listed by name in `health`. An `excluded` repo is only counted: the name it resolved to is
+# the operator's to keep hidden, and the corpus status holds only the manifest's name anyway.
+CORPUS_LISTED_STATES = ("withheld", "clone_failed")
 
 
 def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: str) -> list[str]:
@@ -107,11 +112,13 @@ class PoolManifest:
         agents: Callable[[], Iterable[AgentTokens]],
         root: Path = POOL_DIR,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        corpus_status: Path = CORPUS_STATUS_DIR,
     ) -> None:
         self.config = config
         self.agents = agents
         self.root = root
         self.clock = clock
+        self.corpus_status = corpus_status
         self.sizes: dict[str, int] = {}
         self.errors: dict[str, str] = {}
 
@@ -157,7 +164,8 @@ class PoolManifest:
     def health(self) -> dict[str, Any]:
         """`{<server_id>: {"pool_repos": N}}` for each research server, N being what its
         manifest on disk lists; `{"pool_repos": None, "error": ...}` while it can't be
-        written, and `None` before the first refresh."""
+        written, and `None` before the first refresh. Once crewkiosk-corpus has built that
+        server, `corpus` holds its last build (`corpus_health`)."""
         out: dict[str, Any] = {}
         for s in self.config.mattermost:
             if not s.kiosk_research:
@@ -165,7 +173,32 @@ class PoolManifest:
             out[s.id] = {"pool_repos": self.sizes.get(s.id)}
             if s.id in self.errors:
                 out[s.id]["error"] = self.errors[s.id]
+            corpus = corpus_health(self.corpus_status / f"{s.id}.json")
+            if corpus is not None:
+                out[s.id]["corpus"] = corpus
         return out
+
+
+def corpus_health(path: Path) -> dict[str, Any] | None:
+    """One server's corpus build, from its status file: `{"built_at", "repos", "ok",
+    "withheld": [...], "clone_failed": [...], "excluded"}`, the lists naming repos and the
+    rest counts. None before its first build; `{"error": ...}` when the file can't be read."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return {"error": f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}"}
+    repos = data.get("repos") if isinstance(data, dict) else None
+    if not isinstance(repos, dict):
+        return {"error": f"{path} has no repos"}
+    states = {name: r.get("state") if isinstance(r, dict) else None for name, r in repos.items()}
+    out: dict[str, Any] = {"built_at": data.get("built_at"), "repos": len(states)}
+    out["ok"] = sum(1 for s in states.values() if s == "ok")
+    for state in CORPUS_LISTED_STATES:
+        out[state] = sorted(name for name, s in states.items() if s == state)
+    out["excluded"] = sum(1 for s in states.values() if s == "excluded")
+    return out
 
 
 def _current(path: Path) -> dict[str, Any] | None:

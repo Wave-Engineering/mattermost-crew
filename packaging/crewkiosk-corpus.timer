@@ -1,0 +1,11 @@
+# Runs crewkiosk-corpus.service (#140). 15 minutes is the default `corpus_refresh_minutes`; the
+# builder skips a server whose last build is younger than its own `refresh_minutes`.
+[Unit]
+Description=mattermost-crew kiosk corpus builder, every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

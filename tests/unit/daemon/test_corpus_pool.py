@@ -30,7 +30,11 @@ def research(raw: dict[str, Any], **server: Any) -> dict[str, Any]:
 def wired(make_daemon: Callable[[dict[str, Any]], Any], raw: dict[str, Any], root: Path) -> Any:
     daemon = make_daemon(raw)
     daemon.pool = PoolManifest(
-        daemon.config, daemon.store.agents, root, clock=lambda: datetime(2026, 10, 30, tzinfo=UTC)
+        daemon.config,
+        daemon.store.agents,
+        root,
+        clock=lambda: datetime(2026, 10, 30, tzinfo=UTC),
+        corpus_status=root.parent / "corpus-status",  # never a host's real corpus
     )
     daemon.registry.pool = daemon.pool
     return daemon
@@ -279,6 +283,50 @@ def test_unwritable_pool_reported_in_health(
         pool.chmod(0o755)
     register(daemon, "babel", repo=REPO_A)
     assert daemon.pool.health() == {"dev": {"pool_repos": 1}}
+
+
+def test_health_reports_the_corpus_build(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """#140: once crewkiosk-corpus has built a server, `health` shows its last build, naming
+    withheld and failed repos, and only counting excluded ones."""
+    from crewchat.server import build_handlers
+
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    daemon = wired(make_daemon, research(servers_toml), pool)
+    register(daemon, "babel", repo=REPO_A)
+    assert daemon.pool.health() == {"dev": {"pool_repos": 1}}  # not built yet
+
+    status_dir = tmp_path / "corpus-status"
+    status_dir.mkdir()
+    repos = {
+        REPO_A: {"state": "ok"},
+        REPO_B: {"state": "withheld"},
+        f"{ORG}/c": {"state": "clone_failed"},
+        f"{ORG}/d": {"state": "excluded"},
+        f"{ORG}/e": {"state": "withheld"},
+    }
+    (status_dir / "dev.json").write_text(
+        json.dumps({"server": "dev", "built_at": "2026-10-30T12:00:00+00:00", "repos": repos})
+    )
+    health = build_handlers(daemon.config, daemon.registry)["health"]
+    assert asyncio.run(health({}))["kiosk_research"]["dev"]["corpus"] == {
+        "built_at": "2026-10-30T12:00:00+00:00",
+        "repos": 5,
+        "ok": 1,
+        "withheld": sorted([REPO_B, f"{ORG}/e"]),
+        "clone_failed": [f"{ORG}/c"],
+        "excluded": 1,
+    }
+    assert f"{ORG}/d" not in json.dumps(daemon.pool.health())
+
+    (status_dir / "dev.json").write_text("{")
+    assert daemon.pool.health()["dev"]["corpus"]["error"].startswith("cannot read")
+    (status_dir / "dev.json").write_text("[]")
+    assert daemon.pool.health()["dev"]["corpus"] == {
+        "error": f"{status_dir / 'dev.json'} has no repos"
+    }
 
 
 def test_unremovable_old_manifest_never_fails_register(

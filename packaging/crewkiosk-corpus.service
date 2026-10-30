@@ -1,0 +1,30 @@
+# The kiosk's corpus builder (#140; D-111): one pass over every research server's pool manifest,
+# started by crewkiosk-corpus.timer.
+#
+#   systemctl enable --now crewkiosk-corpus.timer
+#
+# Needs the crewcorpus user and group, packaging/crewcorpus.tmpfiles.conf and
+# packaging/crewchat-pool.tmpfiles.conf installed first, gitleaks 8.19 or later on PATH (for
+# `gitleaks dir`), and /etc/crewkiosk/corpus-<server_id>.credential (0600, crewcorpus) for each
+# research server: a read-only forge token, on its first line.
+[Unit]
+Description=mattermost-crew kiosk corpus builder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=crewcorpus
+Group=crewcorpus
+ExecStart=/opt/mattermost-crew/.venv/bin/crewkiosk-corpus
+# A first build clones every pooled repo: far longer than a oneshot's default 90 s.
+TimeoutStartSec=1h
+# 0027, so each <server> directory is 0750 and inherits the broker's group from the setgid root.
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/crewcorpus
+ProtectHome=yes
+PrivateTmp=yes
+# No chat or broker state or config, and not the kiosk's model credential.
+InaccessiblePaths=-/etc/crewchat -/var/lib/crewchat -/etc/crewbroker -/var/lib/crewbroker -/etc/crewkiosk/model.credential
