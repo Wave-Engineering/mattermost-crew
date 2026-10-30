@@ -38,10 +38,12 @@ DEFAULT_MODEL = "claude-haiku-5-5"
 CLAUDE_ALIASES = frozenset({"default", "best", "fable", "sonnet", "opus", "haiku", "opusplan"})
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_HEAD_BYTES = 16 * 1024
+LINGER_BYTES = 8 * MAX_REQUEST_BYTES  # the most of a refused body read and dropped
 # The part of a response body kept to read `usage` from, when it isn't an event stream.
 MAX_METER_BYTES = 4 * 1024 * 1024
 CONNECT_TIMEOUT_S = 30
 RESPONSE_TIMEOUT_S = 300
+TURNS_TTL_S = 24 * 60 * 60
 PATH_RE = re.compile(
     r"^/a/([0-9a-f]{32})(/v1/messages(?:/count_tokens)?)(?:\?([A-Za-z0-9=&_.-]*))?$"
 )
@@ -130,6 +132,7 @@ class Call:
     latency_ms: int
     input_tokens: int = 0
     output_tokens: int = 0
+    forwarded: bool = True  # False when the broker refused it: the turn cap, or no key
 
 
 class UsageMeter:
@@ -224,7 +227,14 @@ class Dechunker:
 
 def _error(status: int, kind: str, message: str, *, retry: bool = True) -> bytes:
     body = json.dumps({"type": "error", "error": {"type": kind, "message": message}}).encode()
-    reason = {400: "Bad Request", 404: "Not Found", 411: "Length Required"}.get(status, "Error")
+    reason = {
+        400: "Bad Request",
+        404: "Not Found",
+        411: "Length Required",
+        413: "Content Too Large",
+        429: "Too Many Requests",
+        503: "Service Unavailable",
+    }.get(status, "Error")
     head = [
         f"HTTP/1.1 {status} {reason}",
         "content-type: application/json",
@@ -248,6 +258,7 @@ class ModelProxy:
         max_turns: Callable[[], int],
         on_call: Callable[[Call], None],
         ssl_context: ssl.SSLContext | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.upstream = upstream
         self.model = model
@@ -255,7 +266,10 @@ class ModelProxy:
         self.max_turns = max_turns
         self.on_call = on_call
         self.ssl_context = ssl_context
-        self.turns: dict[str, int] = {}
+        self.clock = clock
+        # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
+        # that went quiet must not get its cap back.
+        self.turns: dict[str, tuple[int, float]] = {}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         start = time.monotonic()
@@ -298,6 +312,12 @@ class ModelProxy:
             return
         if length < 0 or length > MAX_REQUEST_BYTES:
             writer.write(_error(413, "request_too_large", "request body too large"))
+            await writer.drain()
+            # A close with the body unread resets the peer, and the reset can take the 413
+            # with it: read and drop a bounded amount first (a lingering close).
+            left = min(max(length, 0), LINGER_BYTES)
+            while left > 0 and (chunk := await reader.read(min(left, 65536))):
+                left -= len(chunk)
             return
         try:
             body = json.loads(await reader.readexactly(length))
@@ -310,18 +330,20 @@ class ModelProxy:
 
         turn: int | None = None
         if path == "/v1/messages":
-            turn = self.turns.get(answer_id, 0) + 1
+            now = self.clock()
+            for aid in [a for a, (_, seen) in self.turns.items() if now - seen > TURNS_TTL_S]:
+                del self.turns[aid]
+            used, seen = self.turns.get(answer_id, (0, now))
+            turn = used + 1
             if turn > self.max_turns():
-                writer.write(
-                    _error(429, "rate_limit_error", "turn limit reached", retry=False)
-                )
-                self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start)))
+                writer.write(_error(429, "rate_limit_error", "turn limit reached", retry=False))
+                self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
                 return
-            self.turns[answer_id] = turn
+            self.turns[answer_id] = (turn, seen)
         key = self.key()
         if key is None:
             writer.write(_error(503, "api_error", "the broker has no model key", retry=False))
-            self.on_call(Call(answer_id, path, turn, 503, 0, _ms(start)))
+            self.on_call(Call(answer_id, path, turn, 503, 0, _ms(start), forwarded=False))
             return
         call = await self._forward(writer, path, query, headers, body, key, answer_id, turn)
         call.latency_ms = _ms(start)

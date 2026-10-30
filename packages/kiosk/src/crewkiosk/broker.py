@@ -153,7 +153,7 @@ class Ledger:
 
     def model(self, server: str, call: proxy.Call) -> None:
         a = self._answer(server, call.answer_id, None)
-        if call.turn is not None:
+        if call.turn is not None and call.forwarded:
             a.model_calls += 1
         a.input_tokens += call.input_tokens
         a.output_tokens += call.output_tokens
@@ -331,9 +331,7 @@ class OpServer:
             return rpc_result(
                 rid,
                 {
-                    "protocolVersion": requested
-                    if isinstance(requested, str)
-                    else MCP_PROTOCOL,
+                    "protocolVersion": requested if isinstance(requested, str) else MCP_PROTOCOL,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "crewkiosk-broker", "version": VERSION},
                 },

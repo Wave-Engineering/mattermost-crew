@@ -24,7 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# A response's encoded size. A search result's line is cut to TEXT_MAX characters.
+# A result's size as JSON-encoded, the form the broker sends. A search result's line is cut to
+# TEXT_MAX characters.
 MAX_RESPONSE_BYTES = 64 * 1024
 TEXT_MAX = 300
 LIST_MAX = 2000
@@ -201,31 +202,34 @@ class Corpus:
         except OSError as exc:
             raise ToolError(f"{path!r} cannot be read: {exc.strerror}") from None
         all_lines = text.splitlines()
-        lines: list[dict[str, Any]] = []
-        size, truncated = 0, False
-        for n, line in enumerate(all_lines[offset : offset + limit], offset):
-            size += len(line.encode()) + 16
-            if size > MAX_RESPONSE_BYTES:
-                truncated = True
-                break
-            lines.append({"n": n, "text": line})
-        return {
+        out: dict[str, Any] = {
             "repo": repo,
             "path": path,
             "commit": self.commit(repo),
             "total_lines": len(all_lines),
-            "lines": lines,
-            "truncated": truncated or offset + limit < len(all_lines),
+            "lines": [],
+            "truncated": True,
         }
+        size = _encoded(out)
+        for n, line in enumerate(all_lines[offset : offset + limit], offset):
+            entry = {"n": n, "text": line}
+            size += _encoded(entry) + 2
+            if size > MAX_RESPONSE_BYTES:
+                return out
+            out["lines"].append(entry)
+        out["truncated"] = offset + limit < len(all_lines)
+        return out
 
     def list(self, repo: str, glob: str | None = None) -> dict[str, Any]:
         top = self.repo_root(repo)
         paths: list[str] = []
         truncated = False
+        size = _encoded({"repo": repo, "commit": "0" * 40, "paths": [], "truncated": True})
         for rel in _walk(top):
             if glob is not None and not fnmatch.fnmatchcase(rel, glob):
                 continue
-            if len(paths) == LIST_MAX:
+            size += len(json.dumps(rel)) + 2
+            if len(paths) == LIST_MAX or size > MAX_RESPONSE_BYTES:
                 truncated = True
                 break
             paths.append(rel)
@@ -249,11 +253,11 @@ class Corpus:
                 if repo is not None:
                     raise
         results: list[dict[str, Any]] = []
-        size, truncated = 0, False
+        size, truncated = _encoded({"query": query, "results": [], "truncated": True}), False
         for name, top in tops:
             for path, line, text in self._rg(top, query, path_glob):
                 hit = {"repo": name, "path": path, "line": line, "text": text[:TEXT_MAX]}
-                size += len(json.dumps(hit).encode())
+                size += _encoded(hit) + 2
                 if len(results) == max_results or size > MAX_RESPONSE_BYTES:
                     truncated = True
                     break
@@ -309,6 +313,11 @@ class Corpus:
             if not isinstance(path, str) or not isinstance(text, str):
                 continue
             yield path.removeprefix("./"), int(data.get("line_number") or 0), text.rstrip("\n")
+
+
+def _encoded(obj: Any) -> int:
+    """`obj`'s size as the broker sends it: `json.dumps`, so non-ASCII text is \\u-escaped."""
+    return len(json.dumps(obj))
 
 
 def _walk(top: Path) -> Iterator[str]:
