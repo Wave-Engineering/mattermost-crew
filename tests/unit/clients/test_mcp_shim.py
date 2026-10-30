@@ -12,7 +12,8 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Sequence
+import tempfile
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -135,6 +136,13 @@ def make_repo(tmp_path: Path, **identity: Any) -> Path:
     ident = {k: v for k, v in ident.items() if v is not None}  # None: leave the field out
     (root / ".claude" / "agent-identity.json").write_text(json.dumps(ident))
     return root
+
+
+@pytest.fixture
+def short_dir() -> Iterator[Path]:
+    # A unix socket path is limited to 108 bytes; pytest's tmp_path can be longer.
+    with tempfile.TemporaryDirectory(prefix="cc-shim-", dir="/tmp") as d:
+        yield Path(d)
 
 
 def make_shim(
@@ -439,19 +447,94 @@ def test_ping_survives_a_daemon_that_is_down(
     asyncio.run(scenario())
 
 
-def test_ping_stops_on_a_daemon_without_the_op(tmp_path: Path) -> None:
-    """An older daemon answers `unsupported`: the shim stops asking, and falls back on its
-    calls' `not_registered` retry (#112)."""
+def test_ping_keeps_asking_a_daemon_without_the_op(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#137: an older daemon answers `unsupported`, and is asked again every `PING_EVERY`,
+    said once at INFO. The upgrade that brings `ping` is a restart, so when the new daemon
+    answers `not_registered`, the idle session registers again with no tool call."""
     daemon, clock = RestartingDaemon(), Clock()
     daemon.pings = DaemonError("ping", "unsupported")
     shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
 
     async def scenario() -> None:
         await shim.start()
-        for _ in range(3):
-            await shim.ping()
-            clock.now += mcp_shim.PING_EVERY
-        assert len(daemon.of("ping")) == 1 and not shim.ping_supported
+        with caplog.at_level(logging.INFO, logger="crewchat_clients.mcp_shim"):
+            for _ in range(3):
+                await shim.ping()
+                clock.now += mcp_shim.PING_EVERY
+        assert len(daemon.of("ping")) == 3
+        said = [r for r in caplog.records if "no ping op" in r.getMessage()]
+        assert [r.levelno for r in said] == [logging.INFO]
+
+        daemon.pings = None  # the upgrade: a daemon with `ping`, which lost the agent
+        daemon.restart()
+        await shim.ping()
+        assert daemon.holds and len(daemon.of("register")) == 2
+
+    asyncio.run(scenario())
+
+
+def test_run_timers_survive_an_unexpected_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing awaits the timer's task: an error that isn't a ShimError is logged, and the
+    next tick still runs, so the ping can't stop in silence."""
+    daemon, clock = RestartingDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+    ticks = 0
+
+    async def sleep(_seconds: float) -> None:
+        nonlocal ticks
+        ticks += 1
+        clock.now += mcp_shim.PING_EVERY
+        if ticks == 1:
+            daemon.pings = RuntimeError("boom")
+        elif ticks == 2:
+            daemon.pings = None
+            daemon.restart()
+        else:
+            raise asyncio.CancelledError
+
+    async def scenario() -> None:
+        await shim.start()
+        with (
+            caplog.at_level(logging.ERROR, logger="crewchat_clients.mcp_shim"),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await shim.run_timers(interval_s=5.0, sleep=sleep)
+
+    asyncio.run(scenario())
+    assert any("tick failed" in r.getMessage() for r in caplog.records)
+    assert daemon.holds and len(daemon.of("register")) == 2  # the second tick re-registered
+
+
+def test_ping_over_a_broken_socket_is_unreachable_and_carries_on(
+    tmp_path: Path, short_dir: Path
+) -> None:
+    """A daemon that accepts and hangs up (one going down) is `DaemonUnreachable`: the ping
+    logs it at debug and returns, and the next ping, with the daemon back, registers again."""
+    sock = short_dir / "crewchat.sock"
+    daemon, clock = RestartingDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def hang_up(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    async def scenario() -> None:
+        await shim.start()
+        server = await asyncio.start_unix_server(hang_up, path=str(sock))
+        try:
+            shim.transport = SocketTransport(sock, timeout_s=2.0)
+            await shim.ping()  # no reply: unreachable, nothing raised
+        finally:
+            server.close()
+            await server.wait_closed()
+        shim.transport = daemon
+        daemon.restart()
+        clock.now += mcp_shim.PING_EVERY
+        await shim.ping()
+        assert daemon.holds and len(daemon.of("register")) == 2
 
     asyncio.run(scenario())
 

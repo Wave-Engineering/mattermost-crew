@@ -344,7 +344,7 @@ JSON lines over the unix socket. Every frame carries `"proto": 1` (D-056). Reque
 | `squawk_ids` | `dev_name, ids` | `{}`. The shim pushes the ids from `.claude/sqtk-mine.json` (R-26). |
 | `subscribe` | `dev_name` | stream of events; the thin one-shot exits on the first |
 | `health` | `dev_name?` | `{backends:{name:{state, since}}}`, keyed by backend name. Discord's entry is `ok`, or `degraded` while scream-hole is unhealthy (D-106). With `dev_name`, an agent the daemon doesn't hold gets `not_registered`, so the shim re-registers after a daemon restart (#112). Without it, `health` is the daemon's liveness check. |
-| `ping` | `dev_name` | `{}`, or `not_registered` for an agent the daemon doesn't hold (#129). The shim's timer asks it every 15 s, so an idle session re-registers after a daemon restart without waiting for a tool call. It touches no backend, unlike `health`. A daemon older than `ping` answers `unsupported`, and the shim stops asking. |
+| `ping` | `dev_name` | `{}`, or `not_registered` for an agent the daemon doesn't hold (#129). The shim's timer asks it every 15 s, so an idle session re-registers after a daemon restart without waiting for a tool call. It touches no backend, unlike `health`. A daemon older than `ping` answers `unsupported`, and the shim asks it again every 15 s anyway: the upgrade that brings `ping` is a restart (#137). |
 
 Every chat frame (`send`, `dm`, `read`, `thread`, `react`, and the Discord ops) names the agent it acts as (`dev_name`) and the backend it goes to (`backend`), because one daemon per host serves N backends. `off_default: true` marks a call that named a backend other than the agent's default, and is logged (R-13).
 
@@ -624,6 +624,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-23 | daemon filters | With the kiosk off, an outsider's message is dropped | R-34 |
 | IT-24 | daemon ↔ Mattermost | An agent posts a new root through the daemon's `send`, the daemon restarts, and a human's reply in that thread is addressed to the agent (`addressed_to` true through the persisted `MyThreads`) (D-104) | R-17, R-19 |
 | IT-25 | daemon ↔ scream-hole | With the scream-hole fake failing its health check, `chat_read`, with and without `post_id`, on Discord answers `unavailable: scream-hole unhealthy`, and the Discord REST fake sees no read; `chat_send` still posts, through the direct fallback. Once the fake is healthy again, the next read is served through scream-hole (D-106) | R-15 |
+| IT-26 | shim ↔ daemon restart | With the shim's timer running and no tool call, the daemon restarts, from one without `ping` (`unsupported`) and from one with it: the shim is registered again within 20 s, and an armed doorbell rides through the restart without exiting and then delivers (#137) | R-26, CT-08 |
 
 ### 6.3 End-to-End Tests (Automated)
 
@@ -1190,7 +1191,7 @@ Exposes the chat contract to agents as `chat_*` tools through a thin MCP shim wi
    - It defines the §5.5 tools. `chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react` and `chat_health` each forward one frame to `/run/crewchat/crewchat.sock`. `chat_set_default(key, backend)` is the one local-only tool: it writes `~/.claude/chat-defaults.json` and sends nothing to the daemon.
    - On start it sends `register` with the Dev-Name and `crew` from `<repo_root>/.claude/agent-identity.json`; `crew` is omitted when the file has none. The result includes the crew's `needs_list` (§5.4), which the daemon takes from `[crews.<crew>] needs_list` in `servers.toml`.
    - It **re-registers** every 24 hours on a timer, and before any call if its last `register` is older than 24 h. The shim lives as long as the session, so a session that stays up for weeks never ages out under R-30.
-   - The same timer sends `ping{dev_name}` every 15 s (#129). A `not_registered` answer means the daemon restarted and lost the registration: the shim registers again and pushes its files, with no tool call, so the agent's doorbell can arm. A daemon that answers `unsupported` is not asked again; one that is down is asked again on the next tick.
+   - The same timer sends `ping{dev_name}` every 15 s (#129). A `not_registered` answer means the daemon restarted and lost the registration: the shim registers again and pushes its files, with no tool call, so the agent's doorbell can arm. A daemon that answers `unsupported` is asked again like any other, because the upgrade that brings `ping` is itself a restart, and a shim that stopped asking missed exactly that one (#137). One that is down is asked again on the next tick. An unexpected error in a tick is logged and the timer carries on, since nothing awaits its task.
    - It runs as the agent's user, so it reads the agent's files; the daemon never does (§5.3).
      - It pushes `kiosk_brief{dev_name, text}`, where `text` is `crewchat_clients.brief.extract_brief` of `<repo_root>/.claude/reseed-revive.md`, at start and whenever that file's mtime changes.
      - It pushes `squawk_ids{dev_name, ids}` from `<repo_root>/.claude/sqtk-mine.json` at start and on change.
@@ -1880,7 +1881,7 @@ release PR, whose own CI re-runs every item on the final `main`.
 | R-23 | Social marked, lapses per delivery, reverts, notifies | Stories 3.1, 3.3 | IT-09, IT-18, E2E-02 | integration / e2e test | Pass |
 | R-24 | Only the partner flips; broker holds state | Story 3.1 | IT-09, IT-18 | integration test | Pass |
 | R-25 | Loop guard | Story 3.3 | IT-10, E2E-03 | integration / e2e test | Pass |
-| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, E2E-01 | integration / e2e test | Pass |
+| R-26 | One merged doorbell | Stories 3.2, 3.4 | IT-11, IT-26, E2E-01 | integration / e2e test | Pass |
 | R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pass |
 | R-28 | Cursor replay: queued exactly once, handed over at least once | Story 3.2 | IT-13 | integration test | Pass |
 | R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
