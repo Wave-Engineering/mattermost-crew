@@ -44,7 +44,8 @@ and the daemon acts on the agent's behalf with what it holds itself.
   that brings the op is itself a restart, and a shim that stopped asking missed it (#137).
 - **Logging (#144).** INFO on stderr by default. Claude Code doesn't keep an MCP server's
   stderr after it connects, so a field check needs a file: `CREWCHAT_SHIM_LOG` sets the level
-  (`debug`, `info` or `warning`, any case), and `CREWCHAT_SHIM_LOG_FILE`, an absolute path,
+  of the shim's own lines (`debug`, `info` or `warning`, any case; the MCP library stays at
+  INFO, as its DEBUG carries message text), and `CREWCHAT_SHIM_LOG_FILE`, an absolute path,
   appends the same lines to that file, created 0600 and never rotated. `debug` shows the
   timer's `tick` and `ping:` lines. Turn both on for a session, then remove them. A bad level
   or path logs one WARNING and the shim starts anyway, on stderr.
@@ -914,17 +915,21 @@ LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.W
 
 
 def configure_logging(environ: Mapping[str, str]) -> None:
-    """The root logger: stderr always, at `CREWCHAT_SHIM_LOG` (`info` by default), plus the
-    file `CREWCHAT_SHIM_LOG_FILE` names (#144). A bad level or path logs one WARNING and
-    leaves stderr alone: the shim never fails to start over its logging."""
+    """The root logger: stderr always, plus the file `CREWCHAT_SHIM_LOG_FILE` names (#144).
+    `CREWCHAT_SHIM_LOG` (`info` by default) sets the level of the shim's own loggers only:
+    the root stays at INFO, or WARNING when asked, because the MCP library logs every request
+    it receives at DEBUG, message text included, and that must never reach a file. A bad
+    level or path logs one WARNING and leaves stderr alone: the shim never fails to start
+    over its logging."""
     root = logging.getLogger()
     stderr = logging.StreamHandler(sys.stderr)
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(stderr)
     wanted = environ.get("CREWCHAT_SHIM_LOG", "info")
-    level = LOG_LEVELS.get(wanted.lower())
-    root.setLevel(level or logging.INFO)
-    if level is None:
+    level = LOG_LEVELS.get(wanted.lower()) or logging.INFO
+    root.setLevel(max(level, logging.INFO))
+    logging.getLogger("crewchat_clients").setLevel(level)
+    if wanted.lower() not in LOG_LEVELS:
         log.warning("CREWCHAT_SHIM_LOG=%r is not debug, info or warning: using info", wanted)
     path = environ.get("CREWCHAT_SHIM_LOG_FILE")
     if not path:

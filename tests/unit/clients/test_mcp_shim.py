@@ -1080,15 +1080,20 @@ def test_socket_transport(tmp_path: Path) -> None:
 # -- logging (#144) ---------------------------------------------------------------------------
 @pytest.fixture
 def root_logger() -> Iterator[logging.Logger]:
-    """The root logger, put back as it was: `configure_logging` adds handlers to it."""
-    root = logging.getLogger()
-    handlers, level = list(root.handlers), root.level
+    """The root logger, put back as it was, with the shim's package logger: `configure_logging`
+    adds handlers to one and sets the level of both."""
+    root, ours = logging.getLogger(), logging.getLogger("crewchat_clients")
+    handlers, levels = list(root.handlers), (root.level, ours.level)
     yield root
     for handler in root.handlers:
         if handler not in handlers:
             handler.close()
+            stream = getattr(handler, "stream", None)
+            if stream is not None and stream is not mcp_shim.sys.stderr:
+                stream.close()  # a StreamHandler never closes its own stream
     root.handlers[:] = handlers
-    root.setLevel(level)
+    root.setLevel(levels[0])
+    ours.setLevel(levels[1])
 
 
 def added(root: logging.Logger, before: list[logging.Handler]) -> list[logging.Handler]:
@@ -1120,11 +1125,12 @@ def test_shim_log_level_switch(
     level: int,
     warned: bool,
 ) -> None:
-    """`CREWCHAT_SHIM_LOG` sets the root level, in any case; unset is today's INFO on stderr,
-    and an unknown value is INFO with one WARNING."""
+    """`CREWCHAT_SHIM_LOG` sets the shim's own level, in any case; the root never goes below
+    INFO. Unset is today's INFO on stderr, and an unknown value is INFO with one WARNING."""
     before = list(root_logger.handlers)
     mcp_shim.configure_logging({} if value is None else {"CREWCHAT_SHIM_LOG": value})
-    assert root_logger.level == level
+    assert logging.getLogger("crewchat_clients").level == level
+    assert root_logger.level == max(level, logging.INFO)
     (stderr,) = added(root_logger, before)
     assert isinstance(stderr, logging.StreamHandler) and stderr.stream is mcp_shim.sys.stderr
     assert len(shim_warnings(caplog)) == (1 if warned else 0)
@@ -1133,7 +1139,8 @@ def test_shim_log_level_switch(
 def test_shim_log_file(
     tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The file gets the timer's DEBUG `ping:` line, at mode 0600, beside stderr."""
+    """The file gets the timer's DEBUG `tick` and `ping:` lines, at mode 0600, beside stderr,
+    and never the MCP library's DEBUG, which carries message text."""
     path = tmp_path / "shim.log"
     before = list(root_logger.handlers)
     env = {"CREWCHAT_SHIM_LOG": "debug", "CREWCHAT_SHIM_LOG_FILE": str(path)}
@@ -1144,10 +1151,13 @@ def test_shim_log_file(
 
     async def scenario() -> None:
         await shim.start()
-        await shim.tick()
+        await shim.tick()  # what the timer runs: `tick`, then the ping
 
     asyncio.run(scenario())
-    assert f"ping: the daemon holds {DEV}" in path.read_text()
+    logging.getLogger("mcp.server.lowlevel.server").debug("Received message: private text")
+    text = path.read_text()
+    assert " tick" in text and f"ping: the daemon holds {DEV}" in text
+    assert "private text" not in text
     assert path.stat().st_mode & 0o777 == 0o600
 
 
