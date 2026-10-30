@@ -212,14 +212,14 @@ def test_register_sends_identity_and_omits_missing_crew(tmp_path: Path) -> None:
     ident = {"dev_name": DEV, "session_id": "s1", "dev_team": "oaw", "dev_avatar": "x"}
     # No remote: the project key is the repo's path (#117).
     key = str(shim.repo_root.resolve())
-    assert daemon.of("register") == [{**ident, "project_key": key}]
+    assert daemon.of("register") == [{**ident, "project_key": key, "repo": ""}]
     assert shim.needs_list == "bj:needs"
 
     daemon2 = FakeDaemon()
     shim2 = make_shim(tmp_path / "b", daemon2, crew="wave")
     asyncio.run(shim2.start())
     key2 = str(shim2.repo_root.resolve())
-    assert daemon2.of("register") == [{**ident, "crew": "wave", "project_key": key2}]
+    assert daemon2.of("register") == [{**ident, "crew": "wave", "project_key": key2, "repo": ""}]
 
 
 def test_shim_register_sends_project_key(tmp_path: Path) -> None:
@@ -243,6 +243,8 @@ def test_shim_register_sends_project_key(tmp_path: Path) -> None:
     asyncio.run(shim.start())
     (frame,) = daemon.of("register")
     assert frame["project_key"] == "gitlab.example.lan/partner-org"
+    # #139: the full repo for the kiosk's corpus pool, still without the credential.
+    assert frame["repo"] == "gitlab.example.lan/partner-org/sub/repo"
     assert "s3cret" not in json.dumps(frame) and "repo.git" not in json.dumps(frame)
 
 

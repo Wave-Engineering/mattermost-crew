@@ -56,6 +56,27 @@ def defaults_path(home: Path | None = None) -> Path:
 def forge_key(remote: str) -> str | None:
     """`<host>/<org>` from an SSH (`git@host:org/r.git`, `ssh://git@host:22/org/r`) or HTTPS
     (`https://host/org/r.git`) remote; None for a local path or anything unparseable."""
+    parts = _remote_parts(remote)
+    if parts is None:
+        return None
+    host, path = parts
+    return f"{host}/{path.partition('/')[0]}"
+
+
+def forge_repo(remote: str) -> str | None:
+    """`<host>/<group>/.../<repo>` from the same remotes as `forge_key`, with `.git` dropped:
+    the full repo the kiosk's corpus pool clones (#139, D-112). None where `forge_key` is."""
+    parts = _remote_parts(remote)
+    if parts is None:
+        return None
+    host, path = parts
+    path = path.removesuffix(".git").rstrip("/")
+    return f"{host}/{path}" if path else None
+
+
+def _remote_parts(remote: str) -> tuple[str, str] | None:
+    """A remote's lower-cased host and its path, stripped of slashes; None for a local path,
+    anything unparseable, or no org."""
     remote = remote.strip()
     if not remote:
         return None
@@ -64,6 +85,8 @@ def forge_key(remote: str) -> str | None:
         if m.group("scheme").lower() == "file":
             return None
         authority, _, path = m.group("rest").partition("/")
+        # A query or fragment can carry a credential: it never leaves the shim.
+        path = re.split(r"[?#]", path, maxsplit=1)[0]
         host = authority.rpartition("@")[2]
         # An IPv6 literal keeps its brackets; the port after it, or after a name, goes.
         host = host[: host.find("]") + 1] if host.startswith("[") else host.partition(":")[0]
@@ -72,10 +95,10 @@ def forge_key(remote: str) -> str | None:
         if scp is None or remote.startswith(("/", ".")):
             return None
         host, path = scp.group("host"), scp.group("path")
-    org = path.strip("/").partition("/")[0]
-    if not host or not org:
+    path = path.strip("/")
+    if not host or not path.partition("/")[0]:
         return None
-    return f"{host.lower()}/{org}"
+    return host.lower(), path
 
 
 def git_remote(repo_root: Path) -> str | None:
@@ -100,6 +123,13 @@ def repo_key(repo_root: Path, remote_for: RemoteFor = git_remote) -> str:
     remote = remote_for(repo_root)
     key = forge_key(remote) if remote else None
     return key or str(repo_root.resolve())
+
+
+def repo_ref(repo_root: Path, remote_for: RemoteFor = git_remote) -> str:
+    """This repo's full forge path for the kiosk's corpus pool (#139), or "" with no forge
+    remote: a path-keyed repo adds nothing to any pool (D-112)."""
+    remote = remote_for(repo_root)
+    return (forge_repo(remote) if remote else None) or ""
 
 
 def load_defaults(path: Path) -> dict[str, Backend]:

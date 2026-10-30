@@ -40,3 +40,15 @@ def allowed(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
     if entry.agents_allow is None:
         return True
     return any(matches(e, project_key, dev_name) for e in entry.agents_allow)
+
+
+def admits_repo(entry: BrokerEntry, repo: str) -> bool:
+    """Whether a full repo may enter this server's corpus pool (D-112): its `host/org` must
+    equal a forge entry in an explicit `agents_allow`, and no forge entry in `agents_deny`.
+    Path and `name:` entries never admit a repo, and no allowlist admits none."""
+    if entry.agents_allow is None:
+        return False
+    forge = "/".join(repo.split("/")[:2])
+    if forge in entry.agents_deny:
+        return False
+    return forge in entry.agents_allow

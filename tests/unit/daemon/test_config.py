@@ -166,6 +166,69 @@ def test_server_kiosk_types_refused(change: dict[str, Any], message: str) -> Non
         parse_config(raw)
 
 
+def _research(raw: dict[str, Any], **server: Any) -> dict[str, Any]:
+    raw["mattermost"][0].update(kiosk=True, kiosk_research=True, **server)
+    raw["crews"]["oaw"]["dev"]["agents_allow"] = ["forge.example.lan/partner-org"]
+    return raw
+
+
+def test_server_research_keys_parse() -> None:
+    """#139: kiosk research and its corpus keys, off and empty by default."""
+    (server,) = parse_config(_raw()).mattermost
+    assert server.kiosk_research is False
+    assert server.corpus_extra == () and server.corpus_exclude == ()
+    assert server.corpus_refresh_minutes == 15
+    raw = _research(
+        _raw(),
+        corpus_extra=["forge.example.lan/partner-org/docs"],
+        corpus_exclude=["forge.example.lan/partner-org/group/infra"],
+        corpus_refresh_minutes=60,
+    )
+    (server,) = parse_config(raw).mattermost
+    assert server.kiosk_research is True
+    assert server.corpus_extra == ("forge.example.lan/partner-org/docs",)
+    assert server.corpus_exclude == ("forge.example.lan/partner-org/group/infra",)
+    assert server.corpus_refresh_minutes == 60
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"kiosk_research": "yes"}, "kiosk_research must be true or false"),
+        ({"corpus_refresh_minutes": 0}, "corpus_refresh_minutes"),
+        ({"corpus_refresh_minutes": True}, "corpus_refresh_minutes"),
+        ({"corpus_extra": "forge.example.lan/a/b"}, "corpus_extra must be an array"),
+        ({"corpus_extra": ["forge.example.lan/org"]}, "is not host/group/.../repo"),
+        ({"corpus_extra": ["forge.example.lan/org/repo.git/"]}, "is not host/group/.../repo"),
+        ({"corpus_exclude": ["forge.example.lan/org/../x"]}, "is not host/group/.../repo"),
+        ({"corpus_exclude": ["Forge.lan/org/repo"]}, "is not host/group/.../repo"),
+        ({"kiosk": False}, "kiosk_research needs kiosk = true"),
+    ],
+)
+def test_server_research_refused(change: dict[str, Any], message: str) -> None:
+    raw = _research(_raw())
+    raw["mattermost"][0].update(change)
+    with pytest.raises(ConfigError, match=message):
+        parse_config(raw)
+
+
+def test_research_needs_allowlist_on_every_crew() -> None:
+    """D-112: an absent agents_allow admits every agent, so research refuses it."""
+    raw = _research(_raw())
+    del raw["crews"]["oaw"]["dev"]["agents_allow"]
+    with pytest.raises(ConfigError, match=r"needs agents_allow on crews\.oaw\.dev"):
+        parse_config(raw)
+    raw = _research(_raw())
+    raw["crews"]["wave"] = {
+        "needs_list": "bj:needs",
+        "dev": {"broker_socket": "/run/crewbroker/wave-dev.sock", "broker_user_id": "b-wave"},
+    }
+    with pytest.raises(ConfigError, match=r"crews\.wave\.dev"):
+        parse_config(raw)
+    raw["crews"]["wave"]["dev"]["agents_allow"] = []  # explicit, even if empty
+    parse_config(raw)
+
+
 def test_allowlist_entry_forms() -> None:
     raw = _raw()
     raw["crews"]["oaw"]["dev"].update(

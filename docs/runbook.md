@@ -128,6 +128,15 @@ kiosk = false
 # Kiosk answers on this server per UTC day, across every outsider and agent; 0 means none.
 # Optional, default 25. The count survives a daemon restart.
 kiosk_daily_cap = 25
+# Kiosk research (#139, D-112). Optional, default false. Needs `kiosk = true`, and an
+# `agents_allow` on every crew table for this server: a repo enters the pool only when its
+# host/org is a forge entry there. Install the pool directory first ("Kiosk research pool").
+# kiosk_research = true
+# Full repos (host/group/.../repo) to pool besides the agents' own, and to keep out of it. An
+# exclude matches however a repo is spelled (case, a trailing .git) and covers its .wiki.
+# corpus_extra = ["forge.example.lan/org/handbook"]
+# corpus_exclude = ["forge.example.lan/org/secret-infra"]
+# corpus_refresh_minutes = 15
 
 # Discord. With `enabled = true`, also set `screamhole_url`, and install the Discord credential
 # at /etc/crewchat/discord.credential (mode 0600).
@@ -431,6 +440,31 @@ sudo systemctl restart crewkiosk.socket
 sudo test -S /run/crewkiosk/kiosk.sock
 echo "crewkiosk.socket is listening on /run/crewkiosk/kiosk.sock"
 ```
+
+## Kiosk research pool
+
+Only on a host with a `kiosk_research = true` server (#139, D-112). The daemon writes one
+manifest per research server into `/var/lib/crewchat-pool`, which the corpus builder (#140)
+reads through the `crewcorpus` group. Order matters:
+
+- tmpfiles refuses to make the directory until the group exists.
+- `crewchat.service` lists the directory as `ReadWritePaths=-/var/lib/crewchat-pool`. The `-`
+  means a directory missing when the unit starts is skipped in silence, and stays read-only
+  inside the daemon's namespace until a restart.
+
+So create the group, then the directory, then restart the daemon:
+
+```bash
+getent group crewcorpus >/dev/null || sudo groupadd --system crewcorpus
+sudo install -m 0644 -o root -g root packaging/crewchat-pool.tmpfiles.conf \
+  /etc/tmpfiles.d/crewchat-pool.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/crewchat-pool.conf
+sudo stat -c '%a %U %G' /var/lib/crewchat-pool   # 2750 crewchat crewcorpus
+sudo systemctl restart crewchat
+```
+
+Then `health` lists each research server under `kiosk_research` with `pool_repos: N`. While
+the manifest can't be written, it shows `pool_repos: null` and the `error` instead.
 
 ## Verify the install
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from crewchat.allowlist import allowed, matches
+from crewchat.allowlist import admits_repo, allowed, matches
 from crewchat.config import BrokerEntry
 
 FORGE = "forge.example.lan/partner-org"
@@ -40,6 +40,19 @@ def test_allowed_rules() -> None:
     assert allowed(entry(deny=(FORGE,)), "forge.example.lan/other", "babel")
     # An empty allowlist admits nobody.
     assert not allowed(entry(allow=()), FORGE, "babel")
+
+
+def test_admits_repo() -> None:
+    """#139, D-112: a repo enters a pool only by its host/org on a forge allow entry."""
+    repo = f"{FORGE}/group/service"
+    assert admits_repo(entry(allow=(FORGE,)), repo)
+    assert admits_repo(entry(allow=(FORGE,)), f"{FORGE}/site")
+    assert not admits_repo(entry(allow=(FORGE,)), "forge.example.lan/partner-org2/x")
+    assert not admits_repo(entry(allow=(FORGE,), deny=(FORGE,)), repo)  # deny wins
+    # Path and name entries never admit a repo, and no allowlist admits none.
+    assert not admits_repo(entry(allow=("/", "name:babel")), repo)
+    assert not admits_repo(entry(), repo)
+    assert not admits_repo(entry(allow=()), repo)
 
 
 def test_empty_project_key_fails_closed() -> None:

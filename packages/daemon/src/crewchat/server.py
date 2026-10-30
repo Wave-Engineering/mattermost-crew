@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from crewchat.config import ServersConfig
+from crewchat.config import ServersConfig, is_repo
 from crewchat.protocol import MAX_FRAME_BYTES, ProtocolError, encode, err, ok, parse_frame
 from crewchat.registry import RegisterError, Registry, mattermost_backend
 
@@ -244,7 +244,8 @@ def build_handlers(
     `discord`. A backend in `health_sources` answers for itself; any other reports
     `configured`, from the daemon's start. With `dev_name`, an agent the registry doesn't
     hold gets `not_registered`, so the shim's retry re-registers it after a restart (#112);
-    without it, `health` is the daemon's liveness check.
+    without it, `health` is the daemon's liveness check. With a kiosk research server, it
+    also reports `kiosk_research: {<server_id>: {"pool_repos": N}}` (#139).
     """
     started = datetime.now(UTC).isoformat()
     sources = dict(health_sources or {})
@@ -261,6 +262,14 @@ def build_handlers(
         project_key = args.get("project_key", "")  # the shim's repo_key(), for the allowlist
         if not isinstance(project_key, str):
             raise OpError("bad_request", "project_key is a string")
+        repo = args.get("repo", "")  # the shim's repo_ref(), for the kiosk's corpus pool (#139)
+        if not isinstance(repo, str):
+            raise OpError("bad_request", "repo is a string")
+        if repo and not is_repo(repo):
+            # Never fails the register: that agent just adds nothing to any pool.
+            # Never the value: a malformed one may still hold part of a remote's credential.
+            log.warning("register %s: dropping a malformed repo", dev_name)
+            repo = ""
         reg = await registry.register(
             dev_name,
             crew,
@@ -268,6 +277,7 @@ def build_handlers(
             dev_team=dev_team,
             dev_avatar=dev_avatar,
             project_key=project_key,
+            repo=repo,
         )
         return reg.result()
 
@@ -289,7 +299,11 @@ def build_handlers(
                 if source is not None
                 else {"state": "configured", "since": started}
             )
-        return {"backends": backends}
+        result: dict[str, Any] = {"backends": backends}
+        research = registry.pool.health() if registry.pool is not None else {}
+        if research:
+            result["kiosk_research"] = research  # #139: each research server's pool size
+        return result
 
     async def ping(args: dict[str, Any]) -> dict[str, Any]:
         """Whether the daemon still holds `dev_name`: the shim's timer asks, so an idle session

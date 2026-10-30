@@ -11,8 +11,10 @@ from crewchat_clients.defaults import (
     DefaultsError,
     NeedsHuman,
     forge_key,
+    forge_repo,
     git_remote,
     repo_key,
+    repo_ref,
     resolve_default,
     write_default,
 )
@@ -70,6 +72,37 @@ def test_resolution_order(tmp_path: Path) -> None:
 )
 def test_forge_key_from_remote(remote: str, key: str | None) -> None:
     assert forge_key(remote) == key
+
+
+@pytest.mark.parametrize(
+    ("remote", "repo"),
+    [
+        (
+            "git@github.com:Wave-Engineering/mattermost-crew.git",
+            "github.com/Wave-Engineering/mattermost-crew",
+        ),
+        (
+            "ssh://git@gitlab.com:2222/example-group/sub/repo.git",
+            "gitlab.com/example-group/sub/repo",
+        ),
+        ("https://user:tok@GitLab.com/example-group/repo", "gitlab.com/example-group/repo"),
+        ("http://git.lan:8080/org/repo/", "git.lan/org/repo"),
+        # A query or fragment can carry a token, and never leaves the shim.
+        ("https://git.lan/org/repo.git?private_token=abc", "git.lan/org/repo"),
+        ("https://git.lan/org/repo#tok", "git.lan/org/repo"),
+        ("/srv/git/repo.git", None),
+        ("file:///srv/git/repo.git", None),
+        ("", None),
+    ],
+)
+def test_forge_repo_forms(remote: str, repo: str | None) -> None:
+    """#139: the full repo, nested groups kept, `.git` and credentials dropped."""
+    assert forge_repo(remote) == repo
+
+
+def test_repo_ref(tmp_path: Path) -> None:
+    assert repo_ref(tmp_path, lambda _root: None) == ""
+    assert repo_ref(tmp_path, lambda _root: REMOTE) == "github.com/Wave-Engineering/mattermost-crew"
 
 
 def test_repo_key_and_git_remote(tmp_path: Path) -> None:

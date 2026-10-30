@@ -8,6 +8,20 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **The kiosk's corpus pool, per server** (#139, the first part of #136). A `[[mattermost]]`
+  server can set `kiosk_research = true`, with `corpus_extra`, `corpus_exclude` (full repos,
+  `host/group/.../repo`) and `corpus_refresh_minutes`. The shim now sends its repo's full forge
+  path on `register`. For each research server the daemon writes
+  `/var/lib/crewchat-pool/<server_id>.json`: the repos of agents holding a token there, plus
+  `corpus_extra`, minus `corpus_exclude`. Repos compare without regard to case or a trailing
+  `.git`, so an exclude wins however a repo is spelled, and it covers the repo's `.wiki`. The
+  manifest carries the excludes too, for the builder to check each repo's canonical path. A
+  repo is kept only when its `host/org` matches a forge entry in an explicit `agents_allow`
+  (D-112): an agent's repo, its own crew's for that server. So research on a server is a config
+  error unless `kiosk = true` and every crew table on that server sets `agents_allow`.
+  `health` reports each research server's pool size, or the error while its manifest can't be
+  written. The runbook's new "Kiosk research pool" section installs the directory. Nothing reads the manifest yet; the corpus
+  builder is #140. With research off nothing changes.
 - **`crewchat-send`, a sender for scripts** (#146). A script posts one message as its
   checkout's agent: `crewchat-send [--backend B] [--thread ID] [--dm] <to> < message`. The text
   is read from STDIN only, so backticks and `$` never meet a shell. The backend is the agent's
