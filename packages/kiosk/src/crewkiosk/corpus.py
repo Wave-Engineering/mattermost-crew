@@ -8,7 +8,7 @@ The kiosk never sees it.
 Per repo:
 
 1. **Resolve its canonical path** through the forge API, with that server's credential for that
-   repo's forge host (`corpus-<server>-<host>.credential`): a forge is never sent another's
+   repo's forge host (`corpus-<server>@<host>.credential`): a forge is never sent another's
    token, and a host with no credential is never asked. A forge keeps redirects after a rename
    or transfer, so a manifest path can lead to a repo the operator excluded under its new name.
    A canonical path that is excluded, with or without `.wiki`, is never cloned, and its last
@@ -26,7 +26,9 @@ Per repo:
    may not exempt itself: `.gitleaks.toml` and `.gitleaksignore` never reach the tree, gitleaks
    runs from an empty directory with no `GITLEAKS_*` variables, and it scans a flat copy, each
    file as `f<n>`, so its default path allowlist (`node_modules/`, `*.svg`, lock files) matches
-   nothing, with `gitleaks:allow` neutralized. A missing gitleaks publishes nothing at all.
+   nothing, with `gitleaks:allow` neutralized. A file keeps the suffix a path-scoped rule needs
+   (`.yaml`, `.tf`, `.php`, `nuget.config`), as `f000001.yaml`. A missing gitleaks publishes
+   nothing at all.
 
 A filesystem error fails that one repo, and a failed build fails that one server: neither stops
 the rest. A repo whose path lies under another pooled repo's is refused.
@@ -69,7 +71,8 @@ log = logging.getLogger(__name__)
 CORPUS_ROOT = Path("/var/lib/crewcorpus")
 POOL_DIR = Path("/var/lib/crewchat-pool")
 # One token per forge host: a pool may span forges, and no forge is ever sent another's token.
-CREDENTIAL = "/etc/crewkiosk/corpus-{server}-{host}.credential"
+# `@` is in neither a server id nor a host, so no two (server, host) pairs share a file.
+CREDENTIAL = "/etc/crewkiosk/corpus-{server}@{host}.credential"
 MAX_FILE_BYTES = 5 * 1024 * 1024
 TEXT_PROBE_BYTES = 8 * 1024
 GIT_TIMEOUT_S = 600
@@ -102,6 +105,10 @@ SCANNER_CONTROL = (".gitleaks.toml", ".gitleaksignore")
 ALLOW_MARKER = b"gitleaks:allow"
 ALLOW_NEUTRALIZED = b"gitleaks-allow"
 LEAKS_FOUND = 3  # the `--exit-code` gitleaks is given for a finding; its errors exit 1
+# The suffixes the default config's path-scoped rules need (kubernetes-secret-yaml,
+# hashicorp-tf-password, freemius-secret-key, nuget-config-password, gitleaks 8.30). None is on
+# its path allowlist, so the shadow name keeps them.
+RULE_SUFFIX = re.compile(r"(?i)(?:\.(?:ya?ml|tf|hcl|php)|nuget\.config)$")
 
 State = Literal["ok", "withheld", "clone_failed", "excluded"]
 Lookup = Callable[[str, str], str]
@@ -378,14 +385,17 @@ def _sizes(git: Git, clone: Path, oids: list[str]) -> dict[str, int]:
     if not oids:
         return {}
     argv = ["git", "-c", "credential.helper=", "cat-file", "--batch-check"]
-    done = subprocess.run(
-        argv,
-        cwd=clone,
-        env=git.env,
-        input="".join(f"{oid}\n" for oid in oids).encode(),
-        capture_output=True,
-        timeout=GIT_TIMEOUT_S,
-    )
+    try:
+        done = subprocess.run(
+            argv,
+            cwd=clone,
+            env=git.env,
+            input="".join(f"{oid}\n" for oid in oids).encode(),
+            capture_output=True,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GitFailed(f"git cat-file: {type(exc).__name__}") from None
     if done.returncode != 0:
         raise GitFailed(f"git cat-file exited {done.returncode}")
     sizes: dict[str, int] = {}
@@ -404,18 +414,25 @@ class Scan:
     paths: tuple[str, ...] = ()
 
 
+def shadow_name(n: int, src: Path) -> str:
+    """`f<n>`, plus the suffix a path-scoped rule needs, if `src` has one: `f000001.yaml`."""
+    m = RULE_SUFFIX.search(src.name)
+    return f"f{n:06d}" + ("." + m.group(0).lstrip(".") if m else "")
+
+
 def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
     """`gitleaks dir` over a flat copy of `tree`: each file as `f<n>`, a hard link, or a
     rewrite with `gitleaks:allow` neutralized if it carries the marker. The default config
     allowlists paths (`node_modules/`, `vendor/`, `*.svg`, lock files and more), so a file
-    scanned under its own path could ship unscanned; under `f<n>` no path matches. Findings
-    are mapped back to the tree's paths. The report keeps only rule ids and paths."""
+    scanned under its own path could ship unscanned; under `f<n>` no path matches. A file
+    keeps a `RULE_SUFFIX` so the rules scoped to it still fire. Findings are mapped back to
+    the tree's paths. The report keeps only rule ids and paths."""
     shadow, empty, report = work / "scan", work / "empty", work / "leaks.json"
     empty.mkdir()
     shadow.mkdir()
     names: dict[str, str] = {}
     for n, src in enumerate(sorted(p for p in tree.rglob("*") if p.is_file()), 1):
-        dest = shadow / f"f{n:06d}"
+        dest = shadow / shadow_name(n, src)
         names[dest.name] = str(src.relative_to(tree))
         data = src.read_bytes()
         if ALLOW_MARKER in data:

@@ -9,6 +9,7 @@ missing gitleaks a failure.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -68,6 +69,12 @@ def test_it29_builds_filters_and_withholds(
         "vend", {"node_modules/pkg/index.js": f'module.exports = "{vendored}"\n'.encode()}
     )
     art = forge.repo("art", {"logo.svg": f"<svg><desc>{vendored}</desc></svg>\n".encode()})
+    # kubernetes-secret-yaml fires only on a `.ya?ml` path: the flat name must keep it. (A
+    # `*secret*` path never reaches the scan at all: the denylist drops it.)
+    sealed = base64.b64encode(secrets.token_bytes(24)).decode()
+    k8s = forge.repo(
+        "k8s", {"deploy/db.yaml": f"kind: Secret\ndata:\n  password: {sealed}\n".encode()}
+    )
     renamed: set[str] = set()
     credential = tmp_path / "corpus-dev.credential"
     credential.write_text(TOKEN + "\n")
@@ -82,9 +89,10 @@ def test_it29_builds_filters_and_withholds(
         clock=clock,
     )
     pool = tmp_path / "pool"
-    write_manifest(pool, repos=[app, lib, moved, vend, art], exclude=[HIDDEN])
+    write_manifest(pool, repos=[app, lib, moved, vend, art, k8s], exclude=[HIDDEN])
 
-    assert run(pool, builder) == 0
+    with caplog.at_level(logging.INFO):
+        assert run(pool, builder) == 0
     current = root / SERVER / "current"
     first = json.loads((root / "status" / f"{SERVER}.json").read_text())
     assert {r: s["state"] for r, s in first["repos"].items()} == {
@@ -93,8 +101,13 @@ def test_it29_builds_filters_and_withholds(
         moved: "ok",
         vend: "withheld",
         art: "withheld",
+        k8s: "withheld",
     }
+    assert "kubernetes-secret-yaml" in caplog.text and "deploy/db.yaml" in caplog.text
+    assert sealed not in caplog.text
+    caplog.clear()
     assert not (current / vend).exists() and not (current / art).exists()
+    assert not (current / k8s).exists()
     top = current / app
     assert {str(p.relative_to(top)) for p in top.rglob("*")} == {"README.md", "src", "src/main.py"}
     for p in [current.resolve(), *current.resolve().rglob("*")]:
@@ -119,6 +132,7 @@ def test_it29_builds_filters_and_withholds(
         moved: "excluded",
         vend: "withheld",
         art: "withheld",
+        k8s: "withheld",
     }
     assert (current / lib / "README.md").read_text() == "lib v1\n"  # its last good copy
     assert status["repos"][lib]["commit"] == first["repos"][lib]["commit"]

@@ -18,7 +18,7 @@ All notable changes to this project are recorded here. The format follows
   withheld and its last good copy is served. A repo can't exempt itself: `.gitleaks.toml` and
   `.gitleaksignore` are dropped, `gitleaks:allow` is ignored, and paths gitleaks skips by
   default (`node_modules/`, `*.svg`, lock files) are scanned too. Each forge host gets its own
-  credential, `/etc/crewkiosk/corpus-<server>-<host>.credential`, so no forge is ever sent
+  credential, `/etc/crewkiosk/corpus-<server>@<host>.credential`, so no forge is ever sent
   another's token. A disk or name error fails that one repo, never the build. Each build is a read-only
   generation, swapped in atomically under `/var/lib/crewcorpus/<server>/current`. The daemon's
   `health` shows each server's last build under `kiosk_research.<server>.corpus`, naming any

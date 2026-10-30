@@ -301,6 +301,34 @@ def test_a_repo_cannot_exempt_itself(
     assert (current(builder) / repo / "a.py").read_text() == "tok = 'x'  # gitleaks:allow\n"
 
 
+def test_shadow_names_keep_rule_suffixes(
+    tmp_path: Path, forge: Forge, make_builder: MakeBuilder
+) -> None:
+    """The suffixes path-scoped rules need survive the flat names; nothing else does, so
+    `pnpm-lock.yaml` keeps `.yaml` but not the lock-file name the allowlist matches."""
+    repo = forge.repo(
+        "a",
+        {
+            "k8s/Db.YML": b"a\n",
+            "main.tf": b"b\n",
+            "pnpm-lock.yaml": b"c\n",
+            "src/NuGet.Config": b"d\n",
+            "web/index.php": b"e\n",
+            "logo.svg": b"f\n",
+        },
+    )
+    assert states(make_builder().build(manifest(repo))) == {repo: "ok"}
+    (seen,) = scans(tmp_path)
+    assert set(seen["files"]) == {
+        "f000001.YML",
+        "f000002",
+        "f000003.tf",
+        "f000004.yaml",
+        "f000005.NuGet.Config",
+        "f000006.php",
+    }
+
+
 def test_gitleaks_missing_is_fatal(
     tmp_path: Path, forge: Forge, make_builder: MakeBuilder, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -469,7 +497,11 @@ def test_each_forge_gets_only_its_own_token(
     assert keys == [(SERVER, "forge.test"), (SERVER, "elsewhere.test")]
     assert asked == [(repo, TOKEN)]  # elsewhere.test was never sent anything
     assert corpus.CREDENTIAL.format(server="dev", host="gitlab.example") == (
-        "/etc/crewkiosk/corpus-dev-gitlab.example.credential"
+        "/etc/crewkiosk/corpus-dev@gitlab.example.credential"
+    )
+    # Server `oaw` on host `dev-github.com` is not server `oaw-dev` on host `github.com`.
+    assert corpus.CREDENTIAL.format(server="oaw", host="dev-github.com") != (
+        corpus.CREDENTIAL.format(server="oaw-dev", host="github.com")
     )
 
     builder.lookup = lambda r, t: "elsewhere.test/org/a"
@@ -519,6 +551,23 @@ def test_nested_repos_are_refused(forge: Forge, make_builder: MakeBuilder) -> No
     status = make_builder().build(manifest(outer, inner))
     assert states(status) == {outer: "ok", inner: "clone_failed"}
     assert inner not in forge.cloned
+
+
+def test_a_hung_size_lookup_fails_only_that_repo(
+    forge: Forge, make_builder: MakeBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slow = forge.repo("slow", {"README.md": b"slow\n"})
+    good = forge.repo("good", {"README.md": b"ok\n"})
+    real = subprocess.run
+    oid = real(["git", "hash-object", "--stdin"], input=b"slow\n", capture_output=True).stdout
+
+    def run(argv: list[str], **kw: Any) -> Any:
+        if "--batch-check" in argv and oid.strip() in kw.get("input", b""):
+            raise subprocess.TimeoutExpired(argv, corpus.GIT_TIMEOUT_S)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(corpus.subprocess, "run", run)
+    assert states(make_builder().build(manifest(slow, good))) == {slow: "clone_failed", good: "ok"}
 
 
 def test_a_failed_build_leaves_no_half_generation(
