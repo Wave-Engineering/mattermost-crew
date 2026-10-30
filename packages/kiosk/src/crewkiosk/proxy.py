@@ -44,6 +44,10 @@ MAX_METER_BYTES = 4 * 1024 * 1024
 CONNECT_TIMEOUT_S = 30
 RESPONSE_TIMEOUT_S = 300
 TURNS_TTL_S = 24 * 60 * 60
+REQUEST_TIMEOUT_S = 30  # to read a request's head and body
+MAX_CONNECTIONS = 64  # per server's model socket
+HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
+HEADER_VALUE_RE = re.compile(r"[\x20-\x7e\t]*")
 PATH_RE = re.compile(
     r"^/a/([0-9a-f]{32})(/v1/messages(?:/count_tokens)?)(?:\?([A-Za-z0-9=&_.-]*))?$"
 )
@@ -133,6 +137,7 @@ class Call:
     input_tokens: int = 0
     output_tokens: int = 0
     forwarded: bool = True  # False when the broker refused it: the turn cap, or no key
+    complete: bool = False  # the whole response reached the client
 
 
 class UsageMeter:
@@ -270,11 +275,19 @@ class ModelProxy:
         # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
         # that went quiet must not get its cap back.
         self.turns: dict[str, tuple[int, float]] = {}
+        self.active = 0
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         start = time.monotonic()
         try:
-            await self._serve(reader, writer, start)
+            if self.active >= MAX_CONNECTIONS:
+                writer.write(_error(503, "overloaded_error", "too many connections"))
+                return
+            self.active += 1
+            try:
+                await self._serve(reader, writer, start)
+            finally:
+                self.active -= 1
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
             pass
         finally:
@@ -285,47 +298,11 @@ class ModelProxy:
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, start: float
     ) -> None:
-        head = await reader.readuntil(b"\r\n\r\n")
-        if len(head) > MAX_HEAD_BYTES:
-            writer.write(_error(400, "invalid_request_error", "request head too large"))
+        # A connection that sends nothing, or half a request, is closed, never held.
+        request = await asyncio.wait_for(self._read(reader, writer), REQUEST_TIMEOUT_S)
+        if request is None:
             return
-        lines = head.decode("latin-1").split("\r\n")
-        method, _, rest = lines[0].partition(" ")
-        target = rest.rpartition(" ")[0]
-        m = PATH_RE.fullmatch(target)
-        if method != "POST" or m is None:
-            writer.write(_error(404, "not_found_error", "not found"))
-            return
-        answer_id, path, query = m.group(1), m.group(2), m.group(3)
-        headers: dict[str, str] = {}
-        for line in lines[1:]:
-            if line:
-                name, _, value = line.partition(":")
-                headers[name.strip().lower()] = value.strip()
-        if "transfer-encoding" in headers or "content-length" not in headers:
-            writer.write(_error(411, "invalid_request_error", "a Content-Length is required"))
-            return
-        try:
-            length = int(headers["content-length"])
-        except ValueError:
-            writer.write(_error(400, "invalid_request_error", "bad Content-Length"))
-            return
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            writer.write(_error(413, "request_too_large", "request body too large"))
-            await writer.drain()
-            # A close with the body unread resets the peer, and the reset can take the 413
-            # with it: read and drop a bounded amount first (a lingering close).
-            left = min(max(length, 0), LINGER_BYTES)
-            while left > 0 and (chunk := await reader.read(min(left, 65536))):
-                left -= len(chunk)
-            return
-        try:
-            body = json.loads(await reader.readexactly(length))
-        except ValueError:
-            body = None
-        if not isinstance(body, dict):
-            writer.write(_error(400, "invalid_request_error", "the body must be a JSON object"))
-            return
+        answer_id, path, query, headers, body = request
         body["model"] = self.model
 
         turn: int | None = None
@@ -348,6 +325,63 @@ class ModelProxy:
         call = await self._forward(writer, path, query, headers, body, key, answer_id, turn)
         call.latency_ms = _ms(start)
         self.on_call(call)
+
+    async def _read(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> tuple[str, str, str | None, dict[str, str], dict[str, Any]] | None:
+        """The request, or None once an error is written. Every header line is checked
+        whole: a bare LF or other control character in one would let a value smuggle a
+        second request upstream, with the broker's key on it."""
+        head = await reader.readuntil(b"\r\n\r\n")
+        if len(head) > MAX_HEAD_BYTES:
+            writer.write(_error(400, "invalid_request_error", "request head too large"))
+            return None
+        lines = head.decode("latin-1").split("\r\n")
+        method, _, rest = lines[0].partition(" ")
+        target = rest.rpartition(" ")[0]
+        m = PATH_RE.fullmatch(target)
+        if method != "POST" or m is None:
+            writer.write(_error(404, "not_found_error", "not found"))
+            return None
+        answer_id, path, query = m.group(1), m.group(2), m.group(3)
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if not line:
+                continue
+            name, sep, value = line.partition(":")
+            if (
+                not sep
+                or not HEADER_NAME_RE.fullmatch(name)
+                or not HEADER_VALUE_RE.fullmatch(value)
+            ):
+                writer.write(_error(400, "invalid_request_error", "malformed header"))
+                return None
+            headers[name.lower()] = value.strip(" \t")
+        if "transfer-encoding" in headers or "content-length" not in headers:
+            writer.write(_error(411, "invalid_request_error", "a Content-Length is required"))
+            return None
+        try:
+            length = int(headers["content-length"])
+        except ValueError:
+            writer.write(_error(400, "invalid_request_error", "bad Content-Length"))
+            return None
+        if length < 0 or length > MAX_REQUEST_BYTES:
+            writer.write(_error(413, "request_too_large", "request body too large"))
+            await writer.drain()
+            # A close with the body unread resets the peer, and the reset can take the 413
+            # with it: read and drop a bounded amount first (a lingering close).
+            left = min(max(length, 0), LINGER_BYTES)
+            while left > 0 and (chunk := await reader.read(min(left, 65536))):
+                left -= len(chunk)
+            return None
+        try:
+            body = json.loads(await reader.readexactly(length))
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            writer.write(_error(400, "invalid_request_error", "the body must be a JSON object"))
+            return None
+        return answer_id, path, query, headers, body
 
     async def _forward(
         self,
@@ -388,10 +422,16 @@ class ModelProxy:
         except (OSError, TimeoutError):
             writer.write(_error(502, "api_error", "the model endpoint is unreachable"))
             return call
+        # Once the request is sent the call is the broker's to account for, however it ends:
+        # a client that hangs up mid-stream must not hide a call it was billed for.
         try:
             up_writer.write(("\r\n".join(out) + "\r\n\r\n").encode() + payload)
             await up_writer.drain()
             await asyncio.wait_for(self._relay(up_reader, writer, call), RESPONSE_TIMEOUT_S)
+        except TimeoutError:
+            call.status = 504 if call.status == 502 else call.status
+        except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            pass  # the status the upstream gave, if any; `complete` stays False
         finally:
             up_writer.close()
             with contextlib.suppress(OSError, ssl.SSLError):
@@ -414,13 +454,16 @@ class ModelProxy:
         dechunk = Dechunker() if chunked else None
         writer.write(head)
         call.bytes = 0
-        while data := await up.read(65536):
-            writer.write(data)
-            await writer.drain()
-            call.bytes += len(data)
-            meter.feed(dechunk.feed(data) if dechunk else data)
-        meter.close()
-        call.input_tokens, call.output_tokens = meter.input_tokens, meter.output_tokens
+        try:
+            while data := await up.read(65536):
+                call.bytes += len(data)
+                meter.feed(dechunk.feed(data) if dechunk else data)
+                writer.write(data)
+                await writer.drain()
+            call.complete = True
+        finally:
+            meter.close()
+            call.input_tokens, call.output_tokens = meter.input_tokens, meter.output_tokens
 
 
 def _ms(start: float) -> int:

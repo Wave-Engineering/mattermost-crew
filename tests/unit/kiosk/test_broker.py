@@ -428,6 +428,7 @@ class Upstreamer:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
         self.sse = False
+        self.slow = False
         self.server: asyncio.base_events.Server | None = None
 
     async def start(self) -> Upstream:
@@ -447,6 +448,17 @@ class Upstreamer:
         }
         body = json.loads(await reader.readexactly(int(headers["content-length"])))
         self.requests.append((head[0], headers, body))
+        if self.slow:
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+            start = {"type": "message_start", "message": {"usage": {"input_tokens": 11}}}
+            writer.write(b"data: " + json.dumps(start).encode() + b"\n\n")
+            with contextlib.suppress(ConnectionError):
+                for _ in range(200):
+                    await writer.drain()
+                    await asyncio.sleep(0.01)
+                    writer.write(b"data: {}\n\n" + b" " * 65536)
+            writer.close()
+            return
         if self.sse:
             events = [
                 {"type": "message_start", "message": {"usage": {"input_tokens": 7}}},
@@ -503,10 +515,11 @@ def with_proxy(
     max_turns: int = 8,
     key: str | None = KEY,
     sse: bool = False,
+    slow: bool = False,
 ) -> Any:
     async def main() -> Any:
         up = Upstreamer()
-        up.sse = sse
+        up.sse, up.slow = sse, slow
         calls: list[Call] = []
         mp = ModelProxy(
             upstream=await up.start(),
@@ -714,6 +727,7 @@ def test_broker_reads_its_own_key(tmp_path: Path) -> None:
 def model_call(answer_id: str = AID, **kw: Any) -> Call:
     base: dict[str, Any] = {"path": "/v1/messages", "turn": 1, "status": 200}
     base |= {"bytes": 100, "latency_ms": 40, "input_tokens": 10, "output_tokens": 5}
+    base |= {"complete": True}
     return Call(answer_id, **(base | kw))
 
 
@@ -1062,3 +1076,131 @@ def test_relay_usage() -> None:
         [sys.executable, "-I", str(RELAY), "shell", "id"], capture_output=True, timeout=30
     )
     assert proc.returncode == 64 and b"usage" in proc.stderr
+
+
+# -- the precheck review's findings (#161) -------------------------------------------------------
+@pytest.mark.parametrize(
+    "header",
+    [
+        "anthropic-beta: x\nContent-Length: 0\n\nPOST /v1/files HTTP/1.1",  # bare LF smuggling
+        "anthropic-beta: x\rinjected: y",
+        "accept: a\x00b",
+        "bad name: x",
+        "no-colon-here",
+    ],
+)
+def test_model_proxy_refuses_malformed_headers(sockdir: Path, header: str) -> None:
+    """A control character in a passed-through header would carry a second request upstream,
+    with the broker's key appended to it: refused before anything is forwarded."""
+
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        assert (await http(path, post(headers=(header,))))[0] == 400
+        assert up.requests == [] and calls == []
+
+    with_proxy(sockdir, scenario)
+
+
+def test_model_proxy_audits_a_call_the_client_abandons(sockdir: Path) -> None:
+    """A client that hangs up mid-stream still leaves its call accounted for: forwarded,
+    counted as a turn, its tokens so far metered, and marked incomplete."""
+
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        reader, writer = await asyncio.open_unix_connection(path)
+        writer.write(post())
+        await writer.drain()
+        await reader.readuntil(b"\r\n\r\n")
+        writer.close()
+        for _ in range(500):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        [call] = calls
+        assert call.forwarded and call.turn == 1 and call.status == 200
+        assert call.complete is False and call.input_tokens == 11
+        assert len(up.requests) == 1
+
+    with_proxy(sockdir, scenario, slow=True)
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    ledger.model(SERVER, model_call(complete=False))
+    [line] = ledger.take(AID)
+    assert line["ok"] is False and line["args"]["complete"] is False
+
+
+def test_idle_connections_are_closed_and_capped(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection that sends nothing is closed, and the sockets refuse past their cap, so no
+    kiosk can hold the broker's descriptors."""
+    monkeypatch.setattr(proxy, "REQUEST_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(broker, "HELLO_TIMEOUT_S", 0.2)
+
+    async def idle(path: str) -> bytes:
+        reader, writer = await asyncio.open_unix_connection(path)
+        data = await asyncio.wait_for(read_to_close(reader), 5)
+        writer.close()
+        return data
+
+    assert with_server(sockdir, op_server(corpus).handle, idle) == b""
+    with_proxy(sockdir, lambda path, up, calls: idle(path))
+
+    monkeypatch.setattr(proxy, "MAX_CONNECTIONS", 2)
+    monkeypatch.setattr(proxy, "REQUEST_TIMEOUT_S", 5)
+
+    async def crowd(path: str, up: Upstreamer, calls: list[Call]) -> int:
+        held = [await asyncio.open_unix_connection(path) for _ in range(2)]
+        await asyncio.sleep(0.1)
+        status = (await http(path, post()))[0]
+        for _, w in held:
+            w.close()
+        return status
+
+    assert with_proxy(sockdir, crowd) == 503
+
+
+def test_audit_args_are_bounded(sockdir: Path, corpus: Corpus) -> None:
+    """A refused call's raw arguments never reach the audit: only the op's own keys, cut
+    short, and the names of any others. 200 lines always fit the daemon's reply limit."""
+    from crewchat.kiosk_broker import MAX_REPLY_BYTES
+
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    big = {"repo": "r" * 5000, "glob": "g" * 300, "x" * 500: "y" * 1_000_000, "n": [1] * 9}
+    call(sockdir, op_server(corpus, ledger), "corpus_list", big)
+    [line] = ledger.take(AID)
+    assert line["args"]["repo"] == "r" * broker.AUDIT_STR_MAX
+    assert line["args"]["unknown_keys"] == ["x" * 64, "n"]
+    assert "y" * 100 not in json.dumps(line)
+    assert broker.audit_args("corpus_list", {"repo": "é" * 256, "glob": "é" * 256}) == {
+        "truncated": True
+    }
+    assert broker.audit_args("shell", {"cmd": "id"}) == {"unknown_keys": ["cmd"]}
+    for _ in range(broker.AUDIT_LINES):
+        ledger.op(
+            SERVER, AID, POST, "corpus_list", broker.audit_args("corpus_list", big), 1, 1, False
+        )
+    reply = Control(ledger, os.getuid()).answer(
+        json.dumps({"op": "audit", "answer_id": AID}).encode()
+    )
+    assert len(broker.jsonl(reply)) < MAX_REPLY_BYTES
+
+
+def test_expired_lines_are_freed_and_a_resumed_answer_keeps_its_day(tmp_path: Path) -> None:
+    tick = Tick()
+    ledger = Ledger(tmp_path / "state", clock=tick)
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 10, True)
+    day = ledger.days[(SERVER, "2026-10-30")][AID]
+    tick.t += broker.AUDIT_TTL_S + 1
+    ledger.op(SERVER, AID2, POST, "corpus_list", {}, 1, 10, True)  # expires AID
+    assert len(day.lines) == 0  # gone from memory, not just from reach
+    ledger.op(SERVER, AID, POST, "corpus_read", {}, 1, 30, True)  # AID comes back
+    m = ledger.metrics()[SERVER]
+    assert m["answers"] == 2 and m["ops"] == 3
+    assert ledger.days[(SERVER, "2026-10-30")][AID].op_latency_ms == [10, 30]
+
+
+def test_server_ids_that_collide_with_sockets_are_skipped(tmp_path: Path) -> None:
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    for server in (SERVER, "control", "dev.model"):
+        write_manifest(pool, server, repos=[A])
+    b = Broker(pool_dir=pool, corpus_root=tmp_path, socket_group=None)
+    assert set(b.manifests()) == {SERVER}

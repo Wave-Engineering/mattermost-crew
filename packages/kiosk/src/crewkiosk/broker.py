@@ -78,6 +78,12 @@ POST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MCP_PROTOCOL = "2025-06-18"
 VERSION = "0.2.6"
 CONTROL_TIMEOUT_S = 5
+HELLO_TIMEOUT_S = 10
+MAX_CONNECTIONS = 64  # per server's op socket
+# An audit line's args: the op's own arguments, strings cut short, the whole capped, so 200
+# lines always fit the daemon's reply limit and a refused call can't bloat the log.
+AUDIT_STR_MAX = 256
+AUDIT_ARGS_MAX = 2048
 
 
 def jsonl(obj: Any) -> bytes:
@@ -125,8 +131,10 @@ class Ledger:
         key = (server, answer_id)
         a = self.answers.get(key)
         if a is None:
-            a = self.answers[key] = Answer(post_id, now, now)
-            self.days.setdefault((server, self._date(now)), {})[answer_id] = a
+            # An answer back after going quiet resumes today's record, never replaces it.
+            day = self.days.setdefault((server, self._date(now)), {})
+            a = day.get(answer_id) or Answer(post_id, now, now)
+            self.answers[key] = day[answer_id] = a
         if post_id is not None and a.post_id is None:
             a.post_id = post_id
         a.last = now
@@ -159,7 +167,8 @@ class Ledger:
         a.output_tokens += call.output_tokens
         args = {"path": call.path, "turn": call.turn, "status": call.status}
         args |= {"input_tokens": call.input_tokens, "output_tokens": call.output_tokens}
-        ok = 200 <= call.status < 300
+        args["complete"] = call.complete
+        ok = 200 <= call.status < 300 and call.complete
         self._line(server, call.answer_id, a, "model", args, call.bytes, call.latency_ms, ok)
 
     def take(self, answer_id: str) -> list[dict[str, Any]]:
@@ -238,7 +247,8 @@ class Ledger:
     def _expire(self, now: float) -> None:
         for key, a in list(self.answers.items()):
             if now - a.last > AUDIT_TTL_S:
-                del self.answers[key]  # its day keeps it for the rollup
+                a.lines.clear()  # dropped after 15 minutes, as the audit promises
+                del self.answers[key]  # its day keeps its counts for the rollup
         today = self._date(now)
         for key in [k for k in self.days if k[1] < today]:
             del self.days[key]
@@ -290,11 +300,25 @@ class OpServer:
         self.server = server
         self.corpus = corpus
         self.ledger = ledger
+        self.active = 0
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await self._serve(reader, writer)
-        except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
+            if self.active >= MAX_CONNECTIONS:
+                log.warning("broker %s: %d op connections: one refused", self.server, self.active)
+                return
+            self.active += 1
+            try:
+                await self._serve(reader, writer)
+            finally:
+                self.active -= 1
+        except (
+            OSError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ValueError,
+            TimeoutError,
+        ):
             pass
         finally:
             writer.close()
@@ -302,7 +326,7 @@ class OpServer:
                 await writer.wait_closed()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        first = await reader.readline()
+        first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_S)
         hello = _hello(first)
         if hello is None:
             log.warning("broker %s: a connection without a valid hello: closed", self.server)
@@ -359,13 +383,35 @@ class OpServer:
             self.server,
             answer_id,
             post_id,
-            str(name),
-            args if isinstance(args, dict) else None,
+            str(name)[:64],
+            audit_args(name, args),
             len(text.encode()),
             latency,
             ok,
         )
         return {"content": [{"type": "text", "text": text}], "isError": not ok}
+
+
+def audit_args(name: Any, args: Any) -> dict[str, Any] | None:
+    """What an audit line records of a call's arguments: the op's own keys, strings cut to
+    AUDIT_STR_MAX, the names (only) of any others, and never more than AUDIT_ARGS_MAX."""
+    if not isinstance(args, dict):
+        return None
+    fields = ops.TOOLS[name][1] if isinstance(name, str) and name in ops.TOOLS else {}
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        if key in fields:
+            if isinstance(value, str):
+                value = value[:AUDIT_STR_MAX]
+            elif not isinstance(value, int | bool | None):
+                value = type(value).__name__
+            out[key] = value
+    unknown = [str(k)[:64] for k in args if k not in fields]
+    if unknown:
+        out["unknown_keys"] = unknown[:10]
+    if len(json.dumps(out)) > AUDIT_ARGS_MAX:
+        return {"truncated": True}
+    return out
 
 
 def _hello(line: bytes) -> tuple[str, str] | None:
@@ -506,6 +552,10 @@ class Broker:
                 m = load_manifest(self.pool_dir / name)
             except ManifestError as exc:
                 log.error("broker: skipping a manifest: %s", exc)
+                continue
+            if m.server == "control" or "." in m.server:
+                # Its sockets would be control.sock, or another server's <server>.model.sock.
+                log.error("broker: server id %r can't have sockets here: skipped", m.server)
                 continue
             found[m.server] = (m.repos, m.max_turns)
         return found

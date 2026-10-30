@@ -496,9 +496,7 @@ def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
         ".",
     ]
     try:
-        done = subprocess.run(
-            argv, cwd=shadow, env=env, capture_output=True, timeout=GIT_TIMEOUT_S
-        )
+        done = subprocess.run(argv, cwd=shadow, env=env, capture_output=True, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return Scan(False, f"gitleaks failed: {type(exc).__name__}")
     if done.returncode == 0:
