@@ -8,6 +8,12 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **`crewchat-send`, a sender for scripts** (#146). A script posts one message as its
+  checkout's agent: `crewchat-send [--backend B] [--thread ID] [--dm] <to> < message`. The text
+  is read from STDIN only, so backticks and `$` never meet a shell. The backend is the agent's
+  default unless named (a thread reply follows its thread). It never registers and never asks:
+  with no live session it exits 4, and with no default backend it exits 3, so a caller can fall
+  back. `crewchat-send --help` lists every exit code.
 - **Mattermost channels by name** (#145). `chat_send`, `chat_read` and `chat_read(post_id)` on
   a Mattermost backend take a channel's URL name (`precheck`), `#name` or display name
   (`Roll Call`), as well as its ID, which still costs no request. The daemon resolves the name
