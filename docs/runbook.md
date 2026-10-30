@@ -667,9 +667,9 @@ yours and are kept; rewrite one only when the upgrade note says so, in two steps
 shows. CI runs every block twice in a row on a fresh host, so the second run is the upgrade
 (IT-20).
 
-**Upgrading to v0.2.6** (#138). A running shim keeps the code it started with. A shim that
-started against a daemon with no `ping` (0.2.3 or earlier) stopped asking for good, so it won't
-re-register by itself across the v0.2.6 daemon restart. Install the clients, then run a
+**Upgrading from v0.2.5 or earlier** (#138). A running shim keeps the code it started with. A
+shim that started against a daemon with no `ping` (0.2.3 or earlier) stopped asking for good, so
+it won't re-register by itself across the upgrade's daemon restart. Install the clients, then run a
 `/mcp reconnect crewchat` sweep on every agent session on the host **before** the daemon
 block's restart. Each session then runs the fixed shim. A session that isn't reconnected
 recovers as it does today: its doorbell exits 2 on `not_registered`, and the next
