@@ -1419,8 +1419,9 @@ def test_the_ledger_fits_in_half_the_units_memory(tmp_path: Path) -> None:
         day.answers[aid(n)] = a
     record = deep_size(day.answers[aid(0)])
     day_size = deep_size(day)
-    # A full day really was measured, never just the Day object around it.
-    assert day_size >= broker.MAX_ANSWERS_PER_DAY * 200, day_size
+    # A full day really was measured, never just the Day object around it, and each record
+    # on its own objects: about 700 B each, where shared objects measure about 220.
+    assert day_size >= broker.MAX_ANSWERS_PER_DAY * 500, day_size
     worst = broker.MAX_LIVE_ANSWERS * (broker.AUDIT_LINES * line + lines + record)
     # A sizing assumption, not a bound the broker enforces: the servers the unit's LimitNOFILE
     # has room for. The broker opens as many as there are manifests.
@@ -1646,6 +1647,23 @@ def test_one_server_holds_at_most_its_share_of_live_answers(
     assert ledger.metrics()[SERVER]["refused"]["hellos"] == 2
     audit = tmp_path / "state" / "audit" / f"{SERVER}.jsonl"
     assert [json.loads(x)["op"] for x in audit.read_text().splitlines()] == ["hello"]
+
+
+def test_a_server_at_its_share_frees_a_quiet_answer_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server at its MAX_LIVE_PER_SERVER, with the pool far from MAX_LIVE_ANSWERS, frees a
+    quiet answer's place on its next hello, not at the next sweep."""
+    monkeypatch.setattr(broker, "MAX_LIVE_PER_SERVER", 2)
+    tick = Tick()
+    ledger = Ledger(tmp_path / "state", clock=tick)
+    assert ledger.hello(SERVER, aid(0), POST) and ledger.hello(SERVER, aid(1), POST)
+    assert not ledger.hello(SERVER, aid(2), POST)
+    assert len(ledger.answers) < broker.MAX_LIVE_ANSWERS  # only the server's share is full
+    tick.t += broker.AUDIT_TTL_S + 1
+    ledger.swept = tick.t  # the sweep isn't due: the server's full share runs it itself
+    assert ledger.hello(SERVER, aid(2), POST)
+    assert list(ledger.answers) == [(SERVER, aid(2))]
 
 
 @pytest.mark.parametrize("ending", ["raises", "cancelled"])
