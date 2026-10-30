@@ -17,6 +17,7 @@
     corpus_extra = ["forge.example.lan/partner-org/docs"]    # optional; full repos
     corpus_exclude = ["forge.example.lan/partner-org/infra"] # optional; always wins
     corpus_refresh_minutes = 15          # optional; how often the corpus is rebuilt
+    kiosk_max_turns = 8                  # optional; model calls per research answer
 
     [discord]
     enabled = true
@@ -60,6 +61,7 @@ DEFAULT_KIOSK_RATE_PER_HOUR = 10
 DEFAULT_LOOP_GUARD_WINDOW = 20
 DEFAULT_KIOSK_DAILY_CAP = 25
 DEFAULT_CORPUS_REFRESH_MINUTES = 15
+DEFAULT_KIOSK_MAX_TURNS = 8
 # A full repo, as the shim's `repo_ref()` gives it: `host/group[/subgroup...]/repo`, no `.git`.
 REPO_ENTRY_RE = re.compile(r"^[a-z0-9.-]+(/[A-Za-z0-9._-]+){2,}$")
 # An allowlist entry (#117): a forge key `host/org`, as `repo_key` gives it; an absolute path;
@@ -91,6 +93,8 @@ class MattermostServer:
     corpus_extra: tuple[str, ...] = ()
     corpus_exclude: tuple[str, ...] = ()
     corpus_refresh_minutes: int = DEFAULT_CORPUS_REFRESH_MINUTES
+    # Model calls per research answer, which crewkiosk-broker's model proxy enforces (#141).
+    kiosk_max_turns: int = DEFAULT_KIOSK_MAX_TURNS
 
 
 @dataclass(frozen=True)
@@ -274,6 +278,11 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
                 f"{source}: mattermost {sid}.corpus_refresh_minutes must be an integer "
                 "of at least 1"
             )
+        turns = item.get("kiosk_max_turns", DEFAULT_KIOSK_MAX_TURNS)
+        if isinstance(turns, bool) or not isinstance(turns, int) or turns < 1:
+            raise ConfigError(
+                f"{source}: mattermost {sid}.kiosk_max_turns must be an integer of at least 1"
+            )
         servers.append(
             MattermostServer(
                 id=sid,
@@ -286,6 +295,7 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
                     item.get("corpus_exclude", []), f"{sid}.corpus_exclude", source
                 ),
                 corpus_refresh_minutes=refresh,
+                kiosk_max_turns=turns,
             )
         )
     return servers

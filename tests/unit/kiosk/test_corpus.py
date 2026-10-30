@@ -53,6 +53,8 @@ def scans(tmp_path: Path) -> list[dict[str, Any]]:
         {"exclude": ["forge.test/org/A.git"]},  # not canonical
         {"refresh_minutes": 0},
         {"refresh_minutes": True},
+        {"max_turns": 0},
+        {"max_turns": "8"},
         {"server": "other", "filename": SERVER},  # names another server than its file
         {"server": "status", "filename": "status"},  # reserved: the world-traversable dir
         {"server": "..", "filename": ".."},
@@ -801,7 +803,12 @@ def test_a_new_generated_at_is_due(forge: Forge, make_builder: MakeBuilder) -> N
     builder.build(m)
     assert not builder.due(m)
     changed = corpus.Manifest(
-        m.server, "2026-10-30T12:05:00+00:00", m.refresh_minutes, m.repos, frozenset({"x/y/z"})
+        m.server,
+        "2026-10-30T12:05:00+00:00",
+        m.refresh_minutes,
+        m.max_turns,
+        m.repos,
+        frozenset({"x/y/z"}),
     )
     assert builder.due(changed)
 
