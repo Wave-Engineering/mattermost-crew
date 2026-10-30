@@ -1204,3 +1204,103 @@ def test_server_ids_that_collide_with_sockets_are_skipped(tmp_path: Path) -> Non
         write_manifest(pool, server, repos=[A])
     b = Broker(pool_dir=pool, corpus_root=tmp_path, socket_group=None)
     assert set(b.manifests()) == {SERVER}
+
+
+def test_one_answer_cannot_hold_every_op_slot(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An answer gets MAX_PER_ANSWER sessions; past that it is refused, and another answer
+    is still served. An idle session is closed after OP_IDLE_S."""
+    op = op_server(corpus)
+
+    async def scenario(path: str) -> None:
+        held = []
+        for _ in range(broker.MAX_PER_ANSWER):
+            reader, writer = await asyncio.open_unix_connection(path)
+            writer.write(hello_line() + rpc(1, "ping"))
+            await writer.drain()
+            assert json.loads(await reader.readline())["result"] == {}
+            held.append(writer)
+        assert await converse(path, hello_line(), rpc(1, "ping")) == []
+        assert [r["id"] for r in await converse(path, hello_line(AID2), rpc(1, "ping"))] == [1]
+        for writer in held:
+            writer.close()
+
+    with_server(sockdir, op.handle, scenario)
+    monkeypatch.setattr(broker, "OP_IDLE_S", 0.2)
+
+    async def idle(path: str) -> bytes:
+        reader, writer = await asyncio.open_unix_connection(path)
+        writer.write(hello_line())
+        await writer.drain()
+        data = await asyncio.wait_for(read_to_close(reader), 5)
+        writer.close()
+        return data
+
+    assert with_server(sockdir, op.handle, idle) == b""
+    assert op.slots.total == 0 and op.slots.per == {}
+
+
+def test_one_answer_cannot_hold_every_model_slot(sockdir: Path) -> None:
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        held = []
+        for _ in range(proxy.MAX_PER_ANSWER):
+            reader, writer = await asyncio.open_unix_connection(path)
+            writer.write(post())
+            await writer.drain()
+            await reader.readuntil(b"\r\n\r\n")  # in flight: the upstream streams slowly
+            held.append(writer)
+        status, _, body = await http(path, post())
+        assert status == 429 and b"at once" in body
+        for writer in held:
+            writer.close()
+        for _ in range(500):
+            if len(calls) == proxy.MAX_PER_ANSWER:
+                break
+            await asyncio.sleep(0.01)
+
+    with_proxy(sockdir, scenario, slow=True, max_turns=50)
+
+
+def test_take_is_capped_across_servers(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "state", clock=Tick())
+    for n in range(8):
+        for _ in range(broker.AUDIT_LINES):
+            ledger.op(f"s{n}", AID, POST, "corpus_list", {}, 1, 1, True)
+    assert len(ledger.take(AID)) == broker.TAKE_MAX
+
+
+def test_stop_ends_open_sessions(tmp_path: Path, sockdir: Path, root: Path) -> None:
+    """On 3.12 a server's wait_closed() waits for every connection: removing a server, or
+    stopping, ends its open sessions instead of hanging on them."""
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    write_manifest(pool, SERVER, repos=[A])
+    run = sockdir / "run"
+    run.mkdir()
+    b = Broker(
+        pool_dir=pool,
+        corpus_root=root,
+        runtime_dir=run,
+        state_dir=tmp_path / "state",
+        model_conf=tmp_path / "model.conf",
+        model_key=tmp_path / "none",
+        socket_group=None,
+        control_uid=os.getuid(),
+    )
+
+    async def main() -> bytes:
+        await b.reload()
+        reader, writer = await asyncio.open_unix_connection(str(run / "dev.sock"))
+        writer.write(hello_line())
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        (pool / f"{SERVER}.json").unlink()
+        await asyncio.wait_for(b.reload(), 5)
+        data = await asyncio.wait_for(read_to_close(reader), 5)
+        writer.close()
+        await b.stop()
+        return data
+
+    assert asyncio.run(main()) == b""
+    assert SERVER not in b.sites

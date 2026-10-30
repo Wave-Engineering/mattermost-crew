@@ -80,6 +80,10 @@ VERSION = "0.2.6"
 CONTROL_TIMEOUT_S = 5
 HELLO_TIMEOUT_S = 10
 MAX_CONNECTIONS = 64  # per server's op socket
+MAX_PER_ANSWER = 4  # of those, for one answer
+OP_IDLE_S = 10 * 60
+# The most lines one audit() returns, across servers: the daemon's reply limit holds them.
+TAKE_MAX = 1000
 # An audit line's args: the op's own arguments, strings cut short, the whole capped, so 200
 # lines always fit the daemon's reply limit and a refused call can't bloat the log.
 AUDIT_STR_MAX = 256
@@ -179,7 +183,7 @@ class Ledger:
             if aid == answer_id:
                 lines.extend(a.lines)
                 a.lines.clear()
-        return sorted(lines, key=lambda line: line["ts"])
+        return sorted(lines, key=lambda line: line["ts"])[-TAKE_MAX:]
 
     def metrics(self) -> dict[str, dict[str, Any]]:
         """Each server's summary for today (UTC)."""
@@ -300,18 +304,16 @@ class OpServer:
         self.server = server
         self.corpus = corpus
         self.ledger = ledger
-        self.active = 0
+        self.slots = proxy.Slots(f"broker {server} ops")
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            if self.active >= MAX_CONNECTIONS:
-                log.warning("broker %s: %d op connections: one refused", self.server, self.active)
+            if not self.slots.admit(writer, MAX_CONNECTIONS):
                 return
-            self.active += 1
             try:
                 await self._serve(reader, writer)
             finally:
-                self.active -= 1
+                self.slots.release(writer)
         except (
             OSError,
             asyncio.IncompleteReadError,
@@ -332,12 +334,24 @@ class OpServer:
             log.warning("broker %s: a connection without a valid hello: closed", self.server)
             return
         answer_id, post_id = hello
-        self.ledger.hello(self.server, answer_id, post_id)
-        while line := await reader.readline():
-            reply = await self._message(line, answer_id, post_id)
-            if reply is not None:
-                writer.write(reply)
-                await writer.drain()
+        if not self.slots.bind(answer_id, MAX_PER_ANSWER):
+            log.warning(
+                "broker %s: answer %s holds %d sessions: one refused",
+                self.server,
+                answer_id,
+                MAX_PER_ANSWER,
+            )
+            return
+        try:
+            self.ledger.hello(self.server, answer_id, post_id)
+            # Idle past OP_IDLE_S, longer than any real gap between an answer's calls: closed.
+            while line := await asyncio.wait_for(reader.readline(), OP_IDLE_S):
+                reply = await self._message(line, answer_id, post_id)
+                if reply is not None:
+                    writer.write(reply)
+                    await writer.drain()
+        finally:
+            self.slots.unbind(answer_id)
 
     async def _message(self, line: bytes, answer_id: str, post_id: str) -> bytes | None:
         try:
@@ -383,7 +397,7 @@ class OpServer:
             self.server,
             answer_id,
             post_id,
-            str(name)[:64],
+            str(name).encode("ascii", "replace").decode()[:64],
             audit_args(name, args),
             len(text.encode()),
             latency,
@@ -493,6 +507,7 @@ class Site:
     corpus: ops.Corpus
     max_turns: int
     model: proxy.ModelProxy | None = None
+    op: OpServer | None = None
     servers: list[asyncio.base_events.Server] = field(default_factory=list)
 
 
@@ -590,7 +605,7 @@ class Broker:
             max_turns=lambda: site.max_turns,
             on_call=lambda call: self.ledger.model(server, call),
         )
-        op = OpServer(server, corpus, self.ledger)
+        op = site.op = OpServer(server, corpus, self.ledger)
         for path, handler in (
             (self.runtime_dir / f"{server}.sock", op.handle),
             (self.runtime_dir / f"{server}.model.sock", model.handle),
@@ -606,6 +621,11 @@ class Broker:
         site = self.sites.pop(server)
         for srv in site.servers:
             srv.close()
+        # 3.12's wait_closed() waits for every connection: end the open sessions first.
+        for slots in (site.op.slots if site.op else None, site.model.slots if site.model else None):
+            if slots is not None:
+                slots.close_all()
+        for srv in site.servers:
             await srv.wait_closed()
         for suffix in (".sock", ".model.sock"):
             with contextlib.suppress(FileNotFoundError):
