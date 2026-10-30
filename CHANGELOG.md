@@ -8,6 +8,28 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **`crewkiosk-broker` is the research kiosk's only door** (#141; D-111, D-112). A
+  long-running service, as `crewkiosk-broker` (`packaging/crewkiosk-broker.service`), holds the
+  corpus read access and its own model key, `/etc/crewkiosk/broker-model.credential` (0600
+  `crewkiosk-broker:crewkiosk-broker`; never the runner's `model.credential`). For each
+  research server's pool manifest it serves an op socket and a model socket under
+  `/run/crewkiosk-broker`, so a connection's scope is the socket it came in on, never a
+  parameter. The op socket speaks a minimal MCP after a `crewkiosk/hello` naming the answer,
+  and offers exactly three typed ops: `corpus_search` (rg, fixed strings), `corpus_read` and
+  `corpus_list`. Each is bounded, refuses a repo outside that server's pool and any path
+  that is absolute, holds `..` or resolves outside the repo, and caps its response at 64 KiB
+  as sent. The model socket proxies `/v1/messages` and `count_tokens`. It adds the key,
+  drops the caller's credentials, pins the model from `model.conf`, refuses bodies over
+  1 MiB, and answers the call after the manifest's `max_turns` (default 8) with a 429 that
+  says not to retry. The broker writes one audit line for each op it served and each model
+  call it proxied, and rolls up daily metrics per server: ops, latency p50/p95, model calls,
+  tokens and wall time per answer. Both are kept under `/var/lib/crewkiosk-broker`, and the
+  daemon reads them over `control.sock` (`crewkiosk-broker-control.socket`). That socket
+  serves only the `crewchat` uid, checked by `SO_PEERCRED`. `crewkiosk-relay`, stdlib only and
+  with no policy, pumps bytes between the kiosk and those sockets: `mcp` for its MCP server,
+  `http` for its model endpoint. Wiring it into the kiosk is #142. CI installs a pinned
+  ripgrep for its tests (`scripts/ci/rg-install.sh`).
+
 - **`crewkiosk-corpus` builds each research server's corpus** (#140; D-111). This is the new
   `crewkiosk` package and its timer (`packaging/crewkiosk-corpus.service` and `.timer`, run as
   `crewcorpus`). It reads each pool manifest (#139). For each repo, it first resolves the
