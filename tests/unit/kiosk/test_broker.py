@@ -1252,12 +1252,16 @@ def test_one_answer_cannot_hold_every_model_slot(sockdir: Path) -> None:
             held.append(writer)
         status, _, body = await http(path, post())
         assert status == 429 and b"at once" in body
+        refused = calls[-1]  # audited, as every refusal is, and no turn spent
+        assert (refused.status, refused.forwarded, refused.turn) == (429, False, 0)
+        assert (await http(path, post(AID2)))[0] == 200  # another answer is still served
         for writer in held:
             writer.close()
         for _ in range(500):
-            if len(calls) == proxy.MAX_PER_ANSWER:
+            if len(calls) == proxy.MAX_PER_ANSWER + 2:
                 break
             await asyncio.sleep(0.01)
+        assert len(calls) == proxy.MAX_PER_ANSWER + 2
 
     with_proxy(sockdir, scenario, slow=True, max_turns=50)
 
@@ -1304,3 +1308,22 @@ def test_stop_ends_open_sessions(tmp_path: Path, sockdir: Path, root: Path) -> N
 
     assert asyncio.run(main()) == b""
     assert SERVER not in b.sites
+
+
+def test_slots_admit_nothing_once_closed() -> None:
+    """A connection accepted just before a stop, whose handler runs after close_all(), is
+    never admitted, so wait_closed() can't wait on it."""
+
+    class Writer:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    slots = proxy.Slots("t")
+    early, late = Writer(), Writer()
+    assert slots.admit(early, 2)  # type: ignore[arg-type]
+    slots.close_all()
+    assert early.closed
+    assert not slots.admit(late, 2)  # type: ignore[arg-type]
+    assert slots.total == 1 and late not in slots.clients

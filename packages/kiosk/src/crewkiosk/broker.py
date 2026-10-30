@@ -335,7 +335,8 @@ class OpServer:
             return
         answer_id, post_id = hello
         if not self.slots.bind(answer_id, MAX_PER_ANSWER):
-            log.warning(
+            # Debug, not warning: a kiosk can reconnect in a loop, and saturation logs once.
+            log.debug(
                 "broker %s: answer %s holds %d sessions: one refused",
                 self.server,
                 answer_id,
@@ -604,6 +605,7 @@ class Broker:
             key=lambda: self.key,
             max_turns=lambda: site.max_turns,
             on_call=lambda call: self.ledger.model(server, call),
+            label=f"broker {server} model",
         )
         op = site.op = OpServer(server, corpus, self.ledger)
         for path, handler in (

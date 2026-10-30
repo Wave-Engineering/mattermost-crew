@@ -74,8 +74,11 @@ class Slots:
         self.per: dict[str, int] = {}
         self.clients: set[asyncio.StreamWriter] = set()
         self.saturated = False
+        self.closed = False
 
     def admit(self, writer: asyncio.StreamWriter, limit: int) -> bool:
+        if self.closed:  # accepted just before the stop, its handler late: never admitted
+            return False
         if self.total >= limit:
             if not self.saturated:  # once per saturation, never once per refusal
                 log.warning("%s: %d connections, refusing more", self.label, self.total)
@@ -102,6 +105,7 @@ class Slots:
         self.clients.discard(writer)
 
     def close_all(self) -> None:
+        self.closed = True
         for writer in list(self.clients):
             writer.close()
 
@@ -311,6 +315,7 @@ class ModelProxy:
         on_call: Callable[[Call], None],
         ssl_context: ssl.SSLContext | None = None,
         clock: Callable[[], float] = time.monotonic,
+        label: str = "model proxy",
     ) -> None:
         self.upstream = upstream
         self.model = model
@@ -322,7 +327,7 @@ class ModelProxy:
         # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
         # that went quiet must not get its cap back.
         self.turns: dict[str, tuple[int, float]] = {}
-        self.slots = Slots("model proxy")
+        self.slots = Slots(label)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         start = time.monotonic()
@@ -351,6 +356,8 @@ class ModelProxy:
         answer_id, path, query, headers, body = request
         if not self.slots.bind(answer_id, MAX_PER_ANSWER):
             writer.write(_error(429, "rate_limit_error", "too many calls at once for this answer"))
+            turn = None if path != "/v1/messages" else 0  # refused before any turn was counted
+            self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
             return
         try:
             await self._call(writer, answer_id, path, query, headers, body, start)
