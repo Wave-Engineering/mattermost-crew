@@ -8,6 +8,27 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **`crewkiosk-corpus` builds each research server's corpus** (#140; D-111). This is the new
+  `crewkiosk` package and its timer (`packaging/crewkiosk-corpus.service` and `.timer`, run as
+  `crewcorpus`). It reads each pool manifest (#139). For each repo, it first resolves the
+  canonical path through the forge API, so a rename that redirects to an excluded repo is
+  never cloned. It then clones the default branch at depth 1 and keeps only UTF-8 text files
+  of 5 MB or less. It drops symlinks, `.git` and the denylist (`.env*`, `*.pem`, `*.key`,
+  `*secret*`, `*credential*` and the like). If `gitleaks dir` finds anything, the repo is
+  withheld and its last good copy is served. A repo can't exempt itself: `.gitleaks.toml` and
+  `.gitleaksignore` are dropped, `gitleaks:allow` is ignored, and paths gitleaks skips by
+  default (`node_modules/`, `*.svg`, lock files) are scanned too. Each forge host gets its own
+  credential, `/etc/crewkiosk/corpus-<server>@<host>.credential` (0600 or 0400; anything
+  others can read is refused), so no forge is ever sent another's token. A repo transferred to
+  another org is excluded, since no allowlist vouched for the new org. An exclude still covers
+  a repo after a rename, and a last good copy is served only if it passes today's denylist and
+  gitleaks. Any error in one repo fails that repo only, never the build. A server whose
+  research is turned off has its corpus removed. Each build is a read-only
+  generation, swapped in atomically under `/var/lib/crewcorpus/<server>/current`. The daemon's
+  `health` shows each server's last build under `kiosk_research.<server>.corpus`, naming any
+  withheld or failed repos. Needs gitleaks 8.19 or later. `crewkiosk@.service` now hides
+  `/var/lib/crewcorpus` too.
+
 - **The shim's logging can be turned up and kept in a file** (#144). Claude Code doesn't keep
   an MCP server's stderr after it connects, so the shim's own lines couldn't be seen in the
   field. `CREWCHAT_SHIM_LOG` sets the level of the shim's own lines (`debug`, `info` or

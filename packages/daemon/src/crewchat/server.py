@@ -245,7 +245,8 @@ def build_handlers(
     `configured`, from the daemon's start. With `dev_name`, an agent the registry doesn't
     hold gets `not_registered`, so the shim's retry re-registers it after a restart (#112);
     without it, `health` is the daemon's liveness check. With a kiosk research server, it
-    also reports `kiosk_research: {<server_id>: {"pool_repos": N}}` (#139).
+    also reports `kiosk_research: {<server_id>: {"pool_repos": N}}` (#139), with that
+    server's last corpus build under `corpus` once crewkiosk-corpus has run (#140).
     """
     started = datetime.now(UTC).isoformat()
     sources = dict(health_sources or {})

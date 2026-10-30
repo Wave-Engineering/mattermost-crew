@@ -12,6 +12,7 @@ members = [
     "crewbroker",
     "crewchat",
     "crewchat-clients",
+    "crewkiosk",
     "mattermost-crew",
 ]
 
@@ -458,6 +459,11 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "mcp", specifier = ">=1.20,<2" }]
+
+[[package]]
+name = "crewkiosk"
+version = "0.2.5"
+source = { editable = "packages/kiosk" }
 
 [[package]]
 name = "cryptography"
@@ -961,6 +967,7 @@ dependencies = [
     { name = "crewbroker" },
     { name = "crewchat" },
     { name = "crewchat-clients" },
+    { name = "crewkiosk" },
 ]
 
 [package.dev-dependencies]
@@ -977,6 +984,7 @@ requires-dist = [
     { name = "crewbroker", editable = "packages/broker" },
     { name = "crewchat", editable = "packages/daemon" },
     { name = "crewchat-clients", editable = "packages/clients" },
+    { name = "crewkiosk", editable = "packages/kiosk" },
 ]
 
 [package.metadata.requires-dev]

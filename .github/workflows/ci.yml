@@ -99,6 +99,8 @@ jobs:
         run: ./scripts/ci/two-user-setup.sh
       - name: Start Mattermost
         run: ./scripts/ci/mattermost-up.sh
+      - name: gitleaks (IT-29)
+        run: ./scripts/ci/gitleaks-install.sh
       - name: make ci
         run: ./scripts/ci/ci.sh
       - name: Start broker

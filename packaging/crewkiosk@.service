@@ -23,5 +23,6 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 # No chat or broker state or config, even by mistake in a permission bit. The pool manifests
-# carry the operator's `corpus_exclude`, the names of repos chosen to be hidden.
-InaccessiblePaths=-/var/lib/crewchat -/etc/crewchat -/etc/crewbroker -/var/lib/crewbroker -/var/lib/crewchat-pool
+# carry the operator's `corpus_exclude`, the names of repos chosen to be hidden. The kiosk never
+# reads the corpus itself either (D-111): crewkiosk-broker serves it (#141).
+InaccessiblePaths=-/var/lib/crewchat -/etc/crewchat -/etc/crewbroker -/var/lib/crewbroker -/var/lib/crewchat-pool -/var/lib/crewcorpus

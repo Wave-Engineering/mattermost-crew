@@ -19,6 +19,7 @@ ROOT_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
         ("crewchat", "crewchat"),
         ("crewbroker", "crewbroker"),
         ("crewchat_clients", "crewchat-clients"),
+        ("crewkiosk", "crewkiosk"),
     ],
 )
 def test_packages_import(module: str, dist: str) -> None:
