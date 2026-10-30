@@ -26,7 +26,9 @@ and `kiosk_research` is turned on.
   as sent. The model socket proxies `/v1/messages` and `count_tokens`. It adds the key,
   drops the caller's credentials, pins the model from `model.conf`, refuses bodies over
   1 MiB, and answers the call after the manifest's `max_turns` (default 8) with a 429 that
-  says not to retry. The broker writes one audit line for each op it served and each model
+  says not to retry. `count_tokens` isn't a turn, but it has a cap of its own, `max_turns`
+  calls per answer, so no call to the shared key is unbounded (#142). A call made while the
+  broker has no key is a 503 and spends none of the answer's turns. The broker writes one audit line for each op it served and each model
   call it proxied, and rolls up daily metrics per server: ops, latency p50/p95, model calls,
   tokens and wall time per answer. Both are kept under `/var/lib/crewkiosk-broker`, and the
   daemon reads them over `/run/crewkiosk-broker-control/control.sock`

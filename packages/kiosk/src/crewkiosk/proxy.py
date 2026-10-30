@@ -10,6 +10,9 @@ served; anything else is 404. The proxy:
 - counts each answer's `/v1/messages` calls. The one after `max_turns` is refused with a 429,
   an Anthropic-shaped `turn limit reached` error and `x-should-retry: false`, so the client
   answers with what it has instead of backing off and retrying;
+- counts each answer's `count_tokens` calls apart from its turns, and refuses the one after
+  `max_turns` the same way (`count_tokens limit reached`): every research server shares the
+  broker's one key, so no call to it is unbounded;
 - streams the upstream response back byte for byte, and reads the token counts from its `usage`
   (a JSON body, or a `text/event-stream`), for the metrics.
 
@@ -334,6 +337,8 @@ class ModelProxy:
         # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
         # that went quiet must not get its cap back.
         self.turns: dict[str, tuple[int, float]] = {}
+        # The same for count_tokens, which isn't a turn but still spends the shared key.
+        self.counts: dict[str, tuple[int, float]] = {}
         self.slots = Slots(label)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -392,19 +397,30 @@ class ModelProxy:
             return
         turn: int | None = None
         if path == "/v1/messages":
-            now = self.clock()
-            for aid in [a for a, (_, seen) in self.turns.items() if now - seen > TURNS_TTL_S]:
-                del self.turns[aid]
-            used, seen = self.turns.get(answer_id, (0, now))
-            turn = used + 1
-            if turn > self.max_turns():
-                writer.write(_error(429, "rate_limit_error", "turn limit reached", retry=False))
-                self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
-                return
-            self.turns[answer_id] = (turn, seen)
+            turn, allowed = self._spend(self.turns, answer_id)
+            limit = "turn limit reached"
+        else:
+            _count, allowed = self._spend(self.counts, answer_id)
+            limit = "count_tokens limit reached"
+        if not allowed:
+            writer.write(_error(429, "rate_limit_error", limit, retry=False))
+            self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
+            return
         call = await self._forward(writer, path, query, headers, body, key, answer_id, turn)
         call.latency_ms = _ms(start)
         self.on_call(call)
+
+    def _spend(self, table: dict[str, tuple[int, float]], answer_id: str) -> tuple[int, bool]:
+        """The answer's next call in `table`, and whether `max_turns` allows it: spent if so.
+        Entries a day old are pruned first."""
+        now = self.clock()
+        for aid in [a for a, (_, seen) in table.items() if now - seen > TURNS_TTL_S]:
+            del table[aid]
+        used, seen = table.get(answer_id, (0, now))
+        if used + 1 > self.max_turns():
+            return used + 1, False
+        table[answer_id] = (used + 1, seen)
+        return used + 1, True
 
     async def _read(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

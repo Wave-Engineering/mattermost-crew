@@ -563,6 +563,24 @@ def test_model_proxy_turn_cap(sockdir: Path) -> None:
     with_proxy(sockdir, scenario)
 
 
+def test_model_proxy_count_tokens_cap(sockdir: Path) -> None:
+    """count_tokens has its own cap of max_turns per answer, refused like the turn cap: past
+    it the answer's turns are still served, and another answer's counts too."""
+
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        count = post(route="/v1/messages/count_tokens")
+        assert [(await http(path, count))[0] for _ in range(2)] == [200, 200]
+        status, headers, body = await http(path, count)
+        assert status == 429 and headers["x-should-retry"] == "false"
+        assert json.loads(body)["error"]["message"] == "count_tokens limit reached"
+        assert [(await http(path, post()))[0] for _ in range(2)] == [200, 200]
+        assert (await http(path, post(AID2, route="/v1/messages/count_tokens")))[0] == 200
+        assert len(up.requests) == 5  # the refused count never left the broker
+        assert calls[2].turn is None and calls[2].forwarded is False
+
+    with_proxy(sockdir, scenario, max_turns=2)
+
+
 def test_model_proxy_turns_kept_a_day(sockdir: Path) -> None:
     """An answer that goes quiet keeps its count, past the audit's 15 minutes; a day later the
     entry is pruned."""
