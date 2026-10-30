@@ -14,10 +14,12 @@ All notable changes to this project are recorded here. The format follows
   path on `register`. For each research server the daemon writes
   `/var/lib/crewchat-pool/<server_id>.json`: the repos of agents holding a token there, plus
   `corpus_extra`, minus `corpus_exclude`. Repos compare without regard to case or a trailing
-  `.git`, so an exclude wins however a repo is spelled. A repo is kept only when its `host/org`
-  matches a forge entry in an explicit `agents_allow` (D-112). So research on a server is a
-  config error unless `kiosk = true` and every crew table on that server sets `agents_allow`.
-  `health` reports each research server's pool size. Nothing reads the manifest yet; the corpus
+  `.git`, so an exclude wins however a repo is spelled, and it covers the repo's `.wiki`. A
+  repo is kept only when its `host/org` matches a forge entry in an explicit `agents_allow`
+  (D-112): an agent's repo, its own crew's for that server. So research on a server is a config
+  error unless `kiosk = true` and every crew table on that server sets `agents_allow`.
+  `health` reports each research server's pool size, or the error while its manifest can't be
+  written. The runbook's new "Kiosk research pool" section installs the directory. Nothing reads the manifest yet; the corpus
   builder is #140. With research off nothing changes.
 - **`crewchat-send`, a sender for scripts** (#146). A script posts one message as its
   checkout's agent: `crewchat-send [--backend B] [--thread ID] [--dm] <to> < message`. The text

@@ -223,6 +223,62 @@ def test_exclude_written_with_git_suffix_still_wins(
     assert manifest(tmp_path)["repos"] == [REPO_B]
 
 
+@pytest.mark.parametrize("wiki", [".wiki", ".WIKI", ".wiki.git"])
+def test_exclude_covers_the_repos_wiki(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    tmp_path: Path,
+    wiki: str,
+) -> None:
+    """`<repo>.wiki` is the excluded repo's wiki, a repo of its own on GitHub and GitLab."""
+    raw = research(servers_toml, corpus_exclude=[f"{ORG}/secret-infra"])
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "infra", repo=f"{ORG}/Secret-Infra{wiki}")
+    register(daemon, "babel", repo=f"{REPO_A}.wiki")  # a wiki nobody excluded is pooled
+    assert manifest(tmp_path)["repos"] == [f"{REPO_A}.wiki"]
+
+
+def test_agent_repo_needs_its_own_crews_allow(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """Another crew's allowlist never vouches for an agent: its repo must pass its own crew's
+    entry. `corpus_extra`, the operator's, may pass any crew's."""
+    other = "forge.example.lan/other-org"
+    raw = research(servers_toml, corpus_extra=[f"{other}/handbook"])
+    raw["crews"]["partner"] = {
+        "needs_list": "bj:needs",
+        "dev": {
+            "broker_socket": "/run/crewbroker/partner-dev.sock",
+            "broker_user_id": "b-partner",
+            "agents_allow": [other],
+        },
+    }
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "babel", repo=f"{other}/private")  # an oaw agent, an org only partner allows
+    asyncio.run(
+        daemon.registry.register("pal", "partner", "s2", project_key=other, repo=f"{other}/tool")
+    )
+    assert manifest(tmp_path)["repos"] == [f"{other}/handbook", f"{other}/tool"]
+
+
+def test_unwritable_pool_reported_in_health(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """`health` counts the manifest on disk: a write that fails reports the error, not N."""
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    daemon = wired(make_daemon, research(servers_toml), pool)
+    pool.chmod(0o555)
+    try:
+        register(daemon, "babel", repo=REPO_A)
+        health = daemon.pool.health()["dev"]
+        assert health["pool_repos"] is None and health["error"].startswith("cannot write")
+    finally:
+        pool.chmod(0o755)
+    register(daemon, "babel", repo=REPO_A)
+    assert daemon.pool.health() == {"dev": {"pool_repos": 1}}
+
+
 def test_unremovable_old_manifest_never_fails_register(
     make_daemon: Callable[[dict[str, Any]], Any],
     servers_toml: dict[str, Any],

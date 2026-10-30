@@ -7,12 +7,17 @@ the full repos (`host/group/.../repo`) that `crewkiosk-corpus` clones for that s
     admitted(agent repos + corpus_extra) - corpus_exclude
 
 where an **agent repo** is the `repo` that an agent holding a token on that server sent with
-its last `register`, and **admitted** means `admits_repo()` passes for that server's broker
-entry of some crew: the repo's `host/org` equals a forge entry in an explicit `agents_allow`,
-and no forge entry in `agents_deny`. Path and `name:` entries never admit a repo (D-112).
-The agent's own word is not a wall. The two walls are the explicit allowlist, and the
-operator's corpus credential for that server. So an entry in `corpus_extra` that the allowlist
-doesn't admit is dropped too.
+its last `register`, and **admitted** means `admits_repo()` passes: the repo's `host/org`
+equals a forge entry in an explicit `agents_allow`, and no forge entry in `agents_deny`. Path
+and `name:` entries never admit a repo (D-112). An agent repo must pass the agent's own crew's
+entry for that server, since another crew's allowlist never vouched for that agent; an entry
+in `corpus_extra`, the operator's own, may pass any crew's. The agent's own word is not a wall.
+The two walls are the explicit allowlist, and the operator's corpus credential for that
+server. So an entry in `corpus_extra` that no allowlist admits is dropped too.
+
+An exclude covers the repo's wiki too (`<repo>.wiki`, a repo of its own on GitHub and GitLab).
+A renamed or transferred repo whose old path still redirects is beyond the daemon's sight: the
+corpus builder resolves each repo's canonical path and checks the excludes again (#140).
 
 The file is `{"server", "generated_at", "refresh_minutes", "repos"}`, written atomically, mode
 0640, into a directory the corpus user's group can read (`packaging/crewchat-pool.tmpfiles.conf`).
@@ -50,18 +55,23 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
     entries = [
         crew.brokers[server_id] for crew in config.crews.values() if server_id in crew.brokers
     ]
-    held = [a.repo for a in agents if server_id in a.servers and a.repo and is_repo(a.repo)]
+    # Each candidate with the entries that may admit it.
+    candidates = [(r, entries) for r in server.corpus_extra]
+    for a in agents:
+        crew = config.crews.get(a.crew)
+        if server_id in a.servers and a.repo and crew and server_id in crew.brokers:
+            candidates.append((a.repo, [crew.brokers[server_id]]))
     # Forges resolve paths without regard to case, and clone `repo.git` as `repo`, so one repo
     # spelled two ways is one repo, and an exclude matches it however it is spelled: an
-    # exclude always wins.
+    # exclude always wins, over the repo's wiki too.
     excluded = {_canon(r).casefold() for r in server.corpus_exclude}
     pool: dict[str, str] = {}
-    canon = (_canon(r) for r in [*server.corpus_extra, *held])
-    for repo in sorted(r for r in canon if is_repo(r)):  # `host/org/.git` is no repo
-        key = repo.casefold()
-        if key in excluded or key in pool:
+    canon = [(_canon(r), admitting) for r, admitting in candidates]
+    for repo, admitting in sorted((c for c in canon if is_repo(c[0])), key=lambda c: c[0]):
+        key = repo.casefold()  # `host/org/.git` is no repo, filtered above
+        if key in excluded or key.removesuffix(".wiki") in excluded or key in pool:
             continue
-        if any(admits_repo(e, repo) for e in entries):
+        if any(admits_repo(e, repo) for e in admitting):
             pool[key] = repo
     return sorted(pool.values())
 
@@ -95,6 +105,7 @@ class PoolManifest:
         self.root = root
         self.clock = clock
         self.sizes: dict[str, int] = {}
+        self.errors: dict[str, str] = {}
 
     def path_for(self, server_id: str) -> Path:
         return self.root / f"{server_id}.json"
@@ -116,28 +127,36 @@ class PoolManifest:
                     log.info("pool: removed %s, research is off on %s", path, server.id)
                 continue
             repos = pool_repos(self.config, agents, server.id)
-            self.sizes[server.id] = len(repos)
             body = {
                 "server": server.id,
                 "refresh_minutes": server.corpus_refresh_minutes,
                 "repos": repos,
             }
-            if _current(path) == body:
-                continue
-            try:
-                _write(path, {**body, "generated_at": self.clock().isoformat()})
-            except OSError as exc:
-                log.error("pool: cannot write %s: %s", path, exc)
-                continue
-            log.info("pool: %s has %d repos", server.id, len(repos))
+            # `health` counts what is on disk, never what failed to get there.
+            if _current(path) != body:
+                try:
+                    _write(path, {**body, "generated_at": self.clock().isoformat()})
+                except OSError as exc:
+                    log.error("pool: cannot write %s: %s", path, exc)
+                    self.sizes.pop(server.id, None)
+                    self.errors[server.id] = f"cannot write {path}: {exc.strerror or exc}"
+                    continue
+                log.info("pool: %s has %d repos", server.id, len(repos))
+            self.sizes[server.id] = len(repos)
+            self.errors.pop(server.id, None)
 
     def health(self) -> dict[str, Any]:
-        """`{<server_id>: {"pool_repos": N}}` for each research server."""
-        return {
-            s.id: {"pool_repos": self.sizes.get(s.id, 0)}
-            for s in self.config.mattermost
-            if s.kiosk_research
-        }
+        """`{<server_id>: {"pool_repos": N}}` for each research server, N being what its
+        manifest on disk lists; `{"pool_repos": None, "error": ...}` while it can't be
+        written, and `None` before the first refresh."""
+        out: dict[str, Any] = {}
+        for s in self.config.mattermost:
+            if not s.kiosk_research:
+                continue
+            out[s.id] = {"pool_repos": self.sizes.get(s.id)}
+            if s.id in self.errors:
+                out[s.id]["error"] = self.errors[s.id]
+        return out
 
 
 def _current(path: Path) -> dict[str, Any] | None:
