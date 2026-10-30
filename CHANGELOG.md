@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`crewchat-send`, a sender for scripts** (#146). A script posts one message as its
+  checkout's agent: `crewchat-send [--backend B] [--thread ID] [--dm] <to> < message`. The text
+  is read from STDIN only, so backticks and `$` never meet a shell. The backend is the agent's
+  default unless named (a thread reply follows its thread). It never registers and never asks:
+  with no live session it exits 4, and with no default backend it exits 3, so a caller can fall
+  back. `crewchat-send --help` lists every exit code.
+
 ### Fixed
 
 - **An idle session registers again after a daemon restart, with no tool call** (#137). From
