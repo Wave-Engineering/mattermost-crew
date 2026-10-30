@@ -56,7 +56,8 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
     # exclude always wins.
     excluded = {_canon(r).casefold() for r in server.corpus_exclude}
     pool: dict[str, str] = {}
-    for repo in sorted(_canon(r) for r in [*server.corpus_extra, *held]):
+    canon = (_canon(r) for r in [*server.corpus_extra, *held])
+    for repo in sorted(r for r in canon if is_repo(r)):  # `host/org/.git` is no repo
         key = repo.casefold()
         if key in excluded or key in pool:
             continue
@@ -66,9 +67,9 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
 
 
 def _canon(repo: str) -> str:
-    """`repo` without any trailing `.git`, the name a forge clones it by."""
-    while repo.endswith(".git"):
-        repo = repo.removesuffix(".git")
+    """`repo` without any trailing `.git`, in any case: the name a forge clones it by."""
+    while repo.casefold().endswith(".git"):
+        repo = repo[: -len(".git")]
     return repo
 
 

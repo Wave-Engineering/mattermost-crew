@@ -207,6 +207,8 @@ def test_exclude_and_dedupe_ignore_case(
     # A forge clones `repo.git` as `repo`: the suffix dodges no exclude, and pools no twin.
     register(daemon, "infra", repo=f"{ORG}/secret-infra.git")
     register(daemon, "other", repo=f"{ORG}/secret-infra.git.git")
+    register(daemon, "caps", repo=f"{ORG}/Secret-Infra.GIT")
+    register(daemon, "bare", repo=f"{ORG}/.git")  # names the org, not a repo: never pooled
     register(daemon, "babel", repo=f"{REPO_A}.git")  # babel's repo is now REPO_A's spelling
     assert manifest(tmp_path)["repos"] == [REPO_A]
 
