@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from typing import Any
 import pytest
 from crewchat.kiosk_broker import KioskBrokerClient
 from crewkiosk import broker, ops, proxy, relay
-from crewkiosk.broker import Broker, Control, Ledger, OpServer, percentile
+from crewkiosk.broker import Broker, Control, Ledger, OpServer, SiteBudget, percentile
 from crewkiosk.ops import Corpus, ToolError
 from crewkiosk.proxy import Call, ConfError, ModelProxy, Upstream, parse_key, parse_model_conf
 
@@ -179,7 +180,9 @@ def op_server(corpus: Corpus, ledger: Ledger | None = None) -> OpServer:
         hello_line(answer_id=AID + "0"),
         hello_line(post_id=""),
         hello_line(post_id="a b"),
-        hello_line(id=1),  # a request, not a notification
+        hello_line(id=None),  # a request's id must be a number or a string
+        hello_line(id=True),
+        hello_line(id=[1]),
         b"not json\n",
         b"\n",
     ],
@@ -216,6 +219,35 @@ def test_hello_then_mcp(sockdir: Path, corpus: Corpus) -> None:
     assert replies[0]["result"]["capabilities"] == {"tools": {}}
     assert replies[1]["result"] == {}
     assert replies[2]["error"]["code"] == -32601
+
+
+def test_hello_request_is_answered(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#142: the runner's hello is a request, answered before anything else, so it knows the
+    answer is admitted before the kiosk starts; the session then serves as after a
+    notification. A hello past a cap is answered with an error, and closed."""
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    replies = with_server(
+        sockdir,
+        op_server(corpus, ledger).handle,
+        lambda path: converse(path, hello_line(id="h"), rpc(1, "ping")),
+    )
+    assert replies == [
+        {"jsonrpc": "2.0", "id": "h", "result": {"admitted": True}},
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+    ]
+    assert (SERVER, AID) in ledger.answers
+    monkeypatch.setattr(broker, "MAX_LIVE_PER_SERVER", 1)
+    (sockdir / "s.sock").unlink(missing_ok=True)
+    refused = with_server(
+        sockdir,
+        op_server(corpus, ledger).handle,
+        lambda path: converse(path, hello_line(answer_id=AID2, id=7), rpc(1, "ping")),
+    )
+    assert refused == [{"jsonrpc": "2.0", "id": 7, "error": refused[0]["error"]}]
+    assert refused[0]["error"]["code"] == broker.HELLO_REFUSED
+    assert (SERVER, AID2) not in ledger.answers
 
 
 def test_tools_list_exact(sockdir: Path, corpus: Corpus) -> None:
@@ -517,7 +549,15 @@ def with_proxy(
     key: str | None = KEY,
     sse: bool = False,
     slow: bool = False,
+    admitted: tuple[str, ...] = (AID, AID2),
+    ledger: Ledger | None = None,
 ) -> Any:
+    """The proxy against a fake upstream, its budget a real ledger where `admitted` said
+    hello."""
+    ledger = ledger or Ledger(sockdir / "state", clock=Tick())
+    for answer_id in admitted:
+        assert ledger.hello(SERVER, answer_id, POST)
+
     async def main() -> Any:
         up = Upstreamer()
         up.sse, up.slow = sse, slow
@@ -526,7 +566,7 @@ def with_proxy(
             upstream=await up.start(),
             model="claude-pinned-1",
             key=lambda: key,
-            max_turns=lambda: max_turns,
+            budget=SiteBudget(ledger, SERVER, lambda: max_turns),
             on_call=calls.append,
         )
         path = str(sockdir / "m.sock")
@@ -581,33 +621,52 @@ def test_model_proxy_count_tokens_cap(sockdir: Path) -> None:
     with_proxy(sockdir, scenario, max_turns=2)
 
 
-def test_model_proxy_turns_kept_a_day(sockdir: Path) -> None:
-    """An answer that goes quiet keeps its count, past the audit's 15 minutes; a day later the
-    entry is pruned."""
-    tick = Tick(0.0)
-    mp = ModelProxy(
-        upstream=Upstream("http", "127.0.0.1", 9, ""),
-        model="m",
-        key=lambda: KEY,
-        max_turns=lambda: 1,
-        on_call=lambda call: None,
-        clock=tick,
-    )
+def test_model_proxy_turns_kept_with_the_record(sockdir: Path) -> None:
+    """#142: an answer's turns are its ledger record's. Quiet past the audit's 15 minutes it
+    is still admitted, by its day record, keeps its count and is served; at the next UTC day
+    the record has gone, with its turns, and without a new hello the id is a 403."""
+    tick = Tick()
+    ledger = Ledger(sockdir / "state", clock=tick)
 
-    async def main() -> list[int]:
-        path = str(sockdir / "m.sock")
-        server = await asyncio.start_unix_server(mp.handle, path=path)
-        statuses = [(await http(path, post()))[0]]  # turn 1, to a closed port: 502
-        tick.t = broker.AUDIT_TTL_S + 60
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> list[int]:
+        statuses = [(await http(path, post()))[0]]
+        tick.t += broker.AUDIT_TTL_S + 60
+        ledger.flush()  # the sweep: the answer is no longer live
+        assert (SERVER, AID) not in ledger.answers
+        statuses += [(await http(path, post()))[0] for _ in range(2)]
+        tick.t = NOON + 24 * 60 * 60
+        ledger.flush()
         statuses.append((await http(path, post()))[0])
-        tick.t = proxy.TURNS_TTL_S + 1
-        statuses.append((await http(path, post(AID2)))[0])
-        server.close()
-        await server.wait_closed()
         return statuses
 
-    assert asyncio.run(main()) == [502, 429, 502]
-    assert set(mp.turns) == {AID2}
+    got = with_proxy(sockdir, scenario, max_turns=2, admitted=(AID,), ledger=ledger)
+    assert got == [200, 200, 429, 403]
+
+
+def test_model_proxy_serves_only_admitted_answers(sockdir: Path) -> None:
+    """#142: an id no hello admitted is a 403 the client won't retry, for turns and counts
+    alike. It spends nothing, never leaves the broker, and makes no record, so it never
+    admits itself; it is audited once a day for the server, and counted after."""
+    ledger = Ledger(sockdir / "state", clock=Tick())
+
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        for route in ("/v1/messages", "/v1/messages", "/v1/messages/count_tokens"):
+            status, headers, _body = await http(path, post(route=route))
+            assert status == 403 and headers["x-should-retry"] == "false"
+        assert up.requests == []
+        assert [(c.turn, c.admitted, c.forwarded) for c in calls] == [
+            (0, False, False),
+            (0, False, False),
+            (None, False, False),
+        ]
+        for call in calls:
+            ledger.model(SERVER, call)
+
+    with_proxy(sockdir, scenario, admitted=(), ledger=ledger)
+    assert ledger.admitted(SERVER, AID) is None and ledger.answers == {}
+    assert ledger.metrics()[SERVER]["refused"]["model_calls"] == 3
+    audit = (sockdir / "state" / "audit" / f"{SERVER}.jsonl").read_text().splitlines()
+    assert [json.loads(x)["args"]["status"] for x in audit] == [403]
 
 
 def test_model_proxy_rewrites(sockdir: Path) -> None:
@@ -1410,8 +1469,10 @@ def deep_size(obj: object, seen: set[int] | None = None) -> int:
 def test_the_ledger_fits_in_half_the_units_memory(tmp_path: Path) -> None:
     """The ledger at its worst: MAX_LIVE_ANSWERS answers of AUDIT_LINES of the largest lines
     the broker writes, and a full day of answer records for every server the unit's
-    LimitNOFILE has room for. It fits in half the unit's MemoryMax: the rest is the ops',
-    the proxy's and the interpreter's. Both are read from the unit, so neither can drift."""
+    LimitNOFILE has room for, each with the model proxy's turns and counts at their worst
+    (#142: the proxy keeps no table of its own). It fits in half the unit's MemoryMax: the
+    rest is the ops', the proxy's connections' and the interpreter's. Both are read from the
+    unit, so neither can drift."""
     service = unit_keys("crewkiosk-broker.service")
     [memory_max] = service["MemoryMax"]
     assert memory_max.endswith("M")
@@ -1437,9 +1498,21 @@ def test_the_ledger_fits_in_half_the_units_memory(tmp_path: Path) -> None:
         # Each record its own post_id, floats and counts, as the broker makes them: shared
         # objects would be counted once for all of them.
         refused = dict.fromkeys(("ops", "model_calls"), day.date)
-        counts = [big + n * 10 + k for k in range(5)]
-        a = broker.Answer(f"{n:064d}", NOON + n + 0.25, NOON + n + 0.5, *counts, refused)
+        # Every count at its worst, the proxy's turns and counts among them: by name, so a
+        # field added later can't shift into another's place.
+        names = ("ops", "pending", "model_calls", "input_tokens", "output_tokens")
+        counts = {k: big + n * 10 + i for i, k in enumerate((*names, "turns", "counts"))}
+        a = broker.Answer(
+            f"{n:064d}", NOON + n + 0.25, NOON + n + 0.5, **counts, refused_on=refused
+        )
         day.answers[aid(n)] = a
+    assert {f.name for f in dataclasses.fields(broker.Answer)} == {
+        "post_id",
+        "started",
+        "last",
+        *counts,
+        "refused_on",
+    }  # every field measured
     record = deep_size(day.answers[aid(0)])
     day_size = deep_size(day)
     # A full day really was measured, never just the Day object around it, and each record

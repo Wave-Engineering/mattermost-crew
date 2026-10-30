@@ -6,12 +6,16 @@ read at start and on SIGHUP, it serves two sockets under `/run/crewkiosk-broker`
 
 - `<server>.sock` (0660, group `crewkiosk`): newline-delimited JSON-RPC 2.0, the minimal MCP
   server subset (`initialize`, `tools/list`, `tools/call`, `ping`). The first message must be
-  the notification `crewkiosk/hello` with `answer_id` (32 hex) and `post_id`; anything else
-  closes the connection. A notification gets no reply, so the hello never reaches the MCP
-  client through the relay. The server scope is the socket a connection arrived on, never a
-  parameter. `tools/list` offers exactly the three ops in `crewkiosk.ops`.
-- `<server>.model.sock` (same mode): the model proxy, `crewkiosk.proxy`, with the turn cap
-  from the manifest's `max_turns`.
+  `crewkiosk/hello` with `answer_id` (32 hex) and `post_id`; anything else closes the
+  connection. As a notification (the relay's mcp mode) it gets no reply, so the hello never
+  reaches the MCP client through the relay. As a request (`crewkiosk-relay hello`, which the
+  research runner runs before it starts the kiosk, #142) it is answered `{"admitted": true}`,
+  or with the error HELLO_REFUSED past a cap, and closed. The server scope is the socket a
+  connection arrived on, never a parameter. `tools/list` offers exactly the three ops in
+  `crewkiosk.ops`.
+- `<server>.model.sock` (same mode): the model proxy, `crewkiosk.proxy`. Its budget is the
+  ledger (`SiteBudget`): it serves only an answer a hello admitted, and spends each call from
+  that answer's record, against the manifest's `max_turns`.
 
 And one for the daemon: `/run/crewkiosk-broker-control/control.sock`, which
 `packaging/crewkiosk-broker-control.socket` creates 0660 `crewkiosk-broker:crewchat` and hands
@@ -29,15 +33,19 @@ dropped 15 minutes after the answer's last line) and appended to
 `/var/lib/crewkiosk-broker/audit/<server>.jsonl` (0600).
 
 **Caps:** the kiosk is untrusted, and mints its own answer ids (#142). An answer gets
-MAX_OPS_PER_ANSWER ops. At most MAX_LIVE_ANSWERS answers, across every server, hold lines in
+MAX_OPS_PER_ANSWER ops, and `max_turns` model calls and as many `count_tokens` calls, both
+spent from its record. At most MAX_LIVE_ANSWERS answers, across every server, hold lines in
 memory at once, a server at most MAX_LIVE_PER_SERVER of them (so one kiosk can't starve the
 others), and a server gets MAX_ANSWERS_PER_DAY answers a UTC day. A hello past any of these
-caps is refused, and makes no record. So the ledger's memory is at most MAX_LIVE_ANSWERS times
-AUDIT_LINES lines, plus each server's day of answer records, whoever mints the ids; a unit
-test holds that to half the unit's MemoryMax. A refusal (an op past the cap, a hello past
-one, a model call the proxy refused) is audited once a day, per answer, or per server when
-there is no record; after that only the day's `refused` counts grow, so a loop of them can't
-fill the disk or stall the loop with writes.
+caps is refused, and makes no record. Only a hello makes one: the model proxy serves an
+answer only while it is live or has a record in its server's day (`Ledger.admitted`), and a
+call for any other id is a 403 that makes none. So the ledger's memory is at most
+MAX_LIVE_ANSWERS times AUDIT_LINES lines, plus each server's day of answer records, whoever
+mints the ids, and the proxy keeps nothing per answer beside them; a unit test holds that to
+half the unit's MemoryMax. A refusal (an op past the cap, a hello past one, a model call the
+proxy refused) is audited once a day, per answer, or per server when there is no record;
+after that only the day's `refused` counts grow, so a loop of them can't fill the disk or
+stall the loop with writes.
 
 **Metrics:** per answer, the ops, model calls, input and output tokens and wall time (hello to
 last activity), rolled up per server and UTC day as running totals, with op latency p50/p95
@@ -96,6 +104,7 @@ MCP_PROTOCOL = "2025-06-18"
 VERSION = "0.2.6"
 CONTROL_TIMEOUT_S = 5
 HELLO_TIMEOUT_S = 10
+HELLO_REFUSED = -32001  # the error a refused hello request gets (crewkiosk-relay hello)
 MAX_CONNECTIONS = 64  # per server's op socket
 MAX_PER_ANSWER = 4  # of those, for one answer
 OP_IDLE_S = 10 * 60
@@ -155,6 +164,10 @@ class Answer:
     model_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # The model proxy's budget (#142): turns and count_tokens calls spent, kept here so they
+    # go with the record, at the day's end, and never outlive it in a table of their own.
+    turns: int = 0
+    counts: int = 0
     refused_on: dict[str, str] | None = None  # refusal kind -> the UTC date it was audited
 
 
@@ -265,6 +278,33 @@ class Ledger:
             self._refuse(server, answer_id, post_id, day, None, "hellos", "hello", None, 0, 0)
         return a is not None
 
+    def admitted(self, server: str, answer_id: str) -> Answer | None:
+        """The answer's record, if a hello made one: live, or in the server's day today, so a
+        long answer whose ops went quiet still gets its model calls. Asking keeps it live, as
+        any line does. None: never admitted (or not since midnight UTC), and nothing made."""
+        key = (server, answer_id)
+        day = self.days.get((server, self._date(self.clock())))
+        known = self.answers.get(key) or (day.answers.get(answer_id) if day else None)
+        if known is None:
+            return None
+        _day, a = self._answer(server, answer_id, None)  # live again, if the caps allow
+        return a or known
+
+    def spend(self, server: str, answer_id: str, kind: proxy.Spend, limit: int) -> tuple[int, bool]:
+        """The admitted answer's next call of `kind` ("turns" or "counts"), and whether
+        `limit` allows it: spent if so. A record gone since `admitted` spends nothing."""
+        a = self.admitted(server, answer_id)
+        if a is None:
+            return 1, False
+        used = a.turns if kind == "turns" else a.counts
+        if used >= limit:
+            return used + 1, False
+        if kind == "turns":
+            a.turns = used + 1
+        else:
+            a.counts = used + 1
+        return used + 1, True
+
     def reserve(self, server: str, answer_id: str, post_id: str) -> Answer | None:
         """An op's place in its answer's MAX_OPS_PER_ANSWER, taken before it runs, so sessions
         calling at once can't pass the cap between the check and the count. The caller drops
@@ -299,10 +339,16 @@ class Ledger:
         self._line(server, answer_id, post_id, day, a, name, args, nbytes, latency_ms, ok)
 
     def model(self, server: str, call: proxy.Call) -> None:
+        args = {"path": call.path, "turn": call.turn, "status": call.status}
+        if not call.admitted:
+            # A 403: an id no hello admitted. It makes no record, or the 403 would admit it.
+            day = self._today(server)
+            refusal = (server, call.answer_id, None, day, None, "model_calls", "model", args)
+            self._refuse(*refusal, 0, call.latency_ms)
+            return
         # Past the day's answer cap a call still counts in the day and reaches the audit
         # file; only its per-answer record is skipped.
         day, a = self._answer(server, call.answer_id, None)
-        args = {"path": call.path, "turn": call.turn, "status": call.status}
         args |= {"input_tokens": call.input_tokens, "output_tokens": call.output_tokens}
         args["complete"] = call.complete
         post_id = a.post_id if a is not None else None
@@ -473,6 +519,14 @@ class Ledger:
             if day.dirty:
                 self._write_metrics(*key, day)  # the day's last minute still reaches its file
 
+    def _today(self, server: str) -> Day:
+        """The server's day, made if new, and no answer record in it."""
+        date = self._date(self.clock())
+        day = self.days.get((server, date))
+        if day is None:
+            day = self.days[(server, date)] = Day(date)
+        return day
+
     @staticmethod
     def _date(ts: float) -> str:
         return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d")
@@ -559,7 +613,7 @@ class OpServer:
         if hello is None:
             log.warning("broker %s: a connection without a valid hello: closed", self.server)
             return
-        answer_id, post_id = hello
+        answer_id, post_id, rid = hello
         if not self.slots.bind(answer_id, MAX_PER_ANSWER):
             # Debug, not warning: a kiosk can reconnect in a loop, and saturation logs once.
             log.debug(
@@ -568,10 +622,17 @@ class OpServer:
                 answer_id,
                 MAX_PER_ANSWER,
             )
+            if rid is not None:
+                writer.write(rpc_error(rid, HELLO_REFUSED, "too many sessions for this answer"))
             return
         try:
             if not self.ledger.hello(self.server, answer_id, post_id):
+                if rid is not None:
+                    writer.write(rpc_error(rid, HELLO_REFUSED, "no more answers for now"))
                 return  # past a cap on answers: counted, closed
+            if rid is not None:
+                writer.write(rpc_result(rid, {"admitted": True}))
+                await writer.drain()
             # Idle past OP_IDLE_S, longer than any real gap between an answer's calls: closed.
             while line := await asyncio.wait_for(reader.readline(), OP_IDLE_S):
                 reply = await self._message(line, answer_id, post_id)
@@ -673,12 +734,17 @@ def audit_args(name: Any, args: Any) -> dict[str, Any] | None:
     return out
 
 
-def _hello(line: bytes) -> tuple[str, str] | None:
+def _hello(line: bytes) -> tuple[str, str, int | str | None] | None:
+    """The hello's answer_id, post_id and request id. A notification (no `id`) is the relay's
+    mcp mode; a request is the runner's, before it starts the kiosk, and is answered (#142)."""
     try:
         msg = json.loads(line)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(msg, dict) or msg.get("method") != "crewkiosk/hello" or "id" in msg:
+    if not isinstance(msg, dict) or msg.get("method") != "crewkiosk/hello":
+        return None
+    rid = msg.get("id")
+    if "id" in msg and (isinstance(rid, bool) or not isinstance(rid, (int, str))):
         return None
     params = msg.get("params")
     if not isinstance(params, dict):
@@ -688,7 +754,7 @@ def _hello(line: bytes) -> tuple[str, str] | None:
         return None
     if not isinstance(post_id, str) or not POST_ID_RE.fullmatch(post_id):
         return None
-    return answer_id, post_id
+    return answer_id, post_id, rid
 
 
 # -- the control socket -----------------------------------------------------------------------
@@ -745,6 +811,22 @@ class Control:
 
 
 # -- the service ------------------------------------------------------------------------------
+class SiteBudget:
+    """One server's model proxy budget, from the ledger (`proxy.Budget`): only an answer a
+    hello admitted is served, and its turns and counts are its record's."""
+
+    def __init__(self, ledger: Ledger, server: str, max_turns: Callable[[], int]) -> None:
+        self.ledger = ledger
+        self.server = server
+        self.max_turns = max_turns
+
+    def admitted(self, answer_id: str) -> bool:
+        return self.ledger.admitted(self.server, answer_id) is not None
+
+    def spend(self, answer_id: str, kind: proxy.Spend) -> tuple[int, bool]:
+        return self.ledger.spend(self.server, answer_id, kind, self.max_turns())
+
+
 @dataclass
 class Site:
     """One research server's sockets."""
@@ -868,7 +950,7 @@ class Broker:
             upstream=self._upstream(),
             model=self.conf.model,
             key=lambda: self.key,
-            max_turns=lambda: site.max_turns,
+            budget=SiteBudget(self.ledger, server, lambda: site.max_turns),
             on_call=lambda call: self.ledger.model(server, call),
             label=f"broker {server} model",
         )

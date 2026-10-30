@@ -7,12 +7,16 @@ served; anything else is 404. The proxy:
 - reads the request body whole (`Content-Length`, at most `MAX_REQUEST_BYTES`) and forces its
   `model` to the pinned model;
 - drops every credential header the caller sent, and adds the broker's own key as `x-api-key`;
-- counts each answer's `/v1/messages` calls. The one after `max_turns` is refused with a 429,
-  an Anthropic-shaped `turn limit reached` error and `x-should-retry: false`, so the client
-  answers with what it has instead of backing off and retrying;
-- counts each answer's `count_tokens` calls apart from its turns, and refuses the one after
-  `max_turns` the same way (`count_tokens limit reached`): every research server shares the
-  broker's one key, so no call to it is unbounded;
+- serves only an answer its `Budget` has admitted, which for the broker means one its ledger
+  holds (a hello on the op socket made it): anything else is a 403, spending nothing. The kiosk
+  names its own answer ids, so this is what bounds them: by the ledger's caps on answers, not
+  by whatever a kiosk invents (#142);
+- spends each `/v1/messages` call from the answer's turns. The one after `max_turns` is refused
+  with a 429, an Anthropic-shaped `turn limit reached` error and `x-should-retry: false`, so
+  the client answers with what it has instead of backing off and retrying;
+- spends each `count_tokens` call from the answer's counts, apart from its turns, and refuses
+  the one after `max_turns` the same way (`count_tokens limit reached`): every research server
+  shares the broker's one key, so no call to it is unbounded;
 - streams the upstream response back byte for byte, and reads the token counts from its `usage`
   (a JSON body, or a `text/event-stream`), for the metrics.
 
@@ -34,7 +38,7 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +53,6 @@ LINGER_BYTES = 8 * MAX_REQUEST_BYTES  # the most of a refused body read and drop
 MAX_METER_BYTES = 4 * 1024 * 1024
 CONNECT_TIMEOUT_S = 30
 RESPONSE_TIMEOUT_S = 300
-TURNS_TTL_S = 24 * 60 * 60
 REQUEST_TIMEOUT_S = 30  # to read a request's head and body
 MAX_CONNECTIONS = 64  # per server's model socket
 MAX_PER_ANSWER = 4  # of those, at once, for one answer
@@ -64,6 +67,22 @@ PASS_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "content-type",
 
 class ConfError(Exception):
     pass
+
+
+Spend = Literal["turns", "counts"]
+
+
+class Budget(Protocol):
+    """One server's answers, as the proxy may serve them: the broker's ledger (`broker.SiteBudget`).
+    The tables are its, so they live and go with its answer records, never the proxy's."""
+
+    def admitted(self, answer_id: str) -> bool:
+        """Whether `answer_id` may be served at all; asking keeps an admitted one live."""
+        ...
+
+    def spend(self, answer_id: str, kind: Spend) -> tuple[int, bool]:
+        """The answer's next call of `kind`, and whether `max_turns` allows it: spent if so."""
+        ...
 
 
 class Slots:
@@ -199,6 +218,8 @@ class Call:
     output_tokens: int = 0
     forwarded: bool = True  # False when the broker refused it: the turn cap, or no key
     complete: bool = False  # the whole response reached the client
+    # False for an answer the budget never admitted (a 403): the ledger makes it no record.
+    admitted: bool = True
 
 
 class UsageMeter:
@@ -321,24 +342,17 @@ class ModelProxy:
         upstream: Upstream,
         model: str,
         key: Callable[[], str | None],
-        max_turns: Callable[[], int],
+        budget: Budget,
         on_call: Callable[[Call], None],
         ssl_context: ssl.SSLContext | None = None,
-        clock: Callable[[], float] = time.monotonic,
         label: str = "model proxy",
     ) -> None:
         self.upstream = upstream
         self.model = model
         self.key = key
-        self.max_turns = max_turns
+        self.budget = budget
         self.on_call = on_call
         self.ssl_context = ssl_context
-        self.clock = clock
-        # answer_id -> (turns, first seen). Kept a day, not the audit's 15 minutes: an answer
-        # that went quiet must not get its cap back.
-        self.turns: dict[str, tuple[int, float]] = {}
-        # The same for count_tokens, which isn't a turn but still spends the shared key.
-        self.counts: dict[str, tuple[int, float]] = {}
         self.slots = Slots(label)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -366,10 +380,18 @@ class ModelProxy:
         if request is None:
             return
         answer_id, path, query, headers, body = request
+        unspent = None if path != "/v1/messages" else 0  # refused before any turn was counted
+        # First: every later refusal is filed under the answer's record, and only an
+        # admitted answer has one.
+        if not self.budget.admitted(answer_id):
+            writer.write(_error(403, "permission_error", "no such answer", retry=False))
+            call = Call(answer_id, path, unspent, 403, 0, _ms(start), forwarded=False)
+            call.admitted = False
+            self.on_call(call)
+            return
         if not self.slots.bind(answer_id, MAX_PER_ANSWER):
             writer.write(_error(429, "rate_limit_error", "too many calls at once for this answer"))
-            turn = None if path != "/v1/messages" else 0  # refused before any turn was counted
-            self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
+            self.on_call(Call(answer_id, path, unspent, 429, 0, _ms(start), forwarded=False))
             return
         try:
             await self._call(writer, answer_id, path, query, headers, body, start)
@@ -397,10 +419,10 @@ class ModelProxy:
             return
         turn: int | None = None
         if path == "/v1/messages":
-            turn, allowed = self._spend(self.turns, answer_id)
+            turn, allowed = self.budget.spend(answer_id, "turns")
             limit = "turn limit reached"
         else:
-            _count, allowed = self._spend(self.counts, answer_id)
+            _count, allowed = self.budget.spend(answer_id, "counts")
             limit = "count_tokens limit reached"
         if not allowed:
             writer.write(_error(429, "rate_limit_error", limit, retry=False))
@@ -409,18 +431,6 @@ class ModelProxy:
         call = await self._forward(writer, path, query, headers, body, key, answer_id, turn)
         call.latency_ms = _ms(start)
         self.on_call(call)
-
-    def _spend(self, table: dict[str, tuple[int, float]], answer_id: str) -> tuple[int, bool]:
-        """The answer's next call in `table`, and whether `max_turns` allows it: spent if so.
-        Entries a day old are pruned first."""
-        now = self.clock()
-        for aid in [a for a, (_, seen) in table.items() if now - seen > TURNS_TTL_S]:
-            del table[aid]
-        used, seen = table.get(answer_id, (0, now))
-        if used + 1 > self.max_turns():
-            return used + 1, False
-        table[answer_id] = (used + 1, seen)
-        return used + 1, True
 
     async def _read(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

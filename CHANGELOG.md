@@ -27,10 +27,16 @@ and `kiosk_research` is turned on.
   drops the caller's credentials, pins the model from `model.conf`, refuses bodies over
   1 MiB, and answers the call after the manifest's `max_turns` (default 8) with a 429 that
   says not to retry. `count_tokens` isn't a turn, but it has a cap of its own, `max_turns`
-  calls per answer, so no call to the shared key is unbounded (#142). A call made while the
-  broker has no key is a 503 and spends none of the answer's turns. The broker writes one audit line for each op it served and each model
-  call it proxied, and rolls up daily metrics per server: ops, latency p50/p95, model calls,
-  tokens and wall time per answer. Both are kept under `/var/lib/crewkiosk-broker`, and the
+  calls per answer, so no call to the shared key is unbounded (#142). It serves only an
+  answer a hello admitted: one live or recorded in its server's day. Any other answer id is
+  a 403 that spends nothing and makes no record, so the turns and counts live in the
+  ledger's answer records and are bounded by its caps on answers (#142). A call made while
+  the broker has no key is a 503 and spends none of the answer's turns. A hello sent as a
+  request is answered `{"admitted": true}`, so the research runner knows the answer is
+  admitted before the kiosk starts. The broker writes one audit line for each op it served
+  and each model call it proxied, and rolls up daily metrics per server: ops, latency
+  p50/p95, model calls, tokens and wall time per answer. Both are kept under
+  `/var/lib/crewkiosk-broker`, and the
   daemon reads them over `/run/crewkiosk-broker-control/control.sock`
   (`crewkiosk-broker-control.socket`). That socket has a directory of its own, out of reach of
   the service's `RuntimeDirectory=` chown, and serves only the `crewchat` uid, checked by
