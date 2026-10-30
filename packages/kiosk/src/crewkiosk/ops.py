@@ -134,8 +134,9 @@ def check_args(name: str, args: object) -> dict[str, Any]:
                 raise ToolError(f"{key} is longer than {f.max_len} characters")
             if "\0" in value:
                 raise ToolError(f"{key} holds a NUL")
-        elif (f.minimum is not None and value < f.minimum) or (
-            f.maximum is not None and value > f.maximum
+        elif isinstance(value, int) and (
+            (f.minimum is not None and value < f.minimum)
+            or (f.maximum is not None and value > f.maximum)
         ):
             raise ToolError(f"{key} must be from {f.minimum} to {f.maximum}")
         out[key] = value

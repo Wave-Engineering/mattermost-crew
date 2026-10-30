@@ -42,7 +42,9 @@ MAX_HEAD_BYTES = 16 * 1024
 MAX_METER_BYTES = 4 * 1024 * 1024
 CONNECT_TIMEOUT_S = 30
 RESPONSE_TIMEOUT_S = 300
-PATH_RE = re.compile(r"^/a/([0-9a-f]{32})(/v1/messages(?:/count_tokens)?)(?:\?([A-Za-z0-9=&_.-]*))?$")
+PATH_RE = re.compile(
+    r"^/a/([0-9a-f]{32})(/v1/messages(?:/count_tokens)?)(?:\?([A-Za-z0-9=&_.-]*))?$"
+)
 # Request headers passed through. Everything else, every credential among them, is dropped.
 PASS_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "content-type", "accept"})
 
