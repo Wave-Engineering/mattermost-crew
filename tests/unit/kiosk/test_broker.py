@@ -570,7 +570,7 @@ def test_model_proxy_turns_kept_a_day(sockdir: Path) -> None:
     mp = ModelProxy(
         upstream=Upstream("http", "127.0.0.1", 9, ""),
         model="m",
-        key=lambda: None,
+        key=lambda: KEY,
         max_turns=lambda: 1,
         on_call=lambda call: None,
         clock=tick,
@@ -579,7 +579,7 @@ def test_model_proxy_turns_kept_a_day(sockdir: Path) -> None:
     async def main() -> list[int]:
         path = str(sockdir / "m.sock")
         server = await asyncio.start_unix_server(mp.handle, path=path)
-        statuses = [(await http(path, post()))[0]]  # turn 1, then no key: 503
+        statuses = [(await http(path, post()))[0]]  # turn 1, to a closed port: 502
         tick.t = broker.AUDIT_TTL_S + 60
         statuses.append((await http(path, post()))[0])
         tick.t = proxy.TURNS_TTL_S + 1
@@ -588,7 +588,7 @@ def test_model_proxy_turns_kept_a_day(sockdir: Path) -> None:
         await server.wait_closed()
         return statuses
 
-    assert asyncio.run(main()) == [503, 429, 503]
+    assert asyncio.run(main()) == [502, 429, 502]
     assert set(mp.turns) == {AID2}
 
 
@@ -649,12 +649,17 @@ def test_model_proxy_streams_and_meters(sockdir: Path) -> None:
 
 
 def test_model_proxy_without_key(sockdir: Path) -> None:
-    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
-        status, headers, _body = await http(path, post())
-        assert status == 503 and headers["x-should-retry"] == "false"
-        assert up.requests == [] and calls[-1].forwarded is False
+    """With no key every call is a 503, and none spends a turn: past max_turns it is still a
+    503, never the turn cap's 429."""
 
-    with_proxy(sockdir, scenario, key=None)
+    async def scenario(path: str, up: Upstreamer, calls: list[Call]) -> None:
+        for _ in range(3):
+            status, headers, _body = await http(path, post())
+            assert status == 503 and headers["x-should-retry"] == "false"
+        assert up.requests == [] and calls[-1].forwarded is False
+        assert [c.turn for c in calls] == [0, 0, 0]
+
+    with_proxy(sockdir, scenario, key=None, max_turns=1)
 
 
 # -- the broker's key and model.conf: crewkiosk-run's rules (test_kiosk_runner's cases) ----------

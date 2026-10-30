@@ -383,6 +383,13 @@ class ModelProxy:
     ) -> None:
         body["model"] = self.model
 
+        # The key first: a call the broker can't make spends none of the answer's turns.
+        key = self.key()
+        if key is None:
+            writer.write(_error(503, "api_error", "the broker has no model key", retry=False))
+            unspent = None if path != "/v1/messages" else 0  # refused before any turn was counted
+            self.on_call(Call(answer_id, path, unspent, 503, 0, _ms(start), forwarded=False))
+            return
         turn: int | None = None
         if path == "/v1/messages":
             now = self.clock()
@@ -395,11 +402,6 @@ class ModelProxy:
                 self.on_call(Call(answer_id, path, turn, 429, 0, _ms(start), forwarded=False))
                 return
             self.turns[answer_id] = (turn, seen)
-        key = self.key()
-        if key is None:
-            writer.write(_error(503, "api_error", "the broker has no model key", retry=False))
-            self.on_call(Call(answer_id, path, turn, 503, 0, _ms(start), forwarded=False))
-            return
         call = await self._forward(writer, path, query, headers, body, key, answer_id, turn)
         call.latency_ms = _ms(start)
         self.on_call(call)
