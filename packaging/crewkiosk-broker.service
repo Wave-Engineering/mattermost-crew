@@ -32,12 +32,13 @@ Restart=on-failure
 # about 40 research servers.
 LimitNOFILE=8192
 # At most 4 ops at once across every server (OPS_AT_ONCE), a search reading at most 4 MiB of
-# rg's output a line at a time, and the proxy's bodies capped at 1 MiB: far under this, so
-# it is only a backstop.
+# rg's output a line at a time, and the proxy's bodies capped at 1 MiB. The ledger is held
+# to half of this by its caps: a unit test reads MemoryMax and LimitNOFILE from this file.
 MemoryMax=512M
 # rg runs in this unit's cgroup, and the kiosk chooses the queries. The default policy (stop)
-# would end the whole broker, every server's sessions with it, when the kernel kills one rg:
-# with continue, that search fails and nothing else does.
+# would end the whole broker, every server's sessions with it, whenever the kernel kills a
+# process here. The kernel kills the largest: if that is an rg, with continue, that search
+# fails and nothing else does. If it is the broker, the unit fails and Restart= brings it back.
 OOMPolicy=continue
 # The per-server sockets only. The control socket has its own directory, made by its socket
 # unit: this one is chowned to crewkiosk-broker at every start.

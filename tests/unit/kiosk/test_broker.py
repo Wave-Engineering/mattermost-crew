@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -821,7 +822,7 @@ def test_control_peer_uid(sockdir: Path) -> None:
 
     refused = with_server(sockdir, Control(ledger, os.getuid() + 1).handle, ask)
     assert refused == b""
-    assert len(ledger.answers[(SERVER, AID)].lines) == 1  # nothing was taken
+    assert len(ledger.lines[(SERVER, AID)]) == 1  # nothing was taken
     served = with_server(sockdir, Control(ledger, os.getuid()).handle, ask)
     assert [x["op"] for x in json.loads(served)["lines"]] == ["corpus_list"]
 
@@ -871,7 +872,8 @@ def test_metrics_rollup(sockdir: Path) -> None:
     tick.t += 12
     ledger.model(SERVER, model_call(input_tokens=100, output_tokens=50))
     ledger.model(SERVER, model_call(turn=None, path="/v1/messages/count_tokens", input_tokens=0))
-    ledger.model(SERVER, model_call(turn=9, status=429, forwarded=False, input_tokens=0))
+    refused = model_call(turn=9, status=429, forwarded=False, input_tokens=0, output_tokens=0)
+    ledger.model(SERVER, refused)
     ledger.hello(SERVER, AID2, "post-2")
     ledger.op(SERVER, AID2, "post-2", "corpus_read", {}, 1, 1000, True)
     ledger.op(OTHER, AID2, "post-2", "corpus_read", {}, 1, 5, True)
@@ -881,11 +883,12 @@ def test_metrics_rollup(sockdir: Path) -> None:
     dev = m[SERVER]
     assert dev["date"] == "2026-10-30" and dev["answers"] == 2
     assert dev["ops"] == 5 and dev["model_calls"] == 1  # count_tokens and a refusal aren't calls
-    assert (dev["input_tokens"], dev["output_tokens"]) == (100, 60)
+    assert (dev["input_tokens"], dev["output_tokens"]) == (100, 55)
+    assert dev["refused"] == {"hellos": 0, "ops": 0, "model_calls": 1}
     assert dev["op_latency_ms"] == {"p50": 30.0, "p95": 1000.0}
     assert dev["per_answer"]["ops"] == {"p50": 1.0, "p95": 4.0}
     assert dev["per_answer"]["model_calls"] == {"p50": 0.0, "p95": 1.0}
-    assert dev["per_answer"]["tokens"] == {"p50": 0.0, "p95": 160.0}
+    assert dev["per_answer"]["tokens"] == {"p50": 0.0, "p95": 155.0}
     assert dev["per_answer"]["wall_s"] == {"p50": 0.0, "p95": 12.0}
     on_disk = sockdir / "state" / "metrics" / f"{SERVER}-2026-10-30.json"
     ledger.flush()  # the file trails the lines by up to METRICS_WRITE_S
@@ -1191,8 +1194,9 @@ def test_expired_lines_are_freed_and_a_resumed_answer_keeps_its_day(tmp_path: Pa
     ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 10, True)
     answer = ledger.days[(SERVER, "2026-10-30")].answers[AID]
     tick.t += broker.AUDIT_TTL_S + 1
+    assert len(ledger.lines[(SERVER, AID)]) == 1
     ledger.op(SERVER, AID2, POST, "corpus_list", {}, 1, 10, True)  # expires AID
-    assert len(answer.lines) == 0  # gone from memory, not just from reach
+    assert (SERVER, AID) not in ledger.lines  # gone from memory, not just from reach
     ledger.op(SERVER, AID, POST, "corpus_read", {}, 1, 30, True)  # AID comes back
     m = ledger.metrics()[SERVER]
     assert m["answers"] == 2 and m["ops"] == 3
@@ -1360,6 +1364,58 @@ def test_control_socket_is_outside_the_runtime_directory() -> None:
     assert socket_unit["SocketGroup"] == ["crewchat"] and socket_unit["SocketMode"] == ["0660"]
     assert "RuntimeDirectoryPreserve" not in service
     assert service["MemoryMax"] == ["512M"]
+
+
+def deep_size(obj: object, seen: set[int] | None = None) -> int:
+    """An object's memory with everything it holds, each object counted once."""
+    seen = set() if seen is None else seen
+    if id(obj) in seen:
+        return 0
+    seen.add(id(obj))
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        size += sum(deep_size(k, seen) + deep_size(v, seen) for k, v in obj.items())
+    elif isinstance(obj, list | tuple | set | deque):
+        size += sum(deep_size(v, seen) for v in obj)
+    for name in getattr(type(obj), "__slots__", ()):
+        size += deep_size(getattr(obj, name), seen)
+    return size
+
+
+def test_the_ledger_fits_in_half_the_units_memory(tmp_path: Path) -> None:
+    """The ledger at its worst: MAX_LIVE_ANSWERS answers of AUDIT_LINES of the largest lines
+    the broker writes, and a full day of answer records for every server the unit's
+    LimitNOFILE has room for. It fits in half the unit's MemoryMax: the rest is the ops',
+    the proxy's and the interpreter's. Both are read from the unit, so neither can drift."""
+    service = unit_keys("crewkiosk-broker.service")
+    [memory_max] = service["MemoryMax"]
+    assert memory_max.endswith("M")
+    limit = int(memory_max[:-1]) * 1024 * 1024
+    # Each server's op and model sockets, and the model's upstreams: MAX_CONNECTIONS each.
+    servers = int(service["LimitNOFILE"][0]) // (3 * broker.MAX_CONNECTIONS)
+    longest = broker.SUN_PATH_MAX - len(os.fsencode(broker.RUNTIME_DIR / ".model.sock"))
+    server, post = "s" * longest, "p" * 64  # the longest POST_ID_RE allows
+    ledger = Ledger(tmp_path / "state", clock=Tick(NOON + 0.123456))
+    # One astral character makes a string 4 bytes a character: the most audit_args keeps.
+    for name, (_doc, fields) in ops.TOOLS.items():
+        args = {f: "\U0001f600" + "a" * 10_000 for f in fields}
+        args |= {f"k{n:02d}" + "x" * 100: 1 for n in range(20)}
+        shown = "o" * ops.NAME_MAX
+        ledger.op(server, AID, post, shown, broker.audit_args(name, args), 0, 0, False)
+    big = 10**15
+    call = model_call(input_tokens=big, output_tokens=big, bytes=big, latency_ms=big)
+    ledger.model(server, call)
+    line = max(deep_size(x) for x in ledger.lines[(server, AID)])
+    lines = sys.getsizeof(deque([None] * broker.AUDIT_LINES, maxlen=broker.AUDIT_LINES))
+    day = broker.Day("2026-10-30")
+    for n in range(broker.MAX_ANSWERS_PER_DAY):
+        refused = dict.fromkeys(("ops", "model_calls"), day.date)
+        day.answers[aid(n)] = broker.Answer(post, NOON, NOON, big, big, big, big, big, refused)
+    record = deep_size(day.answers[aid(0)])
+    worst = broker.MAX_LIVE_ANSWERS * (broker.AUDIT_LINES * line + lines + record)
+    worst += servers * deep_size(day)
+    assert servers >= 40 and line > 4096  # what the caps were sized against
+    assert worst <= limit // 2, (worst, limit)
     # An OOM-killed rg fails its own search; the default policy would stop the whole broker.
     assert service["OOMPolicy"] == ["continue"]
 
@@ -1480,22 +1536,164 @@ def test_search_argv_bounds_rg(corpus: Corpus, fake_rg: Callable[[str], str]) ->
 
 # -- the op cap, metrics writes ------------------------------------------------------------------
 def test_ops_are_capped_per_answer(sockdir: Path, corpus: Corpus) -> None:
-    """Op 201 of one answer is refused without running, and audited as refused; another
-    answer is unaffected."""
-    ledger = Ledger(sockdir / "state", clock=Tick())
+    """Op 201 of one answer is refused without running, audited as refused once a day and
+    counted after; another answer is unaffected."""
+    tick = Tick()
+    ledger = Ledger(sockdir / "state", clock=tick)
     listing = {"name": "corpus_list", "arguments": {"repo": A}}
-    lines = [rpc(n, "tools/call", listing) for n in range(1, broker.MAX_OPS_PER_ANSWER + 2)]
+    lines = [rpc(n, "tools/call", listing) for n in range(1, broker.MAX_OPS_PER_ANSWER + 4)]
     replies = with_server(
         sockdir,
         op_server(corpus, ledger).handle,
         lambda path: converse(path, hello_line(), *lines),
     )
     refused = [r["result"]["isError"] for r in replies]
-    assert refused == [False] * broker.MAX_OPS_PER_ANSWER + [True]
+    assert refused == [False] * broker.MAX_OPS_PER_ANSWER + [True] * 3
     assert "used all 200 of its ops" in replies[-1]["result"]["content"][0]["text"]
     last = ledger.take(AID)[-1]
     assert (last["op"], last["ok"]) == ("corpus_list", False)
-    assert ledger.ops_used(SERVER, AID2) == 0
+    m = ledger.metrics()[SERVER]
+    assert m["ops"] == broker.MAX_OPS_PER_ANSWER and m["refused"]["ops"] == 3
+    assert (SERVER, AID2) not in ledger.answers
+    audit = sockdir / "state" / "audit" / f"{SERVER}.jsonl"
+
+    def refusals() -> int:
+        return sum(not json.loads(x)["ok"] for x in audit.read_text().splitlines())
+
+    assert refusals() == 1
+    tick.t += 86_400  # a new UTC day: the answer's next refusal is audited again
+    ledger.refuse_op(SERVER, AID, POST, "corpus_list", {})
+    ledger.refuse_op(SERVER, AID, POST, "corpus_list", {})
+    assert refusals() == 2
+
+
+def test_refusals_are_audited_once_a_day(tmp_path: Path) -> None:
+    """A loop of refusals writes one line a kind a day, per answer, or per server with no
+    record: the rest only count, so they can't fill the disk or stall the loop."""
+    ledger = Ledger(tmp_path / "state", clock=Tick())
+    ledger.hello(SERVER, AID, POST)
+    turn_cap = model_call(turn=9, status=429, forwarded=False, input_tokens=0, output_tokens=0)
+    for _ in range(5):
+        ledger.model(SERVER, turn_cap)
+        ledger.refuse_op(SERVER, AID, POST, "corpus_list", {})
+        ledger.model(SERVER, model_call(AID2, turn=0, status=429, forwarded=False))
+    audit = tmp_path / "state" / "audit" / f"{SERVER}.jsonl"
+    lines = [json.loads(x) for x in audit.read_text().splitlines()]
+    assert [(x["answer_id"], x["op"], x["ok"]) for x in lines] == [
+        (AID, "model", False),
+        (AID, "corpus_list", False),
+        (AID2, "model", False),
+    ]
+    m = ledger.metrics()[SERVER]
+    assert m["refused"] == {"hellos": 0, "ops": 5, "model_calls": 10}
+    assert m["model_calls"] == 0 and m["output_tokens"] == 0  # a refused call spends nothing
+
+
+def test_live_answers_are_capped_across_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At most MAX_LIVE_ANSWERS answers hold lines at once, across every server: the memory
+    limit is the process's. A hello past it is refused, logged once; a live answer is still
+    served, and a quiet answer's place is freed at once, not at the next sweep."""
+    monkeypatch.setattr(broker, "MAX_LIVE_ANSWERS", 3)
+    caplog.set_level(logging.WARNING, logger="crewkiosk.broker")
+    tick = Tick()
+    ledger = Ledger(tmp_path / "state", clock=tick)
+    assert ledger.hello(SERVER, aid(0), POST) and ledger.hello(SERVER, aid(1), POST)
+    assert ledger.hello(OTHER, aid(2), POST)
+    assert not ledger.hello(OTHER, aid(3), POST)
+    assert not ledger.hello(SERVER, aid(4), POST)
+    assert ledger.hello(SERVER, aid(0), POST)
+    assert [r.getMessage() for r in caplog.records].count(
+        "broker: 3 answers live: no more until one goes quiet"
+    ) == 1
+    assert ledger.metrics()[OTHER]["refused"]["hellos"] == 1
+    tick.t += broker.AUDIT_TTL_S + 1
+    ledger.swept = tick.t  # the sweep isn't due: the full ledger runs it itself
+    assert ledger.hello(SERVER, aid(4), POST)
+    assert list(ledger.answers) == [(SERVER, aid(4))]
+
+
+def test_the_op_cap_holds_for_sessions_calling_at_once(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An op's place under the cap is taken before it runs: one answer's four sessions,
+    calling at once, run exactly MAX_OPS_PER_ANSWER ops, never a few more."""
+    monkeypatch.setattr(broker, "MAX_OPS_PER_ANSWER", 5)
+    ran: list[str] = []
+
+    def slow(name: str, args: object) -> dict[str, Any]:
+        ran.append(name)
+        time.sleep(0.05)
+        return {}
+
+    monkeypatch.setattr(corpus, "call", slow)
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    calls = [rpc(n, "tools/call", {"name": "corpus_list", "arguments": {}}) for n in range(3)]
+
+    async def scenario(path: str) -> None:
+        sessions = range(broker.MAX_PER_ANSWER)
+        await asyncio.gather(*(converse(path, hello_line(), *calls) for _ in sessions))
+
+    with_server(sockdir, op_server(corpus, ledger).handle, scenario)
+    assert len(ran) == 5
+    assert ledger.metrics()[SERVER]["refused"]["ops"] == 3 * broker.MAX_PER_ANSWER - 5
+
+
+def test_a_stop_refuses_the_ops_queued_behind_it(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """close_all() ends the sessions, and an op still queued for a thread is refused, never
+    run: a stop waits for the ops already running, and no more."""
+    gate, ran = threading.Event(), []
+
+    def held(name: str, args: object) -> dict[str, Any]:
+        ran.append(name)
+        gate.wait(5)
+        return {}
+
+    monkeypatch.setattr(corpus, "call", held)
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    op = OpServer(SERVER, corpus, ledger, asyncio.Semaphore(1))
+    done: list[int] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await op.handle(reader, writer)
+        done.append(1)
+
+    listing = rpc(1, "tools/call", {"name": "corpus_list", "arguments": {}})
+
+    async def until(cond: Callable[[], bool]) -> None:
+        for _ in range(500):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("timed out")
+
+    async def scenario(path: str) -> None:
+        first = asyncio.ensure_future(converse(path, hello_line(aid(1)), listing))
+        await until(lambda: len(ran) == 1)
+        second = asyncio.ensure_future(converse(path, hello_line(aid(2)), listing))
+        await until(lambda: op.slots.total == 2)
+        await asyncio.sleep(0.05)  # the second op waits on the semaphore
+        op.slots.close_all()
+        gate.set()
+        await until(lambda: len(done) == 2)
+        await asyncio.gather(first, second, return_exceptions=True)
+
+    with_server(sockdir, handle, scenario)
+    assert ran == ["corpus_list"]
+
+
+def test_the_flush_sweeps_a_quiet_ledger(tmp_path: Path) -> None:
+    """With nothing more coming in, the timer's flush still drops the lines of an answer
+    quiet past AUDIT_TTL_S."""
+    tick = Tick()
+    ledger = Ledger(tmp_path / "state", clock=tick)
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+    tick.t += broker.AUDIT_TTL_S + 1
+    ledger.flush()
+    assert ledger.lines == {} and ledger.answers == {}
 
 
 def test_metrics_are_written_at_most_once_an_interval(
@@ -1671,9 +1869,9 @@ def aid(n: int) -> str:
 def test_answers_a_day_are_capped(
     sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Past MAX_ANSWERS_PER_DAY a server's new hello is refused, audited ok:false and logged
-    once, and makes no record; a known answer is still served, and a model call past the cap
-    still counts in the day."""
+    """Past MAX_ANSWERS_PER_DAY a server's new hello is refused, logged once, audited ok:false
+    once a day and counted after, and makes no record; a known answer is still served, and a
+    model call past the cap still counts in the day."""
     monkeypatch.setattr(broker, "MAX_ANSWERS_PER_DAY", 3)
     caplog.set_level(logging.WARNING, logger="crewkiosk.broker")
     ledger = Ledger(sockdir / "state", clock=Tick())
@@ -1690,14 +1888,12 @@ def test_answers_a_day_are_capped(
     ) == 1
     audit = sockdir / "state" / "audit" / f"{SERVER}.jsonl"
     refused = [json.loads(x) for x in audit.read_text().splitlines()]
-    assert [(x["op"], x["answer_id"], x["ok"]) for x in refused] == [
-        ("hello", aid(3), False),
-        ("hello", aid(4), False),
-    ]
+    assert [(x["op"], x["answer_id"], x["ok"]) for x in refused] == [("hello", aid(3), False)]
     ledger.model(SERVER, model_call(aid(9), input_tokens=7))
     assert (SERVER, aid(9)) not in ledger.answers
     m = ledger.metrics()[SERVER]
     assert m["answers"] == 3 and m["model_calls"] == 1 and m["input_tokens"] == 7
+    assert m["refused"]["hellos"] == 2
     # Through the socket: a refused hello is closed with no reply.
     replies = with_server(
         sockdir,
@@ -1812,12 +2008,38 @@ def test_stop_expires_everything_and_survives_a_failing_server(
     async def main() -> None:
         await b.reload()
         await b.start_control(None)
+        # The first line writes the metrics file; the second, inside METRICS_WRITE_S, leaves
+        # it behind, for the stop to bring up to date.
+        b.ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
         b.ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
         monkeypatch.setattr(b, "_close", close)
         await b.stop()
         assert b.control is not None and not b.control.is_serving()
 
     asyncio.run(main())
-    assert b.sites == {} and b.ledger.answers == {}
+    assert b.sites == {} and b.ledger.answers == {} and b.ledger.lines == {}
     # The broker's clock is the real one: whatever today is, its file was written.
-    assert list((tmp_path / "state" / "metrics").glob(f"{SERVER}-*.json"))
+    [metrics] = (tmp_path / "state" / "metrics").glob(f"{SERVER}-*.json")
+    assert json.loads(metrics.read_text())["ops"] == 2
+
+
+def test_stop_writes_the_metrics_when_the_control_socket_fails(
+    tmp_path: Path, sockdir: Path, root: Path
+) -> None:
+    b, _run = broker_for(tmp_path, sockdir, root, SERVER)
+
+    class Broken:
+        def close(self) -> None:
+            raise OSError("close refused")
+
+    async def main() -> None:
+        await b.reload()
+        b.ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+        b.ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+        b.control = Broken()  # type: ignore[assignment]
+        with pytest.raises(OSError):
+            await b.stop()
+
+    asyncio.run(main())
+    [metrics] = (tmp_path / "state" / "metrics").glob(f"{SERVER}-*.json")
+    assert json.loads(metrics.read_text())["ops"] == 2
