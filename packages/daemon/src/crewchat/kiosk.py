@@ -78,6 +78,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from crewchat.adapters.base import InboundMessage
+from crewchat.config import RESEARCH_SERVER_RE
 from crewchat.doorbell import DoorbellEvent
 from crewchat.threads import STATE_DIR
 from crewchat.tokens import DIR_MODE, FILE_MODE, write_private_json
@@ -111,7 +112,7 @@ KIOSK_SOCKET = "/run/crewkiosk/kiosk.sock"  # packaging/crewkiosk.socket (D-107)
 KIOSK_RESEARCH_DIR = "/run/crewkiosk"
 FRAME_VERSION = "crewkiosk/1"
 # What packaging/crewkiosk-research-run accepts in a frame header, and nothing else.
-FRAME_SERVER_RE = re.compile(r"^[a-z0-9._-]+$")
+FRAME_SERVER_RE = RESEARCH_SERVER_RE
 FRAME_POST_RE = re.compile(r"^[A-Za-z0-9]+$")
 FRAME_ANSWER_RE = re.compile(r"^[0-9a-f]{32}$")  # secrets.token_hex(16)
 # A research op in the review, `op(args) → bytes`: its args cut to this many characters.

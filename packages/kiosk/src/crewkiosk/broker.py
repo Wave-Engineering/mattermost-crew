@@ -4,7 +4,8 @@ A long-running service, as `crewkiosk-broker`. It alone holds the corpus read ac
 broker's model key. For each research server, one manifest in `/var/lib/crewchat-pool` (#139),
 read at start and on SIGHUP, it serves two sockets under `/run/crewkiosk-broker`:
 
-- `<server>.sock` (0660, group `crewkiosk`): newline-delimited JSON-RPC 2.0, the minimal MCP
+- `<server>.sock` (0660, group `crewkiosk-r-<server>`, that server's research kiosk user's
+  own, #142): newline-delimited JSON-RPC 2.0, the minimal MCP
   server subset (`initialize`, `tools/list`, `tools/call`, `ping`). The first message must be
   `crewkiosk/hello` with `answer_id` (32 hex) and `post_id`; anything else closes the
   connection. As a notification (the relay's mcp mode) it gets no reply, so the hello never
@@ -91,7 +92,10 @@ MODEL_CONF = Path("/etc/crewkiosk/model.conf")
 # The broker's own model key (babelfish, 2026-10-30: two keys). Never the runner's
 # model.credential, which the broker's unit can't even reach.
 MODEL_KEY = Path("/etc/crewkiosk/broker-model.credential")
-SOCKET_GROUP = "crewkiosk"
+# Each server's two sockets get that server's own group (#142): its research kiosk's user,
+# which packaging/crewkiosk-research-units creates and puts the broker in. No other server's
+# kiosk, and not the research-off crewkiosk, can open them by path.
+SOCKET_GROUP = "crewkiosk-r-{server}"
 CONTROL_USER = "crewchat"
 SOCKET_MODE = 0o660
 AUDIT_MODE = 0o600
@@ -770,6 +774,15 @@ def peer_uid(writer: asyncio.StreamWriter) -> int | None:
     return int(uid)
 
 
+def own_socket(path: Path, group: str | None, server: str) -> None:
+    """A server socket's group (`group` formatted with the server; None leaves it), then its
+    mode. A server whose group is missing gets no sockets (KeyError), rather than sockets some
+    other user could open. IT-31b applies it to its own sockets, as the broker does."""
+    if group is not None:
+        os.chown(path, -1, grp.getgrnam(group.format(server=server)).gr_gid)
+    os.chmod(path, SOCKET_MODE)
+
+
 class Control:
     """The daemon's socket: audit and metrics, for the daemon's uid only."""
 
@@ -964,7 +977,7 @@ class Broker:
                     path.unlink()
                 srv = await asyncio.start_unix_server(handler, path=str(path), limit=MAX_LINE_BYTES)
                 site.servers.append(srv)
-                self._own(path)
+                self._own(path, server)
         except BaseException:
             await self._shut(server, site)
             raise
@@ -988,10 +1001,8 @@ class Broker:
             with contextlib.suppress(FileNotFoundError):
                 (self.runtime_dir / f"{server}{suffix}").unlink()
 
-    def _own(self, path: Path) -> None:
-        if self.socket_group is not None:
-            os.chown(path, -1, grp.getgrnam(self.socket_group).gr_gid)
-        os.chmod(path, SOCKET_MODE)
+    def _own(self, path: Path, server: str) -> None:
+        own_socket(path, self.socket_group, server)
 
     async def start_control(self, sock: socket.socket | None) -> None:
         """The control socket systemd handed over, or (in development) one made here."""

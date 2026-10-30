@@ -22,7 +22,7 @@ The variables every block reads:
 |---|---|---|
 | `CREWBROKER_INSTANCES` | each broker on this host, as `<crew>:<server_id>`, space-separated | `oaw:oaw-dev` |
 | `AGENT_USER` | the agents' OS user (optional, default `agent`) | `agent` |
-| `CREWKIOSK_RESEARCH_SERVERS` | each `kiosk_research = true` server on this host, space-separated (optional; see [Install kiosk research](#install-kiosk-research)) | `oaw-dev` |
+| `CREWKIOSK_RESEARCH_SERVERS` | each `kiosk_research = true` server on this host, space-separated (optional; see [Install kiosk research](#install-kiosk-research)). A research server's id is `[a-z0-9_]+`: no `-` and no `.` | `oaw_lab` |
 
 Run every block as a user with `sudo` (the verify step needs `sudo -u` the agents' user too, or
 root; see [Verify the install](#verify-the-install)), from the root of a checkout of the release
@@ -40,6 +40,9 @@ The host needs:
 
 - **Linux with systemd**, `sudo`, `git`, `tar`, `jq` (the verify step uses `jq`) and `acl`
   (`setfacl` at `/usr/bin/setfacl`, and `getfacl`; the daemon's unit sets the socket's ACL).
+  On a kiosk research host, the research unit's `PrivatePIDs=` needs systemd 257 or later.
+  Without it the uid wall between research servers still holds, and `verify-install` says which
+  you have.
 - **Python 3.12** and **uv**. The install uses the system `python3.12` when there is one;
   otherwise uv downloads 3.12 into `/opt/mattermost-crew/python`, which every service user can
   reach. `uv` must be on the installing user's `PATH`.
@@ -131,7 +134,9 @@ kiosk = false
 kiosk_daily_cap = 25
 # Kiosk research (#139, D-112). Optional, default false. Needs `kiosk = true`, and an
 # `agents_allow` on every crew table for this server: a repo enters the pool only when its
-# host/org is a forge entry there. Install the pool directory first ("Kiosk research pool").
+# host/org is a forge entry there. The server's id must be [a-z0-9_]+, with no '-' or '.',
+# since it names systemd units and sockets: the daemon refuses any other. Install the pool
+# directory first ("Kiosk research pool").
 # kiosk_research = true
 # Full repos (host/group/.../repo) to pool besides the agents' own, and to keep out of it. An
 # exclude matches however a repo is spelled (case, a trailing .git) and covers its .wiki.
@@ -562,16 +567,24 @@ echo "kiosk research is installed for: $CREWKIOSK_RESEARCH_SERVERS"
 
 `health` then lists each research server under `kiosk_research`, with its overhead metrics.
 
-**After recreating the `crewkiosk` user**, re-run `crewkiosk-research-units <server>` for every
-research server, then `sudo systemctl daemon-reload`. The drop-in carries `crewkiosk`'s uid,
-because the unit's namespace has no `/etc/passwd`, and the runner refuses to run (exit 64) under
-any other uid. A recreated user with a new uid fails closed until then.
+**Each research server's kiosk runs as a user of its own**, `crewkiosk-r-<server>`, which
+`crewkiosk-research-units` creates (a system user, no login, no home) and whose group it gives
+`crewkiosk-broker`. The broker gives that server's two sockets that group, mode 0660, so no
+other server's kiosk can open them, and none can see or signal another's processes. The broker
+takes up a new group only when it restarts, which this block does after the units.
+
+**After recreating a `crewkiosk-r-<server>` user**, re-run `crewkiosk-research-units <server>`,
+then `sudo systemctl daemon-reload` and restart `crewkiosk-broker`. The drop-in carries that
+user's uid, because the unit's namespace has no `/etc/passwd`, and the runner refuses to run
+(exit 64) under any other uid. A recreated user with a new uid fails closed until then.
 
 **Adding or removing a research server.** To add one, put it in `CREWKIOSK_RESEARCH_SERVERS`
 and re-run this block. To remove one, stop and disable its socket, remove
 `/etc/systemd/system/crewkiosk-research-<server>.socket`,
 `/etc/systemd/system/crewkiosk-research-<server>@.service` (a symlink) and
-`/etc/systemd/system/crewkiosk-research-<server>@.service.d/`, then `daemon-reload`.
+`/etc/systemd/system/crewkiosk-research-<server>@.service.d/`, then `daemon-reload`, remove
+the user (`sudo userdel crewkiosk-r-<server>`, which takes its group too), and restart
+`crewkiosk-broker`.
 
 ## Kiosk research pool
 

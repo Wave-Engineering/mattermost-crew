@@ -45,7 +45,42 @@ printf 'prompt=%s\n' "$prompt"
 # In a research unit (#142), also what its namespace holds, for tests/integration/test_kiosk_confinement.py.
 if [[ "${ANTHROPIC_BASE_URL:-}" == */a/* ]]; then
   exec /usr/bin/python3 -I -S -c '
-import json, os, socket
+import json, os, re, socket, sys, time
+prompt = sys.argv[1]
+if "LINGER" in prompt:
+    # Stay up, so that another server'"'"'s instance can try to reach this one (IT-31b).
+    time.sleep(45)
+    sys.exit(0)
+def others(prompt):
+    # Another server'"'"'s live instance: its host pids and its answer id come in the prompt.
+    # What this one can reach of it, by those pids and by a walk of its own /proc. The test
+    # wants a failure in every "kill" entry and no "root" or "environ" entry at all.
+    m = re.search(r"OTHER server=([a-z0-9_]+) answer=([0-9a-f]{32}) pids=([0-9,]+)", prompt)
+    if m is None:
+        return None
+    server, answer, pids = m.group(1), m.group(2).encode(), [int(p) for p in m.group(3).split(",")]
+    found = {}
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            found["kill %d" % pid] = "signalled"
+        except OSError as e:
+            found["kill %d" % pid] = type(e).__name__
+    walked = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+    for pid in sorted((walked | set(pids)) - {os.getpid()}):
+        try:
+            names = os.listdir("/proc/%d/root/run/crewkiosk-broker" % pid)
+            if any(n.startswith(server + ".") for n in names):
+                found["root %d" % pid] = sorted(names)
+        except OSError:
+            pass
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as f:
+                if answer in f.read():
+                    found["environ %d" % pid] = "its answer id"
+        except OSError:
+            pass
+    return {"walked": len(walked), "found": found}
 def connect(path):
     s = socket.socket(socket.AF_UNIX)
     try:
@@ -70,6 +105,17 @@ def tcp(host):
         return "connected"
     except OSError as e:
         return type(e).__name__
+def dns(server):
+    # A raw DNS query for example.com's A record, straight to a resolver: no resolv.conf, no
+    # glibc. Only a reply counts as getting through.
+    query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(3)
+            s.sendto(query, (server, 53))
+            return "reply" if s.recv(512)[:2] == query[:2] else "other"
+    except OSError as e:
+        return type(e).__name__
 def setuid_bins():
     found = []
     for d in ("/usr/bin", "/usr/sbin"):
@@ -80,23 +126,12 @@ def setuid_bins():
             except OSError:
                 pass
     return found
-def elevate(path):
-    # Each binary is asked for nothing but `id -u` where it can run one; the uid must not change.
-    import subprocess
-    argv = {"sudo": [path, "-n", "id", "-u"], "su": [path, "-c", "id -u", "root"]}.get(
-        os.path.basename(path), [path, "--help"])
-    try:
-        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=5)
-        return {"rc": r.returncode, "out": r.stdout.decode(errors="replace").strip()[:40]}
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"rc": None, "out": type(e).__name__}
 status = dict(l.split(":", 1) for l in open("/proc/self/status").read().splitlines() if ":" in l)
 b = "/run/crewkiosk-broker"
-bins = setuid_bins()
 print("probe=" + json.dumps({
     "uid": os.getuid(),
     "no_new_privs": status.get("NoNewPrivs", "").strip(),
-    "setuid": {p: elevate(p) for p in bins if os.path.basename(p) in ("sudo", "su", "passwd", "mount")},
+    "setuid": setuid_bins(),
     "root": sorted(os.listdir("/")),
     "broker_dir": sorted(os.listdir(b)) if os.path.isdir(b) else None,
     "connect": {n: connect(f"{b}/{n}") for s in ("itdev", "itother")
@@ -106,9 +141,10 @@ print("probe=" + json.dumps({
         "/etc/crewkiosk/broker-model.credential", "/home", "/opt/mattermost-crew",
         "/var/lib/crewcorpus", "/var/lib/crewchat")},
     "tcp": tcp("1.1.1.1"),
-    "dns": tcp("example.com"),
+    "dns": {s: dns(s) for s in ("127.0.0.53", "1.1.1.1")},
+    "others": others(prompt),
 }))
-'
+' "$prompt"
 fi
 EOF
 # -D: a stock Ubuntu /usr/local has no libexec (GitHub's hosted image did; the ephemeral pool's doesn't).

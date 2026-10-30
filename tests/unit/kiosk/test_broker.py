@@ -7,9 +7,11 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
+import grp
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import stat
@@ -984,6 +986,41 @@ def test_metrics_rollup(sockdir: Path) -> None:
 
 
 # -- the service ---------------------------------------------------------------------------------
+def test_broker_sockets_take_their_servers_group(tmp_path: Path, sockdir: Path, root: Path) -> None:
+    """#142: each server's two sockets get that server's own group, 0660. A server whose group
+    doesn't exist gets no sockets at all, and the others still open."""
+    mine = grp.getgrgid(os.getgid()).gr_name
+    if not re.fullmatch(r"[a-z0-9_]+", mine):
+        pytest.skip(f"this user's group, {mine!r}, is not a research server id")
+    missing = "no_such_group_142"
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    write_manifest(pool, mine, repos=[A])
+    write_manifest(pool, missing, repos=[C])
+    run = sockdir / "run"
+    run.mkdir()
+    b = Broker(
+        pool_dir=pool,
+        corpus_root=root,
+        runtime_dir=run,
+        state_dir=tmp_path / "state",
+        model_conf=tmp_path / "model.conf",
+        model_key=tmp_path / "broker-model.credential",
+        socket_group="{server}",  # the real one is crewkiosk-r-{server}
+        control_uid=os.getuid(),
+    )
+
+    async def main() -> None:
+        await b.reload()
+        assert sorted(p.name for p in run.iterdir()) == [f"{mine}.model.sock", f"{mine}.sock"]
+        for p in run.iterdir():
+            assert (p.stat().st_gid, stat.S_IMODE(p.stat().st_mode)) == (os.getgid(), 0o660)
+        assert set(b.sites) == {mine}
+        await b.stop()
+
+    asyncio.run(main())
+
+
 def test_broker_sockets_per_server(tmp_path: Path, sockdir: Path, root: Path) -> None:
     """One op socket and one model socket per research server, 0660; a server whose manifest
     goes is closed on reload, and a changed max_turns applies to the open socket."""
@@ -2020,10 +2057,10 @@ def test_one_failing_server_never_stops_the_others(
     b, run = broker_for(tmp_path, sockdir, root, SERVER, OTHER)
     real_own = b._own
 
-    def own(path: Path) -> None:
+    def own(path: Path, server: str) -> None:
         if path.name == f"{OTHER}.model.sock":
             raise PermissionError("chown refused")
-        real_own(path)
+        real_own(path, server)
 
     async def main() -> None:
         monkeypatch.setattr(b, "_own", own)

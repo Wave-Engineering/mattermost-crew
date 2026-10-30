@@ -28,6 +28,15 @@ and `kiosk_research` is turned on.
   - **The namespace.** The unit starts from an empty root, with `/usr` package content, no
     network but its loopback, and only that server's two broker sockets. Both model keys and
     the broker's control socket are hidden by name.
+  - **A user per server.** Each server's kiosk runs as `crewkiosk-r-<server>`, which the units
+    script creates, and the broker gives that server's sockets that user's group, 0660. No
+    other server's kiosk, and not `crewkiosk`, can open them by path. Under
+    `ProtectProc=invisible`, none can see, signal or reach through `/proc` another server's
+    running kiosk. `PrivatePIDs=yes` adds a PID namespace on systemd 257 and later. An older
+    systemd ignores it, and the uid wall holds alone.
+  - **Research server ids** are `[a-z0-9_]+`, at most 20 characters, and never `control`. The
+    daemon's config refuses any other id with `kiosk_research = true`, by the units script's
+    own rules, and a test holds the two together.
   - **`crewkiosk-research-run`.** It needs its stdin to be a connection accepted on that
     server's socket, and a header naming the same server (argv[1], from the unit); otherwise it
     exits 67. It checks its uid by number, from the unit's drop-in. It says hello, starts the
@@ -152,7 +161,8 @@ and `kiosk_research` is turned on.
   `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
   `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could
   ever be cloned. The research install gives `crewcorpus` the directory's `x` by ACL and nothing
-  more. It doesn't join `crewkiosk`, which would also open the broker's sockets to it.
+  more. It doesn't join `crewkiosk`, which would also let it list `/etc/crewkiosk` and read the
+  runner's `model.conf`.
 - **`chat_dm` to an unknown username is `not_found`**, not `backend_error … NotFoundError`
   (#148, mattermost-crew:triage #48).
 

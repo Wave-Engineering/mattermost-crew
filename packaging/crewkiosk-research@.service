@@ -32,7 +32,8 @@ CollectMode=inactive-or-failed
 Type=simple
 User=crewkiosk
 Group=crewkiosk
-# ExecStart comes from the server's drop-in: crewkiosk-research-run <server>.
+# The server's drop-in replaces both with the server's own user, crewkiosk-r-<server>, and
+# gives the ExecStart: crewkiosk-research-run <server>.
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
@@ -68,6 +69,13 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
+# Each server's instances run as that server's own user, so ProtectProc=invisible hides every
+# other server's processes, and the kernel's same-uid check refuses /proc/<pid>/root (another
+# server's broker sockets), /proc/<pid>/environ (its answer id) and kill(2) across servers.
+# IT-31b runs two servers' instances at once to prove it. A PID namespace per instance is a
+# second wall on systemd 257 or later. An older systemd warns and ignores the key, and the uid
+# wall still holds; verify-install reports which.
+PrivatePIDs=yes
 # None of these exists in the empty namespace. Hidden by name as well, so that no later bind,
 # here or in a drop-in, can bring them back: the daemon's control socket, and both model keys.
 # The research kiosk holds no model key at all; the broker adds its own.

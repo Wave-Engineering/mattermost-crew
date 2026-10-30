@@ -7,7 +7,9 @@ reports what its namespace holds whenever it runs in research mode. Here a fake 
 both servers' sockets and a control socket, all mode 0666, and a broker model key that
 `crewkiosk` could read outside the unit: so only the unit stands between the kiosk and them.
 Each connection goes through the real socket, unit, drop-in, runner (its uid, sockname and
-header checks, and the hello) and relay; the test asserts what each instance saw.
+header checks, and the hello) and relay; the test asserts what each instance saw. The last two
+tests take the uid wall: each server's sockets, owned as the broker owns them, open only to that
+server's user, and no instance can reach another server's live one through /proc or a signal.
 
 Root via sudo, systemd, and kiosk-up.sh's install: it runs in `scripts/ci/installed-test.sh`.
 Elsewhere it skips, unless `CREWCHAT_INSTALLED_REQUIRED=1`, which makes that a failure.
@@ -20,6 +22,7 @@ import os
 import pwd
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -133,18 +136,39 @@ def broker(servers: list[str]) -> Iterator[FakeBroker]:
         sudo("rm", "-rf", "--", str(BROKER_DIR), str(CONTROL_DIR), str(BROKER_KEY))
 
 
-def ask(via: str, server: str) -> bytes:
+def ask_argv(via: str, server: str, question: str, answer: str) -> list[str]:
+    header = f"crewkiosk/1 server={server} post=p1 answer={answer}"
+    sock = f"/run/crewkiosk/research-{via}.sock"
+    client = CLIENT.replace("THE-QUESTION", question)
+    return ["sudo", "-n", "-u", "crewchat", "/usr/bin/python3", "-I", "-c", client, sock, header]
+
+
+def ask(via: str, server: str, question: str = "THE-QUESTION", answer: str = ANSWER) -> bytes:
     """One answer, as the daemon asks it: as `crewchat`, on `via`'s research socket, framed
     for `server`."""
-    header = f"crewkiosk/1 server={server} post=p1 answer={ANSWER}"
-    sock = f"/run/crewkiosk/research-{via}.sock"
-    proc = subprocess.run(
-        ["sudo", "-n", "-u", "crewchat", "/usr/bin/python3", "-I", "-c", CLIENT, sock, header],
-        capture_output=True,
-        timeout=120,
-    )
+    proc = subprocess.run(ask_argv(via, server, question, answer), capture_output=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+def research_user(server: str) -> str:
+    return f"crewkiosk-r-{server}"
+
+
+def instance_pids(server: str) -> list[int]:
+    """Every process in `server`'s running research instances, by their units' cgroups: so the
+    lookup depends on the unit, not on the user it runs as."""
+    listed = sudo(
+        "systemctl", "list-units", "--plain", "--no-legend", f"crewkiosk-research-{server}@*"
+    ).stdout
+    pids: list[int] = []
+    for line in listed.splitlines():
+        unit = line.split()[0]
+        cgroup = sudo("systemctl", "show", "-P", "ControlGroup", unit).stdout.strip()
+        if cgroup:
+            procs = sudo("cat", f"/sys/fs/cgroup{cgroup}/cgroup.procs").stdout
+            pids += [int(p) for p in procs.split()]
+    return pids
 
 
 def probe_of(reply: bytes) -> dict[str, object]:
@@ -164,7 +188,10 @@ def test_each_research_unit_sees_only_its_own_server(
     mine, other = servers[which], servers[1 - which]
     broker.seen.clear()
     probe = probe_of(ask(mine, mine))
-    assert probe["uid"] == pwd.getpwnam("crewkiosk").pw_uid
+    # The server's own user: neither crewkiosk nor the other server's.
+    assert probe["uid"] == pwd.getpwnam(research_user(mine)).pw_uid
+    assert probe["uid"] != pwd.getpwnam(research_user(other)).pw_uid
+    assert probe["uid"] != pwd.getpwnam("crewkiosk").pw_uid
     assert set(probe["root"]) <= ROOT_ENTRIES, probe["root"]  # type: ignore[arg-type]
     assert probe["broker_dir"] == [f"{mine}.model.sock", f"{mine}.sock"]
     assert probe["connect"] == {
@@ -178,11 +205,14 @@ def test_each_research_unit_sees_only_its_own_server(
         expected = {"listed:0"} if path == "/home" else {"FileNotFoundError", "PermissionError"}
         assert got in expected, (path, got)
     # /usr/bin is bound whole, so curl and the like are there: the network wall is what holds.
-    assert probe["tcp"] != "connected" and probe["dns"] != "connected"
-    # And a setuid binary buys nothing: no new privileges, so the uid never changes.
+    # DNS is asked raw, at systemd-resolved's stub and at a public resolver, since glibc with
+    # no resolv.conf would only try 127.0.0.1:53, where nothing listens even unconfined.
+    assert probe["tcp"] != "connected"
+    assert set(probe["dns"]) == {"127.0.0.53", "1.1.1.1"}  # type: ignore[arg-type]
+    assert "reply" not in probe["dns"].values(), probe["dns"]  # type: ignore[attr-defined]
+    # Setuid binaries are there (/usr/bin is whole), and buy nothing: NoNewPrivs is the guard.
+    assert probe["setuid"], "no setuid binary in the namespace: this check would prove nothing"
     assert probe["no_new_privs"] == "1"
-    for path, result in probe["setuid"].items():  # type: ignore[attr-defined]
-        assert result["out"] != "0", (path, result)
     # The broker heard this server's hello on its own socket, and nothing on the other's.
     assert f"{mine}.sock" in broker.seen
     assert not {f"{other}.sock", f"{other}.model.sock", "control.sock"} & set(broker.seen)
@@ -212,3 +242,76 @@ def test_a_frame_for_another_server_gets_nothing(servers: list[str], broker: Fak
             break
         time.sleep(0.5)
     assert "a header for another server" in journal, journal
+
+
+CONNECT = """
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(sys.argv[1])
+    print("connected")
+except OSError as e:
+    print(type(e).__name__)
+"""
+
+
+def test_broker_sockets_open_only_to_their_servers_user(
+    servers: list[str], broker: FakeBroker
+) -> None:
+    """The uid wall, with the mount wall out of the way: outside any unit, by path, each
+    server's broker sockets, owned as crewkiosk-broker owns them, open to that server's user
+    and to no other server's, nor to crewkiosk."""
+    own = (
+        "import sys; from pathlib import Path; from crewkiosk.broker import SOCKET_GROUP,"
+        " own_socket; own_socket(Path(sys.argv[1]), SOCKET_GROUP, sys.argv[2])"
+    )
+    socks = {s: [BROKER_DIR / f"{s}.sock", BROKER_DIR / f"{s}.model.sock"] for s in servers}
+    try:
+        for server, paths in socks.items():
+            for path in paths:
+                done = sudo(sys.executable, "-c", own, str(path), server)
+                assert done.returncode == 0, done.stderr
+        for user in [research_user(s) for s in servers] + ["crewkiosk"]:
+            for server, paths in socks.items():
+                for path in paths:
+                    got = sudo("-u", user, "/usr/bin/python3", "-I", "-c", CONNECT, str(path))
+                    want = "connected" if user == research_user(server) else "PermissionError"
+                    assert got.stdout.strip() == want, (user, str(path), got.stdout, got.stderr)
+    finally:
+        for paths in socks.values():
+            sudo("chmod", "0666", *map(str, paths))
+
+
+def test_no_instance_reaches_another_servers_live_one(
+    servers: list[str], broker: FakeBroker
+) -> None:
+    """With the other server's instance running, by its host pids and by a walk of /proc,
+    this one can't signal it, read its environment (its answer id), or reach its broker
+    sockets through /proc/<pid>/root. The uid wall does that on any systemd: with both servers
+    on one uid and no PrivatePIDs (systemd 255), this test fails."""
+    mine, other = servers
+    other_answer = "fedcba9876543210fedcba9876543210"
+    lingering = subprocess.Popen(
+        ask_argv(other, other, "LINGER", other_answer),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        pids: list[int] = []
+        for _ in range(60):
+            pids = instance_pids(other)
+            if len(pids) >= 2:  # the runner and its kiosk, at least
+                break
+            time.sleep(0.5)
+        assert len(pids) >= 2, f"{other}'s instance never started: {pids}"
+        question = f"OTHER server={other} answer={other_answer} pids={','.join(map(str, pids))}"
+        found = probe_of(ask(mine, mine, question))["others"]
+        assert isinstance(found, dict) and found["walked"] > 0, found
+        assert found["found"], found  # one kill entry per pid, at least
+        kills = {k: v for k, v in found["found"].items() if k.startswith("kill ")}
+        assert len(kills) == len(pids), found
+        assert "signalled" not in kills.values(), found
+        assert not {k for k in found["found"] if not k.startswith("kill ")}, found
+    finally:
+        lingering.terminate()
+        lingering.wait(timeout=30)

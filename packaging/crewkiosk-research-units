@@ -12,14 +12,23 @@
 #     /usr/local/share/crewkiosk/crewkiosk-research@.service): a *linked* unit, so each instance
 #     is named for this server and loads only this server's drop-in;
 #   - crewkiosk-research-<server>@.service.d/10-server.conf: the server's two broker sockets,
-#     bound read-only, the ExecStart that passes the server to crewkiosk-research-run, and
-#     crewkiosk's uid as CREWKIOSK_UID, for the runner's user check.
-# Rerunning it rewrites the same three files. It runs no systemctl: it prints the commands.
+#     bound read-only, the ExecStart that passes the server to crewkiosk-research-run, the
+#     server's own user as User= and Group=, and that user's uid as CREWKIOSK_UID, for the
+#     runner's user check.
+# Each server's kiosk runs as a system user of its own, crewkiosk-r-<server> (nologin, no
+# home), which this creates when it is missing, and crewkiosk-broker joins its group. The broker
+# gives that server's two sockets that group, mode 0660: so no other server's kiosk, and not the
+# research-off crewkiosk, can open them even with the path in hand, and ProtectProc=invisible
+# hides every other server's processes (#142, babelfish's ruling on #163).
+# Rerunning it rewrites the same three files and leaves an existing user as it is. It runs no
+# systemctl: it prints the commands.
 #
 # It refuses, and writes nothing:
-#   - a server id that is not the frame header's ([a-z0-9._-]+), that crewkiosk-broker never
-#     serves (`control`, or any `.`: `<x>.model` would be server x's model socket), whose
-#     socket paths are too long, or that `systemd-escape` would alter (so no `-`);
+#   - a server id that is not the frame header's ([a-z0-9_]+: no `.`, since `<x>.model` would
+#     be server x's model socket, and no `-`, which `systemd-escape` alters and which gives a
+#     unit its prefixes' drop-ins), that crewkiosk-broker never serves (`control`), or whose
+#     socket paths, or its user's name, are too long. The daemon's config refuses the same ids
+#     (crewchat.config.research_server_problem);
 #   - a body that is not a regular file, or that sits in a systemd unit search path, as
 #     `systemd-analyze unit-paths` reports them. There, the symlinks would be aliases, and an
 #     alias instance loads another server's drop-in (measured, D-113).
@@ -27,14 +36,16 @@
 # partner's yes-prod (D-113, S-25).
 set -euo pipefail
 
-KIOSK_USER=crewkiosk
+BROKER_USER=crewkiosk-broker
 UNIT_DIR=/etc/systemd/system
 BODY=/usr/local/share/crewkiosk/crewkiosk-research@.service
 RUNNER=/usr/local/libexec/crewkiosk-research-run
 RESEARCH_DIR=/run/crewkiosk
 BROKER_DIR=/run/crewkiosk-broker
-SERVER_RE='^[a-z0-9._-]+$'
+SERVER_RE='^[a-z0-9_]+$' # config.py's RESEARCH_SERVER_RE
 SUN_PATH_MAX=107 # sun_path is 108 bytes, with its NUL
+RESEARCH_USER_PREFIX=crewkiosk-r-
+USER_NAME_MAX=32 # useradd's limit
 
 die() {
   echo "crewkiosk-research-units: $*" >&2
@@ -63,7 +74,7 @@ done
 server="$1"
 
 # The server id.
-[[ "$server" =~ $SERVER_RE ]] || die "server id '$server' is not [a-z0-9._-]+"
+[[ "$server" =~ $SERVER_RE ]] || die "server id '$server' is not [a-z0-9_]+ (no '-', no '.')"
 [[ "$server" != control && "$server" != *.* ]] ||
   die "crewkiosk-broker serves no server '$server' (no 'control', no '.')"
 [[ "$(systemd-escape -- "$server")" == "$server" ]] ||
@@ -71,6 +82,9 @@ server="$1"
 for path in "$BROKER_DIR/$server.model.sock" "$RESEARCH_DIR/research-$server.sock"; do
   ((${#path} <= SUN_PATH_MAX)) || die "server id '$server' is too long for $path"
 done
+research_user="$RESEARCH_USER_PREFIX$server"
+((${#research_user} <= USER_NAME_MAX)) ||
+  die "server id '$server' is too long for its user, $research_user"
 
 # The body: a file, and outside every unit search path.
 [[ -f "$BODY" && ! -L "$BODY" ]] || die "no unit body at $BODY (a regular file, not a link)"
@@ -85,9 +99,18 @@ while IFS= read -r dir; do
   fi
 done <<<"$search"
 
-# The kiosk's uid, for the runner's own check: its namespace has no /etc/passwd to ask.
-kiosk_uid="$(id -u -- "$KIOSK_USER" 2>/dev/null)" || die "no $KIOSK_USER user"
-[[ "$kiosk_uid" =~ ^[1-9][0-9]*$ ]] || die "$KIOSK_USER is uid $kiosk_uid; it must not be root"
+# The server's own user, and the broker in its group, so the broker can give it its sockets.
+if ! getent passwd -- "$research_user" >/dev/null; then
+  useradd --system --user-group --no-create-home --home-dir /nonexistent \
+    --shell /usr/sbin/nologin -- "$research_user" || die "could not create $research_user"
+fi
+if id -- "$BROKER_USER" >/dev/null 2>&1 &&
+  ! id -nG -- "$BROKER_USER" | tr ' ' '\n' | grep -qxF -- "$research_user"; then
+  usermod -aG "$research_user" -- "$BROKER_USER" || die "could not add $BROKER_USER to $research_user"
+fi
+# Its uid, for the runner's own check: the namespace has no /etc/passwd to ask.
+kiosk_uid="$(id -u -- "$research_user" 2>/dev/null)" || die "no $research_user user"
+[[ "$kiosk_uid" =~ ^[1-9][0-9]*$ ]] || die "$research_user is uid $kiosk_uid; it must not be root"
 
 socket_unit="crewkiosk-research-$server.socket"
 service_unit="crewkiosk-research-$server@.service"
@@ -131,11 +154,15 @@ write "$dropin_dir/10-server.conf" <<EOF
 [Service]
 BindReadOnlyPaths=-$BROKER_DIR/$server.sock
 BindReadOnlyPaths=-$BROKER_DIR/$server.model.sock
+User=$research_user
+Group=$research_user
 Environment=CREWKIOSK_UID=$kiosk_uid
 ExecStart=
 ExecStart=$RUNNER $server
 EOF
 
 echo "crewkiosk-research-units: wrote $socket_unit, $service_unit and its drop-in in $UNIT_DIR"
-# Restart, not enable --now: a rerun that changed the socket must apply it (#128).
+# Restart, not enable --now: a rerun that changed the socket must apply it (#128). The broker
+# restarts to take up its new group: until then it can't give this server its sockets.
 echo "  systemctl daemon-reload && systemctl enable $socket_unit && systemctl restart $socket_unit"
+echo "  systemctl restart crewkiosk-broker.service"

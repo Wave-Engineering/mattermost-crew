@@ -27,8 +27,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from crewchat.config import (
+    RESEARCH_SERVER_RE,
+    RESEARCH_SOCKET_PATHS,
+    RESEARCH_USER_PREFIX,
+    SUN_PATH_MAX,
+    USER_NAME_MAX,
+    research_server_problem,
+)
 from crewchat.kiosk import (
     CLAUDE_FLAGS,
+    FRAME_SERVER_RE,
     KIOSK_RESEARCH_DIR,
     KIOSK_RUN,
     KIOSK_SOCKET,
@@ -39,6 +48,7 @@ from crewchat.kiosk import (
     RunnerError,
     parse_reply,
 )
+from crewkiosk import broker as kiosk_broker
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGING = ROOT / "packaging"
@@ -744,10 +754,14 @@ def directives(text: str) -> dict[str, list[str]]:
 
 
 def units_script(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """The units script for the current user, and a copy of the body outside every unit search
-    path: (script, body, unit dir)."""
+    """The units script, its server's user replaced by the current user once the user name's
+    own checks have run (so it creates no user), and a copy of the body outside every unit
+    search path: (script, body, unit dir)."""
     text, n = re.subn(
-        r"^KIOSK_USER=.*$", f"KIOSK_USER={getpass.getuser()}", UNITS_SCRIPT.read_text(), flags=re.M
+        r"^(  die \"server id '\$server' is too long for its user, \$research_user\"\n)",
+        rf"\1research_user={getpass.getuser()}\n",
+        UNITS_SCRIPT.read_text(),
+        flags=re.M,
     )
     assert n == 1
     script = tmp_path / "crewkiosk-research-units"
@@ -804,6 +818,9 @@ def test_research_units_render_one_server(tmp_path: Path) -> None:
                 f"-/run/crewkiosk-broker/{server}.sock",
                 f"-/run/crewkiosk-broker/{server}.model.sock",
             ],
+            # The server's own user (here, as units_script substitutes it, the current one).
+            "User": [getpass.getuser()],
+            "Group": [getpass.getuser()],
             "Environment": [f"CREWKIOSK_UID={os.getuid()}"],
             "ExecStart": ["", f"/usr/local/libexec/crewkiosk-research-run {server}"],
         }
@@ -825,6 +842,46 @@ def test_research_units_refuse_a_bad_server(tmp_path: Path, server: str) -> None
     proc = render(script, body, unit_dir, server)
     assert proc.returncode != 0 and "crewkiosk-research-units" in proc.stderr
     assert not unit_dir.exists()
+
+
+def shell_constant(script: Path, name: str) -> str:
+    """A `NAME=value` or `NAME='value'` line's value, with any trailing comment cut."""
+    pattern = rf"^{name}=(?:'([^']*)'|(\S*))(?:\s+#.*)?$"
+    ((quoted, bare),) = re.findall(pattern, script.read_text(), flags=re.M)
+    return quoted or bare
+
+
+def test_research_server_rules_cannot_drift() -> None:
+    """#142: the daemon's config, the frame header, the runner and the units script take one
+    server id rule. The daemon refusing an id the script would write units for, or accepting
+    one it would refuse, is a research server that never answers."""
+    assert FRAME_SERVER_RE is RESEARCH_SERVER_RE
+    for script in (UNITS_SCRIPT, RESEARCH):
+        assert shell_constant(script, "SERVER_RE") == RESEARCH_SERVER_RE.pattern
+        assert shell_constant(script, "BROKER_DIR") == "/run/crewkiosk-broker"
+        assert shell_constant(script, "RESEARCH_DIR") == KIOSK_RESEARCH_DIR
+    header_re = shell_constant(RESEARCH, "HEADER_RE")
+    assert f"server=({RESEARCH_SERVER_RE.pattern[1:-1]}) " in header_re
+    assert int(shell_constant(UNITS_SCRIPT, "SUN_PATH_MAX")) == SUN_PATH_MAX
+    assert shell_constant(UNITS_SCRIPT, "RESEARCH_USER_PREFIX") == RESEARCH_USER_PREFIX
+    assert int(shell_constant(UNITS_SCRIPT, "USER_NAME_MAX")) == USER_NAME_MAX
+    # And the broker gives each server's sockets that same user's group.
+    assert kiosk_broker.SOCKET_GROUP == RESEARCH_USER_PREFIX + "{server}"
+    paths = ("/run/crewkiosk-broker/{}.model.sock", f"{KIOSK_RESEARCH_DIR}/research-{{}}.sock")
+    assert paths == RESEARCH_SOCKET_PATHS
+
+
+@needs_systemd_analyze
+@pytest.mark.parametrize(
+    "server",
+    ["dev", "oaw_dev", "oaw-dev", "a.b", "control", "Dev", "", "x" * 74, "x" * 75, "x" * 80],
+)
+def test_research_units_agree_with_the_config(tmp_path: Path, server: str) -> None:
+    """The same rule, by behaviour: the script writes units for exactly the ids the config
+    lets be research servers, right up to the socket path's length limit."""
+    script, body, unit_dir = units_script(tmp_path)
+    proc = render(script, body, unit_dir, server)
+    assert (proc.returncode == 0) == (research_server_problem(server) is None), proc.stderr
 
 
 @needs_systemd_analyze
@@ -883,8 +940,10 @@ def test_research_body_is_the_wall() -> None:
         "ProtectKernelLogs",
         "ProtectControlGroups",
         "RestrictNamespaces",
+        "PrivatePIDs",
     ):
         assert unit[setting] == ["yes"], setting
+    assert unit["ProtectProc"] == ["invisible"]
 
 
 # The research-off kiosk as v0.2.5 shipped it (#142). crewkiosk@.service has one deliberate

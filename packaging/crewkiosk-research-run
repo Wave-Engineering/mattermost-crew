@@ -53,8 +53,8 @@ BROKER_DIR=/run/crewkiosk-broker
 RELAY_PORT=8417
 KIOSK_PATH=/usr/local/bin:/usr/bin:/bin
 MODEL_PIN=claude-haiku-5-5
-SERVER_RE='^[a-z0-9._-]+$'
-HEADER_RE='^crewkiosk/1 server=([a-z0-9._-]+) post=([A-Za-z0-9]+) answer=([0-9a-f]{32})$'
+SERVER_RE='^[a-z0-9_]+$' # config.py's RESEARCH_SERVER_RE
+HEADER_RE='^crewkiosk/1 server=([a-z0-9_]+) post=([A-Za-z0-9]+) answer=([0-9a-f]{32})$'
 ALLOWED_TOOLS=mcp__kiosk__corpus_search,mcp__kiosk__corpus_read,mcp__kiosk__corpus_list
 
 kiosk_uid="${CREWKIOSK_UID:-}"
