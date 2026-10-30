@@ -99,10 +99,12 @@ def stack(tmp_path: Path, rg: str) -> Iterator[dict[str, Any]]:
     model = ThreadingHTTPServer(("127.0.0.1", 0), Model)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     run = Path(tempfile.mkdtemp(prefix="it30-"))  # short: Unix socket paths
+    control = Path(tempfile.mkdtemp(prefix="it30c-")) / "control.sock"  # its own dir, as in prod
     broker = Broker(
         pool_dir=pool,
         corpus_root=root,
         runtime_dir=run,
+        control_path=control,
         state_dir=tmp_path / "state",
         model_conf=tmp_path / "model.conf",
         model_key=key,
@@ -116,12 +118,13 @@ def stack(tmp_path: Path, rg: str) -> Iterator[dict[str, Any]]:
     asyncio.run_coroutine_threadsafe(broker.reload(), loop).result(30)
     asyncio.run_coroutine_threadsafe(broker.start_control(None), loop).result(30)
     try:
-        yield {"run": run, "state": tmp_path / "state", "broker": broker}
+        yield {"run": run, "control": control, "state": tmp_path / "state", "broker": broker}
     finally:
         asyncio.run_coroutine_threadsafe(broker.stop(), loop).result(30)
         loop.call_soon_threadsafe(loop.stop)
         model.shutdown()
         shutil.rmtree(run, ignore_errors=True)
+        shutil.rmtree(control.parent, ignore_errors=True)
 
 
 class Session:
@@ -196,7 +199,6 @@ def message(port: int, answer_id: str, model: str = "claude-opus-whatever") -> i
 def test_it30_broker_end_to_end(stack: dict[str, Any]) -> None:
     run: Path = stack["run"]
     assert sorted(p.name for p in run.iterdir()) == [
-        "control.sock",
         "dev.model.sock",
         "dev.sock",
         "other.model.sock",
@@ -257,7 +259,7 @@ def test_it30_broker_end_to_end(stack: dict[str, Any]) -> None:
         assert body["model"] == "claude-haiku-5-5"  # pinned: no model.conf, the default
 
     # -- the daemon's side: audit by answer, then forgotten; metrics -------------------------
-    client = KioskBrokerClient(str(run / "control.sock"))
+    client = KioskBrokerClient(str(stack["control"]))
     lines = asyncio.run(client.audit(AID))
     ops = [(x["server"], x["op"], x["ok"]) for x in lines]
     assert ops == [

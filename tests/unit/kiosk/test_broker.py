@@ -609,6 +609,9 @@ def test_model_proxy_rewrites(sockdir: Path) -> None:
         assert status == 200 and json.loads(body)["usage"]["output_tokens"] == 5
         line, headers, forwarded = up.requests[-1]
         assert line == "POST /gw/v1/messages HTTP/1.1"
+        assert up.server is not None
+        port = up.server.sockets[0].getsockname()[1]
+        assert headers["host"] == f"127.0.0.1:{port}"  # the stub's port isn't http's own
         assert headers["x-api-key"] == KEY and "authorization" not in headers
         assert headers["anthropic-version"] == "2023-06-01" and "x-forwarded-for" not in headers
         assert forwarded == {"model": "claude-pinned-1", "max_tokens": 5}
@@ -625,6 +628,7 @@ def test_model_proxy_rewrites(sockdir: Path) -> None:
         ):
             assert (await http(path, raw))[0] == 404, raw
         assert (await http(path, post(body=b"[1]")))[0] == 400
+        assert (await http(path, post(body=b"[" * 100_000 + b"]" * 100_000)))[0] == 400
         chunked = b"POST /a/" + AID.encode() + b"/v1/messages HTTP/1.1\r\n"
         chunked += b"transfer-encoding: chunked\r\n\r\n0\r\n\r\n"
         assert (await http(path, chunked))[0] == 411
@@ -884,6 +888,7 @@ def test_metrics_rollup(sockdir: Path) -> None:
     assert dev["per_answer"]["tokens"] == {"p50": 0.0, "p95": 160.0}
     assert dev["per_answer"]["wall_s"] == {"p50": 0.0, "p95": 12.0}
     on_disk = sockdir / "state" / "metrics" / f"{SERVER}-2026-10-30.json"
+    ledger.flush()  # the file trails the lines by up to METRICS_WRITE_S
     assert json.loads(on_disk.read_text()) == dev
     assert stat.S_IMODE(on_disk.stat().st_mode) == 0o600
     # A new UTC day starts a new rollup.
@@ -903,10 +908,12 @@ def test_broker_sockets_per_server(tmp_path: Path, sockdir: Path, root: Path) ->
     write_manifest(pool, OTHER, repos=[C], max_turns=3)
     run = sockdir / "run"
     run.mkdir()
+    control = sockdir / "ctl" / "control.sock"
     b = Broker(
         pool_dir=pool,
         corpus_root=root,
         runtime_dir=run,
+        control_path=control,
         state_dir=tmp_path / "state",
         model_conf=tmp_path / "model.conf",
         model_key=tmp_path / "broker-model.credential",
@@ -919,13 +926,12 @@ def test_broker_sockets_per_server(tmp_path: Path, sockdir: Path, root: Path) ->
         await b.start_control(None)
         names = sorted(p.name for p in run.iterdir())
         assert names == [
-            "control.sock",
             "dev.model.sock",
             "dev.sock",
             "other.model.sock",
             "other.sock",
         ]
-        for p in run.iterdir():
+        for p in [*run.iterdir(), control]:
             assert stat.S_IMODE(p.stat().st_mode) == 0o660, p
         assert b.sites[OTHER].max_turns == 3 and b.sites[SERVER].corpus.repos == (A, B)
         # The other server's socket serves the other server's pool, and only that.
@@ -939,11 +945,7 @@ def test_broker_sockets_per_server(tmp_path: Path, sockdir: Path, root: Path) ->
         (pool / f"{OTHER}.json").unlink()
         write_manifest(pool, SERVER, repos=[A], max_turns=2)
         await b.reload()
-        assert sorted(p.name for p in run.iterdir()) == [
-            "control.sock",
-            "dev.model.sock",
-            "dev.sock",
-        ]
+        assert sorted(p.name for p in run.iterdir()) == ["dev.model.sock", "dev.sock"]
         assert b.sites[SERVER].max_turns == 2 and b.sites[SERVER].corpus.repos == (A,)
         await b.stop()
 
@@ -1187,14 +1189,15 @@ def test_expired_lines_are_freed_and_a_resumed_answer_keeps_its_day(tmp_path: Pa
     tick = Tick()
     ledger = Ledger(tmp_path / "state", clock=tick)
     ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 10, True)
-    day = ledger.days[(SERVER, "2026-10-30")][AID]
+    answer = ledger.days[(SERVER, "2026-10-30")].answers[AID]
     tick.t += broker.AUDIT_TTL_S + 1
     ledger.op(SERVER, AID2, POST, "corpus_list", {}, 1, 10, True)  # expires AID
-    assert len(day.lines) == 0  # gone from memory, not just from reach
+    assert len(answer.lines) == 0  # gone from memory, not just from reach
     ledger.op(SERVER, AID, POST, "corpus_read", {}, 1, 30, True)  # AID comes back
     m = ledger.metrics()[SERVER]
     assert m["answers"] == 2 and m["ops"] == 3
-    assert ledger.days[(SERVER, "2026-10-30")][AID].op_latency_ms == [10, 30]
+    assert ledger.days[(SERVER, "2026-10-30")].answers[AID] is answer and answer.ops == 2
+    assert list(ledger.days[(SERVER, "2026-10-30")].op_latency_ms) == [10, 10, 30]
 
 
 def test_server_ids_that_collide_with_sockets_are_skipped(tmp_path: Path) -> None:
@@ -1327,3 +1330,302 @@ def test_slots_admit_nothing_once_closed() -> None:
     assert early.closed
     assert not slots.admit(late, 2)  # type: ignore[arg-type]
     assert slots.total == 1 and late not in slots.clients
+
+
+# -- the units -----------------------------------------------------------------------------------
+PACKAGING = Path(__file__).parents[3] / "packaging"
+
+
+def unit_keys(name: str) -> dict[str, list[str]]:
+    """A unit file's `Key=value` lines, every value of each key, comments and sections aside."""
+    keys: dict[str, list[str]] = {}
+    for line in (PACKAGING / name).read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not line.startswith(("#", ";", "[")):
+            keys.setdefault(key.strip(), []).append(value.strip())
+    return keys
+
+
+def test_control_socket_is_outside_the_runtime_directory() -> None:
+    """The service's RuntimeDirectory= is chowned, recursively, at every start: a control
+    socket inside it would lose its crewchat group at every boot, and the daemon its audit."""
+    from crewchat import kiosk_broker
+
+    service = unit_keys("crewkiosk-broker.service")
+    socket_unit = unit_keys("crewkiosk-broker-control.socket")
+    [listen] = socket_unit["ListenStream"]
+    runtime = [Path("/run", d) for v in service["RuntimeDirectory"] for d in v.split()]
+    assert runtime and all(not Path(listen).is_relative_to(d) for d in runtime), listen
+    assert listen == str(broker.CONTROL_SOCKET) == kiosk_broker.CONTROL_SOCKET
+    assert socket_unit["SocketGroup"] == ["crewchat"] and socket_unit["SocketMode"] == ["0660"]
+    assert "RuntimeDirectoryPreserve" not in service
+    assert service["MemoryMax"] == ["512M"]
+
+
+# -- corpus_search streams rg ----------------------------------------------------------------------
+FAKE_RG = """\
+import json, os, pathlib, sys
+here = pathlib.Path(sys.argv[0]).resolve().parent
+(here / "pid").write_text(str(os.getpid()))
+mode = (here / "mode").read_text()
+
+
+def match(n, text="needle"):
+    data = {"path": {"text": f"./f{n}.txt"}, "line_number": n, "lines": {"text": text + "\\n"}}
+    return json.dumps({"type": "match", "data": data}) + "\\n"
+
+
+if mode == "noise":  # never a match, never an end
+    while True:
+        sys.stdout.write(json.dumps({"type": "begin", "data": {"path": {"text": "./x"}}}) + "\\n")
+elif mode == "matches":  # matches without end
+    n = 0
+    while True:
+        n += 1
+        sys.stdout.write(match(n))
+elif mode == "long":  # a minified line, then an ordinary one
+    sys.stdout.write(match(1, "x" * 1_000_000 + "needle"))
+    sys.stdout.write(match(2))
+"""
+
+
+@pytest.fixture
+def fake_rg(tmp_path: Path) -> Callable[[str], str]:
+    """`fake_rg(mode)`: the path of an rg that writes as `mode` says, and records its pid."""
+    home = tmp_path / "fake-rg"
+    home.mkdir()
+    rg = home / "rg"
+    rg.write_text(f"#!{sys.executable} -I\n{FAKE_RG}")
+    rg.chmod(0o755)
+
+    def make(mode: str) -> str:
+        (home / "mode").write_text(mode)
+        return str(rg)
+
+    return make
+
+
+def gone(pid_file: Path) -> bool:
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_search_stops_rg_at_its_output_budget(
+    corpus: Corpus, fake_rg: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An rg that writes without end is killed once the search has read its budget, and the
+    result is what fit, marked truncated: its output never lands in memory whole."""
+    monkeypatch.setattr(ops, "RG_OUTPUT_MAX", 1024 * 1024)
+    corpus.rg = fake_rg("noise")
+    start = time.monotonic()
+    found = corpus.call("corpus_search", {"query": "needle", "repo": A})
+    assert found == {"query": "needle", "results": [], "truncated": True}
+    assert time.monotonic() - start < ops.RG_TIMEOUT_S  # the budget stopped it, not the timer
+    assert gone(Path(corpus.rg).parent / "pid")
+
+
+def test_search_kills_rg_once_it_has_its_results(
+    corpus: Corpus, fake_rg: Callable[[str], str]
+) -> None:
+    corpus.rg = fake_rg("matches")
+    found = corpus.call("corpus_search", {"query": "needle", "repo": A, "max_results": 3})
+    assert [r["path"] for r in found["results"]] == ["f1.txt", "f2.txt", "f3.txt"]
+    assert found["truncated"] is True
+    assert gone(Path(corpus.rg).parent / "pid")
+
+
+def test_search_drops_an_overlong_line(corpus: Corpus, fake_rg: Callable[[str], str]) -> None:
+    """rg's JSON printer ignores --max-columns: a line past RG_LINE_MAX is read to its end
+    and dropped, never held whole, and the search goes on."""
+    corpus.rg = fake_rg("long")
+    found = corpus.call("corpus_search", {"query": "needle", "repo": A})
+    assert found["results"] == [{"repo": A, "path": "f2.txt", "line": 2, "text": "needle"}]
+    assert found["truncated"] is False
+
+
+# -- the op cap, metrics writes ------------------------------------------------------------------
+def test_ops_are_capped_per_answer(sockdir: Path, corpus: Corpus) -> None:
+    """Op 201 of one answer is refused without running, and audited as refused; another
+    answer is unaffected."""
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    listing = {"name": "corpus_list", "arguments": {"repo": A}}
+    lines = [rpc(n, "tools/call", listing) for n in range(1, broker.MAX_OPS_PER_ANSWER + 2)]
+    replies = with_server(
+        sockdir,
+        op_server(corpus, ledger).handle,
+        lambda path: converse(path, hello_line(), *lines),
+    )
+    refused = [r["result"]["isError"] for r in replies]
+    assert refused == [False] * broker.MAX_OPS_PER_ANSWER + [True]
+    assert "used all 200 of its ops" in replies[-1]["result"]["content"][0]["text"]
+    last = ledger.take(AID)[-1]
+    assert (last["op"], last["ok"]) == ("corpus_list", False)
+    assert ledger.ops_used(SERVER, AID2) == 0
+
+
+def test_metrics_are_written_at_most_once_an_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However many lines come, a day's metrics file is written once per METRICS_WRITE_S;
+    flush() writes only a day that is behind, and a day that ends is written once more."""
+    tick = Tick()
+    ledger = Ledger(tmp_path / "state", clock=tick)
+    writes: list[tuple[str, str]] = []
+    real = ledger._write_metrics
+
+    def counted(server: str, date: str, day: broker.Day) -> None:
+        writes.append((server, date))
+        real(server, date, day)
+
+    monkeypatch.setattr(ledger, "_write_metrics", counted)
+    for n in range(broker.LATENCY_SAMPLE + 10):
+        ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, n, True)
+    assert len(writes) == 1
+    day = ledger.days[(SERVER, "2026-10-30")]
+    assert len(day.op_latency_ms) == broker.LATENCY_SAMPLE  # a bounded sample, the latest
+    tick.t += broker.METRICS_WRITE_S - 1
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+    assert len(writes) == 1
+    tick.t += 1
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+    assert len(writes) == 2
+    ledger.flush()
+    assert len(writes) == 2  # nothing behind
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+    ledger.flush()
+    assert len(writes) == 3
+    on_disk = tmp_path / "state" / "metrics" / f"{SERVER}-2026-10-30.json"
+    assert json.loads(on_disk.read_text())["ops"] == broker.LATENCY_SAMPLE + 13
+    # The day's last line, after its last write, still reaches its file when the day ends.
+    ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+    tick.t += 86_400
+    ledger.op(SERVER, AID2, POST, "corpus_list", {}, 1, 1, True)
+    assert json.loads(on_disk.read_text())["ops"] == broker.LATENCY_SAMPLE + 14
+
+
+# -- hostile input -------------------------------------------------------------------------------
+def test_deep_nesting_is_refused_not_raised(sockdir: Path, corpus: Corpus) -> None:
+    """JSON nested past the parser's depth is a RecursionError, not a ValueError: each parser
+    refuses it as malformed, and the session goes on."""
+    deep = b"[" * 100_000 + b"]" * 100_000 + b"\n"
+    assert broker._hello(deep) is None
+    replies = with_server(
+        sockdir,
+        op_server(corpus).handle,
+        lambda path: converse(path, hello_line(), deep, rpc(1, "ping")),
+    )
+    assert replies[0]["error"]["code"] == -32700 and replies[1]["result"] == {}
+    control = Control(Ledger(sockdir / "state", clock=Tick()), os.getuid())
+    assert control.answer(deep)["ok"] is False
+
+
+def test_refusals_echo_only_cleaned_names(
+    sockdir: Path, corpus: Corpus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tool or argument name the kiosk chose is cut to 64 printable ASCII characters
+    wherever it is echoed: the refusal, the log line and the audit line."""
+    evil = "x\nINJECTED " + "é" * 100
+    with pytest.raises(ToolError) as tool:
+        corpus.call(evil, {})
+    with pytest.raises(ToolError) as arg:
+        corpus.call("corpus_list", {"repo": A, evil: 1})
+    for exc in (tool.value, arg.value):
+        assert "\n" not in str(exc) and "é" not in str(exc)
+        assert len(str(exc)) < 64 + 30
+    caplog.set_level(logging.INFO, logger="crewkiosk.broker")
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    call(sockdir, op_server(corpus, ledger), evil, {})
+    messages = [r.getMessage() for r in caplog.records if "refused" in r.getMessage()]
+    assert messages and all("\n" not in m and "é" not in m for m in messages)
+    [line] = ledger.take(AID)
+    assert line["op"] == ops.printable(evil) and len(line["op"]) == 64
+
+
+# -- reloads -------------------------------------------------------------------------------------
+def broker_for(tmp_path: Path, sockdir: Path, root: Path, *servers: str) -> tuple[Broker, Path]:
+    pool = tmp_path / "pool"
+    pool.mkdir(exist_ok=True)
+    for server in servers:
+        write_manifest(pool, server, repos=[A])
+    run = sockdir / "run"
+    run.mkdir(exist_ok=True)
+    b = Broker(
+        pool_dir=pool,
+        corpus_root=root,
+        runtime_dir=run,
+        control_path=sockdir / "ctl" / "control.sock",
+        state_dir=tmp_path / "state",
+        model_conf=tmp_path / "model.conf",
+        model_key=tmp_path / "none",
+        socket_group=None,
+        control_uid=os.getuid(),
+    )
+    return b, run
+
+
+def test_one_failing_server_never_stops_the_others(
+    tmp_path: Path, sockdir: Path, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server whose second socket can't be set up is never registered half-open: its first
+    socket is closed again, the others serve, and the next reload tries it afresh."""
+    b, run = broker_for(tmp_path, sockdir, root, SERVER, OTHER)
+    real_own = b._own
+
+    def own(path: Path) -> None:
+        if path.name == f"{OTHER}.model.sock":
+            raise PermissionError("chown refused")
+        real_own(path)
+
+    async def main() -> None:
+        monkeypatch.setattr(b, "_own", own)
+        await b.reload()
+        assert set(b.sites) == {SERVER}
+        assert sorted(p.name for p in run.iterdir()) == ["dev.model.sock", "dev.sock"]
+        replies = await converse(str(run / "dev.sock"), hello_line(), rpc(1, "ping"))
+        assert replies == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+        monkeypatch.setattr(b, "_own", real_own)
+        await b.reload()
+        assert set(b.sites) == {SERVER, OTHER}
+        await b.stop()
+
+    asyncio.run(main())
+
+
+def test_reloads_are_serialised_and_none_follows_a_stop(
+    tmp_path: Path, sockdir: Path, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    b, _run = broker_for(tmp_path, sockdir, root, SERVER)
+    real_open = b._open
+    active, peak = [0], [0]
+
+    async def tracked(*args: Any) -> None:
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        try:
+            await asyncio.sleep(0.02)
+            await real_open(*args)
+        finally:
+            active[0] -= 1
+
+    async def main() -> None:
+        monkeypatch.setattr(b, "_open", tracked)
+        await asyncio.gather(b.reload(), b.reload(), b.reload())
+        assert peak[0] == 1 and len(b.sites[SERVER].servers) == 2
+        await b.stop()
+        await b.reload()  # a SIGHUP that waited on the stop
+        assert b.sites == {}
+
+    asyncio.run(main())
+
+
+def test_server_ids_too_long_for_a_socket_path_are_skipped(tmp_path: Path) -> None:
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    runtime = Path("/" + "d" * 89)  # 90 bytes: "/a.model.sock" fits, a longer id does not
+    for server in ("a", "abcdefgh"):
+        write_manifest(pool, server, repos=[A])
+    b = Broker(pool_dir=pool, corpus_root=tmp_path, runtime_dir=runtime, socket_group=None)
+    assert set(b.manifests()) == {"a"}

@@ -125,6 +125,13 @@ class Upstream:
         port = parts.port or (443 if parts.scheme == "https" else 80)
         return cls(parts.scheme, parts.hostname, port, parts.path.rstrip("/"))
 
+    @property
+    def authority(self) -> str:
+        """The Host header's value: the port only when it isn't the scheme's own."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        default = 443 if self.scheme == "https" else 80
+        return host if self.port == default else f"{host}:{self.port}"
+
 
 @dataclass(frozen=True)
 class ModelConf:
@@ -447,7 +454,7 @@ class ModelProxy:
             return None
         try:
             body = json.loads(await reader.readexactly(length))
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested past the parser's depth
             body = None
         if not isinstance(body, dict):
             writer.write(_error(400, "invalid_request_error", "the body must be a JSON object"))
@@ -468,7 +475,7 @@ class ModelProxy:
         up = self.upstream
         payload = json.dumps(body).encode()
         target = up.path + path + (f"?{query}" if query else "")
-        out = [f"POST {target} HTTP/1.1", f"host: {up.host}"]
+        out = [f"POST {target} HTTP/1.1", f"host: {up.authority}"]
         out += [f"{k}: {v}" for k, v in headers.items() if k in PASS_HEADERS]
         out += [
             f"x-api-key: {key}",

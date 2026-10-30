@@ -5,11 +5,15 @@
 # systemd makes it, so it can carry the daemon's group: the broker can't chgrp a socket to
 # crewchat without joining that group. The broker then serves only the crewchat uid on it
 # (SO_PEERCRED), whatever this mode says. A research kiosk unit must not see it (#142).
+#
+# Its directory is its own, never /run/crewkiosk-broker: the service's RuntimeDirectory= chowns
+# that one, recursively, to crewkiosk-broker:crewkiosk-broker at every start, which would take
+# this socket's crewchat group and lock the daemon out.
 [Unit]
 Description=mattermost-crew kiosk broker control socket
 
 [Socket]
-ListenStream=/run/crewkiosk-broker/control.sock
+ListenStream=/run/crewkiosk-broker-control/control.sock
 SocketUser=crewkiosk-broker
 SocketGroup=crewchat
 SocketMode=0660

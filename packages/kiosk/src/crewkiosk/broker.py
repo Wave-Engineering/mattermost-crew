@@ -13,22 +13,27 @@ read at start and on SIGHUP, it serves two sockets under `/run/crewkiosk-broker`
 - `<server>.model.sock` (same mode): the model proxy, `crewkiosk.proxy`, with the turn cap
   from the manifest's `max_turns`.
 
-And one for the daemon: `control.sock`, which `packaging/crewkiosk-broker-control.socket`
-creates 0660 `crewkiosk-broker:crewchat` and hands over (socket activation): the broker can't
-give a socket the daemon's group without joining it. Whatever the file mode, a peer whose uid
-(`SO_PEERCRED`) isn't `crewchat`'s is closed before a byte is read. One JSON line in, one out:
-`{"op": "audit", "answer_id"}` returns that answer's audit lines and forgets them;
-`{"op": "metrics"}` returns each server's daily summary.
+And one for the daemon: `/run/crewkiosk-broker-control/control.sock`, which
+`packaging/crewkiosk-broker-control.socket` creates 0660 `crewkiosk-broker:crewchat` and hands
+over (socket activation): the broker can't give a socket the daemon's group without joining
+it. It has a directory of its own because the service's `RuntimeDirectory=` chowns its
+directory, recursively, at every start, and would take the socket's group with it. Whatever
+the file mode, a peer whose uid (`SO_PEERCRED`) isn't `crewchat`'s is closed before a byte is
+read. One JSON line in, one out: `{"op": "audit", "answer_id"}` returns that answer's audit
+lines and forgets them; `{"op": "metrics"}` returns each server's daily summary.
 
 **Audit:** one line per op served and per model call proxied, `{ts, server, answer_id,
 post_id, op, args, bytes, latency_ms, ok}`, written by the broker from what it itself relayed,
 never from anything the runner or the kiosk reports. Held in memory per answer (200 lines,
 dropped 15 minutes after the answer's last line) and appended to
-`/var/lib/crewkiosk-broker/audit/<server>.jsonl` (0600).
+`/var/lib/crewkiosk-broker/audit/<server>.jsonl` (0600). An answer gets MAX_OPS_PER_ANSWER ops;
+each one after is refused, and audited as refused.
 
-**Metrics:** per answer, the ops, op latencies, model calls, input and output tokens and wall
-time (hello to last activity), rolled up per server and UTC day, in memory and in
-`/var/lib/crewkiosk-broker/metrics/<server>-<date>.json`.
+**Metrics:** per answer, the ops, model calls, input and output tokens and wall time (hello to
+last activity), rolled up per server and UTC day as running totals, with op latency p50/p95
+over the day's latest LATENCY_SAMPLE ops. The summary is computed when asked for, never per
+line. Its copy in `/var/lib/crewkiosk-broker/metrics/<server>-<date>.json` is written at most
+every METRICS_WRITE_S, and on stop.
 """
 
 from __future__ import annotations
@@ -61,6 +66,8 @@ from crewkiosk.corpus import CORPUS_ROOT, POOL_DIR, ManifestError, load_manifest
 log = logging.getLogger(__name__)
 
 RUNTIME_DIR = Path("/run/crewkiosk-broker")
+# Made by crewkiosk-broker-control.socket, never the service: see the module docstring.
+CONTROL_SOCKET = Path("/run/crewkiosk-broker-control/control.sock")
 STATE_DIR = Path("/var/lib/crewkiosk-broker")
 MODEL_CONF = Path("/etc/crewkiosk/model.conf")
 # The broker's own model key (babelfish, 2026-10-30: two keys). Never the runner's
@@ -88,6 +95,13 @@ TAKE_MAX = 1000
 # lines always fit the daemon's reply limit and a refused call can't bloat the log.
 AUDIT_STR_MAX = 256
 AUDIT_ARGS_MAX = 2048
+# The kiosk is untrusted: an answer's ops are capped, so a loop of them ends.
+MAX_OPS_PER_ANSWER = 200
+# A day's op latency p50/p95 is over its latest ops, never all of them.
+LATENCY_SAMPLE = 1024
+METRICS_WRITE_S = 60
+# sun_path is 108 bytes on Linux, its NUL included.
+SUN_PATH_MAX = 107
 
 
 def jsonl(obj: Any) -> bytes:
@@ -112,11 +126,25 @@ class Answer:
     started: float
     last: float
     ops: int = 0
-    op_latency_ms: list[int] = field(default_factory=list)
     model_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     lines: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=AUDIT_LINES))
+
+
+@dataclass
+class Day:
+    """One server's UTC day, as running totals: an audit line costs the same at 23:59 as at
+    00:01, however many came before it."""
+
+    answers: dict[str, Answer] = field(default_factory=dict)
+    ops: int = 0
+    model_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    op_latency_ms: deque[int] = field(default_factory=lambda: deque(maxlen=LATENCY_SAMPLE))
+    dirty: bool = False  # changed since its metrics file was written
+    written: float | None = None
 
 
 class Ledger:
@@ -126,26 +154,35 @@ class Ledger:
         self.state_dir = state_dir
         self.clock = clock
         self.answers: dict[tuple[str, str], Answer] = {}
-        # (server, UTC date) -> the day's answers, kept for the rollup after their lines go.
-        self.days: dict[tuple[str, str], dict[str, Answer]] = {}
+        # (server, UTC date) -> the day, which keeps its answers for the rollup after their
+        # lines go.
+        self.days: dict[tuple[str, str], Day] = {}
 
-    def _answer(self, server: str, answer_id: str, post_id: str | None) -> Answer:
+    def _answer(self, server: str, answer_id: str, post_id: str | None) -> tuple[Day, Answer]:
         now = self.clock()
         self._expire(now)
+        day = self.days.setdefault((server, self._date(now)), Day())
         key = (server, answer_id)
         a = self.answers.get(key)
         if a is None:
             # An answer back after going quiet resumes today's record, never replaces it.
-            day = self.days.setdefault((server, self._date(now)), {})
-            a = day.get(answer_id) or Answer(post_id, now, now)
-            self.answers[key] = day[answer_id] = a
+            a = day.answers.get(answer_id) or Answer(post_id, now, now)
+            self.answers[key] = a
+        # An answer still open across midnight joins the new day too.
+        day.answers.setdefault(answer_id, a)
         if post_id is not None and a.post_id is None:
             a.post_id = post_id
         a.last = now
-        return a
+        return day, a
 
     def hello(self, server: str, answer_id: str, post_id: str) -> None:
         self._answer(server, answer_id, post_id)
+
+    def ops_used(self, server: str, answer_id: str) -> int:
+        a = self.answers.get((server, answer_id))
+        if a is None:
+            a = self.days.get((server, self._date(self.clock())), Day()).answers.get(answer_id)
+        return a.ops if a is not None else 0
 
     def op(
         self,
@@ -158,22 +195,26 @@ class Ledger:
         latency_ms: int,
         ok: bool,
     ) -> None:
-        a = self._answer(server, answer_id, post_id)
+        day, a = self._answer(server, answer_id, post_id)
         a.ops += 1
-        a.op_latency_ms.append(latency_ms)
-        self._line(server, answer_id, a, name, args, nbytes, latency_ms, ok)
+        day.ops += 1
+        day.op_latency_ms.append(latency_ms)
+        self._line(server, answer_id, day, a, name, args, nbytes, latency_ms, ok)
 
     def model(self, server: str, call: proxy.Call) -> None:
-        a = self._answer(server, call.answer_id, None)
+        day, a = self._answer(server, call.answer_id, None)
         if call.turn is not None and call.forwarded:
             a.model_calls += 1
+            day.model_calls += 1
         a.input_tokens += call.input_tokens
         a.output_tokens += call.output_tokens
+        day.input_tokens += call.input_tokens
+        day.output_tokens += call.output_tokens
         args = {"path": call.path, "turn": call.turn, "status": call.status}
         args |= {"input_tokens": call.input_tokens, "output_tokens": call.output_tokens}
         args["complete"] = call.complete
         ok = 200 <= call.status < 300 and call.complete
-        self._line(server, call.answer_id, a, "model", args, call.bytes, call.latency_ms, ok)
+        self._line(server, call.answer_id, day, a, "model", args, call.bytes, call.latency_ms, ok)
 
     def take(self, answer_id: str) -> list[dict[str, Any]]:
         """Every server's audit lines for `answer_id`, and forget them."""
@@ -189,15 +230,22 @@ class Ledger:
         """Each server's summary for today (UTC)."""
         today = self._date(self.clock())
         out: dict[str, dict[str, Any]] = {}
-        for (server, date), answers in self.days.items():
+        for (server, date), day in self.days.items():
             if date == today:
-                out[server] = summary(date, answers)
+                out[server] = summary(date, day)
         return out
+
+    def flush(self) -> None:
+        """Write every day's metrics file that is behind: on a timer, and on stop."""
+        for (server, date), day in list(self.days.items()):
+            if day.dirty:
+                self._write_metrics(server, date, day)
 
     def _line(
         self,
         server: str,
         answer_id: str,
+        day: Day,
         a: Answer,
         name: str,
         args: Any,
@@ -217,11 +265,14 @@ class Ledger:
             "ok": ok,
         }
         a.lines.append(line)
+        day.dirty = True
         try:
             self._append(self.state_dir / "audit" / f"{server}.jsonl", jsonl(line))
-            self._write_metrics(server)
         except OSError as exc:
-            log.error("broker %s: cannot record the audit or metrics: %s", server, exc.strerror)
+            log.error("broker %s: cannot record the audit: %s", server, exc.strerror)
+        now = self.clock()
+        if day.written is None or now - day.written >= METRICS_WRITE_S:
+            self._write_metrics(server, self._date(now), day)
 
     def _append(self, path: Path, data: bytes) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -232,21 +283,26 @@ class Ledger:
         finally:
             os.close(fd)
 
-    def _write_metrics(self, server: str) -> None:
-        date = self._date(self.clock())
-        data = summary(date, self.days.get((server, date), {}))
+    def _write_metrics(self, server: str, date: str, day: Day) -> None:
+        """The day's summary to its file, replaced whole. A failure is logged and the day
+        stays dirty, so the next line or flush tries again."""
+        day.written, day.dirty = self.clock(), False
         path = self.state_dir / "metrics" / f"{server}-{date}.json"
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         try:
-            os.fchmod(fd, AUDIT_MODE)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(jsonl(data))
-            os.replace(tmp, path)
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp)
-            raise
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+            try:
+                os.fchmod(fd, AUDIT_MODE)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(jsonl(summary(date, day)))
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                raise
+        except OSError as exc:
+            day.dirty = True
+            log.error("broker %s: cannot record the metrics: %s", server, exc.strerror)
 
     def _expire(self, now: float) -> None:
         for key, a in list(self.answers.items()):
@@ -255,18 +311,20 @@ class Ledger:
                 del self.answers[key]  # its day keeps its counts for the rollup
         today = self._date(now)
         for key in [k for k in self.days if k[1] < today]:
-            del self.days[key]
+            day = self.days.pop(key)
+            if day.dirty:
+                self._write_metrics(*key, day)  # the day's last minute still reaches its file
 
     @staticmethod
     def _date(ts: float) -> str:
         return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d")
 
 
-def summary(date: str, answers: dict[str, Answer]) -> dict[str, Any]:
-    """One server's day: totals, op latency p50/p95 across the day, and per-answer ops, model
-    calls, tokens and wall time (hello to last activity) as p50/p95."""
-    latencies = [ms for a in answers.values() for ms in a.op_latency_ms]
-    per = list(answers.values())
+def summary(date: str, day: Day) -> dict[str, Any]:
+    """One server's day: totals, op latency p50/p95 over the day's latest LATENCY_SAMPLE ops,
+    and per-answer ops, model calls, tokens and wall time (hello to last activity) as p50/p95.
+    Computed only when asked for, or when the metrics file is written."""
+    per = list(day.answers.values())
 
     def spread(values: list[int] | list[float]) -> dict[str, float | None]:
         return {"p50": percentile(values, 50), "p95": percentile(values, 95)}
@@ -274,11 +332,11 @@ def summary(date: str, answers: dict[str, Answer]) -> dict[str, Any]:
     return {
         "date": date,
         "answers": len(per),
-        "ops": sum(a.ops for a in per),
-        "model_calls": sum(a.model_calls for a in per),
-        "input_tokens": sum(a.input_tokens for a in per),
-        "output_tokens": sum(a.output_tokens for a in per),
-        "op_latency_ms": spread(latencies),
+        "ops": day.ops,
+        "model_calls": day.model_calls,
+        "input_tokens": day.input_tokens,
+        "output_tokens": day.output_tokens,
+        "op_latency_ms": spread(list(day.op_latency_ms)),
         "per_answer": {
             "ops": spread([a.ops for a in per]),
             "model_calls": spread([a.model_calls for a in per]),
@@ -357,7 +415,7 @@ class OpServer:
     async def _message(self, line: bytes, answer_id: str, post_id: str) -> bytes | None:
         try:
             msg = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested past the parser's depth
             return rpc_error(None, -32700, "parse error")
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
             return rpc_error(None, -32600, "invalid request")
@@ -387,18 +445,21 @@ class OpServer:
         start = time.monotonic()
         name = params.get("name") if isinstance(params, dict) else None
         args = params.get("arguments", {}) if isinstance(params, dict) else None
+        shown = ops.printable(name)
         try:
+            if self.ledger.ops_used(self.server, answer_id) >= MAX_OPS_PER_ANSWER:
+                raise ops.ToolError(f"this answer has used all {MAX_OPS_PER_ANSWER} of its ops")
             result = await asyncio.to_thread(self.corpus.call, str(name), args)
             text, ok = json.dumps(result), True
         except ops.ToolError as exc:
             text, ok = str(exc), False
-            log.info("broker %s: %s refused: %s", self.server, name, exc)
+            log.info("broker %s: %s refused: %s", self.server, shown, exc)
         latency = int((time.monotonic() - start) * 1000)
         self.ledger.op(
             self.server,
             answer_id,
             post_id,
-            str(name).encode("ascii", "replace").decode()[:64],
+            shown,
             audit_args(name, args),
             len(text.encode()),
             latency,
@@ -421,7 +482,7 @@ def audit_args(name: Any, args: Any) -> dict[str, Any] | None:
             elif not isinstance(value, int | bool | None):
                 value = type(value).__name__
             out[key] = value
-    unknown = [str(k)[:64] for k in args if k not in fields]
+    unknown = [ops.printable(k) for k in args if k not in fields]
     if unknown:
         out["unknown_keys"] = unknown[:10]
     if len(json.dumps(out)) > AUDIT_ARGS_MAX:
@@ -432,7 +493,7 @@ def audit_args(name: Any, args: Any) -> dict[str, Any] | None:
 def _hello(line: bytes) -> tuple[str, str] | None:
     try:
         msg = json.loads(line)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(msg, dict) or msg.get("method") != "crewkiosk/hello" or "id" in msg:
         return None
@@ -486,7 +547,7 @@ class Control:
     def answer(self, line: bytes) -> dict[str, Any]:
         try:
             req = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             return {"ok": False, "error": "not JSON"}
         if not isinstance(req, dict):
             return {"ok": False, "error": "not an object"}
@@ -519,6 +580,7 @@ class Broker:
         pool_dir: Path = POOL_DIR,
         corpus_root: Path = CORPUS_ROOT,
         runtime_dir: Path = RUNTIME_DIR,
+        control_path: Path = CONTROL_SOCKET,
         state_dir: Path = STATE_DIR,
         model_conf: Path = MODEL_CONF,
         model_key: Path = MODEL_KEY,
@@ -531,6 +593,7 @@ class Broker:
         self.pool_dir = pool_dir
         self.corpus_root = corpus_root
         self.runtime_dir = runtime_dir
+        self.control_path = control_path
         self.model_conf = model_conf
         self.model_key = model_key
         self.socket_group = socket_group
@@ -542,6 +605,10 @@ class Broker:
         self.key: str | None = None
         self.conf = proxy.ModelConf(proxy.DEFAULT_BASE_URL, proxy.DEFAULT_MODEL)
         self.control: asyncio.base_events.Server | None = None
+        # One reload at a time: a SIGHUP during a reload, or a stop, waits for it. A reload
+        # that was waiting on a stop does nothing.
+        self.lock = asyncio.Lock()
+        self.stopped = False
 
     def load_model(self) -> None:
         """model.conf and the key, re-read on each reload. A bad key leaves the proxy
@@ -570,27 +637,42 @@ class Broker:
                 log.error("broker: skipping a manifest: %s", exc)
                 continue
             if m.server == "control" or "." in m.server:
-                # Its sockets would be control.sock, or another server's <server>.model.sock.
+                # Its sockets would be a development control.sock, or another server's
+                # <server>.model.sock.
                 log.error("broker: server id %r can't have sockets here: skipped", m.server)
+                continue
+            longest = self.runtime_dir / f"{m.server}.model.sock"
+            if len(os.fsencode(longest)) > SUN_PATH_MAX:
+                log.warning("broker: server id %r is too long for a socket path: skipped", m.server)
                 continue
             found[m.server] = (m.repos, m.max_turns)
         return found
 
     async def reload(self) -> None:
-        self.load_model()
-        wanted = self.manifests()
-        for server in sorted(set(self.sites) - set(wanted)):
-            await self._close(server)
-            log.info("broker %s: no manifest: its sockets are closed", server)
-        for server, (repos, turns) in sorted(wanted.items()):
-            site = self.sites.get(server)
-            if site is None:
-                await self._open(server, repos, turns)
-                continue
-            site.corpus.repos, site.max_turns = repos, turns
-            if site.model is not None:
-                site.model.upstream = self._upstream()
-                site.model.model = self.conf.model
+        async with self.lock:
+            if self.stopped:
+                return
+            self.load_model()
+            wanted = self.manifests()
+            for server in sorted(set(self.sites) - set(wanted)):
+                try:
+                    await self._close(server)
+                except Exception:  # one server's trouble never stops the others' reload
+                    log.exception("broker %s: closing its sockets failed", server)
+                    continue
+                log.info("broker %s: no manifest: its sockets are closed", server)
+            for server, (repos, turns) in sorted(wanted.items()):
+                site = self.sites.get(server)
+                if site is not None:
+                    site.corpus.repos, site.max_turns = repos, turns
+                    if site.model is not None:
+                        site.model.upstream = self._upstream()
+                        site.model.model = self.conf.model
+                    continue
+                try:
+                    await self._open(server, repos, turns)
+                except Exception:  # its sockets are gone again; the others still open
+                    log.exception("broker %s: opening its sockets failed", server)
 
     def _upstream(self) -> proxy.Upstream:
         return self.upstream_override or proxy.Upstream.parse(self.conf.base_url)
@@ -598,7 +680,6 @@ class Broker:
     async def _open(self, server: str, repos: tuple[str, ...], turns: int) -> None:
         corpus = ops.Corpus(server, repos, self.corpus_root, rg=self.rg)
         site = Site(corpus, turns)
-        self.sites[server] = site
         model = site.model = proxy.ModelProxy(
             upstream=self._upstream(),
             model=self.conf.model,
@@ -608,19 +689,27 @@ class Broker:
             label=f"broker {server} model",
         )
         op = site.op = OpServer(server, corpus, self.ledger)
-        for path, handler in (
-            (self.runtime_dir / f"{server}.sock", op.handle),
-            (self.runtime_dir / f"{server}.model.sock", model.handle),
-        ):
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-            srv = await asyncio.start_unix_server(handler, path=str(path), limit=MAX_LINE_BYTES)
-            self._own(path)
-            site.servers.append(srv)
+        try:
+            for path, handler in (
+                (self.runtime_dir / f"{server}.sock", op.handle),
+                (self.runtime_dir / f"{server}.model.sock", model.handle),
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                srv = await asyncio.start_unix_server(handler, path=str(path), limit=MAX_LINE_BYTES)
+                site.servers.append(srv)
+                self._own(path)
+        except BaseException:
+            await self._shut(server, site)
+            raise
+        # Registered only once both sockets serve: a half-open site is never in sites.
+        self.sites[server] = site
         log.info("broker %s: serving %d pooled repos", server, len(repos))
 
     async def _close(self, server: str) -> None:
-        site = self.sites.pop(server)
+        await self._shut(server, self.sites.pop(server))
+
+    async def _shut(self, server: str, site: Site) -> None:
         for srv in site.servers:
             srv.close()
         # 3.12's wait_closed() waits for every connection: end the open sessions first.
@@ -647,18 +736,22 @@ class Broker:
         if sock is not None:
             self.control = await asyncio.start_unix_server(control.handle, sock=sock)
             return
-        path = self.runtime_dir / "control.sock"
+        path = self.control_path
+        path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
         self.control = await asyncio.start_unix_server(control.handle, path=str(path))
         os.chmod(path, SOCKET_MODE)
 
     async def stop(self) -> None:
-        for server in list(self.sites):
-            await self._close(server)
-        if self.control is not None:
-            self.control.close()
-            await self.control.wait_closed()
+        async with self.lock:
+            self.stopped = True
+            for server in list(self.sites):
+                await self._close(server)
+            if self.control is not None:
+                self.control.close()
+                await self.control.wait_closed()
+            self.ledger.flush()
 
 
 def listened_socket() -> socket.socket | None:
@@ -672,16 +765,36 @@ def listened_socket() -> socket.socket | None:
     return socket.socket(fileno=3)
 
 
+async def flush_metrics(ledger: Ledger) -> None:
+    """Each day's metrics file, brought up to date every METRICS_WRITE_S, so a quiet spell
+    still reaches the disk."""
+    while True:
+        await asyncio.sleep(METRICS_WRITE_S)
+        ledger.flush()
+
+
 async def serve(broker: Broker) -> None:
     await broker.reload()
     await broker.start_control(listened_socket())
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
+    # The loop holds tasks only weakly: these references keep each reload alive to its end.
+    tasks: set[asyncio.Task[None]] = set()
+
+    def spawn(coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
     loop.add_signal_handler(signal.SIGTERM, stop.set)
     loop.add_signal_handler(signal.SIGINT, stop.set)
-    loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.ensure_future(broker.reload()))
-    await stop.wait()
-    await broker.stop()
+    loop.add_signal_handler(signal.SIGHUP, lambda: spawn(broker.reload()))
+    flusher = asyncio.ensure_future(flush_metrics(broker.ledger))
+    try:
+        await stop.wait()
+    finally:
+        flusher.cancel()
+        await broker.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -689,6 +802,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-dir", type=Path, default=POOL_DIR)
     parser.add_argument("--corpus-root", type=Path, default=CORPUS_ROOT)
     parser.add_argument("--runtime-dir", type=Path, default=RUNTIME_DIR)
+    # Only when systemd hands over no socket, as in development.
+    parser.add_argument("--control-socket", type=Path, default=CONTROL_SOCKET)
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     ns = parser.parse_args(argv)
     logging.basicConfig(
@@ -700,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
         pool_dir=ns.pool_dir,
         corpus_root=ns.corpus_root,
         runtime_dir=ns.runtime_dir,
+        control_path=ns.control_socket,
         state_dir=ns.state_dir,
     )
     asyncio.run(serve(broker))

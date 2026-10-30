@@ -10,16 +10,21 @@ check is a backstop. A refusal is a `ToolError`, which the broker returns as an 
 Arguments are checked against each op's schema, the one `tools/list` publishes: no property it
 doesn't name, every string and integer bounded. No op takes a command, a URL or a path outside
 the pool. `corpus_search` runs `rg --fixed-strings` over each repo in turn, with no config
-file, no ignore files and no symlinks followed, and its query always comes after `--`.
+file, no ignore files and no symlinks followed, and its query always comes after `--`. Its
+output is read as a stream, one bounded line at a time, and rg is killed as soon as the search
+has its results or has read RG_OUTPUT_MAX bytes: a one-character query over a large repo never
+lands in memory whole.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
 import subprocess
-from collections.abc import Iterator
+import threading
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,11 +37,39 @@ LIST_MAX = 2000
 RG = "rg"
 RG_TIMEOUT_S = 20
 RG_PATH = "/usr/local/bin:/usr/bin:/bin"
+# rg's JSON printer ignores --max-columns, so a minified 5 MB file is one 5 MB event: each
+# line is read at most RG_LINE_MAX bytes, the rest of a longer one dropped, and one search
+# reads at most RG_OUTPUT_MAX bytes of rg's output across its repos.
+RG_LINE_MAX = 64 * 1024
+RG_OUTPUT_MAX = 4 * 1024 * 1024
+NAME_MAX = 64
 
 
 class ToolError(Exception):
     """An op refused or failed. Its message goes back to the kiosk, so it never holds a
     filesystem path outside the corpus."""
+
+
+class _Spent(Exception):
+    """A search read its RG_OUTPUT_MAX of rg's output."""
+
+
+@dataclass
+class _Budget:
+    """The bytes of rg's output a search may still read, across its repos."""
+
+    left: int = RG_OUTPUT_MAX
+
+    def spend(self, n: int) -> None:
+        self.left -= n
+        if self.left < 0:
+            raise _Spent
+
+
+def printable(value: object, limit: int = NAME_MAX) -> str:
+    """A name the kiosk chose, as a log line, an audit line or a refusal may echo it: cut to
+    `limit` characters, anything but printable ASCII as `?`."""
+    return "".join(c if c.isascii() and c.isprintable() else "?" for c in str(value)[:limit])
 
 
 @dataclass(frozen=True)
@@ -111,13 +144,13 @@ def tool_list() -> list[dict[str, Any]]:
 def check_args(name: str, args: object) -> dict[str, Any]:
     """`args` for op `name`, defaults filled in, or a ToolError naming what is wrong."""
     if name not in TOOLS:
-        raise ToolError(f"unknown tool {name!r}")
+        raise ToolError(f"unknown tool {printable(name)!r}")
     if not isinstance(args, dict):
         raise ToolError("arguments must be an object")
     fields = TOOLS[name][1]
     extra = sorted(set(args) - set(fields))
     if extra:
-        raise ToolError(f"unknown argument {extra[0]!r}")
+        raise ToolError(f"unknown argument {printable(extra[0])!r}")
     out: dict[str, Any] = {}
     for key, f in fields.items():
         if key not in args or args[key] is None:
@@ -254,20 +287,30 @@ class Corpus:
                     raise
         results: list[dict[str, Any]] = []
         size, truncated = _encoded({"query": query, "results": [], "truncated": True}), False
-        for name, top in tops:
-            for path, line, text in self._rg(top, query, path_glob):
-                hit = {"repo": name, "path": path, "line": line, "text": text[:TEXT_MAX]}
-                size += _encoded(hit) + 2
-                if len(results) == max_results or size > MAX_RESPONSE_BYTES:
-                    truncated = True
+        budget = _Budget(RG_OUTPUT_MAX)
+        try:
+            for name, top in tops:
+                # closing(): a break kills this repo's rg now, not when the generator is freed.
+                with contextlib.closing(self._rg(top, query, path_glob, budget)) as hits:
+                    for path, line, text in hits:
+                        hit = {"repo": name, "path": path, "line": line, "text": text[:TEXT_MAX]}
+                        size += _encoded(hit) + 2
+                        if len(results) == max_results or size > MAX_RESPONSE_BYTES:
+                            truncated = True
+                            break
+                        results.append(hit)
+                if truncated:
                     break
-                results.append(hit)
-            if truncated:
-                break
+        except _Spent:
+            truncated = True
         return {"query": query, "results": results, "truncated": truncated}
 
-    def _rg(self, top: Path, query: str, glob: str | None) -> Iterator[tuple[str, int, str]]:
-        """`(path, line, text)` for each match in one repo, from `rg --json`."""
+    def _rg(
+        self, top: Path, query: str, glob: str | None, budget: _Budget
+    ) -> Generator[tuple[str, int, str], None, None]:
+        """`(path, line, text)` for each match in one repo, from `rg --json`, read as it
+        comes. Every byte read is spent from `budget`; past it, `_Spent`. rg is killed
+        whenever the generator ends: exhausted, closed, spent or timed out."""
         argv = [
             self.rg,
             "--json",
@@ -286,33 +329,76 @@ class Corpus:
             argv += ["--glob", glob]
         argv += ["--", query, "."]
         try:
-            done = subprocess.run(
+            proc = subprocess.Popen(
                 argv,
                 cwd=top,
                 env={"PATH": RG_PATH, "LC_ALL": "C.UTF-8"},
-                capture_output=True,
-                timeout=RG_TIMEOUT_S,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError:
             raise ToolError("search is unavailable on this host (no rg)") from None
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             raise ToolError(f"search failed: {type(exc).__name__}") from None
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(RG_TIMEOUT_S, expire)
+        timer.start()
+        try:
+            for raw in _lines(proc, budget):
+                hit = _match(raw)
+                if hit is not None:
+                    yield hit
+            proc.wait()
+        finally:
+            timer.cancel()
+            proc.kill()  # a no-op once rg has exited
+            proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
+        if timed_out.is_set():
+            raise ToolError("search failed: timed out")
         # 0 found, 1 found nothing; 2 an error, though rg may still have printed matches.
-        if done.returncode not in (0, 1, 2):
-            raise ToolError(f"search failed: rg exited {done.returncode}")
-        for raw in done.stdout.splitlines():
-            try:
-                event = json.loads(raw)
-            except ValueError:
-                continue
-            if event.get("type") != "match":
-                continue
-            data = event["data"]
-            path = data.get("path", {}).get("text")
-            text = data.get("lines", {}).get("text")
-            if not isinstance(path, str) or not isinstance(text, str):
-                continue
-            yield path.removeprefix("./"), int(data.get("line_number") or 0), text.rstrip("\n")
+        if proc.returncode not in (0, 1, 2):
+            raise ToolError(f"search failed: rg exited {proc.returncode}")
+
+
+def _lines(proc: subprocess.Popen[bytes], budget: _Budget) -> Iterator[bytes]:
+    """rg's stdout, a line at a time, each at most RG_LINE_MAX bytes: a longer line is read
+    to its end and dropped. Raises _Spent once `budget` is used up."""
+    assert proc.stdout is not None
+    long_line = False
+    while chunk := proc.stdout.readline(RG_LINE_MAX):
+        budget.spend(len(chunk))
+        whole = chunk.endswith(b"\n")
+        if whole and not long_line:
+            yield chunk
+        long_line = not whole
+
+
+def _match(raw: bytes) -> tuple[str, int, str] | None:
+    """One `rg --json` line's `(path, line, text)`, if it is a match."""
+    try:
+        event = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(event, dict) or event.get("type") != "match":
+        return None
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return None
+    path = (data.get("path") or {}).get("text")
+    text = (data.get("lines") or {}).get("text")
+    number = data.get("line_number")
+    if not isinstance(path, str) or not isinstance(text, str):
+        return None
+    line = number if isinstance(number, int) and not isinstance(number, bool) else 0
+    return path.removeprefix("./"), line, text.rstrip("\n")
 
 
 def _encoded(obj: Any) -> int:

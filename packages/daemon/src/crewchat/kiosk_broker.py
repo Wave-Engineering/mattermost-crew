@@ -17,7 +17,8 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-CONTROL_SOCKET = "/run/crewkiosk-broker/control.sock"
+# Its own directory, not the broker's runtime one (packaging/crewkiosk-broker-control.socket).
+CONTROL_SOCKET = "/run/crewkiosk-broker-control/control.sock"
 TIMEOUT_S = 2.0
 MAX_REPLY_BYTES = 4 * 1024 * 1024
 

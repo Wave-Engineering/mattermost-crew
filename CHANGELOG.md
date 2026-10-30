@@ -24,8 +24,12 @@ All notable changes to this project are recorded here. The format follows
   says not to retry. The broker writes one audit line for each op it served and each model
   call it proxied, and rolls up daily metrics per server: ops, latency p50/p95, model calls,
   tokens and wall time per answer. Both are kept under `/var/lib/crewkiosk-broker`, and the
-  daemon reads them over `control.sock` (`crewkiosk-broker-control.socket`). That socket
-  serves only the `crewchat` uid, checked by `SO_PEERCRED`. `crewkiosk-relay`, stdlib only and
+  daemon reads them over `/run/crewkiosk-broker-control/control.sock`
+  (`crewkiosk-broker-control.socket`). That socket has a directory of its own, out of reach of
+  the service's `RuntimeDirectory=` chown, and serves only the `crewchat` uid, checked by
+  `SO_PEERCRED`. An answer gets 200 ops. The daily metrics are running totals, computed when
+  asked for, and written to disk at most once a minute. `corpus_search` streams rg's output
+  under a 4 MiB budget and kills rg once it has its results. `crewkiosk-relay`, stdlib only and
   with no policy, pumps bytes between the kiosk and those sockets: `mcp` for its MCP server,
   `http` for its model endpoint. Wiring it into the kiosk is #142. CI installs a pinned
   ripgrep for its tests (`scripts/ci/rg-install.sh`).
