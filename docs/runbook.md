@@ -22,6 +22,7 @@ The variables every block reads:
 |---|---|---|
 | `CREWBROKER_INSTANCES` | each broker on this host, as `<crew>:<server_id>`, space-separated | `oaw:oaw-dev` |
 | `AGENT_USER` | the agents' OS user (optional, default `agent`) | `agent` |
+| `CREWKIOSK_RESEARCH_SERVERS` | each `kiosk_research = true` server on this host, space-separated (optional; see [Install kiosk research](#install-kiosk-research)) | `oaw-dev` |
 
 Run every block as a user with `sudo` (the verify step needs `sudo -u` the agents' user too, or
 root; see [Verify the install](#verify-the-install)), from the root of a checkout of the release
@@ -443,6 +444,135 @@ sudo test -S /run/crewkiosk/kiosk.sock
 echo "crewkiosk.socket is listening on /run/crewkiosk/kiosk.sock"
 ```
 
+## Install kiosk research
+
+Only on a host with a `kiosk_research = true` server (#136; D-110 to D-113), after the kiosk
+runner. List those servers in `CREWKIOSK_RESEARCH_SERVERS`; with it empty, this block does
+nothing. It installs three things:
+
+- **The corpus builder.** `crewkiosk-corpus.timer` runs it as `crewcorpus`. It clones each
+  server's pool with that server's own read-only forge credential.
+- **The broker.** `crewkiosk-broker` runs as its own user, holds the broker's model key, and
+  serves each research server's ops and model proxy on its own sockets.
+- **One research socket and unit per server.** Each is a linked copy of one shared body,
+  written by `crewkiosk-research-units`.
+
+The research kiosk runs as `crewkiosk`, in an empty namespace with no network. It holds no model
+key: it reaches the model only through the broker.
+
+> **WARNING (D-113):** the unit body lives at
+> `/usr/local/share/crewkiosk/crewkiosk-research@.service`, outside every systemd unit search
+> path, and must never be put in one. There, the per-server links would be aliases, and one
+> server's connection would mount another server's broker sockets. `crewkiosk-research-units`
+> refuses to run if the body is in a search path.
+
+Before this block, the operator writes the inputs in the table below (as Configure shows, in two
+steps). They are issued at deploy time, and never by an agent. On a partner's production server,
+issuing them, and the deploy itself, are the human partner's, under that deploy's yes-prod
+(CP-03, S-25).
+
+| File | What it is | Write it as | The install hands it to |
+|---|---|---|---|
+| `/etc/crewkiosk/broker-model.credential` | the broker's own model API key, one line: a **second** key, not the runner's `model.credential` | 0600, root | `crewkiosk-broker`, 0600 |
+| `/etc/crewkiosk/corpus-<server_id>@<forge host>.credential` | a read-only token for that forge, issued for that server's pool, one per server and forge host | 0600, root | `crewcorpus`, 0600 |
+
+The host also needs `rg` (the broker's `corpus_search`) and `gitleaks` 8.19 or later (the
+builder's scrub), on `/usr/local/bin:/usr/bin:/bin`. Choose each server's `corpus_exclude` in
+`servers.toml` before its first build: an excluded repo is never cloned.
+
+```bash
+set -euo pipefail
+if [[ -z "${CREWKIOSK_RESEARCH_SERVERS:-}" ]]; then
+  echo "CREWKIOSK_RESEARCH_SERVERS is empty: no research server on this host"
+  exit 0
+fi
+UV="$(command -v uv)"
+getent passwd crewkiosk >/dev/null || { echo "install the kiosk runner first" >&2; exit 1; }
+sudo test -s /etc/crewkiosk/broker-model.credential ||
+  { echo "write /etc/crewkiosk/broker-model.credential first (the table above)" >&2; exit 1; }
+for tool in rg gitleaks; do
+  command -v "$tool" >/dev/null || echo "warning: no $tool on PATH; research can't work until it is installed" >&2
+done
+
+# The users. The broker reaches the corpus and the kiosk's group through its unit's
+# SupplementaryGroups, not through group membership here.
+getent group crewcorpus >/dev/null || sudo groupadd --system crewcorpus
+getent passwd crewcorpus >/dev/null || sudo useradd --system --gid crewcorpus --no-create-home \
+  --home-dir /nonexistent --shell /usr/sbin/nologin crewcorpus
+getent passwd crewkiosk-broker >/dev/null || sudo useradd --system --user-group --no-create-home \
+  --home-dir /nonexistent --shell /usr/sbin/nologin crewkiosk-broker
+
+# The code: the kiosk package into the daemon's environment, beside it.
+sudo env UV_PYTHON_INSTALL_DIR=/opt/mattermost-crew/python UV_LINK_MODE=copy \
+  "$UV" --directory /opt/mattermost-crew sync --frozen --no-dev --python 3.12 \
+  --package crewkiosk --inexact
+
+# The keys. /etc/crewkiosk is 0750 root:crewkiosk: the broker traverses it as a member of
+# crewkiosk (its unit's SupplementaryGroups), and crewcorpus by this ACL, which gives it the
+# directory's x and nothing else.
+sudo chown crewkiosk-broker:crewkiosk-broker /etc/crewkiosk/broker-model.credential
+sudo chmod 0600 /etc/crewkiosk/broker-model.credential
+sudo setfacl -m u:crewcorpus:x /etc/crewkiosk
+for cred in /etc/crewkiosk/corpus-*@*.credential; do
+  [[ -e "$cred" ]] || continue
+  sudo chown crewcorpus:crewcorpus "$cred"
+  sudo chmod 0600 "$cred"
+done
+
+# The pool and corpus directories, then the builder and the broker.
+sudo install -m 0644 -o root -g root packaging/crewchat-pool.tmpfiles.conf \
+  /etc/tmpfiles.d/crewchat-pool.conf
+sudo install -m 0644 -o root -g root packaging/crewcorpus.tmpfiles.conf \
+  /etc/tmpfiles.d/crewcorpus.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/crewchat-pool.conf /etc/tmpfiles.d/crewcorpus.conf
+sudo install -m 0644 -o root -g root packaging/crewkiosk-corpus.service \
+  packaging/crewkiosk-corpus.timer packaging/crewkiosk-broker.service \
+  packaging/crewkiosk-broker-control.socket /etc/systemd/system/
+
+# The research kiosk: the runner and the relay beside crewkiosk-run, the body outside every
+# unit search path (the WARNING above), and each server's socket, linked unit and drop-in.
+sudo install -m 0755 -o root -g root packaging/crewkiosk-research-run \
+  /usr/local/libexec/crewkiosk-research-run
+sudo install -m 0755 -o root -g root packages/kiosk/src/crewkiosk/relay.py \
+  /usr/local/libexec/crewkiosk-relay
+sudo install -D -m 0755 -o root -g root packaging/crewkiosk-research-units \
+  /usr/local/sbin/crewkiosk-research-units
+sudo install -D -m 0644 -o root -g root packaging/crewkiosk-research@.service \
+  /usr/local/share/crewkiosk/crewkiosk-research@.service
+for server in $CREWKIOSK_RESEARCH_SERVERS; do
+  sudo /usr/local/sbin/crewkiosk-research-units "$server"
+done
+
+sudo systemctl daemon-reload
+# Restart, not `enable --now`, so a re-run applies the units it installs (#128).
+units=(crewkiosk-broker-control.socket crewkiosk-broker.service crewkiosk-corpus.timer)
+for server in $CREWKIOSK_RESEARCH_SERVERS; do
+  units+=("crewkiosk-research-$server.socket")
+done
+sudo systemctl enable "${units[@]}"
+sudo systemctl restart "${units[@]}"
+# The daemon picks up the pool directory only on a restart ("Kiosk research pool").
+sudo systemctl restart crewchat
+for server in $CREWKIOSK_RESEARCH_SERVERS; do
+  sudo test -S "/run/crewkiosk/research-$server.sock"
+done
+sudo test -S /run/crewkiosk-broker-control/control.sock
+echo "kiosk research is installed for: $CREWKIOSK_RESEARCH_SERVERS"
+```
+
+`health` then lists each research server under `kiosk_research`, with its overhead metrics.
+
+**After recreating the `crewkiosk` user**, re-run `crewkiosk-research-units <server>` for every
+research server, then `sudo systemctl daemon-reload`. The drop-in carries `crewkiosk`'s uid,
+because the unit's namespace has no `/etc/passwd`, and the runner refuses to run (exit 64) under
+any other uid. A recreated user with a new uid fails closed until then.
+
+**Adding or removing a research server.** To add one, put it in `CREWKIOSK_RESEARCH_SERVERS`
+and re-run this block. To remove one, stop and disable its socket, remove
+`/etc/systemd/system/crewkiosk-research-<server>.socket`,
+`/etc/systemd/system/crewkiosk-research-<server>@.service` (a symlink) and
+`/etc/systemd/system/crewkiosk-research-<server>@.service.d/`, then `daemon-reload`.
+
 ## Kiosk research pool
 
 Only on a host with a `kiosk_research = true` server (#139, D-112). The daemon writes one
@@ -486,7 +616,12 @@ with Discord enabled, a configured squawkie credential, and the kiosk's
 `/etc/crewkiosk/model.credential`. On a host with `crewkiosk` it also checks the kiosk socket,
 that the daemon runs with no new privileges, that `/etc/crewkiosk/model.conf`, when there is
 one, is 0640 `root:crewkiosk`, and the same files with `crewkiosk` in place of the agents'
-user: `crewkiosk` may read its own model credential and nothing else (R-08). Last, it
+user: `crewkiosk` may read its own model credential and nothing else (R-08). On a research host
+(with `crewkiosk-broker`), it checks both model keys as their users: `crewkiosk-broker` reads only
+its own key, and `crewkiosk` only the runner's. For each server in `CREWKIOSK_RESEARCH_SERVERS`, it
+checks that the linked unit points at the shared body and that the body is in no unit search path.
+It also checks that the unit loads with an empty root, no network, no new privileges, both keys
+hidden, `crewkiosk`'s current uid, and exactly that server's two broker sockets (D-113). Last, it
 deactivates the `verify-canary` bot on every broker instance with the broker's `deactivate`, and
 checks the server's `delete_at` came back above 0, so a verify leaves no active bot on the
 server. The next verify reactivates it.
@@ -519,6 +654,15 @@ yours and are kept; rewrite one only when the upgrade note says so, in two steps
 shows. CI runs every block twice in a row on a fresh host, so the second run is the upgrade
 (IT-20).
 
+**Upgrading to v0.2.6** (#138). A running shim keeps the code it started with. A shim that
+started against a daemon with no `ping` (0.2.3 or earlier) stopped asking for good, so it won't
+re-register by itself across the v0.2.6 daemon restart. Install the clients, then run a
+`/mcp reconnect crewchat` sweep on every agent session on the host **before** the daemon
+block's restart. Each session then runs the fixed shim. A session that isn't reconnected
+recovers as it does today: its doorbell exits 2 on `not_registered`, and the next
+`chat_health()` registers it. A research server also needs [Install kiosk
+research](#install-kiosk-research), and its inputs, the first time.
+
 ## Rollback
 
 **To the previous release.** Check out the previous release tag and run the three install blocks
@@ -545,9 +689,22 @@ sudo systemctl disable --now crewchat crewkiosk.socket
 for entry in $CREWBROKER_INSTANCES; do
   sudo systemctl disable --now "crewbroker@${entry%%:*}-${entry#*:}"
 done
+for server in ${CREWKIOSK_RESEARCH_SERVERS:-}; do
+  sudo systemctl disable --now "crewkiosk-research-$server.socket"
+  sudo rm -rf "/etc/systemd/system/crewkiosk-research-$server.socket" \
+    "/etc/systemd/system/crewkiosk-research-$server@.service" \
+    "/etc/systemd/system/crewkiosk-research-$server@.service.d"
+done
+sudo systemctl disable --now crewkiosk-broker.service crewkiosk-broker-control.socket \
+  crewkiosk-corpus.timer 2>/dev/null || true
 sudo rm -f /etc/systemd/system/crewchat.service /etc/systemd/system/crewbroker@.service \
   /etc/systemd/system/crewkiosk.socket /etc/systemd/system/crewkiosk@.service \
-  /etc/tmpfiles.d/crewbroker.conf /usr/local/libexec/crewkiosk-run
+  /etc/tmpfiles.d/crewbroker.conf /usr/local/libexec/crewkiosk-run \
+  /etc/systemd/system/crewkiosk-broker.service /etc/systemd/system/crewkiosk-broker-control.socket \
+  /etc/systemd/system/crewkiosk-corpus.service /etc/systemd/system/crewkiosk-corpus.timer \
+  /etc/tmpfiles.d/crewcorpus.conf /etc/tmpfiles.d/crewchat-pool.conf \
+  /usr/local/libexec/crewkiosk-research-run /usr/local/libexec/crewkiosk-relay \
+  /usr/local/sbin/crewkiosk-research-units /usr/local/share/crewkiosk/crewkiosk-research@.service
 sudo rm -rf /etc/systemd/system/crewchat.service.d
 sudo systemctl daemon-reload
 sudo rm -rf /opt/mattermost-crew

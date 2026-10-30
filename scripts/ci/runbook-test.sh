@@ -15,6 +15,8 @@ set -euo pipefail
 
 export CREWCHAT_RUNBOOK_IT=1
 export CREWBROKER_INSTANCES="${CREWBROKER_INSTANCES:-ci:local}"
+# "Install kiosk research" for one server (#142): the broker, the builder and its units.
+export CREWKIOSK_RESEARCH_SERVERS="${CREWKIOSK_RESEARCH_SERVERS:-local}"
 
 uv sync --frozen
 mkdir -p reports

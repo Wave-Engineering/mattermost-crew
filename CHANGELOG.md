@@ -13,6 +13,41 @@ and `kiosk_research` is turned on.
 
 ### Added
 
+- **Kiosks research their server's corpus, confined to that server** (#142, the last part of
+  #136; D-110 to D-113). R-31 is amended.
+  - **Framing.** On a `kiosk_research = true` server, the daemon frames each answer to that
+    server's own socket, `/run/crewkiosk/research-<server>.sock`. The header line comes first,
+    `crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>`, under a research prompt: cite the
+    repo, path and commit; say what a repo declares, not what runs; no answer means a human.
+  - **The units.** Each research server has a socket and unit of its own, written by
+    `crewkiosk-research-units <server>`. Each unit is linked to one shared body,
+    `/usr/local/share/crewkiosk/crewkiosk-research@.service`, which must sit outside every
+    unit search path: the script refuses otherwise. In a search path, the links would be
+    aliases, and one server's connection would mount another server's sockets (measured,
+    D-113).
+  - **The namespace.** The unit starts from an empty root, with `/usr` package content, no
+    network but its loopback, and only that server's two broker sockets. Both model keys and
+    the broker's control socket are hidden by name.
+  - **`crewkiosk-research-run`.** It needs its stdin to be a connection accepted on that
+    server's socket, and a header naming the same server (argv[1], from the unit); otherwise it
+    exits 67. It checks its uid by number, from the unit's drop-in. It says hello, starts the
+    relay, and runs `claude -p --tools ""` with a strict MCP config naming only the relay. It
+    holds no model key.
+  - **The audit.** The broker's audit lines for the answer go in its transcript record as
+    `research`.
+  - **Research off** keeps `crewkiosk.socket`, `crewkiosk@.service` and `crewkiosk-run`
+    unchanged, apart from the #139/#140 hardening. A test pins them to v0.2.5's bytes.
+  - **Tests.** IT-31 has a real kiosk answer from two pooled repos, and a hostile model runs no
+    native tool. IT-31b confines two servers' units on one body.
+  - **Docs.** The runbook gains "Install kiosk research" and its operator inputs: the broker's
+    own model key, and one read-only forge token per server and forge host. `make
+    verify-install` checks both keys as their users, and each research unit as systemd loads
+    it.
+
+  **Upgrade note.** Installing these on a real host is a deploy: on a partner's production
+  server, the human partner's yes-prod. After recreating the `crewkiosk` user, re-run
+  `crewkiosk-research-units` for every research server.
+
 - **`crewkiosk-broker` is the research kiosk's only door** (#141; D-111, D-112). A
   long-running service, as `crewkiosk-broker` (`packaging/crewkiosk-broker.service`), holds the
   corpus read access and its own model key, `/etc/crewkiosk/broker-model.credential` (0600
@@ -113,6 +148,11 @@ and `kiosk_research` is turned on.
 
 ### Fixed
 
+- **The corpus builder can reach its forge credentials** (#142). `crewkiosk-corpus` runs as
+  `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
+  `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could
+  ever be cloned. The research install gives `crewcorpus` the directory's `x` by ACL and nothing
+  more. It doesn't join `crewkiosk`, which would also open the broker's sockets to it.
 - **`chat_dm` to an unknown username is `not_found`**, not `backend_error … NotFoundError`
   (#148, mattermost-crew:triage #48).
 

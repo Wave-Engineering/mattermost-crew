@@ -32,6 +32,14 @@
 #   - the running daemon has NoNewPrivs set: it reaches the kiosk without changing user;
 #   - crewkiosk cannot read any of the known credential files above.
 #
+# Kiosk research (#142), on a host with the crewkiosk-broker user:
+#   - crewkiosk-broker reads its own key, /etc/crewkiosk/broker-model.credential, and not the
+#     runner's; crewkiosk reads its own and not the broker's; the agent's user reads neither;
+#   - for each server in CREWKIOSK_RESEARCH_SERVERS, its linked unit points at the shared body,
+#     which sits in no unit search path, and loads with an empty root, no network, no new
+#     privileges, both keys hidden, crewkiosk's current uid, and exactly that server's two
+#     broker sockets bound (D-113).
+#
 # The credentials that servers.toml names (Story 3.7): /etc/crewchat/discord.credential (or
 # `[discord] credential`) when Discord is enabled, and `[squawkie] credential` when set; and, on a
 # kiosk host, the kiosk's model credential /etc/crewkiosk/model.credential. Neither the agent's
@@ -54,6 +62,9 @@ KIOSK_USER=crewkiosk
 KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
 KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
 KIOSK_MODEL_CONF=/etc/crewkiosk/model.conf
+BROKER_USER=crewkiosk-broker
+BROKER_KEY=/etc/crewkiosk/broker-model.credential
+RESEARCH_BODY=/usr/local/share/crewkiosk/crewkiosk-research@.service
 SERVERS_TOML=/etc/crewchat/servers.toml
 # The daemon's own interpreter, which has tomllib (Python 3.12).
 CREWCHAT_PYTHON="$(dirname "$CREWCHAT_BIN")/python"
@@ -317,6 +328,67 @@ if id "$KIOSK_USER" >/dev/null 2>&1; then
       no_read_as "$KIOSK_USER" "$file"
     done
   fi
+fi
+
+# Kiosk research (#142; D-111, D-113), on a host with the crewkiosk-broker user. The two model
+# keys, as the users who hold them: the research-off runner (crewkiosk) opens only its own, and
+# the broker only its own. A research-mode runner is also crewkiosk, so a file mode can't stop it
+# opening the runner's key: its unit hides both keys, and each research unit is checked here as
+# systemd loads it. What such a unit can actually reach is IT-31b's, on this same body.
+if id "$BROKER_USER" >/dev/null 2>&1; then
+  if sudo -n -u "$BROKER_USER" test -r "$BROKER_KEY"; then
+    pass "$BROKER_USER can read its own key, $BROKER_KEY"
+  else
+    fail "$BROKER_USER cannot read its key $BROKER_KEY"
+  fi
+  no_read_as "$BROKER_USER" "$KIOSK_CREDENTIAL"
+  no_read_as "$KIOSK_USER" "$BROKER_KEY"
+  no_agent_read "$BROKER_KEY"
+  if sudo -n -u "$KIOSK_USER" test -r "$KIOSK_CREDENTIAL"; then
+    pass "the research-off runner ($KIOSK_USER) can read its own key, $KIOSK_CREDENTIAL"
+  else
+    fail "$KIOSK_USER cannot read its key $KIOSK_CREDENTIAL"
+  fi
+  search="$(systemd-analyze unit-paths)"
+  kiosk_uid="$(id -u "$KIOSK_USER")"
+  for server in ${CREWKIOSK_RESEARCH_SERVERS:-}; do
+    unit="crewkiosk-research-${server}@verify.service"
+    link="/etc/systemd/system/crewkiosk-research-${server}@.service"
+    if [[ "$(readlink -- "$link" || true)" != "$RESEARCH_BODY" ]]; then
+      fail "$link is not a link to $RESEARCH_BODY (re-run crewkiosk-research-units $server)"
+      continue
+    fi
+    if grep -qxF -- "$(dirname "$RESEARCH_BODY")" <<<"$search"; then
+      fail "$RESEARCH_BODY is in a unit search path (D-113)"
+    fi
+    declare -A prop=()
+    while IFS='=' read -r key value; do
+      prop["$key"]="$value"
+    done < <(systemctl show "$unit" -p LoadState -p User -p TemporaryFileSystem -p PrivateNetwork \
+      -p NoNewPrivileges -p InaccessiblePaths -p BindReadOnlyPaths -p Environment)
+    bad=()
+    [[ "${prop[LoadState]:-}" == loaded ]] || bad+=("LoadState=${prop[LoadState]:-}")
+    [[ "${prop[User]:-}" == "$KIOSK_USER" ]] || bad+=("User=${prop[User]:-}")
+    [[ " ${prop[TemporaryFileSystem]:-} " == *" /:ro "* ]] || bad+=("no TemporaryFileSystem=/:ro")
+    [[ "${prop[PrivateNetwork]:-}" == yes ]] || bad+=("PrivateNetwork=${prop[PrivateNetwork]:-}")
+    [[ "${prop[NoNewPrivileges]:-}" == yes ]] || bad+=("NoNewPrivileges=${prop[NoNewPrivileges]:-}")
+    for key in "$KIOSK_CREDENTIAL" "$BROKER_KEY"; do
+      [[ " ${prop[InaccessiblePaths]:-} " == *" -${key} "* ]] || bad+=("$key not hidden")
+    done
+    # Of the broker's sockets, exactly this server's two (D-113).
+    broker_binds="$(tr ' ' '\n' <<<"${prop[BindReadOnlyPaths]:-}" | grep -F '/run/crewkiosk-broker' |
+      sed 's/^-//; s/:.*//' | sort | tr '\n' ' ')"
+    want="/run/crewkiosk-broker/${server}.model.sock /run/crewkiosk-broker/${server}.sock "
+    [[ "$broker_binds" == "$want" ]] || bad+=("broker binds: ${broker_binds:-none}")
+    [[ " ${prop[Environment]:-} " == *" CREWKIOSK_UID=${kiosk_uid} "* ]] ||
+      bad+=("CREWKIOSK_UID is not $kiosk_uid (re-run crewkiosk-research-units $server)")
+    if ((${#bad[@]} == 0)); then
+      pass "$unit: empty root, no network, both keys hidden, only $server's broker sockets"
+    else
+      fail "$unit: ${bad[*]}"
+    fi
+    unset prop
+  done
 fi
 
 if ((failures > 0)); then
