@@ -4,12 +4,7 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.2.6] — 2026-10-30
-
-Agents name Mattermost channels by URL name, `#name` or display name, and scripts get a sender
-of their own. An idle session registers again after a daemon restart. The research kiosk's
-corpus pool, corpus builder and broker arrive, and stay idle until their units are installed
-and `kiosk_research` is turned on.
+## [Unreleased]
 
 ### Added
 
@@ -54,8 +49,42 @@ and `kiosk_research` is turned on.
     it.
 
   **Upgrade note.** Installing these on a real host is a deploy: on a partner's production
-  server, the human partner's yes-prod. After recreating the `crewkiosk` user, re-run
-  `crewkiosk-research-units` for every research server.
+  server, the human partner's yes-prod. After recreating a server's `crewkiosk-r-<server>`
+  user, re-run `crewkiosk-research-units` for it and restart `crewkiosk-broker`. #138's
+  upgrade note still applies to an upgrade from v0.2.5 or earlier: reconnect each session's
+  crewchat MCP server before the daemon restarts.
+
+### Changed
+
+- **`crewkiosk-broker` admits answers, and bounds every call to its key** (#142).
+  - It serves only an answer a hello admitted, one live or recorded in its server's day. Any
+    other answer id is a 403 that spends nothing and makes no record. So the turns and counts
+    live in the ledger's answer records, bounded by its caps on answers.
+  - `count_tokens` isn't a turn, but it has a cap of its own, `max_turns` calls per answer,
+    so no call to the shared key is unbounded.
+  - A call made while the broker has no key is a 503, and spends none of the answer's turns.
+  - A hello sent as a request is answered `{"admitted": true}`, so the research runner knows
+    the answer is admitted before the kiosk starts.
+  - Each server's two sockets get that server's own group, `crewkiosk-r-<server>`, not
+    `crewkiosk`.
+
+### Fixed
+
+- **The corpus builder can reach its forge credentials** (#142). `crewkiosk-corpus` runs as
+  `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
+  `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could
+  ever be cloned. The research install gives `crewcorpus` the directory's `x` by ACL and nothing
+  more. It doesn't join `crewkiosk`, which would also let it list `/etc/crewkiosk` and read the
+  runner's `model.conf`.
+
+## [0.2.6] — 2026-10-30
+
+Agents name Mattermost channels by URL name, `#name` or display name, and scripts get a sender
+of their own. An idle session registers again after a daemon restart. The research kiosk's
+corpus pool, corpus builder and broker arrive, and stay idle until their units are installed
+and `kiosk_research` is turned on.
+
+### Added
 
 - **`crewkiosk-broker` is the research kiosk's only door** (#141; D-111, D-112). A
   long-running service, as `crewkiosk-broker` (`packaging/crewkiosk-broker.service`), holds the
@@ -70,17 +99,9 @@ and `kiosk_research` is turned on.
   as sent. The model socket proxies `/v1/messages` and `count_tokens`. It adds the key,
   drops the caller's credentials, pins the model from `model.conf`, refuses bodies over
   1 MiB, and answers the call after the manifest's `max_turns` (default 8) with a 429 that
-  says not to retry. `count_tokens` isn't a turn, but it has a cap of its own, `max_turns`
-  calls per answer, so no call to the shared key is unbounded (#142). It serves only an
-  answer a hello admitted: one live or recorded in its server's day. Any other answer id is
-  a 403 that spends nothing and makes no record, so the turns and counts live in the
-  ledger's answer records and are bounded by its caps on answers (#142). A call made while
-  the broker has no key is a 503 and spends none of the answer's turns. A hello sent as a
-  request is answered `{"admitted": true}`, so the research runner knows the answer is
-  admitted before the kiosk starts. The broker writes one audit line for each op it served
-  and each model call it proxied, and rolls up daily metrics per server: ops, latency
-  p50/p95, model calls, tokens and wall time per answer. Both are kept under
-  `/var/lib/crewkiosk-broker`, and the
+  says not to retry. The broker writes one audit line for each op it served and each model
+  call it proxied, and rolls up daily metrics per server: ops, latency p50/p95, model calls,
+  tokens and wall time per answer. Both are kept under `/var/lib/crewkiosk-broker`, and the
   daemon reads them over `/run/crewkiosk-broker-control/control.sock`
   (`crewkiosk-broker-control.socket`). That socket has a directory of its own, out of reach of
   the service's `RuntimeDirectory=` chown, and serves only the `crewchat` uid, checked by
@@ -157,12 +178,6 @@ and `kiosk_research` is turned on.
 
 ### Fixed
 
-- **The corpus builder can reach its forge credentials** (#142). `crewkiosk-corpus` runs as
-  `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
-  `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could
-  ever be cloned. The research install gives `crewcorpus` the directory's `x` by ACL and nothing
-  more. It doesn't join `crewkiosk`, which would also let it list `/etc/crewkiosk` and read the
-  runner's `model.conf`.
 - **`chat_dm` to an unknown username is `not_found`**, not `backend_error … NotFoundError`
   (#148, mattermost-crew:triage #48).
 
