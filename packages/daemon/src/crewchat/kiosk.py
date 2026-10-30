@@ -22,9 +22,9 @@
 - **Research** (#142; D-111). On a server with `kiosk_research = true` the session has a
   `Research`. The prompt starts with `KIOSK_RESEARCH_HEADER` instead (`research_header`: the
   cite, declares-not-running and no-answer rules, and the expert's own repo when that
-  server pools it). The answer goes to `/run/crewkiosk/research.sock`
-  (`packaging/crewkiosk-research.socket`), whose confined unit reaches only
-  `crewkiosk-broker`, and the prompt is preceded by one header line,
+  server pools it). The answer goes to that server's own socket,
+  `/run/crewkiosk/research-<server>.sock`, whose confined unit reaches only that server's
+  `crewkiosk-broker` sockets (D-113), and the prompt is preceded by one header line,
   `crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>`, with a fresh `answer_id` per
   answer. After the answer, the broker's audit lines for that `answer_id` go in its transcript
   record as `research`, and the review shows them one per op as `op(args) → bytes`. A server
@@ -106,8 +106,9 @@ KIOSK_SUBDIR = "kiosk"  # /var/lib/crewchat/kiosk
 KIOSK_USER = "crewkiosk"
 KIOSK_RUN = "/usr/local/libexec/crewkiosk-run"  # packaging/crewkiosk-run, root-owned
 KIOSK_SOCKET = "/run/crewkiosk/kiosk.sock"  # packaging/crewkiosk.socket (D-107)
-# packaging/crewkiosk-research.socket (#142): a research server's answers, framed.
-KIOSK_RESEARCH_SOCKET = "/run/crewkiosk/research.sock"
+# A research server's answers, framed (#142), each to its own server's socket,
+# research-<server>.sock, which packaging/crewkiosk-research-units writes (D-113).
+KIOSK_RESEARCH_DIR = "/run/crewkiosk"
 FRAME_VERSION = "crewkiosk/1"
 # What packaging/crewkiosk-research-run accepts in a frame header, and nothing else.
 FRAME_SERVER_RE = re.compile(r"^[a-z0-9._-]+$")
@@ -266,16 +267,21 @@ class ClaudeCliRunner:
         self,
         *,
         socket: str = KIOSK_SOCKET,
-        research_socket: str = KIOSK_RESEARCH_SOCKET,
+        research_dir: str = KIOSK_RESEARCH_DIR,
         timeout_s: float = RUNNER_TIMEOUT_S,
     ):
         self.socket = socket
-        self.research_socket = research_socket
+        self.research_dir = research_dir
         self.timeout_s = timeout_s
 
+    def research_socket(self, server: str) -> str:
+        """`server`'s research socket: its own unit, which mounts only its own broker sockets
+        (D-113)."""
+        return f"{self.research_dir}/research-{server}.sock"
+
     async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str:
-        """With a `frame`, the answer goes through the research socket, the header line
-        first; without one, today's socket and bytes, unchanged."""
+        """With a `frame`, the answer goes through its server's research socket, the header
+        line first; without one, today's socket and bytes, unchanged."""
         try:
             return parse_reply(
                 await asyncio.wait_for(self._exchange(prompt, frame), self.timeout_s)
@@ -285,7 +291,7 @@ class ClaudeCliRunner:
 
     async def _exchange(self, prompt: str, frame: ResearchFrame | None = None) -> bytes:
         head = frame.header() if frame is not None else b""
-        path = self.research_socket if frame is not None else self.socket
+        path = self.research_socket(frame.server) if frame is not None else self.socket
         try:
             reader, writer = await asyncio.open_unix_connection(path)
         except OSError as exc:

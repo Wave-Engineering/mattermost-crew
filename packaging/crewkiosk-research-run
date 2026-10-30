@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# The research kiosk's CLI runner (#142; D-111). Install root-owned, mode 0755, at
+# The research kiosk's CLI runner (#142; D-111, D-113). Install root-owned, mode 0755, at
 # /usr/local/libexec/crewkiosk-research-run, beside crewkiosk-run. The daemon never runs it: it
-# connects to /run/crewkiosk/research.sock (packaging/crewkiosk-research.socket, Accept=yes), and
-# systemd starts one packaging/crewkiosk-research@.service instance per connection, as
-# crewkiosk, confined: no network but its own loopback, no filesystem but what the unit binds,
-# and of the broker's sockets only the ones under /run/crewkiosk-broker.
+# connects to its server's research socket, /run/crewkiosk/research-<server>.sock
+# (crewkiosk-research-<server>.socket, Accept=yes, written by crewkiosk-research-units), and
+# systemd starts one instance of that server's linked crewkiosk-research@.service per
+# connection, as crewkiosk, confined: no network but its own loopback, no filesystem but what
+# the unit binds, and of the broker's sockets only that server's two.
 #
-# Its stdin is one header line, then the prompt to EOF (the daemon half-closes):
+#   crewkiosk-research-run <server>
+#
+# The server is the unit's word, not the daemon's: the unit's drop-in passes it as argv[1].
+# Its stdin is the accepted connection: one header line, then the prompt to EOF (the daemon
+# half-closes):
 #   crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>
 # and it replies on stdout as crewkiosk-run does: `ok` and the answer, or `error <rc>`. Its own
 # refusals go to stderr, the instance's journal, and reach the daemon as no reply at all. It:
 #   - refuses to run as anyone but crewkiosk, and drops every inherited environment variable
-#     (crewkiosk-run's preamble, copied: that file stays as v0.2.5 shipped it);
-#   - parses the header strictly, and needs that server's two broker sockets,
-#     /run/crewkiosk-broker/<server>.sock and <server>.model.sock;
+#     (crewkiosk-run's preamble, adapted: that file stays as v0.2.5 shipped it). The namespace
+#     has no /etc/passwd, so no name lookup works in it: the unit's drop-in carries crewkiosk's
+#     uid as CREWKIOSK_UID, resolved by crewkiosk-research-units at install, and the runner
+#     compares numbers;
+#   - before reading a byte, needs its stdin to be a connection accepted on
+#     /run/crewkiosk/research-<server>.sock: the kernel's word for which socket the daemon
+#     connected to, which holds even if a unit layout or a header is ever wrong (D-113);
+#   - parses the header strictly, needs it to name the same server, and needs that server's
+#     two broker sockets, /run/crewkiosk-broker/<server>.sock and <server>.model.sock;
 #   - says hello to the broker for the answer and waits for its answer (`crewkiosk-relay
 #     hello`): the broker serves the model only to an answer a hello admitted, so the kiosk
 #     starts only once it is, and no model call can come first;
@@ -28,22 +39,25 @@
 #     --allowedTools <the three corpus ops> --settings '{"switchModelsOnFlag":false}'
 #     --model claude-haiku-5-5`. The model is pinned only to satisfy the CLI: the broker's
 #     proxy forces the model it is configured with, whatever the request names.
-# Exit codes, before the CLI runs: 64 the wrong user, 67 the header, 68 a broker socket, 69
-# the hello (not admitted), 70 the relay never listened.
+# Exit codes, before the CLI runs: 64 the wrong user, 67 the frame (the server argument, the
+# socket it was reached on, or the header), 68 a broker socket, 69 the hello (not admitted),
+# 70 the relay never listened.
 set -euo pipefail
 
-KIOSK_USER=crewkiosk
 CLAUDE=/usr/local/bin/claude
 RELAY=/usr/local/libexec/crewkiosk-relay
+RESEARCH_DIR=/run/crewkiosk
 BROKER_DIR=/run/crewkiosk-broker
 RELAY_PORT=8417
 KIOSK_PATH=/usr/local/bin:/usr/bin:/bin
 MODEL_PIN=claude-haiku-5-5
+SERVER_RE='^[a-z0-9._-]+$'
 HEADER_RE='^crewkiosk/1 server=([a-z0-9._-]+) post=([A-Za-z0-9]+) answer=([0-9a-f]{32})$'
 ALLOWED_TOOLS=mcp__kiosk__corpus_search,mcp__kiosk__corpus_read,mcp__kiosk__corpus_list
 
-if [[ "$(id -un)" != "$KIOSK_USER" ]]; then
-  echo "crewkiosk-research-run: must run as $KIOSK_USER" >&2
+kiosk_uid="${CREWKIOSK_UID:-}"
+if [[ ! "$kiosk_uid" =~ ^[1-9][0-9]*$ || "$(id -u)" != "$kiosk_uid" ]]; then
+  echo "crewkiosk-research-run: must run as crewkiosk, under its unit (CREWKIOSK_UID)" >&2
   exit 64
 fi
 
@@ -54,14 +68,31 @@ done < <(compgen -e)
 export PATH="$KIOSK_PATH"
 umask 077
 
-# The header: one line, exactly the daemon's shape, or nothing runs.
+# The server: the unit's, from its drop-in.
+server="${1:-}"
+if [[ $# -ne 1 || ! "$server" =~ $SERVER_RE ]]; then
+  echo "crewkiosk-research-run: needs one server argument, from the unit" >&2
+  exit 67
+fi
+
+# The socket the daemon reached: the kernel's word, asked of stdin before a byte is read.
+sockname="$(python3 -I -S -c 'import socket; s = socket.socket(fileno=0); print(s.getsockname()); s.detach()' 2>/dev/null)" || sockname=""
+if [[ "$sockname" != "$RESEARCH_DIR/research-$server.sock" ]]; then
+  echo "crewkiosk-research-run: not a connection to $server's research socket" >&2
+  exit 67
+fi
+
+# The header: one line, exactly the daemon's shape, for this unit's server, or nothing runs.
 header=""
 IFS= read -r header || true
 if [[ ! "$header" =~ $HEADER_RE ]]; then
   echo "crewkiosk-research-run: a malformed header line" >&2
   exit 67
 fi
-server="${BASH_REMATCH[1]}"
+if [[ "${BASH_REMATCH[1]}" != "$server" ]]; then
+  echo "crewkiosk-research-run: a header for another server" >&2
+  exit 67
+fi
 post="${BASH_REMATCH[2]}"
 answer="${BASH_REMATCH[3]}"
 op_sock="$BROKER_DIR/$server.sock"

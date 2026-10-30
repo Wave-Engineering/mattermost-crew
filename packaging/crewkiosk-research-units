@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Write one research server's kiosk units (#142; D-113). Install root-owned, mode 0755, at
+# /usr/local/sbin/crewkiosk-research-units.
+#
+#   crewkiosk-research-units [--unit-dir DIR] [--body FILE] <server>
+#
+# Each research server gets a socket and a unit of its own: the unit is the per-server wall.
+# This writes three small files in DIR (default /etc/systemd/system):
+#   - crewkiosk-research-<server>.socket, listening on /run/crewkiosk/research-<server>.sock
+#     (0660 root:crewchat, Accept=yes);
+#   - crewkiosk-research-<server>@.service, a symlink to the shared body FILE (default
+#     /usr/local/share/crewkiosk/crewkiosk-research@.service): a *linked* unit, so each instance
+#     is named for this server and loads only this server's drop-in;
+#   - crewkiosk-research-<server>@.service.d/10-server.conf: the server's two broker sockets,
+#     bound read-only, the ExecStart that passes the server to crewkiosk-research-run, and
+#     crewkiosk's uid as CREWKIOSK_UID, for the runner's user check.
+# Rerunning it rewrites the same three files. It runs no systemctl: it prints the commands.
+#
+# It refuses, and writes nothing:
+#   - a server id that is not the frame header's ([a-z0-9._-]+), that crewkiosk-broker never
+#     serves (`control`, or any `.`: `<x>.model` would be server x's model socket), whose
+#     socket paths are too long, or that `systemd-escape` would alter (so no `-`);
+#   - a body that is not a regular file, or that sits in a systemd unit search path, as
+#     `systemd-analyze unit-paths` reports them. There, the symlinks would be aliases, and an
+#     alias instance loads another server's drop-in (measured, D-113).
+# Installing these on a real host is a deploy: on a partner's production server, the human
+# partner's yes-prod (D-113, S-25).
+set -euo pipefail
+
+KIOSK_USER=crewkiosk
+UNIT_DIR=/etc/systemd/system
+BODY=/usr/local/share/crewkiosk/crewkiosk-research@.service
+RUNNER=/usr/local/libexec/crewkiosk-research-run
+RESEARCH_DIR=/run/crewkiosk
+BROKER_DIR=/run/crewkiosk-broker
+SERVER_RE='^[a-z0-9._-]+$'
+SUN_PATH_MAX=107 # sun_path is 108 bytes, with its NUL
+
+die() {
+  echo "crewkiosk-research-units: $*" >&2
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --unit-dir)
+      UNIT_DIR="${2:?--unit-dir needs a directory}"
+      shift 2
+      ;;
+    --body)
+      BODY="${2:?--body needs a file}"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+[[ $# -eq 1 ]] || die "usage: crewkiosk-research-units [--unit-dir DIR] [--body FILE] <server>"
+server="$1"
+
+# The server id.
+[[ "$server" =~ $SERVER_RE ]] || die "server id '$server' is not [a-z0-9._-]+"
+[[ "$server" != control && "$server" != *.* ]] ||
+  die "crewkiosk-broker serves no server '$server' (no 'control', no '.')"
+[[ "$(systemd-escape -- "$server")" == "$server" ]] ||
+  die "systemd-escape would alter server id '$server' (no '-', no leading '.')"
+for path in "$BROKER_DIR/$server.model.sock" "$RESEARCH_DIR/research-$server.sock"; do
+  ((${#path} <= SUN_PATH_MAX)) || die "server id '$server' is too long for $path"
+done
+
+# The body: a file, and outside every unit search path.
+[[ -f "$BODY" && ! -L "$BODY" ]] || die "no unit body at $BODY (a regular file, not a link)"
+body_dir="$(realpath -e -- "$(dirname -- "$BODY")")"
+search="$(systemd-analyze unit-paths)" || die "systemd-analyze unit-paths failed"
+[[ -n "$search" ]] || die "systemd-analyze reported no unit search paths"
+while IFS= read -r dir; do
+  [[ -n "$dir" ]] || continue
+  real="$(realpath -m -- "$dir")"
+  if [[ "$body_dir" == "$real" || "$body_dir" == "$real"/* ]]; then
+    die "the unit body $BODY is in the unit search path $dir; install it outside every one (D-113)"
+  fi
+done <<<"$search"
+
+# The kiosk's uid, for the runner's own check: its namespace has no /etc/passwd to ask.
+kiosk_uid="$(id -u -- "$KIOSK_USER" 2>/dev/null)" || die "no $KIOSK_USER user"
+[[ "$kiosk_uid" =~ ^[1-9][0-9]*$ ]] || die "$KIOSK_USER is uid $kiosk_uid; it must not be root"
+
+socket_unit="crewkiosk-research-$server.socket"
+service_unit="crewkiosk-research-$server@.service"
+dropin_dir="$UNIT_DIR/$service_unit.d"
+mkdir -p -- "$UNIT_DIR" "$dropin_dir"
+
+write() { # write <file>: stdin to <file>, mode 0644, replaced whole
+  local tmp
+  tmp="$(mktemp -- "$1.XXXXXX")"
+  cat >"$tmp"
+  chmod 0644 -- "$tmp"
+  mv -f -- "$tmp" "$1"
+}
+
+write "$UNIT_DIR/$socket_unit" <<EOF
+# Server $server's research kiosk socket (#142; D-113). Written by crewkiosk-research-units:
+# rerun it rather than edit this file. Only the daemon's group (crewchat) can connect, and each
+# connection starts one crewkiosk-research-$server@ instance, confined to $server's broker sockets.
+[Unit]
+Description=mattermost-crew research kiosk socket for $server
+
+[Socket]
+ListenStream=$RESEARCH_DIR/research-$server.sock
+SocketUser=root
+SocketGroup=crewchat
+SocketMode=0660
+DirectoryMode=0755
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+ln -sfn -- "$BODY" "$UNIT_DIR/$service_unit"
+
+write "$dropin_dir/10-server.conf" <<EOF
+# Server $server's part of its research kiosk unit (#142; D-113). Written by
+# crewkiosk-research-units: rerun it rather than edit this file. The unit body is shared,
+# $BODY.
+[Service]
+BindReadOnlyPaths=-$BROKER_DIR/$server.sock
+BindReadOnlyPaths=-$BROKER_DIR/$server.model.sock
+Environment=CREWKIOSK_UID=$kiosk_uid
+ExecStart=
+ExecStart=$RUNNER $server
+EOF
+
+echo "crewkiosk-research-units: wrote $socket_unit, $service_unit and its drop-in in $UNIT_DIR"
+# Restart, not enable --now: a rerun that changed the socket must apply it (#128).
+echo "  systemctl daemon-reload && systemctl enable $socket_unit && systemctl restart $socket_unit"
