@@ -841,7 +841,7 @@ def test_guild_tools_forward_discord_ops(tmp_path: Path) -> None:
     async def scenario() -> None:
         await shim.start()
         await shim.chat_list_channels(GUILD)
-        await shim.chat_resolve(GUILD, "agent-ops")
+        await shim.chat_resolve("agent-ops", guild_id=GUILD)
         await shim.chat_create_channel(GUILD, "new-room", type="voice")
         await shim.chat_create_thread("#agent-ops", "a thread", message="first")
         await shim.chat_list_channels(GUILD, type="category")
@@ -881,7 +881,7 @@ def test_guild_tools_take_todays_args(tmp_path: Path) -> None:
 
     guild = {
         "chat_list_channels": {"guild_id", "type"},
-        "chat_resolve": {"guild_id", "name", "type"},
+        "chat_resolve": {"guild_id", "name", "type", "backend"},  # backend: Mattermost (#145)
         "chat_create_channel": {"guild_id", "name", "type"},
         "chat_create_thread": {"channel_id", "name", "message"},
     }
@@ -896,6 +896,29 @@ def test_guild_tools_take_todays_args(tmp_path: Path) -> None:
     for tool, args in guild.items():
         assert args <= set(tools[tool].inputSchema["properties"]), tool
     assert "post_id" in tools["chat_read"].inputSchema["properties"]
+
+
+def test_chat_resolve_without_guild_routes_to_mattermost(tmp_path: Path) -> None:
+    """#145: with no `guild_id`, `chat_resolve` goes to the default backend, or the one
+    named, and never carries a guild."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.chat_resolve("#precheck")
+        await shim.chat_resolve("Roll Call", backend="discord")
+
+    asyncio.run(scenario())
+    first, second = daemon.of("resolve")
+    assert first == {
+        "dev_name": DEV,
+        "backend": "mattermost:ci",
+        "name": "#precheck",
+        "type": "channel",
+    }
+    assert second["backend"] == "discord" and second["off_default"] is True
+    assert "guild_id" not in first and "guild_id" not in second
 
 
 def test_chat_send_to_discord_carries_attach_and_embed(tmp_path: Path) -> None:

@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Mattermost channels by name** (#145). `chat_send`, `chat_read` and `chat_read(post_id)` on
+  a Mattermost backend take a channel's URL name (`precheck`), `#name` or display name
+  (`Roll Call`), as well as its ID, which still costs no request. The daemon resolves the name
+  as the agent, in its one team, by the broker's rule: the URL name first, then a casefolded
+  display name over the agent's own public and private channels. An ambiguous name is
+  `bad_request` listing the candidates, and an unknown one, or a private channel the bot isn't
+  in, is `not_found`; neither posts anywhere. A bot on more than one team is told to pass the
+  channel ID. `chat_resolve` without a `guild_id` now resolves a channel on the named or
+  default backend, so it works on Mattermost; with a `guild_id` it is Discord's, as before.
+
 ### Fixed
 
 - **An idle session registers again after a daemon restart, with no tool call** (#137). From

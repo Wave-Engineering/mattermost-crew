@@ -17,6 +17,7 @@ from crewchat.threads import MyThreads
 from tests.unit.daemon.test_mattermost import Tokens, backend
 
 DEV = "babel"
+CHAN = "c" * 26  # an ID: a name would be resolved first (#145)
 
 
 def test_embed_mattermost_attachment(mm: Any, run: Any, daemon: Any) -> None:
@@ -25,7 +26,7 @@ def test_embed_mattermost_attachment(mm: Any, run: Any, daemon: Any) -> None:
     tokens = Tokens(mm)
     tokens.add(DEV)
     b = backend(mm, tokens)
-    msg = run(b.send(DEV, "chan", "with an embed", embed=parse_embed("Build: green: 12/12")))
+    msg = run(b.send(DEV, CHAN, "with an embed", embed=parse_embed("Build: green: 12/12")))
     props = mm.posts[msg.post_id]["props"]
     assert props["attachments"][0] == {"title": "Build", "text": "green: 12/12"}  # first colon
     assert props["crew_proto"] == 1
@@ -48,7 +49,7 @@ def test_embed_mattermost_attachment(mm: Any, run: Any, daemon: Any) -> None:
             "proto": 1,
             "id": "x",
             "op": "send",
-            "args": {"dev_name": DEV, "backend": b.name, "to": "chan", "text": "x", "embed": bad},
+            "args": {"dev_name": DEV, "backend": b.name, "to": CHAN, "text": "x", "embed": bad},
         }
         got = asyncio.run(server.handle_line(json.dumps(frame).encode()))
         assert got["ok"] is False and got["error"].startswith("bad_request"), bad
@@ -65,13 +66,13 @@ def test_attachments_upload_with_the_agents_own_token(
     held = tmp_path / "held"
     held.write_bytes(b"log line 1\nlog line 2\n")
     att = Attachment(name="build.log", path=held, size=held.stat().st_size)
-    msg = run(b.send(DEV, "chan", "see attached", attachments=[att], embed=Embed("Log", "")))
+    msg = run(b.send(DEV, CHAN, "see attached", attachments=[att], embed=Embed("Log", "")))
     post = mm.posts[msg.post_id]
     (file_id,) = post["file_ids"]
     stored = mm.files[file_id]
     assert (stored["name"], stored["data"]) == ("build.log", held.read_bytes())
     assert stored["user_id"] == me
-    assert stored["channel_id"] == "chan"
+    assert stored["channel_id"] == CHAN
     agent_token = tokens.held[(DEV, "dev")]
     assert ("POST", "/files", agent_token) in mm.requests
     assert post["props"]["attachments"] == [{"title": "Log", "text": ""}]
@@ -83,13 +84,13 @@ def test_read_one_and_has_post(mm: Any, run: Any) -> None:
     b = backend(mm, tokens)
     assert isinstance(b, PostProbe)
     human = mm.add_user("bj", is_bot=False)
-    post = mm.add_post(human, "chan", "a human root")
-    one = run(b.read_one(DEV, "chan", post["id"]))
+    post = mm.add_post(human, CHAN, "a human root")
+    one = run(b.read_one(DEV, CHAN, post["id"]))
     assert (one.post_id, one.text, one.backend) == (post["id"], "a human root", "mattermost:dev")
     with pytest.raises(NotFound):
         run(b.read_one(DEV, "other-chan", post["id"]))
     with pytest.raises(NotFound):
-        run(b.read_one(DEV, "chan", "p" + "9" * 25))
+        run(b.read_one(DEV, CHAN, "p" + "9" * 25))
     assert run(b.has_post(DEV, post["id"])) is True
     assert run(b.has_post(DEV, "p" + "9" * 25)) is False
     mm.hidden_from[post["id"]] = {tokens.user_ids[DEV]}
@@ -108,6 +109,7 @@ HOSTILE_IDS = [
     "a%2Fb",
     "",
 ]
+HOSTILE_CHANNELS = [h for h in HOSTILE_IDS if h not in {"A" * 26, "a" * 27}]
 
 
 def test_mattermost_hostile_ids_send_nothing(mm: Any, run: Any) -> None:
@@ -123,12 +125,20 @@ def test_mattermost_hostile_ids_send_nothing(mm: Any, run: Any) -> None:
         for call in (
             lambda bad=bad: b.read_one(DEV, good, bad),
             lambda bad=bad: b.thread(DEV, bad),
-            lambda bad=bad: b.read(DEV, bad),
-            lambda bad=bad: b.read(DEV, bad, since=1.0),
         ):
             with pytest.raises(ValueError):
                 run(call())
         assert run(b.has_post(DEV, bad)) is False
+    # A channel may now be a name (#145), so `"A" * 26` and `"a" * 27` are names to look up.
+    # What can't be one, a path, query or control character, still sends nothing.
+    for bad in HOSTILE_CHANNELS:
+        for call in (
+            lambda bad=bad: b.read(DEV, bad),
+            lambda bad=bad: b.read(DEV, bad, since=1.0),
+            lambda bad=bad: b.read_one(DEV, bad, "p" * 26) if bad else b.read(DEV, bad),
+        ):
+            with pytest.raises(ValueError):
+                run(call())
     for bad in ("../me", "bj/x", "bj?x", "bj\n", "@", "-bj"):
         with pytest.raises(ValueError):
             run(b.dm(DEV, bad, "hi"))

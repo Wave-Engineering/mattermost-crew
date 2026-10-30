@@ -206,6 +206,15 @@ class GuildBackend(Protocol):
 
 
 @runtime_checkable
+class ChannelResolver(Protocol):
+    """A backend that resolves a channel name and has no other guild op: Mattermost (#145)."""
+
+    async def resolve(
+        self, dev_name: str, name: str, type: str = "channel", guild_id: str | None = None
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
 class PostProbe(Protocol):
     """A Mattermost server answering whether it holds a post, as the agent (R-12)."""
 

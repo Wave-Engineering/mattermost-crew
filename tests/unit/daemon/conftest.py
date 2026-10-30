@@ -365,6 +365,12 @@ class FakeMattermost:
             return httpx.Response(200, json=found)
         if request.method == "GET" and path == "/users/me/teams":
             return httpx.Response(200, json=[{"id": t} for t in self.teams])
+        if request.method == "GET" and parts[0] == "teams" and parts[2:4] == ["channels", "name"]:
+            # `GET /teams/{id}/channels/name/{name}` (#145): a channel the agent can see there.
+            named = [c for c in self.teams.get(parts[1], []) if c.get("name") == parts[4]]
+            return httpx.Response(200, json=dict(named[0])) if named else httpx.Response(
+                404, json={"id": "app.channel.get_by_name.missing.app_error"}
+            )
         if request.method == "GET" and parts[:3] == ["users", "me", "teams"] and len(parts) == 5:
             channels = self.teams.get(parts[3], [])
             return httpx.Response(200, json=[dict(c) for c in channels])
