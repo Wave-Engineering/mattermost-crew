@@ -1,6 +1,6 @@
 [project]
 name = "crewkiosk"
-version = "0.2.5"
+version = "0.2.6"
 description = "The kiosk's research side: the corpus builder, and in later releases its broker and relay (#136)."
 requires-python = ">=3.12"
 # Stdlib only: the corpus builder and the broker each run as their own system user and need no

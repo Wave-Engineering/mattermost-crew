@@ -1,6 +1,6 @@
 [project]
 name = "crewbroker"
-version = "0.2.5"
+version = "0.2.6"
 description = "The per-crew broker: creates bot accounts and mints, rotates and revokes their tokens."
 requires-python = ">=3.12"
 dependencies = [
