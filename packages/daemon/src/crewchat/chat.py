@@ -21,7 +21,9 @@ backend other than the agent's default) is logged as `off-default: <dev> <backen
   is `discord`, a 26-character lowercase id is Mattermost); for Mattermost, the agent's
   persisted thread set picks the server, and otherwise a `GET /api/v4/posts/{id}` as the agent
   on **only** the servers it is registered on. Nothing found is `not_found`.
-- The guild ops are Discord's (`GuildBackend`); a Mattermost backend answers `unsupported`.
+- The guild ops are Discord's (`GuildBackend`); a Mattermost backend answers `unsupported`,
+  except `resolve` of a channel (`ChannelResolver`, #145). On Mattermost, `send`, `read` and
+  `read_one` take a channel's URL name or display name, with or without `#`, as well as its ID.
 
 The daemon never reads a file on the agent's side (§5.3). What it knows about the agent's seed
 brief and its squawks is what the shim pushed: `AgentContext` keeps it for the doorbell and the
@@ -46,6 +48,7 @@ from typing import Any
 from crewchat.adapters.base import (
     Attachment,
     BackendUnavailable,
+    ChannelResolver,
     ChatBackend,
     Embed,
     GuildBackend,
@@ -313,11 +316,20 @@ def build_chat_handlers(
 
     async def resolve(args: dict[str, Any]) -> dict[str, Any]:
         dev_name, _reg, backend_name, backend = agent(args)
-        g = guild(backend_name, backend, "resolve")
         name = _str(args, "name")
         kind = _str(args, "type", required=False) or "channel"
         guild_id = _str(args, "guild_id", required=False)
         assert name is not None
+        g: GuildBackend | ChannelResolver
+        if isinstance(backend, GuildBackend):
+            g = backend
+        elif isinstance(backend, ChannelResolver):
+            # Mattermost resolves channel names only (#145); users and roles are Discord's.
+            if kind != "channel":
+                raise OpError("unsupported", f"{backend_name} resolves only channels")
+            g = backend
+        else:
+            raise OpError("unsupported", f"{backend_name} has no resolve")
         try:
             found = await g.resolve(dev_name, name, kind, guild_id)
         except Exception as exc:

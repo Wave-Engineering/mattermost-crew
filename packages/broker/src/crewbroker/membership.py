@@ -42,6 +42,12 @@ log = logging.getLogger(__name__)
 # be a display name, so it is never sent to a `/name/` endpoint.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 CHANNEL_TYPES = {"O", "P"}  # public and private; never a DM or group message
+
+
+def keep_channel(item: dict[str, Any]) -> bool:
+    """A public or private channel that isn't archived: the only kind a name resolves to."""
+    return item.get("type") in CHANNEL_TYPES and not item.get("delete_at")
+
 # Time kept back before the caller's deadline for the reply to reach the daemon.
 DEADLINE_RESERVE_S = 0.5
 DEFERRED = "deferred: the caller's deadline is near"
@@ -137,7 +143,7 @@ class Membership:
                 partial(self.client.list_team_channels, team_id),
                 partial(self.client.list_my_team_channels, team_id),
             ],
-            keep=lambda c: c.get("type") in CHANNEL_TYPES and not c.get("delete_at"),
+            keep=keep_channel,
         )
 
     def _lookup(self, target: Target, resolve: Callable[[], str]) -> None:

@@ -28,8 +28,24 @@ All notable changes to this project are recorded here. The format follows
   default unless named (a thread reply follows its thread). It never registers and never asks:
   with no live session it exits 4, and with no default backend it exits 3, so a caller can fall
   back. `crewchat-send --help` lists every exit code.
+- **Mattermost channels by name** (#145). `chat_send`, `chat_read` and `chat_read(post_id)` on
+  a Mattermost backend take a channel's URL name (`precheck`), `#name` or display name
+  (`Roll Call`), as well as its ID, which still costs no request. The daemon resolves the name
+  as the agent, in its one team, by the broker's rule: the URL name first, then a casefolded
+  display name over the agent's own public and private channels. An ambiguous name is
+  `bad_request` listing the candidates, and an unknown one, or a private channel the bot isn't
+  in, is `not_found`; neither posts anywhere. A bot on more than one team is told to pass the
+  channel ID. `chat_resolve` without a `guild_id` now resolves a channel on the named or
+  default backend, so it works on Mattermost; with a `guild_id` it is Discord's, as before.
+  A name is cached for 10 minutes. When its ID is refused, the name is resolved again: a
+  channel deleted, or a private one the bot was removed from, is `not_found`, and a renamed
+  channel's send is retried once on its new ID; any other refusal keeps its error. A name reused by a new channel within those 10 minutes still
+  reaches the old one until the entry expires, so pass the ID where that matters.
 
 ### Fixed
+
+- **`chat_dm` to an unknown username is `not_found`**, not `backend_error … NotFoundError`
+  (#148, mattermost-crew:triage #48).
 
 - **An idle session registers again after a daemon restart, with no tool call** (#137). From
   this release on, #129's claim in 0.2.4 holds: the shim's timer pings every 15 s, and

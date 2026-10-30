@@ -1,5 +1,5 @@
 """Stories 2.4 and 2.4c: the thin MCP shim over the daemon's socket. IT-04, IT-05, IT-15,
-IT-16 and IT-25.
+IT-16, IT-25 and IT-28.
 
 The daemon side is wired as `crewchat serve` wires it, on a real unix socket: the registry, the
 token store, one `MattermostBackend` per configured server (over in-process brokers, as in
@@ -25,6 +25,10 @@ through `SocketTransport`, as an agent's session does.
   and without `post_id`, on Discord answers `unavailable: scream-hole unhealthy` and the
   Discord REST fake sees no read; `chat_send` still posts, through the direct fallback; once
   the fake is healthy again, the next read is served through scream-hole.
+- IT-28 (R-09, #145): on Mattermost, `chat_send`, `chat_read` and `chat_read(post_id)` take a
+  channel's URL name, `#name` or display name (a private channel's too), and `chat_resolve`
+  answers its ID with no `guild_id`; an unknown name (`../users/me` too) is `not_found`, a
+  control character is `bad_request`, and `type="user"` is `unsupported`.
 
 IT-15 and IT-25 need no Mattermost and always run; the others skip without one.
 """
@@ -370,6 +374,73 @@ def test_it05_reply_follows_thread_and_named_backend_is_logged(
     asyncio.run(scenario())
 
 
+# -- IT-28 -------------------------------------------------------------------------------------
+def test_it28_mattermost_channel_names(
+    mattermost: Any,
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
+    sock_dir: Path,
+) -> None:
+    """IT-28 (R-09, #145): a Mattermost channel by URL name, `#name` or display name."""
+    channel = setup["channel_id"]
+    slug = str(mm_request(mattermost, "GET", f"/channels/{channel}").json()["name"])
+    room = mm_request(
+        mattermost,
+        "POST",
+        "/channels",
+        json={
+            "team_id": setup["team_id"],
+            "name": f"it28-{slug}",
+            "display_name": f"IT28 Room {slug}",
+            "type": "P",
+        },
+    )
+    assert room.status_code == 201, room.text
+    room_id = str(room.json()["id"])
+    sock = sock_dir / "crewchat.sock"
+    host = Host(tmp_path, FakeDiscord(), mattermost=mattermost, setup=setup, server_ids=["ci"])
+
+    async def scenario() -> None:
+        async with host.serving(sock):
+            repo = make_repo(tmp_path, "shim-it28", home_backend="mattermost:ci")
+            shim, _ = make_shim(repo, sock, tmp_path)
+            await shim.start()
+            user_id = host.seat(shim.registration["account"])
+            resp = mm_request(
+                mattermost, "POST", f"/channels/{room_id}/members", json={"user_id": user_id}
+            )
+            assert resp.status_code == 201, resp.text
+
+            by_slug = await shim.chat_send(slug, "it28 by URL name")
+            by_hash = await shim.chat_send(f"#{slug}", "it28 by #name")
+            for sent in (by_slug, by_hash):
+                assert post(mattermost, sent["post_id"])["channel_id"] == channel
+            got = await shim.chat_read(f"#{slug}", limit=2)
+            assert [m["text"].split("\n")[0] for m in got["messages"]] == [
+                "it28 by URL name",
+                "it28 by #name",
+            ]
+            one = await shim.chat_read(slug, post_id=by_slug["post_id"])
+            assert [m["post_id"] for m in one["messages"]] == [by_slug["post_id"]]
+
+            display = f"it28 room {slug}"  # a display name, casefolded: a private channel
+            in_room = await shim.chat_send(display, "it28 by display name")
+            assert post(mattermost, in_room["post_id"])["channel_id"] == room_id
+            found = await shim.chat_resolve(f"#{slug}")
+            assert (found["id"], found["type"]) == (channel, "channel")
+
+            with pytest.raises(ShimError, match="not_found"):
+                await shim.chat_send("it28-no-such-room", "never sent")
+            with pytest.raises(ShimError, match="not_found"):
+                await shim.chat_read("../users/me")  # a display name at most: in no path
+            with pytest.raises(ShimError, match="bad_request"):
+                await shim.chat_read("it28\nroom")
+            with pytest.raises(ShimError, match="unsupported"):
+                await shim.chat_resolve("bj", type="user")
+
+    asyncio.run(scenario())
+
+
 # -- IT-15 -------------------------------------------------------------------------------------
 def test_it15_discord_through_chat(
     tmp_path: Path, sock_dir: Path, caplog: pytest.LogCaptureFixture
@@ -437,7 +508,7 @@ def test_it15_discord_through_chat(
             assert [m["post_id"] for m in one["messages"]] == [sent["post_id"]]
             listed = await shim.chat_list_channels(GUILD_ID)
             assert {"id": chan, "name": "agent-ops", "type": "text"} in listed["channels"]
-            found = await shim.chat_resolve(GUILD_ID, "#agent-ops")
+            found = await shim.chat_resolve("#agent-ops", guild_id=GUILD_ID)
             assert found["id"] == chan
             made = await shim.chat_create_channel(GUILD_ID, "IT15 Room")
             assert discord.channels[made["id"]]["name"] == "it15-room"

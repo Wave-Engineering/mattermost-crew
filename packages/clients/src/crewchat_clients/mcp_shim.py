@@ -46,10 +46,12 @@ and the daemon acts on the agent's behalf with what it holds itself.
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
   squawk records, at start and whenever they change.
-- **Discord's guild ops (D-108).** `chat_list_channels`, `chat_resolve`,
-  `chat_create_channel` and `chat_create_thread` take today's `disc_*` argument shapes and
-  always send `backend="discord"`. `chat_read` with `post_id` reads one message. There are
-  no `disc_*` aliases: they were removed before the first deploy.
+- **Discord's guild ops (D-108).** `chat_list_channels`, `chat_create_channel` and
+  `chat_create_thread` take today's `disc_*` argument shapes and always send
+  `backend="discord"`. `chat_resolve` does too when given a `guild_id`; without one it goes to
+  the named or default backend, where a Mattermost server resolves a channel name (#145).
+  `chat_read` with `post_id` reads one message. There are no `disc_*` aliases: they were
+  removed before the first deploy.
 - **Health (#112).** `chat_health` sends `dev_name`, so a restarted daemon answers
   `not_registered` and the call re-registers, as any other call does.
 """
@@ -821,10 +823,32 @@ class Shim:
     async def chat_list_channels(self, guild_id: str, type: str = "text") -> dict[str, Any]:
         return await self._discord_op("list_channels", {"guild_id": guild_id, "type": type})
 
-    async def chat_resolve(self, guild_id: str, name: str, type: str = "channel") -> dict[str, Any]:
-        return await self._discord_op(
-            "resolve", {"guild_id": guild_id, "name": name, "type": type}
-        )
+    async def chat_resolve(
+        self,
+        name: str,
+        type: str = "channel",
+        guild_id: str | None = None,
+        backend: str | None = None,
+    ) -> dict[str, Any]:
+        """With `guild_id`, Discord, as before. Without, the named or default backend: a
+        Mattermost server resolves a channel name in the agent's team (#145)."""
+        if guild_id is not None:
+            return await self._discord_op(
+                "resolve", {"guild_id": guild_id, "name": name, "type": type}
+            )
+        route = await self._route(backend)
+        if isinstance(route, dict):
+            return route
+        backend_name, off = route
+        frame: dict[str, Any] = {
+            "dev_name": self.dev_name,
+            "backend": backend_name,
+            "name": name,
+            "type": type,
+        }
+        if off:
+            frame["off_default"] = True
+        return await self._forward("resolve", frame)
 
     async def chat_create_channel(
         self, guild_id: str, name: str, type: str = "text"
@@ -844,11 +868,12 @@ class Shim:
 
 # -- MCP ----------------------------------------------------------------------------------------
 TOOLS: dict[str, str] = {
-    "chat_send": "Send `text` to channel `to`. With `thread`, it replies on that thread's "
+    "chat_send": "Send `text` to channel `to` (an ID, or a name such as `precheck` or "
+    "`#precheck`, on either backend). With `thread`, it replies on that thread's "
     "backend. `backend` (mattermost:<server-id> or discord) overrides the default. "
     "`attach_path` attaches a local file (at most 8 MiB); `embed` is `title:body`.",
-    "chat_read": "Recent messages in `channel` (`since` epoch seconds, at most `limit`), or "
-    "the one message `post_id`.",
+    "chat_read": "Recent messages in `channel` (an ID or a name, on either backend; `since` "
+    "epoch seconds, at most `limit`), or the one message `post_id`.",
     "chat_thread": "Every message in the thread `post_id` belongs to.",
     "chat_dm": "A direct message to the user `to`; `attach_path` and `embed` as chat_send.",
     "chat_react": "Add the reaction `emoji` to the post `post_id`.",
@@ -858,7 +883,9 @@ TOOLS: dict[str, str] = {
     # Discord only (D-108).
     "chat_list_channels": "Discord only: the guild's channels of `type` (text, voice or "
     "category).",
-    "chat_resolve": "Discord only: the ID of the channel, user or role `name` (`type`).",
+    "chat_resolve": "The ID of `name`. On Discord, give `guild_id`: a channel, user or role "
+    "(`type`). On Mattermost (the default, or `backend`), no `guild_id`: a channel, by URL "
+    "name or display name, in the agent's team.",
     "chat_create_channel": "Discord only: create a channel `name` of `type` in the guild.",
     "chat_create_thread": "Discord only: create a thread `name` in `channel_id`, with an "
     "optional first `message`.",
