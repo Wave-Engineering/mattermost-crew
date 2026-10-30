@@ -23,9 +23,9 @@ All notable changes to this project are recorded here. The format follows
   in, is `not_found`; neither posts anywhere. A bot on more than one team is told to pass the
   channel ID. `chat_resolve` without a `guild_id` now resolves a channel on the named or
   default backend, so it works on Mattermost; with a `guild_id` it is Discord's, as before.
-  A name is cached for 10 minutes. When its channel is deleted, or the bot is removed from a
-  private one, the name is resolved again: a renamed channel's send is retried once on its new
-  ID, else it is `not_found`. A name reused by a new channel within those 10 minutes still
+  A name is cached for 10 minutes. When its ID is refused, the name is resolved again: a
+  channel deleted, or a private one the bot was removed from, is `not_found`, and a renamed
+  channel's send is retried once on its new ID; any other refusal keeps its error. A name reused by a new channel within those 10 minutes still
   reaches the old one until the entry expires, so pass the ID where that matters.
 
 ### Fixed

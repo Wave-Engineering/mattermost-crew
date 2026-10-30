@@ -129,12 +129,18 @@ async def match_channel(
     An async copy of the broker's rule (`crewbroker.membership._match`), kept here because
     the daemon never imports the broker: the URL name first, when it has the URL-name shape;
     then a casefolded display-name match over the agent's own public and private channels.
-    `tests/unit/daemon/test_channel_names.py` pins both copies to the same cases."""
+    `tests/unit/daemon/test_channel_names.py` pins both copies to the same cases. One
+    difference: Mattermost's own 403 on the URL name (a private channel the agent was removed
+    from) also falls through to the listing, where the broker reports an error (#148)."""
     if SLUG_RE.fullmatch(name):
         try:
             return str((await by_slug())["id"])
         except NotFoundError:
             pass  # not a URL name: maybe a display name
+        except MattermostAPIError as exc:
+            # A URL name the agent can't see is no different from none; anything else raises.
+            if not unreadable(exc):
+                raise
     wanted = name.casefold()
     found: dict[str, dict[str, Any]] = {}
     for item in await listing():
@@ -197,10 +203,9 @@ def unreadable(exc: Exception) -> bool:
 
 
 def stale_channel(exc: Exception) -> bool:
-    """Whether a channel's ID answered as gone: a 404, or Mattermost's own 403 (#148)."""
-    return isinstance(exc, NotFoundError) or (
-        isinstance(exc, MattermostAPIError) and exc.status_code == 403 and exc.error_id is not None
-    )
+    """Whether a cached channel ID may be gone (#148): Mattermost's own 403 or 404, as for a
+    replay scope. A proxy's page is an outage, never a reason to resolve again."""
+    return unreadable(exc)
 
 
 class TokenRefresher(Protocol):
@@ -520,28 +525,30 @@ class MattermostBackend:
         channel: str,
         op: Callable[[str], Awaitable[T]],
     ) -> T:
-        """`op` on `channel` as an ID. When a name's ID answers 404, or Mattermost's own 403
-        (a channel deleted, or a private one the agent left), the entry is dropped and the name
-        resolved once more: `op` is retried once on a new ID, which is safe because the refused
-        request made nothing; else the name is `NotFound`. An ID the caller gave is passed
-        through, and its 404 raised as it came."""
+        """`op` on `channel` as an ID. When a name's ID answers Mattermost's own 403 or 404, the
+        entry is dropped and the name resolved once more. A name that no longer resolves (a
+        channel deleted, or a private one the agent left) is `NotFound`. One that resolves to a
+        new ID is retried there once, which is safe because the refused request made nothing.
+        One that resolves to the same ID was refused for another reason, such as a deleted
+        thread root or a channel the agent may not post in, so that error is raised as it came.
+        An ID the caller gave is passed through, its errors raised as they came."""
         channel_id = await self._channel_id(dev_name, client, channel)
         try:
             return await op(channel_id)
         except MattermostAPIError as exc:
             if channel_id == channel or not stale_channel(exc):
                 raise
+            refused = exc
         self._forget_channel(dev_name, channel, channel_id)
-        fresh = await self._channel_id(dev_name, client, channel)
-        if fresh != channel_id:
-            try:
-                return await op(fresh)
-            except MattermostAPIError as exc:
-                if not stale_channel(exc):
-                    raise
-        # The name still resolves, but to an ID that refuses: never left in the cache.
-        self._forget_channel(dev_name, channel, fresh)
-        raise NotFound(f"channel {channel!r}")
+        fresh = await self._channel_id(dev_name, client, channel)  # NotFound when it's gone
+        if fresh == channel_id:
+            raise refused
+        try:
+            return await op(fresh)
+        except MattermostAPIError as exc:
+            if stale_channel(exc):
+                self._forget_channel(dev_name, channel, fresh)
+            raise
 
     async def resolve(
         self, dev_name: str, name: str, type: str = "channel", guild_id: str | None = None

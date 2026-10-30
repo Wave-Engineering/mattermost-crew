@@ -97,22 +97,22 @@ def test_channel_id_unknown_is_not_found(mm: Any, run: Any) -> None:
         run(b.read(DEV, "bj"))
 
 
-def test_channel_id_caches_and_evicts_on_404(mm: Any, run: Any) -> None:
+def test_channel_id_caches_and_re_resolves_on_404(mm: Any, run: Any) -> None:
     b, _, _ = world(mm)
     run(b.read(DEV, "precheck"))
     first = len(lookups(mm))
     run(b.read(DEV, "precheck"))
     assert len(lookups(mm)) == first  # cached
-    # The channel is gone: its ID 404s, the name resolves once more to the same ID, so the
-    # name is not found, and the entry is dropped so the next call resolves again.
+    # Its ID 404s: the name is resolved once more, to the same ID, so the 404 had another
+    # cause and is raised as it came; the entry is cached again.
     mm.errors[f"/channels/{PRECHECK}/posts"] = 1
     mm.error_status[f"/channels/{PRECHECK}/posts"] = 404
-    with pytest.raises(NotFound):
+    with pytest.raises(NotFoundError):
         run(b.read(DEV, "precheck"))
     second = len(lookups(mm))
     assert second > first
     run(b.read(DEV, "precheck"))
-    assert len(lookups(mm)) > second
+    assert len(lookups(mm)) == second
 
 
 def op_server(daemon: Any, b: Any, run: Any) -> Any:
@@ -129,26 +129,58 @@ def op_server(daemon: Any, b: Any, run: Any) -> Any:
     return call
 
 
-@pytest.mark.parametrize("status", [403, 404])
-@pytest.mark.parametrize("op", ["send", "read"])
-def test_cached_name_that_refuses_is_not_found(
-    mm: Any, run: Any, daemon: Any, op: str, status: int
-) -> None:
-    """A cached name whose channel was deleted (404), or a private one the agent was removed
-    from (Mattermost's 403), answers `not_found`, not `backend_error` (#148)."""
-    b, _, _ = world(mm)
-    call = op_server(daemon, b, run)
-    args = {"backend": b.name, "channel": "precheck"}
-    assert call("read", **args)["ok"] is True  # cached
-    if op == "send":
-        args = {"backend": b.name, "to": "precheck", "text": "hi"}
-    # A send is `POST /posts`, with the channel in the body; a read names it in the path.
+def refuse_cached(mm: Any, op: str, status: int) -> None:
+    """The next request on `PRECHECK` for `op` answers Mattermost's own `status`. A send is
+    `POST /posts`, with the channel in the body; a read names the channel in the path."""
     fragment = "/posts" if op == "send" else f"/channels/{PRECHECK}/posts"
     mm.errors[fragment] = 1
     mm.error_status[fragment] = status
-    refused = call(op, **args)
+
+
+def op_args(b: Any, op: str) -> dict[str, Any]:
+    if op == "send":
+        return {"backend": b.name, "to": "precheck", "text": "hi"}
+    return {"backend": b.name, "channel": "precheck"}
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("op", ["send", "read"])
+def test_cached_name_whose_channel_is_gone_is_not_found(
+    mm: Any, run: Any, daemon: Any, op: str, status: int
+) -> None:
+    """A cached name whose channel was deleted (404), or a private one the agent was removed
+    from (Mattermost's 403, on the ID and on the URL name), answers `not_found`, not
+    `backend_error` (#148)."""
+    b, _, _ = world(mm)
+    call = op_server(daemon, b, run)
+    assert call("read", **op_args(b, "read"))["ok"] is True  # cached
+    mm.teams[TEAM] = [c for c in mm.teams[TEAM] if c["id"] != PRECHECK]
+    refuse_cached(mm, op, status)
+    if status == 403:
+        mm.errors["/channels/name/precheck"] = 1
+        mm.error_status["/channels/name/precheck"] = 403
+    refused = call(op, **op_args(b, op))
     assert refused["ok"] is False and refused["error"].startswith("not_found"), refused
-    assert not mm.posts or all(p["message"] != "hi" for p in mm.posts.values())
+    assert all(p["message"] != "hi" for p in mm.posts.values())
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("op", ["send", "read"])
+def test_cached_name_refused_for_another_reason_keeps_its_error(
+    mm: Any, run: Any, daemon: Any, op: str, status: int
+) -> None:
+    """The name still resolves to the same ID, so the refusal had another cause, such as a
+    deleted thread root or a channel the agent may not post in: it stays `backend_error`
+    as before, and the name stays cached."""
+    b, _, _ = world(mm)
+    call = op_server(daemon, b, run)
+    assert call("read", **op_args(b, "read"))["ok"] is True
+    refuse_cached(mm, op, status)
+    refused = call(op, **op_args(b, op))
+    assert refused["ok"] is False and refused["error"].startswith("backend_error"), refused
+    n = len(lookups(mm))
+    assert call("read", **op_args(b, "read"))["ok"] is True
+    assert len(lookups(mm)) == n
 
 
 def test_renamed_name_is_retried_once_on_its_new_id(mm: Any, run: Any) -> None:
@@ -167,20 +199,22 @@ def test_renamed_name_is_retried_once_on_its_new_id(mm: Any, run: Any) -> None:
     assert len(lookups(mm)) == n  # the new ID is cached
 
 
-def test_proxy_403_and_given_id_404_are_not_rewritten(mm: Any, run: Any) -> None:
-    """Only Mattermost's own 403 means the channel is gone: a proxy's 403 page stays an
-    outage. A 404 on an ID the caller gave is raised as it came, with no lookup."""
+@pytest.mark.parametrize("status", [403, 404])
+def test_proxy_page_and_given_id_404_are_not_rewritten(mm: Any, run: Any, status: int) -> None:
+    """Only Mattermost's own 403 or 404 sends a name to be resolved again: a proxy's page
+    stays an outage, with no lookup. A 404 on an ID the caller gave is raised as it came."""
     from mcp_server_mattermost.exceptions import MattermostAPIError
 
     b, _, _ = world(mm)
     run(b.read(DEV, "precheck"))
     fragment = f"/channels/{PRECHECK}/posts"
     mm.errors[fragment] = 1
-    mm.error_status[fragment] = 403
+    mm.error_status[fragment] = status
     mm.error_html.add(fragment)
-    with pytest.raises(MattermostAPIError) as exc_info:
+    n = len(lookups(mm))
+    with pytest.raises(MattermostAPIError):
         run(b.read(DEV, "precheck"))
-    assert not isinstance(exc_info.value, NotFoundError)
+    assert len(lookups(mm)) == n
     mm.error_html.discard(fragment)
     mm.errors[fragment] = 1
     mm.error_status[fragment] = 404
