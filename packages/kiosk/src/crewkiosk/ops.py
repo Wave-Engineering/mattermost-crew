@@ -39,9 +39,12 @@ RG_TIMEOUT_S = 20
 RG_PATH = "/usr/local/bin:/usr/bin:/bin"
 # rg's JSON printer ignores --max-columns, so a minified 5 MB file is one 5 MB event: each
 # line is read at most RG_LINE_MAX bytes, the rest of a longer one dropped, and one search
-# reads at most RG_OUTPUT_MAX bytes of rg's output across its repos.
+# reads at most RG_OUTPUT_MAX bytes of rg's output across its repos. A dropped line's bytes
+# come from their own RG_DROP_MAX, so one minified match can't end the search; the timer
+# backs both.
 RG_LINE_MAX = 64 * 1024
 RG_OUTPUT_MAX = 4 * 1024 * 1024
+RG_DROP_MAX = 16 * 1024 * 1024
 NAME_MAX = 64
 
 
@@ -56,13 +59,22 @@ class _Spent(Exception):
 
 @dataclass
 class _Budget:
-    """The bytes of rg's output a search may still read, across its repos."""
+    """The bytes of rg's output a search may still read, across its repos: lines it keeps,
+    and lines too long to keep, each from their own allowance."""
 
     left: int = RG_OUTPUT_MAX
+    drop_left: int = RG_DROP_MAX
+    dropped: bool = False  # a line was too long: the results can't be complete
 
     def spend(self, n: int) -> None:
         self.left -= n
         if self.left < 0:
+            raise _Spent
+
+    def drop(self, n: int) -> None:
+        self.dropped = True
+        self.drop_left -= n
+        if self.drop_left < 0:
             raise _Spent
 
 
@@ -287,7 +299,7 @@ class Corpus:
                     raise
         results: list[dict[str, Any]] = []
         size, truncated = _encoded({"query": query, "results": [], "truncated": True}), False
-        budget = _Budget(RG_OUTPUT_MAX)
+        budget = _Budget(RG_OUTPUT_MAX, RG_DROP_MAX)
         try:
             for name, top in tops:
                 # closing(): a break kills this repo's rg now, not when the generator is freed.
@@ -303,6 +315,8 @@ class Corpus:
                     break
         except _Spent:
             truncated = True
+        # A dropped line may have held a match: say the results aren't the whole answer.
+        truncated = truncated or budget.dropped
         return {"query": query, "results": results, "truncated": truncated}
 
     def _rg(
@@ -323,6 +337,9 @@ class Corpus:
             "5",
             "--max-filesize",
             "5M",
+            # rg's default is up to 12 threads, each with a line buffer up to --max-filesize.
+            "--threads",
+            "2",
             "--no-messages",
         ]
         if glob is not None:
@@ -348,8 +365,8 @@ class Corpus:
             proc.kill()
 
         timer = threading.Timer(RG_TIMEOUT_S, expire)
-        timer.start()
         try:
+            timer.start()  # inside the try: if it can't start, rg is still killed
             for raw in _lines(proc, budget):
                 hit = _match(raw)
                 if hit is not None:
@@ -370,14 +387,16 @@ class Corpus:
 
 def _lines(proc: subprocess.Popen[bytes], budget: _Budget) -> Iterator[bytes]:
     """rg's stdout, a line at a time, each at most RG_LINE_MAX bytes: a longer line is read
-    to its end and dropped. Raises _Spent once `budget` is used up."""
+    to its end and dropped. Raises _Spent once either of `budget`'s allowances is used up."""
     assert proc.stdout is not None
     long_line = False
     while chunk := proc.stdout.readline(RG_LINE_MAX):
-        budget.spend(len(chunk))
         whole = chunk.endswith(b"\n")
         if whole and not long_line:
+            budget.spend(len(chunk))
             yield chunk
+        else:
+            budget.drop(len(chunk))
         long_line = not whole
 
 

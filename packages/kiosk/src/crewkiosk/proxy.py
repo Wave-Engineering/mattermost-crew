@@ -219,12 +219,12 @@ class UsageMeter:
             line, _, rest = bytes(self.buf).partition(b"\n")
             self.buf = bytearray(rest)
             if line.startswith(b"data:"):
-                with contextlib.suppress(ValueError):
+                with contextlib.suppress(ValueError, RecursionError):
                     self._event(json.loads(line[5:]))
 
     def close(self) -> None:
         if not self.sse:
-            with contextlib.suppress(ValueError):
+            with contextlib.suppress(ValueError, RecursionError):
                 body = json.loads(self.buf)
                 if isinstance(body, dict):
                     self._usage(body.get("usage"), output=True)

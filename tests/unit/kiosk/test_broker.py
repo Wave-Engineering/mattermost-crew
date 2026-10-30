@@ -1360,6 +1360,8 @@ def test_control_socket_is_outside_the_runtime_directory() -> None:
     assert socket_unit["SocketGroup"] == ["crewchat"] and socket_unit["SocketMode"] == ["0660"]
     assert "RuntimeDirectoryPreserve" not in service
     assert service["MemoryMax"] == ["512M"]
+    # An OOM-killed rg fails its own search; the default policy would stop the whole broker.
+    assert service["OOMPolicy"] == ["continue"]
 
 
 # -- corpus_search streams rg ----------------------------------------------------------------------
@@ -1386,6 +1388,14 @@ elif mode == "matches":  # matches without end
 elif mode == "long":  # a minified line, then an ordinary one
     sys.stdout.write(match(1, "x" * 1_000_000 + "needle"))
     sys.stdout.write(match(2))
+elif mode == "huge":  # a minified line past the whole output budget, then an ordinary one
+    sys.stdout.write(match(1, "x" * 6_000_000 + "needle"))
+    sys.stdout.write(match(2))
+elif mode == "sleep":  # says nothing, and never ends
+    import time
+    time.sleep(60)
+elif mode == "argv":
+    (here / "argv").write_text(json.dumps(sys.argv[1:]))
 """
 
 
@@ -1439,11 +1449,33 @@ def test_search_kills_rg_once_it_has_its_results(
 
 def test_search_drops_an_overlong_line(corpus: Corpus, fake_rg: Callable[[str], str]) -> None:
     """rg's JSON printer ignores --max-columns: a line past RG_LINE_MAX is read to its end
-    and dropped, never held whole, and the search goes on."""
-    corpus.rg = fake_rg("long")
-    found = corpus.call("corpus_search", {"query": "needle", "repo": A})
-    assert found["results"] == [{"repo": A, "path": "f2.txt", "line": 2, "text": "needle"}]
-    assert found["truncated"] is False
+    and dropped, never held whole, and the search goes on, saying it isn't complete. A line
+    longer than the whole output budget comes from its own allowance, so it ends nothing."""
+    for mode in ("long", "huge"):
+        corpus.rg = fake_rg(mode)
+        found = corpus.call("corpus_search", {"query": "needle", "repo": A})
+        assert found["results"] == [{"repo": A, "path": "f2.txt", "line": 2, "text": "needle"}]
+        assert found["truncated"] is True, mode
+
+
+def test_search_times_out_and_kills_rg(
+    corpus: Corpus, fake_rg: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "RG_TIMEOUT_S", 0.5)
+    corpus.rg = fake_rg("sleep")
+    with pytest.raises(ToolError, match="timed out"):
+        corpus.call("corpus_search", {"query": "needle", "repo": A})
+    assert gone(Path(corpus.rg).parent / "pid")
+
+
+def test_search_argv_bounds_rg(corpus: Corpus, fake_rg: Callable[[str], str]) -> None:
+    corpus.rg = fake_rg("argv")
+    corpus.call("corpus_search", {"query": "--files", "repo": A, "path_glob": "*.md"})
+    argv = json.loads((Path(corpus.rg).parent / "argv").read_text())
+    assert argv[argv.index("--threads") + 1] == "2"
+    assert argv[argv.index("--max-filesize") + 1] == "5M"
+    assert {"--no-config", "--no-follow", "--fixed-strings", "--json"} <= set(argv)
+    assert argv[-3:] == ["--", "--files", "."]  # the query is never a flag
 
 
 # -- the op cap, metrics writes ------------------------------------------------------------------
@@ -1629,3 +1661,163 @@ def test_server_ids_too_long_for_a_socket_path_are_skipped(tmp_path: Path) -> No
         write_manifest(pool, server, repos=[A])
     b = Broker(pool_dir=pool, corpus_root=tmp_path, runtime_dir=runtime, socket_group=None)
     assert set(b.manifests()) == {"a"}
+
+
+# -- the ledger's memory is bounded --------------------------------------------------------------
+def aid(n: int) -> str:
+    return f"{n:032x}"
+
+
+def test_answers_a_day_are_capped(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Past MAX_ANSWERS_PER_DAY a server's new hello is refused, audited ok:false and logged
+    once, and makes no record; a known answer is still served, and a model call past the cap
+    still counts in the day."""
+    monkeypatch.setattr(broker, "MAX_ANSWERS_PER_DAY", 3)
+    caplog.set_level(logging.WARNING, logger="crewkiosk.broker")
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    assert all(ledger.hello(SERVER, aid(n), POST) for n in range(3))
+    assert not ledger.hello(SERVER, aid(3), POST)
+    assert not ledger.hello(SERVER, aid(4), POST)
+    assert ledger.hello(SERVER, aid(0), POST)  # already today's: never refused
+    assert ledger.hello(OTHER, aid(3), POST)  # the cap is per server
+    day = ledger.days[(SERVER, "2026-10-30")]
+    assert set(day.answers) == {aid(n) for n in range(3)}
+    assert (SERVER, aid(3)) not in ledger.answers
+    assert [r.getMessage() for r in caplog.records].count(
+        f"broker {SERVER}: 3 answers today: no more until midnight UTC"
+    ) == 1
+    audit = sockdir / "state" / "audit" / f"{SERVER}.jsonl"
+    refused = [json.loads(x) for x in audit.read_text().splitlines()]
+    assert [(x["op"], x["answer_id"], x["ok"]) for x in refused] == [
+        ("hello", aid(3), False),
+        ("hello", aid(4), False),
+    ]
+    ledger.model(SERVER, model_call(aid(9), input_tokens=7))
+    assert (SERVER, aid(9)) not in ledger.answers
+    m = ledger.metrics()[SERVER]
+    assert m["answers"] == 3 and m["model_calls"] == 1 and m["input_tokens"] == 7
+    # Through the socket: a refused hello is closed with no reply.
+    replies = with_server(
+        sockdir,
+        op_server(corpus, ledger).handle,
+        lambda path: converse(path, hello_line(aid(5)), rpc(1, "ping")),
+    )
+    assert replies == []
+
+
+def test_live_answers_are_capped_by_the_socket(sockdir: Path, corpus: Corpus) -> None:
+    """The op socket holds MAX_CONNECTIONS connections, each one answer: the 65th is closed
+    before it can make one."""
+    ledger = Ledger(sockdir / "state", clock=Tick())
+    op = op_server(corpus, ledger)
+
+    async def scenario(path: str) -> list[dict[str, Any]]:
+        held = []
+        for n in range(broker.MAX_CONNECTIONS):
+            reader, writer = await asyncio.open_unix_connection(path)
+            writer.write(hello_line(aid(n)) + rpc(1, "ping"))
+            await writer.drain()
+            assert json.loads(await reader.readline())["result"] == {}
+            held.append(writer)
+        refused = await converse(path, hello_line(aid(999)), rpc(1, "ping"))
+        for writer in held:
+            writer.close()
+        return refused
+
+    assert with_server(sockdir, op.handle, scenario) == []
+    assert len(ledger.days[(SERVER, "2026-10-30")].answers) == broker.MAX_CONNECTIONS
+
+
+def test_ops_share_a_bounded_thread_pool(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However many sessions call at once, at most OPS_AT_ONCE ops run in threads: the
+    default executor also resolves the model proxy's upstream."""
+    lock, running, peak = threading.Lock(), [0], [0]
+
+    def slow(name: str, args: object) -> dict[str, Any]:
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.1)
+        with lock:
+            running[0] -= 1
+        return {}
+
+    monkeypatch.setattr(corpus, "call", slow)
+    op = op_server(corpus)
+    listing = {"name": "corpus_list", "arguments": {"repo": A}}
+
+    async def scenario(path: str) -> None:
+        await asyncio.gather(
+            *(converse(path, hello_line(aid(n)), rpc(1, "tools/call", listing)) for n in range(10))
+        )
+
+    with_server(sockdir, op.handle, scenario)
+    assert peak[0] == broker.OPS_AT_ONCE
+
+
+def test_a_new_answer_reaches_the_metrics_file(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "state", clock=Tick())
+    ledger.hello(SERVER, AID, POST)
+    ledger.flush()
+    on_disk = tmp_path / "state" / "metrics" / f"{SERVER}-2026-10-30.json"
+    assert json.loads(on_disk.read_text())["answers"] == 1
+
+
+def test_a_line_goes_to_its_own_days_file(tmp_path: Path) -> None:
+    """A line keyed on a day that the clock has since left is written to that day's file,
+    never to today's."""
+    ledger = Ledger(tmp_path / "state", clock=Tick())  # 2026-10-30
+    day = broker.Day("2026-10-29")
+    ledger._line(SERVER, AID, POST, day, None, "corpus_list", {}, 1, 1, True)
+    metrics = tmp_path / "state" / "metrics"
+    assert sorted(p.name for p in metrics.iterdir()) == [f"{SERVER}-2026-10-29.json"]
+
+
+def test_the_metrics_flusher_survives_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(broker, "METRICS_WRITE_S", 0.01)
+    calls: list[int] = []
+
+    class Failing:
+        def flush(self) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+
+    async def main() -> None:
+        task = asyncio.ensure_future(broker.flush_metrics(Failing()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(main())
+    assert len(calls) >= 2
+
+
+def test_stop_expires_everything_and_survives_a_failing_server(
+    tmp_path: Path, sockdir: Path, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stop() drops every answer's lines whatever the sweep's last run, still closes the
+    control socket and writes the metrics when one server's close fails."""
+    b, _run = broker_for(tmp_path, sockdir, root, SERVER, OTHER)
+    real_close = b._close
+
+    async def close(server: str) -> None:
+        await real_close(server)
+        if server == SERVER:
+            raise OSError("unlink refused")
+
+    async def main() -> None:
+        await b.reload()
+        await b.start_control(None)
+        b.ledger.op(SERVER, AID, POST, "corpus_list", {}, 1, 1, True)
+        monkeypatch.setattr(b, "_close", close)
+        await b.stop()
+        assert b.control is not None and not b.control.is_serving()
+
+    asyncio.run(main())
+    assert b.sites == {} and b.ledger.answers == {}
+    # The broker's clock is the real one: whatever today is, its file was written.
+    assert list((tmp_path / "state" / "metrics").glob(f"{SERVER}-*.json"))

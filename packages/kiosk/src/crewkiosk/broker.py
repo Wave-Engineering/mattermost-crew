@@ -27,7 +27,9 @@ post_id, op, args, bytes, latency_ms, ok}`, written by the broker from what it i
 never from anything the runner or the kiosk reports. Held in memory per answer (200 lines,
 dropped 15 minutes after the answer's last line) and appended to
 `/var/lib/crewkiosk-broker/audit/<server>.jsonl` (0600). An answer gets MAX_OPS_PER_ANSWER ops;
-each one after is refused, and audited as refused.
+each one after is refused, and audited as refused. A server gets MAX_ANSWERS_PER_DAY answers a
+UTC day: a hello past that is refused and audited, and makes no record, so the ledger's memory
+is bounded whoever mints the answer ids.
 
 **Metrics:** per answer, the ops, model calls, input and output tokens and wall time (hello to
 last activity), rolled up per server and UTC day as running totals, with op latency p50/p95
@@ -95,8 +97,14 @@ TAKE_MAX = 1000
 # lines always fit the daemon's reply limit and a refused call can't bloat the log.
 AUDIT_STR_MAX = 256
 AUDIT_ARGS_MAX = 2048
-# The kiosk is untrusted: an answer's ops are capped, so a loop of them ends.
+# The kiosk is untrusted: an answer's ops are capped, so a loop of them ends, and a server's
+# answers a day are capped, so a client minting answer ids can't grow the ledger without end.
 MAX_OPS_PER_ANSWER = 200
+MAX_ANSWERS_PER_DAY = 10_000
+# Expired answers are swept at most this often, never on every line.
+EXPIRE_EVERY_S = 30
+# Ops run in threads, at most this many at once across every server: rg is the heavy one.
+OPS_AT_ONCE = 4
 # A day's op latency p50/p95 is over its latest ops, never all of them.
 LATENCY_SAMPLE = 1024
 METRICS_WRITE_S = 60
@@ -137,6 +145,7 @@ class Day:
     """One server's UTC day, as running totals: an audit line costs the same at 23:59 as at
     00:01, however many came before it."""
 
+    date: str  # UTC, as the ledger keys it: a line is written to this day's file, never today's
     answers: dict[str, Answer] = field(default_factory=dict)
     ops: int = 0
     model_calls: int = 0
@@ -145,6 +154,7 @@ class Day:
     op_latency_ms: deque[int] = field(default_factory=lambda: deque(maxlen=LATENCY_SAMPLE))
     dirty: bool = False  # changed since its metrics file was written
     written: float | None = None
+    full: bool = False  # reached MAX_ANSWERS_PER_DAY; logged once
 
 
 class Ledger:
@@ -157,31 +167,59 @@ class Ledger:
         # (server, UTC date) -> the day, which keeps its answers for the rollup after their
         # lines go.
         self.days: dict[tuple[str, str], Day] = {}
+        self.swept = float("-inf")
 
-    def _answer(self, server: str, answer_id: str, post_id: str | None) -> tuple[Day, Answer]:
+    def _answer(
+        self, server: str, answer_id: str, post_id: str | None
+    ) -> tuple[Day, Answer | None]:
+        """The day and the answer's record, made if new. None for the answer once the server's
+        day holds MAX_ANSWERS_PER_DAY: past that, a new answer gets no record."""
         now = self.clock()
-        self._expire(now)
-        day = self.days.setdefault((server, self._date(now)), Day())
+        if now - self.swept >= EXPIRE_EVERY_S:
+            self._expire(now)
+        date = self._date(now)
+        day = self.days.get((server, date))
+        if day is None:
+            day = self.days[(server, date)] = Day(date)
         key = (server, answer_id)
         a = self.answers.get(key)
         if a is None:
             # An answer back after going quiet resumes today's record, never replaces it.
-            a = day.answers.get(answer_id) or Answer(post_id, now, now)
+            a = day.answers.get(answer_id)
+            if a is None:
+                if len(day.answers) >= MAX_ANSWERS_PER_DAY:
+                    if not day.full:
+                        day.full = True
+                        log.warning(
+                            "broker %s: %d answers today: no more until midnight UTC",
+                            server,
+                            MAX_ANSWERS_PER_DAY,
+                        )
+                    return day, None
+                a = Answer(post_id, now, now)
+                day.dirty = True
             self.answers[key] = a
-        # An answer still open across midnight joins the new day too.
+        # An answer still open across midnight joins the new day too, with its counts so far:
+        # that day's per-answer spreads include them, though its totals don't (#142).
         day.answers.setdefault(answer_id, a)
         if post_id is not None and a.post_id is None:
             a.post_id = post_id
         a.last = now
         return day, a
 
-    def hello(self, server: str, answer_id: str, post_id: str) -> None:
-        self._answer(server, answer_id, post_id)
+    def hello(self, server: str, answer_id: str, post_id: str) -> bool:
+        """Records the answer, or, past MAX_ANSWERS_PER_DAY, audits the refused hello (on disk
+        only: it makes no record) and returns False."""
+        day, a = self._answer(server, answer_id, post_id)
+        if a is None:
+            self._line(server, answer_id, post_id, day, None, "hello", None, 0, 0, False)
+        return a is not None
 
     def ops_used(self, server: str, answer_id: str) -> int:
         a = self.answers.get((server, answer_id))
         if a is None:
-            a = self.days.get((server, self._date(self.clock())), Day()).answers.get(answer_id)
+            day = self.days.get((server, self._date(self.clock())))
+            a = day.answers.get(answer_id) if day is not None else None
         return a.ops if a is not None else 0
 
     def op(
@@ -196,25 +234,33 @@ class Ledger:
         ok: bool,
     ) -> None:
         day, a = self._answer(server, answer_id, post_id)
-        a.ops += 1
+        if a is not None:
+            a.ops += 1
         day.ops += 1
         day.op_latency_ms.append(latency_ms)
-        self._line(server, answer_id, day, a, name, args, nbytes, latency_ms, ok)
+        self._line(server, answer_id, post_id, day, a, name, args, nbytes, latency_ms, ok)
 
     def model(self, server: str, call: proxy.Call) -> None:
+        # Past the day's answer cap a call still counts in the day and reaches the audit
+        # file; only its per-answer record is skipped.
         day, a = self._answer(server, call.answer_id, None)
         if call.turn is not None and call.forwarded:
-            a.model_calls += 1
             day.model_calls += 1
-        a.input_tokens += call.input_tokens
-        a.output_tokens += call.output_tokens
+            if a is not None:
+                a.model_calls += 1
         day.input_tokens += call.input_tokens
         day.output_tokens += call.output_tokens
+        if a is not None:
+            a.input_tokens += call.input_tokens
+            a.output_tokens += call.output_tokens
         args = {"path": call.path, "turn": call.turn, "status": call.status}
         args |= {"input_tokens": call.input_tokens, "output_tokens": call.output_tokens}
         args["complete"] = call.complete
         ok = 200 <= call.status < 300 and call.complete
-        self._line(server, call.answer_id, day, a, "model", args, call.bytes, call.latency_ms, ok)
+        post_id = a.post_id if a is not None else None
+        self._line(
+            server, call.answer_id, post_id, day, a, "model", args, call.bytes, call.latency_ms, ok
+        )
 
     def take(self, answer_id: str) -> list[dict[str, Any]]:
         """Every server's audit lines for `answer_id`, and forget them."""
@@ -241,30 +287,42 @@ class Ledger:
             if day.dirty:
                 self._write_metrics(server, date, day)
 
+    def close(self) -> None:
+        """On stop: every answer's lines dropped, whatever the sweep's last run, and every
+        metrics file brought up to date."""
+        for a in self.answers.values():
+            a.lines.clear()
+        self.answers.clear()
+        self.flush()
+
     def _line(
         self,
         server: str,
         answer_id: str,
+        post_id: str | None,
         day: Day,
-        a: Answer,
+        a: Answer | None,
         name: str,
         args: Any,
         nbytes: int,
         latency_ms: int,
         ok: bool,
     ) -> None:
+        """One audit line: kept in memory with the answer's record, if it has one, and always
+        appended to the server's audit file."""
         line = {
             "ts": datetime.fromtimestamp(self.clock(), UTC).isoformat(),
             "server": server,
             "answer_id": answer_id,
-            "post_id": a.post_id,
+            "post_id": a.post_id if a is not None else post_id,
             "op": name,
             "args": args,
             "bytes": nbytes,
             "latency_ms": latency_ms,
             "ok": ok,
         }
-        a.lines.append(line)
+        if a is not None:
+            a.lines.append(line)
         day.dirty = True
         try:
             self._append(self.state_dir / "audit" / f"{server}.jsonl", jsonl(line))
@@ -272,7 +330,7 @@ class Ledger:
             log.error("broker %s: cannot record the audit: %s", server, exc.strerror)
         now = self.clock()
         if day.written is None or now - day.written >= METRICS_WRITE_S:
-            self._write_metrics(server, self._date(now), day)
+            self._write_metrics(server, day.date, day)
 
     def _append(self, path: Path, data: bytes) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -305,6 +363,10 @@ class Ledger:
             log.error("broker %s: cannot record the metrics: %s", server, exc.strerror)
 
     def _expire(self, now: float) -> None:
+        """The sweep: answers quiet past AUDIT_TTL_S, and past days. Run at most every
+        EXPIRE_EVERY_S from a line, so an answer's lines can outlive AUDIT_TTL_S by that much,
+        never more; take() and close() run it, or its effect, at once."""
+        self.swept = now
         for key, a in list(self.answers.items()):
             if now - a.last > AUDIT_TTL_S:
                 a.lines.clear()  # dropped after 15 minutes, as the audit promises
@@ -358,11 +420,20 @@ def rpc_error(rid: Any, code: int, message: str) -> bytes:
 class OpServer:
     """One server's op socket: the MCP subset, after a hello."""
 
-    def __init__(self, server: str, corpus: ops.Corpus, ledger: Ledger) -> None:
+    def __init__(
+        self,
+        server: str,
+        corpus: ops.Corpus,
+        ledger: Ledger,
+        threads: asyncio.Semaphore | None = None,
+    ) -> None:
         self.server = server
         self.corpus = corpus
         self.ledger = ledger
         self.slots = proxy.Slots(f"broker {server} ops")
+        # The broker's one semaphore, shared by every server: the default executor also
+        # serves the proxy's getaddrinfo, so ops never fill it.
+        self.threads = threads or asyncio.Semaphore(OPS_AT_ONCE)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -402,7 +473,8 @@ class OpServer:
             )
             return
         try:
-            self.ledger.hello(self.server, answer_id, post_id)
+            if not self.ledger.hello(self.server, answer_id, post_id):
+                return  # the server's answers for today are used up: audited, closed
             # Idle past OP_IDLE_S, longer than any real gap between an answer's calls: closed.
             while line := await asyncio.wait_for(reader.readline(), OP_IDLE_S):
                 reply = await self._message(line, answer_id, post_id)
@@ -449,7 +521,8 @@ class OpServer:
         try:
             if self.ledger.ops_used(self.server, answer_id) >= MAX_OPS_PER_ANSWER:
                 raise ops.ToolError(f"this answer has used all {MAX_OPS_PER_ANSWER} of its ops")
-            result = await asyncio.to_thread(self.corpus.call, str(name), args)
+            async with self.threads:
+                result = await asyncio.to_thread(self.corpus.call, str(name), args)
             text, ok = json.dumps(result), True
         except ops.ToolError as exc:
             text, ok = str(exc), False
@@ -609,6 +682,7 @@ class Broker:
         # that was waiting on a stop does nothing.
         self.lock = asyncio.Lock()
         self.stopped = False
+        self.threads = asyncio.Semaphore(OPS_AT_ONCE)
 
     def load_model(self) -> None:
         """model.conf and the key, re-read on each reload. A bad key leaves the proxy
@@ -688,7 +762,7 @@ class Broker:
             on_call=lambda call: self.ledger.model(server, call),
             label=f"broker {server} model",
         )
-        op = site.op = OpServer(server, corpus, self.ledger)
+        op = site.op = OpServer(server, corpus, self.ledger, self.threads)
         try:
             for path, handler in (
                 (self.runtime_dir / f"{server}.sock", op.handle),
@@ -747,11 +821,14 @@ class Broker:
         async with self.lock:
             self.stopped = True
             for server in list(self.sites):
-                await self._close(server)
+                try:
+                    await self._close(server)
+                except Exception:  # as in reload: one server never keeps the rest open
+                    log.exception("broker %s: closing its sockets failed", server)
             if self.control is not None:
                 self.control.close()
                 await self.control.wait_closed()
-            self.ledger.flush()
+            self.ledger.close()
 
 
 def listened_socket() -> socket.socket | None:
@@ -770,7 +847,10 @@ async def flush_metrics(ledger: Ledger) -> None:
     still reaches the disk."""
     while True:
         await asyncio.sleep(METRICS_WRITE_S)
-        ledger.flush()
+        try:
+            ledger.flush()
+        except Exception:  # never the end of the metrics: the next round tries again
+            log.exception("broker: the metrics flush failed")
 
 
 async def serve(broker: Broker) -> None:

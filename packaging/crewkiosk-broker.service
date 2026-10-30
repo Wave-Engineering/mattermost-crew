@@ -31,9 +31,14 @@ Restart=on-failure
 # Each server's two sockets hold at most 64 connections each, plus 64 upstream: room for
 # about 40 research servers.
 LimitNOFILE=8192
-# Up to 4 searches at once, each reading at most 4 MiB of rg's output a line at a time, and
-# the proxy's bodies capped at 1 MiB: far under this, so it is only a backstop.
+# At most 4 ops at once across every server (OPS_AT_ONCE), a search reading at most 4 MiB of
+# rg's output a line at a time, and the proxy's bodies capped at 1 MiB: far under this, so
+# it is only a backstop.
 MemoryMax=512M
+# rg runs in this unit's cgroup, and the kiosk chooses the queries. The default policy (stop)
+# would end the whole broker, every server's sessions with it, when the kernel kills one rg:
+# with continue, that search fails and nothing else does.
+OOMPolicy=continue
 # The per-server sockets only. The control socket has its own directory, made by its socket
 # unit: this one is chowned to crewkiosk-broker at every start.
 RuntimeDirectory=crewkiosk-broker
