@@ -15,10 +15,16 @@ All notable changes to this project are recorded here. The format follows
   `/var/lib/crewchat-pool/<server_id>.json`: the repos of agents holding a token there, plus
   `corpus_extra`, minus `corpus_exclude`. Repos compare without regard to case or a trailing
   `.git`, so an exclude wins however a repo is spelled. A repo is kept only when its `host/org`
-  matches a forge entry in an explicit `agents_allow` (D-112). So research on a server is a config error unless
-  `kiosk = true` and every crew table on that server sets `agents_allow`. `health` reports each
-  research server's pool size. Nothing reads the manifest yet; the corpus builder is #140. With
-  research off nothing changes.
+  matches a forge entry in an explicit `agents_allow` (D-112). So research on a server is a
+  config error unless `kiosk = true` and every crew table on that server sets `agents_allow`.
+  `health` reports each research server's pool size. Nothing reads the manifest yet; the corpus
+  builder is #140. With research off nothing changes.
+- **`crewchat-send`, a sender for scripts** (#146). A script posts one message as its
+  checkout's agent: `crewchat-send [--backend B] [--thread ID] [--dm] <to> < message`. The text
+  is read from STDIN only, so backticks and `$` never meet a shell. The backend is the agent's
+  default unless named (a thread reply follows its thread). It never registers and never asks:
+  with no live session it exits 4, and with no default backend it exits 3, so a caller can fall
+  back. `crewchat-send --help` lists every exit code.
 
 ### Fixed
 

@@ -294,7 +294,8 @@ mattermost-crew/
 │       ├── mcp_shim.py               # thin MCP server: chat_* tools
 │       ├── defaults.py               # R-11 default-backend resolution (agent's user)
 │       ├── brief.py                  # extract_brief: the seed's `## Kiosk` section
-│       └── doorbell.py               # thin one-shot: exits on one event
+│       ├── doorbell.py               # thin one-shot: exits on one event
+│       └── send.py                   # crewchat-send: one message from a script (#146)
 ├── tests/  unit/  integration/  e2e/
 └── docs/   SKETCHBOOK.md  for-mother.md  architecture.md  runbook.md
             partner-guide.md  mattermost-crew-devspec.md
@@ -319,6 +320,7 @@ The broker remains a separate package, a separate service and a separate OS user
 - Each host has **one** daemon socket, `/run/crewchat/crewchat.sock`. It is mode `0660`, owned by `crewchat:crewchat-clients`, and mounted into every container on that host.
 - A thin client registers with the Dev-Name and `crew` from `.claude/agent-identity.json`, and the daemon accepts it. If the file has no `crew`, the host's `default_crew` in `/etc/crewchat/servers.toml` is used.
 - The shim also sends `dev_team` and `dev_avatar` from the identity file, falling back to the legacy `/tmp/claude-agent-<md5(repo_root)>.json`, then to `""` (D-103). Both are self-declared, like the Dev-Name. The avatar is display only (the Discord signature); no addressing, membership or trust decision reads it. Only the shim reads these files; the daemon package never names them.
+- **`crewchat-send`** (#146) posts one message from a script as the checkout's agent: the Dev-Name read as the doorbell reads it, the backend from `--backend`, else the thread's backend (`thread_backend`), else R-11's default without asking, and the text from STDIN only. Like the doorbell it **never registers**: the session's shim owns the registration, and a script with no live session gets `not_registered` (exit 4) and sends nothing. Its exit codes (0 sent; 1 refused; 2 usage; 3 no default; 4 not registered; 5 unreachable) are the contract a caller falls back on.
 - The daemon never reads files in an agent's home or repo. Its `~` is `crewchat`'s home, and in containers the agent's paths aren't host paths. Anything it needs from the agent's side (the kiosk brief, squawk IDs, the resolved default backend) is pushed by the shim over the socket.
 - Agents on one host are one trust boundary (D-055). The accepted cost is that a same-host agent could post as a crewmate, which falls under D-005.
 
@@ -625,6 +627,7 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-24 | daemon ↔ Mattermost | An agent posts a new root through the daemon's `send`, the daemon restarts, and a human's reply in that thread is addressed to the agent (`addressed_to` true through the persisted `MyThreads`) (D-104) | R-17, R-19 |
 | IT-25 | daemon ↔ scream-hole | With the scream-hole fake failing its health check, `chat_read`, with and without `post_id`, on Discord answers `unavailable: scream-hole unhealthy`, and the Discord REST fake sees no read; `chat_send` still posts, through the direct fallback. Once the fake is healthy again, the next read is served through scream-hole (D-106) | R-15 |
 | IT-26 | shim ↔ daemon restart | With the shim's timer running and no tool call, the daemon restarts, from one without `ping` (`unsupported`) and from one with it: the shim is registered again within 20 s, and an armed doorbell rides through the restart without exiting and then delivers (#137) | R-26, CT-08 |
+| IT-27 | script ↔ daemon | `crewchat-send`, a real subprocess in the checkout of an agent the shim registered, posts the STDIN text verbatim (backticks intact) to a channel by name on the agent's default backend, and prints the post ID; a checkout with no registered session exits 4, says so without the text, and nothing is posted (#146) | R-09, R-11 |
 
 ### 6.3 End-to-End Tests (Automated)
 
@@ -1866,7 +1869,7 @@ release PR, whose own CI re-runs every item on the final `main`.
 | R-08 | Token not readable by the agent | Stories 1.4, 3.7 | IT-01, IT-20 | integration test | Pass |
 | R-09 | One tool contract | Story 2.4 | IT-16, E2E-01 | integration / e2e test | Pass |
 | R-10 | Configured server instances | Stories 1.4, 2.1, 2.4 | IT-16 | integration test | Pass |
-| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04 | integration test | Pass |
+| R-11 | Default-backend resolution; headless fails loud | Story 2.4 | IT-04, IT-27 | integration test | Pass |
 | R-12 | Reply follows thread and backend | Story 2.4 | IT-05, E2E-01 | integration / e2e test | Pass |
 | R-13 | Explicit backend used and logged | Story 2.4 | IT-05 | integration test | Pass |
 | R-14 | Protocol marker; older versions parse | Stories 1.4, 2.1, 2.2 | IT-06 | integration test | Pass |
