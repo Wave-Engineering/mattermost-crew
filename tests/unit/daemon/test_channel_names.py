@@ -103,13 +103,99 @@ def test_channel_id_caches_and_evicts_on_404(mm: Any, run: Any) -> None:
     first = len(lookups(mm))
     run(b.read(DEV, "precheck"))
     assert len(lookups(mm)) == first  # cached
-    # The channel is gone: its ID 404s, the entry is dropped, and the next call resolves again.
+    # The channel is gone: its ID 404s, the name resolves once more to the same ID, so the
+    # name is not found, and the entry is dropped so the next call resolves again.
     mm.errors[f"/channels/{PRECHECK}/posts"] = 1
     mm.error_status[f"/channels/{PRECHECK}/posts"] = 404
-    with pytest.raises(NotFoundError):
+    with pytest.raises(NotFound):
         run(b.read(DEV, "precheck"))
+    second = len(lookups(mm))
+    assert second > first
     run(b.read(DEV, "precheck"))
-    assert len(lookups(mm)) > first
+    assert len(lookups(mm)) > second
+
+
+def op_server(daemon: Any, b: Any, run: Any) -> Any:
+    """A call of one chat op as `DEV`, through the daemon's handlers, as the shim makes it."""
+    run(daemon.registry.register(DEV, None, "s1"))
+    handlers = build_handlers(daemon.config, daemon.registry)
+    handlers.update(build_chat_handlers(daemon.registry, {b.name: b}, MyThreads(), AgentContext()))
+    server = DaemonServer(handlers)
+
+    def call(op: str, **args: Any) -> dict[str, Any]:
+        frame = {"proto": 1, "id": "x", "op": op, "args": {"dev_name": DEV, **args}}
+        return run(server.handle_line(json.dumps(frame).encode()))
+
+    return call
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("op", ["send", "read"])
+def test_cached_name_that_refuses_is_not_found(
+    mm: Any, run: Any, daemon: Any, op: str, status: int
+) -> None:
+    """A cached name whose channel was deleted (404), or a private one the agent was removed
+    from (Mattermost's 403), answers `not_found`, not `backend_error` (#148)."""
+    b, _, _ = world(mm)
+    call = op_server(daemon, b, run)
+    args = {"backend": b.name, "channel": "precheck"}
+    assert call("read", **args)["ok"] is True  # cached
+    if op == "send":
+        args = {"backend": b.name, "to": "precheck", "text": "hi"}
+    # A send is `POST /posts`, with the channel in the body; a read names it in the path.
+    fragment = "/posts" if op == "send" else f"/channels/{PRECHECK}/posts"
+    mm.errors[fragment] = 1
+    mm.error_status[fragment] = status
+    refused = call(op, **args)
+    assert refused["ok"] is False and refused["error"].startswith("not_found"), refused
+    assert not mm.posts or all(p["message"] != "hi" for p in mm.posts.values())
+
+
+def test_renamed_name_is_retried_once_on_its_new_id(mm: Any, run: Any) -> None:
+    """The cached ID is gone, but the name now resolves to another channel: the send is
+    retried there once, and the new ID is cached."""
+    b, _, _ = world(mm)
+    run(b.read(DEV, "precheck"))
+    fresh = "n" * 26
+    mm.teams[TEAM][0] = {"id": fresh, "type": "O", "name": "precheck", "display_name": "x"}
+    mm.errors["/posts"] = 1  # the send's `POST /posts`, to the cached ID
+    mm.error_status["/posts"] = 404
+    sent = run(b.send(DEV, "precheck", "moved"))
+    assert mm.posts[sent.post_id]["channel_id"] == fresh
+    n = len(lookups(mm))
+    run(b.send(DEV, "precheck", "again"))
+    assert len(lookups(mm)) == n  # the new ID is cached
+
+
+def test_proxy_403_and_given_id_404_are_not_rewritten(mm: Any, run: Any) -> None:
+    """Only Mattermost's own 403 means the channel is gone: a proxy's 403 page stays an
+    outage. A 404 on an ID the caller gave is raised as it came, with no lookup."""
+    from mcp_server_mattermost.exceptions import MattermostAPIError
+
+    b, _, _ = world(mm)
+    run(b.read(DEV, "precheck"))
+    fragment = f"/channels/{PRECHECK}/posts"
+    mm.errors[fragment] = 1
+    mm.error_status[fragment] = 403
+    mm.error_html.add(fragment)
+    with pytest.raises(MattermostAPIError) as exc_info:
+        run(b.read(DEV, "precheck"))
+    assert not isinstance(exc_info.value, NotFoundError)
+    mm.error_html.discard(fragment)
+    mm.errors[fragment] = 1
+    mm.error_status[fragment] = 404
+    n = len(lookups(mm))
+    with pytest.raises(NotFoundError):
+        run(b.read(DEV, PRECHECK))
+    assert len(lookups(mm)) == n
+
+
+def test_dm_to_an_unknown_username_is_not_found(mm: Any, run: Any, daemon: Any) -> None:
+    """mattermost-crew:triage #48: `chat_dm` to no such user is `not_found`."""
+    b, _, _ = world(mm)
+    call = op_server(daemon, b, run)
+    missing = call("dm", backend=b.name, to="nobody.oaw", text="hi")
+    assert missing["ok"] is False and missing["error"].startswith("not_found"), missing
 
 
 def test_cache_is_per_agent(mm: Any, run: Any) -> None:
@@ -237,6 +323,11 @@ CASES: list[tuple[str, list[dict[str, Any]], str | None]] = [
         "ambiguous",
     ),
     ("dm", [{"id": "F", "name": "x__y", "display_name": "dm", "type": "D"}], None),
+    (
+        "Gone",
+        [{"id": "G", "name": "gone-1", "display_name": "gone", "type": "O", "delete_at": 1}],
+        None,
+    ),
 ]
 
 
@@ -247,7 +338,7 @@ def test_daemon_and_broker_match_agree(
     """`match_channel` is a copy of `crewbroker.membership._match`: both give the same
     answer, or both refuse, on the same cases."""
     from crewbroker.mattermost import NotFound as BrokerNotFound
-    from crewbroker.membership import Target, Unresolved, _match
+    from crewbroker.membership import Target, Unresolved, _match, keep_channel
 
     by_name = {c["name"]: c for c in channels}
 
@@ -264,9 +355,6 @@ def test_daemon_and_broker_match_agree(
     async def daemon_listing() -> list[dict[str, Any]]:
         return channels
 
-    def kept(c: dict[str, Any]) -> bool:
-        return c.get("type") in {"O", "P"}
-
     def outcome(fn: Any) -> tuple[str | None, str]:
         try:
             return fn(), ""
@@ -275,7 +363,8 @@ def test_daemon_and_broker_match_agree(
         except NotFound as exc:
             return None, str(exc)
 
-    broker = outcome(lambda: _match(Target("channel", name), broker_slug, [lambda: channels], kept))
+    target = Target("channel", name)
+    broker = outcome(lambda: _match(target, broker_slug, [lambda: channels], keep_channel))
     ours = outcome(lambda: asyncio.run(match_channel(name, daemon_slug, daemon_listing)))
     assert broker == ours
     assert broker[0] == want

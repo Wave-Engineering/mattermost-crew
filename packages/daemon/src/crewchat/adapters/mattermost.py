@@ -114,6 +114,11 @@ CHANNEL_TYPES = {"O", "P"}  # public and private; never a DM or group message, a
 CHANNEL_CACHE_S = 600.0
 
 
+def keep_channel(item: Mapping[str, Any]) -> bool:
+    """A public or private channel that isn't archived, as the broker's `keep_channel`."""
+    return item.get("type") in CHANNEL_TYPES and not item.get("delete_at")
+
+
 async def match_channel(
     name: str,
     by_slug: Callable[[], Awaitable[dict[str, Any]]],
@@ -133,9 +138,7 @@ async def match_channel(
     wanted = name.casefold()
     found: dict[str, dict[str, Any]] = {}
     for item in await listing():
-        if item.get("type") in CHANNEL_TYPES and (
-            str(item.get("display_name", "")).casefold() == wanted
-        ):
+        if keep_channel(item) and str(item.get("display_name", "")).casefold() == wanted:
             found[str(item["id"])] = item
     if len(found) == 1:
         return next(iter(found))
@@ -190,6 +193,13 @@ def unreadable(exc: Exception) -> bool:
         isinstance(exc, MattermostAPIError)
         and exc.status_code in UNREADABLE
         and exc.error_id is not None
+    )
+
+
+def stale_channel(exc: Exception) -> bool:
+    """Whether a channel's ID answered as gone: a 404, or Mattermost's own 403 (#148)."""
+    return isinstance(exc, NotFoundError) or (
+        isinstance(exc, MattermostAPIError) and exc.status_code == 403 and exc.error_id is not None
     )
 
 
@@ -352,7 +362,7 @@ class MattermostBackend:
         self._clients: dict[str, _Client] = {}
         self._agents: dict[str, _Agent] = {}
         self._users: dict[str, dict[str, Any]] = {}  # author ID -> user object, cached
-        # (dev_name, casefolded name) -> (channel ID, expiry): per agent, as each resolves as
+        # (dev_name, name as given) -> (channel ID, expiry): per agent, as each resolves as
         # itself, so one agent never learns a private channel's ID from another's lookup (#145).
         self._channels: dict[tuple[str, str], tuple[str, float]] = {}
         self._monotonic = monotonic
@@ -503,6 +513,36 @@ class MattermostBackend:
         if channel_id != channel:
             self._channels.pop((dev_name, channel.removeprefix("#")), None)
 
+    async def _on_channel(
+        self,
+        dev_name: str,
+        client: MattermostClient,
+        channel: str,
+        op: Callable[[str], Awaitable[T]],
+    ) -> T:
+        """`op` on `channel` as an ID. When a name's ID answers 404, or Mattermost's own 403
+        (a channel deleted, or a private one the agent left), the entry is dropped and the name
+        resolved once more: `op` is retried once on a new ID, which is safe because the refused
+        request made nothing; else the name is `NotFound`. An ID the caller gave is passed
+        through, and its 404 raised as it came."""
+        channel_id = await self._channel_id(dev_name, client, channel)
+        try:
+            return await op(channel_id)
+        except MattermostAPIError as exc:
+            if channel_id == channel or not stale_channel(exc):
+                raise
+        self._forget_channel(dev_name, channel, channel_id)
+        fresh = await self._channel_id(dev_name, client, channel)
+        if fresh != channel_id:
+            try:
+                return await op(fresh)
+            except MattermostAPIError as exc:
+                if not stale_channel(exc):
+                    raise
+        # The name still resolves, but to an ID that refuses: never left in the cache.
+        self._forget_channel(dev_name, channel, fresh)
+        raise NotFound(f"channel {channel!r}")
+
     async def resolve(
         self, dev_name: str, name: str, type: str = "channel", guild_id: str | None = None
     ) -> dict[str, Any]:
@@ -566,12 +606,12 @@ class MattermostBackend:
         require_channel_name(channel)  # before any request (#62)
 
         async def request(client: MattermostClient) -> InboundMessage:
-            channel_id = await self._channel_id(dev_name, client, channel)
-            try:
-                return await self._post(client, channel_id, text, thread, attachments, embed)
-            except NotFoundError:
-                self._forget_channel(dev_name, channel, channel_id)
-                raise
+            return await self._on_channel(
+                dev_name,
+                client,
+                channel,
+                lambda cid: self._post(client, cid, text, thread, attachments, embed),
+            )
 
         return await self._call(dev_name, request)
 
@@ -582,8 +622,12 @@ class MattermostBackend:
         require_channel_name(channel)
 
         async def request(client: MattermostClient) -> InboundMessage:
-            channel_id = await self._channel_id(dev_name, client, channel)
-            return await self._post(client, channel_id, text, thread, (), None, kiosk=True)
+            return await self._on_channel(
+                dev_name,
+                client,
+                channel,
+                lambda cid: self._post(client, cid, text, thread, (), None, kiosk=True),
+            )
 
         return await self._call(dev_name, request)
 
@@ -631,18 +675,15 @@ class MattermostBackend:
     ) -> list[InboundMessage]:
         require_channel_name(channel)  # before any request (#62)
 
+        async def fetch(client: MattermostClient, channel_id: str) -> dict[str, Any]:
+            if since is not None:
+                return await client.get_posts_since(channel_id, int(since * 1000))
+            return await client.get_posts(channel_id, per_page=limit or DEFAULT_READ_LIMIT)
+
         async def request(client: MattermostClient) -> list[InboundMessage]:
-            channel_id = await self._channel_id(dev_name, client, channel)
-            try:
-                if since is not None:
-                    result = await client.get_posts_since(channel_id, int(since * 1000))
-                else:
-                    result = await client.get_posts(
-                        channel_id, per_page=limit or DEFAULT_READ_LIMIT
-                    )
-            except NotFoundError:
-                self._forget_channel(dev_name, channel, channel_id)
-                raise
+            result = await self._on_channel(
+                dev_name, client, channel, lambda cid: fetch(client, cid)
+            )
             return await self._messages(client, result)
 
         messages = await self._call(dev_name, request)
@@ -672,7 +713,10 @@ class MattermostBackend:
         me = await self.user_id(dev_name)
 
         async def request(client: MattermostClient) -> InboundMessage:
-            other = user_id or str((await client.get_user_by_username(str(username)))["id"])
+            try:
+                other = user_id or str((await client.get_user_by_username(str(username)))["id"])
+            except NotFoundError as exc:
+                raise NotFound(f"user {username!r}") from exc
             channel = await client.create_direct_channel([me, other])
             return await self._post(client, str(channel["id"]), text, None, attachments, embed)
 

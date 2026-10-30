@@ -23,8 +23,15 @@ All notable changes to this project are recorded here. The format follows
   in, is `not_found`; neither posts anywhere. A bot on more than one team is told to pass the
   channel ID. `chat_resolve` without a `guild_id` now resolves a channel on the named or
   default backend, so it works on Mattermost; with a `guild_id` it is Discord's, as before.
+  A name is cached for 10 minutes. When its channel is deleted, or the bot is removed from a
+  private one, the name is resolved again: a renamed channel's send is retried once on its new
+  ID, else it is `not_found`. A name reused by a new channel within those 10 minutes still
+  reaches the old one until the entry expires, so pass the ID where that matters.
 
 ### Fixed
+
+- **`chat_dm` to an unknown username is `not_found`**, not `backend_error … NotFoundError`
+  (#148, mattermost-crew:triage #48).
 
 - **An idle session registers again after a daemon restart, with no tool call** (#137). From
   this release on, #129's claim in 0.2.4 holds: the shim's timer pings every 15 s, and
