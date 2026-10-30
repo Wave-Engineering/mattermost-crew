@@ -100,7 +100,9 @@ REPO_ENTRY_RE = re.compile(r"^[a-z0-9.-]+(/[A-Za-z0-9._-]+){2,}$")
 SERVER_RE = re.compile(r"^[a-z0-9._-]+$")
 # `<root>/status` is world-traversable, and `.` and `..` are no directory of their own.
 RESERVED_SERVERS = frozenset({"status", ".", ".."})
-MANIFEST_KEYS = frozenset({"server", "generated_at", "refresh_minutes", "repos", "exclude"})
+MANIFEST_KEYS = frozenset(
+    {"server", "generated_at", "refresh_minutes", "max_turns", "repos", "exclude"}
+)
 
 # Matched, casefolded, against every path component, the basename among them.
 DENYLIST = (
@@ -151,6 +153,7 @@ class Manifest:
     server: str
     generated_at: str
     refresh_minutes: int
+    max_turns: int
     repos: tuple[str, ...]
     exclude: frozenset[str]
 
@@ -209,13 +212,16 @@ def load_manifest(path: Path) -> Manifest:
         raise ManifestError(f"{path}: generated_at must be a string")
     if isinstance(refresh, bool) or not isinstance(refresh, int) or refresh < 1:
         raise ManifestError(f"{path}: refresh_minutes must be a positive integer")
+    turns = data["max_turns"]
+    if isinstance(turns, bool) or not isinstance(turns, int) or turns < 1:
+        raise ManifestError(f"{path}: max_turns must be a positive integer")
     if not isinstance(repos, list) or not all(is_repo(r) for r in repos):
         raise ManifestError(f"{path}: repos must be a list of host/group/.../repo")
     if not isinstance(exclude, list) or not all(
         isinstance(e, str) and is_repo(e) and e == canon_key(e) for e in exclude
     ):
         raise ManifestError(f"{path}: exclude must be canonical repo keys")
-    return Manifest(server, generated, refresh, tuple(repos), frozenset(exclude))
+    return Manifest(server, generated, refresh, turns, tuple(repos), frozenset(exclude))
 
 
 class SameHostRedirects(urllib.request.HTTPRedirectHandler):

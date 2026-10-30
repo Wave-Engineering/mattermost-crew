@@ -127,8 +127,12 @@ class Clock:
         self.now += timedelta(minutes=minutes)
 
 
-def manifest(*repos: str, exclude: tuple[str, ...] = (), refresh: int = 15) -> Manifest:
-    return Manifest(SERVER, "2026-10-30T12:00:00+00:00", refresh, repos, frozenset(exclude))
+def manifest(
+    *repos: str, exclude: tuple[str, ...] = (), refresh: int = 15, max_turns: int = 8
+) -> Manifest:
+    return Manifest(
+        SERVER, "2026-10-30T12:00:00+00:00", refresh, max_turns, repos, frozenset(exclude)
+    )
 
 
 def write_manifest(
@@ -140,6 +144,7 @@ def write_manifest(
         "server": server,
         "generated_at": "2026-10-30T12:00:00+00:00",
         "refresh_minutes": 15,
+        "max_turns": 8,
         "repos": [],
         "exclude": [],
     }

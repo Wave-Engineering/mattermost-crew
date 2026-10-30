@@ -178,17 +178,20 @@ def test_server_research_keys_parse() -> None:
     assert server.kiosk_research is False
     assert server.corpus_extra == () and server.corpus_exclude == ()
     assert server.corpus_refresh_minutes == 15
+    assert server.kiosk_max_turns == 8
     raw = _research(
         _raw(),
         corpus_extra=["forge.example.lan/partner-org/docs"],
         corpus_exclude=["forge.example.lan/partner-org/group/infra"],
         corpus_refresh_minutes=60,
+        kiosk_max_turns=4,
     )
     (server,) = parse_config(raw).mattermost
     assert server.kiosk_research is True
     assert server.corpus_extra == ("forge.example.lan/partner-org/docs",)
     assert server.corpus_exclude == ("forge.example.lan/partner-org/group/infra",)
     assert server.corpus_refresh_minutes == 60
+    assert server.kiosk_max_turns == 4
 
 
 @pytest.mark.parametrize(
@@ -199,6 +202,8 @@ def test_server_research_keys_parse() -> None:
         ({"id": ".."}, "mattermost id '..' is reserved"),
         ({"corpus_refresh_minutes": 0}, "corpus_refresh_minutes"),
         ({"corpus_refresh_minutes": True}, "corpus_refresh_minutes"),
+        ({"kiosk_max_turns": 0}, "kiosk_max_turns must be an integer of at least 1"),
+        ({"kiosk_max_turns": True}, "kiosk_max_turns"),
         ({"corpus_extra": "forge.example.lan/a/b"}, "corpus_extra must be an array"),
         ({"corpus_extra": ["forge.example.lan/org"]}, "is not host/group/.../repo"),
         ({"corpus_extra": ["forge.example.lan/org/repo.git/"]}, "is not host/group/.../repo"),
