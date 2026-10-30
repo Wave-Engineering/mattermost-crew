@@ -109,7 +109,8 @@ HOSTILE_IDS = [
     "a%2Fb",
     "",
 ]
-HOSTILE_CHANNELS = [h for h in HOSTILE_IDS if h not in {"A" * 26, "a" * 27}]
+# A channel may be a name (#145), checked in `test_channel_names`; these can be no name at all.
+HOSTILE_CHANNELS = ["a" * 26 + "\n", "a\x00b", "", "x" * 65]
 
 
 def test_mattermost_hostile_ids_send_nothing(mm: Any, run: Any) -> None:
@@ -129,8 +130,8 @@ def test_mattermost_hostile_ids_send_nothing(mm: Any, run: Any) -> None:
             with pytest.raises(ValueError):
                 run(call())
         assert run(b.has_post(DEV, bad)) is False
-    # A channel may now be a name (#145), so `"A" * 26` and `"a" * 27` are names to look up.
-    # What can't be one, a path, query or control character, still sends nothing.
+    # A channel may now be a name (#145), looked up without its text in any path. What can't
+    # be one, empty, too long or with a control character, still sends nothing.
     for bad in HOSTILE_CHANNELS:
         for call in (
             lambda bad=bad: b.read(DEV, bad),

@@ -27,8 +27,8 @@ through `SocketTransport`, as an agent's session does.
   the fake is healthy again, the next read is served through scream-hole.
 - IT-28 (R-09, #145): on Mattermost, `chat_send`, `chat_read` and `chat_read(post_id)` take a
   channel's URL name, `#name` or display name (a private channel's too), and `chat_resolve`
-  answers its ID with no `guild_id`; an unknown name is `not_found`, a path is `bad_request`,
-  and `type="user"` is `unsupported`.
+  answers its ID with no `guild_id`; an unknown name (`../users/me` too) is `not_found`, a
+  control character is `bad_request`, and `type="user"` is `unsupported`.
 
 IT-15 and IT-25 need no Mattermost and always run; the others skip without one.
 """
@@ -431,8 +431,10 @@ def test_it28_mattermost_channel_names(
 
             with pytest.raises(ShimError, match="not_found"):
                 await shim.chat_send("it28-no-such-room", "never sent")
+            with pytest.raises(ShimError, match="not_found"):
+                await shim.chat_read("../users/me")  # a display name at most: in no path
             with pytest.raises(ShimError, match="bad_request"):
-                await shim.chat_read("../users/me")
+                await shim.chat_read("it28\nroom")
             with pytest.raises(ShimError, match="unsupported"):
                 await shim.chat_resolve("bj", type="user")
 

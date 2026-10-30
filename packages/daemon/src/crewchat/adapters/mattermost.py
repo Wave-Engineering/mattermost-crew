@@ -106,9 +106,10 @@ def require_mm_id(value: str, what: str) -> str:
 # A channel name `send`, `read` and `resolve` accept for an ID (#145). The URL-name test is the
 # broker's (`crewbroker.membership.SLUG_RE`): only a name it matches is ever put in a REST path.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-# Any other name is only ever compared with display names, never put in a path; still, one
-# that carries a path, query or control character is refused before any request (#62).
-CHANNEL_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\?#%]{1,64}$")
+# Any other name is only ever compared with display names, never put in a path, so a display
+# name such as `Q&A / Support` is fine; one with a control character, or past Mattermost's
+# 64-character limit, is refused before any request (#62).
+CHANNEL_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 CHANNEL_TYPES = {"O", "P"}  # public and private; never a DM or group message, as the broker
 CHANNEL_CACHE_S = 600.0
 
@@ -148,12 +149,12 @@ async def match_channel(
 
 def require_channel_name(value: str) -> str:
     """A channel ID unchanged, else the name without one leading `#`; a `ValueError`
-    (`bad_request`) for anything with a path, query or control character, before any
-    request is made (#62, #145)."""
+    (`bad_request`) for an empty name, a control character or more than 64 characters,
+    before any request is made (#62, #145)."""
     if is_mm_id(value):
         return value
     name = value.removeprefix("#") if isinstance(value, str) else ""
-    if name in {".", ".."} or not CHANNEL_NAME_RE.fullmatch(name):
+    if not CHANNEL_NAME_RE.fullmatch(name) or not name.strip():
         raise ValueError(f"channel must be a Mattermost ID or a channel name, not {value!r}")
     return name
 
@@ -471,7 +472,9 @@ class MattermostBackend:
         if is_mm_id(channel):
             return channel
         name = require_channel_name(channel)
-        key = (dev_name, name.casefold())
+        # Keyed on the name as given: `standup` (a URL name) and `Standup` (a display name)
+        # can be two channels.
+        key = (dev_name, name)
         held = self._channels.get(key)
         if held is not None and held[1] > self._monotonic():
             return held[0]
@@ -495,9 +498,10 @@ class MattermostBackend:
         return found
 
     def _forget_channel(self, dev_name: str, channel: str, channel_id: str) -> None:
-        """A 404 on a resolved channel's ID: drop it, so the next call resolves again."""
+        """A resolved channel's ID that 404s, or doesn't hold the post asked for: drop it, so
+        the next call resolves again."""
         if channel_id != channel:
-            self._channels.pop((dev_name, channel.removeprefix("#").casefold()), None)
+            self._channels.pop((dev_name, channel.removeprefix("#")), None)
 
     async def resolve(
         self, dev_name: str, name: str, type: str = "channel", guild_id: str | None = None
@@ -596,6 +600,7 @@ class MattermostBackend:
             except NotFoundError as exc:
                 raise NotFound(f"post {post_id}") from exc
             if channel_id and str(post.get("channel_id", "")) != channel_id:
+                self._forget_channel(dev_name, channel, channel_id)
                 raise NotFound(f"post {post_id} in {channel}")
             return await self.message(client, post)
 

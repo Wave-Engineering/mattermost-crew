@@ -132,10 +132,8 @@ def test_team_choice_single_several_and_none(mm: Any, run: Any) -> None:
         run(b.read(DEV, "precheck"))
 
 
-@pytest.mark.parametrize(
-    "bad", ["", "#", "..", "#..", "a/b", "../users/me", "a?x=1", "a\n", "a%2Fb", "a\\b", "x" * 65]
-)
-def test_hostile_channel_names_send_nothing(mm: Any, run: Any, bad: str) -> None:
+@pytest.mark.parametrize("bad", ["", "#", " ", "a\n", "a\x00b", "a\x7f", "x" * 65])
+def test_malformed_channel_names_send_nothing(mm: Any, run: Any, bad: str) -> None:
     b, _, _ = world(mm)
     before = list(mm.requests)
     for call in (
@@ -147,6 +145,56 @@ def test_hostile_channel_names_send_nothing(mm: Any, run: Any, bad: str) -> None
         with pytest.raises(ValueError):
             run(call())
     assert [r for r in mm.requests if r not in before] == []
+
+
+@pytest.mark.parametrize(
+    "odd", ["..", "#..", "a/b", "../users/me", "a?x=1", "a%2Fb", "a\\b", "A" * 26]
+)
+def test_unslug_names_never_reach_a_path(mm: Any, run: Any, odd: str) -> None:
+    """Only a URL-name-shaped name is put in a REST path. Any other is compared with display
+    names only, so it reaches no path built from it, and an unmatched one is `not_found`."""
+    b, _, _ = world(mm)
+    before = list(mm.requests)
+    with pytest.raises(NotFound):
+        run(b.send(DEV, odd, "x"))
+    new = [p for (_m, p, _t) in mm.requests if (_m, p, _t) not in before]
+    assert all("/name/" not in p for p in new), new
+    listings = {"/users/me/teams", f"/users/me/teams/{TEAM}/channels"}
+    assert {p for p in new if "/teams" in p} <= listings
+
+
+def test_display_name_with_path_characters(mm: Any, run: Any) -> None:
+    b, _, _ = world(mm)
+    qa = "s" * 26
+    mm.teams[TEAM].append({"id": qa, "type": "O", "name": "qa", "display_name": "Q&A / Support"})
+    for name in ("Q&A / Support", "#q&a / support"):
+        sent = run(b.send(DEV, name, "hi"))
+        assert mm.posts[sent.post_id]["channel_id"] == qa
+
+
+def test_cache_keeps_url_name_and_display_name_apart(mm: Any, run: Any) -> None:
+    """`standup` is A's URL name and `Standup` is B's display name: two channels, in either
+    order, while both are cached."""
+    b, _, _ = world(mm)
+    a, b_id = "a" * 26, "b" * 26
+    mm.teams[TEAM] += [
+        {"id": a, "type": "O", "name": "standup", "display_name": "Morning"},
+        {"id": b_id, "type": "O", "name": "daily", "display_name": "Standup"},
+    ]
+    assert mm.posts[run(b.send(DEV, "Standup", "1")).post_id]["channel_id"] == b_id
+    assert mm.posts[run(b.send(DEV, "standup", "2")).post_id]["channel_id"] == a
+    assert mm.posts[run(b.send(DEV, "Standup", "3")).post_id]["channel_id"] == b_id
+
+
+def test_read_one_drops_a_mapping_whose_channel_lacks_the_post(mm: Any, run: Any) -> None:
+    b, _, _ = world(mm)
+    elsewhere = mm.add_post(mm.add_user("bj", is_bot=False), ROLL, "in roll call")
+    run(b.read(DEV, "precheck"))
+    n = len(lookups(mm))
+    with pytest.raises(NotFound):
+        run(b.read_one(DEV, "precheck", elsewhere["id"]))
+    run(b.read(DEV, "precheck"))
+    assert len(lookups(mm)) > n  # resolved again
 
 
 def test_resolve_channel_on_mattermost(mm: Any, run: Any, daemon: Any) -> None:
