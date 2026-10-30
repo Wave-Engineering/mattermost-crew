@@ -5,8 +5,9 @@
 #
 # Needs the crewcorpus user and group, packaging/crewcorpus.tmpfiles.conf and
 # packaging/crewchat-pool.tmpfiles.conf installed first, gitleaks 8.19 or later on PATH (for
-# `gitleaks dir`), and /etc/crewkiosk/corpus-<server_id>.credential (0600, crewcorpus) for each
-# research server: a read-only forge token, on its first line.
+# `gitleaks dir`), and /etc/crewkiosk/corpus-<server_id>-<forge host>.credential (0600,
+# crewcorpus) for each forge host in each research server's pool: a read-only token for that
+# forge, on its first line. A host with no credential is never contacted.
 [Unit]
 Description=mattermost-crew kiosk corpus builder
 Wants=network-online.target

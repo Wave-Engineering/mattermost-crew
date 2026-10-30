@@ -7,14 +7,16 @@ The kiosk never sees it.
 
 Per repo:
 
-1. **Resolve its canonical path** through the forge API, with the server's corpus credential.
-   A forge keeps redirects after a rename or transfer, so a manifest path can lead to a repo
-   the operator excluded under its new name. A canonical path that is excluded, with or without
-   `.wiki`, is never cloned, and its last good copy is dropped. A lookup that fails is
+1. **Resolve its canonical path** through the forge API, with that server's credential for that
+   repo's forge host (`corpus-<server>-<host>.credential`): a forge is never sent another's
+   token, and a host with no credential is never asked. A forge keeps redirects after a rename
+   or transfer, so a manifest path can lead to a repo the operator excluded under its new name.
+   A canonical path that is excluded, with or without `.wiki`, is never cloned, and its last
+   good copy is dropped. A lookup that fails, or that redirects off its forge, is
    `clone_failed`: the unresolved path is never cloned.
-2. **Clone** the canonical path at depth 1, blobs over 5 MB left out, no checkout. The token
-   reaches git through `GIT_ASKPASS`, which reads the credential file itself, so it is never in
-   an argv, a URL or the environment.
+2. **Clone** the canonical path at depth 1, blobs over 5 MB left out, no checkout, and no
+   redirect followed. The token reaches git through `GIT_ASKPASS`, which reads the credential
+   file itself, so it is never in an argv, a URL or the environment.
 3. **Extract** the tree from the object store, not a checkout: a checkout would fetch every
    blob the filter left out. Only regular files of 5 MB or less that are UTF-8 text with no NUL
    are kept. Symlinks, submodules and `.git` never reach the tree, nor does any path with a
@@ -22,8 +24,12 @@ Per repo:
 4. **Scan** it with `gitleaks dir`. A finding or a gitleaks error withholds the repo, and its
    last good copy is served. Only the rule ids and file paths are logged, never a value. A repo
    may not exempt itself: `.gitleaks.toml` and `.gitleaksignore` never reach the tree, gitleaks
-   runs from an empty directory with no `GITLEAKS_*` variables, and it scans a copy in which
-   `gitleaks:allow` is neutralized. A missing gitleaks publishes nothing at all.
+   runs from an empty directory with no `GITLEAKS_*` variables, and it scans a flat copy, each
+   file as `f<n>`, so its default path allowlist (`node_modules/`, `*.svg`, lock files) matches
+   nothing, with `gitleaks:allow` neutralized. A missing gitleaks publishes nothing at all.
+
+A filesystem error fails that one repo, and a failed build fails that one server: neither stops
+the rest. A repo whose path lies under another pooled repo's is refused.
 
 Each server is published as a new generation, `gen-<utc>-<n>`, with dirs 0555 and files 0444,
 and `current` is swapped onto it atomically. Generations older than the previous one are
@@ -62,7 +68,8 @@ log = logging.getLogger(__name__)
 
 CORPUS_ROOT = Path("/var/lib/crewcorpus")
 POOL_DIR = Path("/var/lib/crewchat-pool")
-CREDENTIAL = "/etc/crewkiosk/corpus-{server}.credential"
+# One token per forge host: a pool may span forges, and no forge is ever sent another's token.
+CREDENTIAL = "/etc/crewkiosk/corpus-{server}-{host}.credential"
 MAX_FILE_BYTES = 5 * 1024 * 1024
 TEXT_PROBE_BYTES = 8 * 1024
 GIT_TIMEOUT_S = 600
@@ -183,9 +190,29 @@ def load_manifest(path: Path) -> Manifest:
     return Manifest(server, generated, refresh, tuple(repos), frozenset(exclude))
 
 
+class SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to https on the same host: urllib would carry the token's
+    header to wherever a redirect points."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if new.scheme != "https" or new.hostname != old.hostname:
+            raise urllib.error.HTTPError(newurl, code, "redirect off the forge", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def forge_canonical(repo: str, token: str) -> str:
     """`repo`'s canonical `host/path`, from the forge's API: GitHub's `full_name`, GitLab's
-    `path_with_namespace`. A redirect is followed, which is the point. Raises LookupFailed."""
+    `path_with_namespace`. A same-host redirect is followed, which is the point; any other is
+    refused. Raises LookupFailed."""
     host, path = repo.split("/", 1)
     if host == "github.com":
         if path.count("/") != 1:
@@ -197,8 +224,9 @@ def forge_canonical(repo: str, token: str) -> str:
         url, key = f"https://{host}/api/v4/projects/{encoded}", "path_with_namespace"
         headers = {"PRIVATE-TOKEN": token}
     request = urllib.request.Request(url, headers=headers)
+    opener = urllib.request.build_opener(SameHostRedirects())
     try:
-        with urllib.request.urlopen(request, timeout=LOOKUP_TIMEOUT_S) as reply:
+        with opener.open(request, timeout=LOOKUP_TIMEOUT_S) as reply:
             data = json.loads(reply.read())
     except urllib.error.HTTPError as exc:
         raise LookupFailed(f"{repo}: the forge answered {exc.code}") from None
@@ -252,7 +280,8 @@ class Git:
         }
 
     def run(self, *args: str, cwd: Path | None = None) -> bytes:
-        argv = ["git", "-c", "credential.helper=", *args]
+        # The canonical path needs no redirect, and git would answer one with the token.
+        argv = ["git", "-c", "credential.helper=", "-c", "http.followRedirects=false", *args]
         try:
             done = subprocess.run(
                 argv, cwd=cwd, env=self.env, capture_output=True, timeout=GIT_TIMEOUT_S
@@ -376,19 +405,23 @@ class Scan:
 
 
 def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
-    """`gitleaks dir` over a copy of `tree` with `gitleaks:allow` neutralized: hard links,
-    except for the files that carry the marker. The report keeps only rule ids and paths."""
+    """`gitleaks dir` over a flat copy of `tree`: each file as `f<n>`, a hard link, or a
+    rewrite with `gitleaks:allow` neutralized if it carries the marker. The default config
+    allowlists paths (`node_modules/`, `vendor/`, `*.svg`, lock files and more), so a file
+    scanned under its own path could ship unscanned; under `f<n>` no path matches. Findings
+    are mapped back to the tree's paths. The report keeps only rule ids and paths."""
     shadow, empty, report = work / "scan", work / "empty", work / "leaks.json"
     empty.mkdir()
-    for src in sorted(p for p in tree.rglob("*") if p.is_file()):
-        dest = shadow / src.relative_to(tree)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+    shadow.mkdir()
+    names: dict[str, str] = {}
+    for n, src in enumerate(sorted(p for p in tree.rglob("*") if p.is_file()), 1):
+        dest = shadow / f"f{n:06d}"
+        names[dest.name] = str(src.relative_to(tree))
         data = src.read_bytes()
         if ALLOW_MARKER in data:
             dest.write_bytes(data.replace(ALLOW_MARKER, ALLOW_NEUTRALIZED))
         else:
             os.link(src, dest)
-    shadow.mkdir(exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")}
     argv = [
         gitleaks,
@@ -414,7 +447,7 @@ def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
     try:
         findings = json.loads(report.read_text(encoding="utf-8"))
         rules = sorted({str(f["RuleID"]) for f in findings})
-        paths = sorted({str(Path(f["File"]).relative_to(shadow)) for f in findings})
+        paths = sorted({names[Path(f["File"]).name] for f in findings})
     except (OSError, ValueError, KeyError, TypeError):
         return Scan(False, "gitleaks found leaks, and its report is unreadable")
     return Scan(False, "gitleaks found leaks", tuple(rules), tuple(paths))
@@ -452,6 +485,21 @@ def drop_published(gen: Path, repo: str) -> None:
         os.chmod(parent, DIR_MODE)
 
 
+def discard(target: Path) -> None:
+    """Remove a repo's partial copy from a generation still being built; never raises."""
+    with contextlib.suppress(OSError):
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        else:
+            remove_tree(target)
+
+
+def nested_repos(repos: Iterable[str]) -> set[str]:
+    """Each repo whose path lies under another's (`host/org/a/b` under `host/org/a`)."""
+    listed = set(repos)
+    return {r for r in listed if any(r.startswith(f"{s}/") for s in listed if s != r)}
+
+
 def link_copy(src: Path, dest: Path) -> None:
     """A last good copy, as hard links: its files are 0444 and never written again."""
     for dirpath, _, filenames in os.walk(src):
@@ -472,7 +520,9 @@ class Builder:
         root: Path = CORPUS_ROOT,
         *,
         gitleaks: str = "gitleaks",
-        credential: Callable[[str], Path] = lambda s: Path(CREDENTIAL.format(server=s)),
+        credential: Callable[[str, str], Path] = lambda s, h: Path(
+            CREDENTIAL.format(server=s, host=h)
+        ),
         lookup: Lookup = forge_canonical,
         clone_url: CloneUrl = https_url,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -515,18 +565,28 @@ class Builder:
         last_gen = current.resolve() if current.is_symlink() else None
         now = self.clock()
         work = Path(tempfile.mkdtemp(dir=server_root, prefix=".work-"))
+        gen: Path | None = None
+        swapped = False
         try:
             gen = self._new_gen(server_root, now)
-            results = {
-                repo: self._repo(manifest, repo, work, gen, previous.get(repo), last_gen, now)
-                for repo in manifest.repos
-            }
+            nested = nested_repos(manifest.repos)
+            results: dict[str, RepoResult] = {}
+            for repo in manifest.repos:
+                if repo in nested:
+                    # Its tree would land inside another repo's.
+                    log.error("corpus %s: %s nests inside another pooled repo", server, repo)
+                    results[repo] = RepoResult("clone_failed")
+                    continue
+                results[repo] = self._repo(
+                    manifest, repo, work, gen, previous.get(repo), last_gen, now
+                )
             set_modes(gen)
             link = server_root / "current.new"
             with contextlib.suppress(FileNotFoundError):
                 link.unlink()
             link.symlink_to(gen.name)
             os.replace(link, current)
+            swapped = True
             for old in server_root.glob("gen-*"):
                 if old.resolve() not in {gen.resolve(), last_gen}:
                     remove_tree(old)
@@ -536,6 +596,8 @@ class Builder:
                     drop_published(last_gen, repo)
         finally:
             remove_tree(work)
+            if gen is not None and not swapped:
+                remove_tree(gen)  # a half-built generation, never published
         status = {
             "server": server,
             "built_at": now.isoformat(),
@@ -563,9 +625,15 @@ class Builder:
         last_gen: Path | None,
         now: datetime,
     ) -> RepoResult:
-        """One repo, published into `gen`: fresh, its last good copy, or nothing."""
+        """One repo, published into `gen`: fresh, its last good copy, or nothing. A filesystem
+        error (a full disk, a name too long) fails this repo only, never the build."""
         server = manifest.server
-        result = self._fresh(manifest, repo, work, gen)
+        try:
+            result = self._fresh(manifest, repo, work, gen)
+        except OSError as exc:
+            log.error("corpus %s: %s: %s", server, repo, exc.strerror or type(exc).__name__)
+            discard(gen / repo)
+            result = RepoResult("clone_failed")
         if result.state == "ok":
             result.last_ok = now.isoformat()
             return result
@@ -573,7 +641,17 @@ class Builder:
             return result
         old = last_gen / repo if last_gen is not None else None
         if old is not None and old.is_dir() and isinstance(before, dict):
-            link_copy(old, gen / repo)
+            try:
+                link_copy(old, gen / repo)
+            except OSError as exc:
+                log.error(
+                    "corpus %s: %s: its last good copy: %s",
+                    server,
+                    repo,
+                    exc.strerror or type(exc).__name__,
+                )
+                discard(gen / repo)
+                return RepoResult(result.state)
             log.warning(
                 "corpus %s: %s is %s, serving its last good copy", server, repo, result.state
             )
@@ -589,12 +667,21 @@ class Builder:
     def _fresh(self, manifest: Manifest, repo: str, work: Path, gen: Path) -> RepoResult:
         server = manifest.server
         here = Path(tempfile.mkdtemp(dir=work, prefix="repo-"))
-        credential = self.credential(server)
+        host = repo.split("/", 1)[0]
+        credential = self.credential(server, host)
         try:
             token = read_token(credential)
+        except (OSError, ValueError) as exc:
+            # No token for this forge: nothing is asked of it, and no other forge's is sent.
+            log.error("corpus %s: %s: no credential for %s: %s", server, repo, host, _no_token(exc))
+            return RepoResult("clone_failed")
+        try:
             canonical = self.lookup(repo, token)
-        except (OSError, ValueError, LookupFailed) as exc:
-            log.error("corpus %s: %s: lookup failed: %s", server, repo, _no_token(exc))
+        except LookupFailed as exc:
+            log.error("corpus %s: %s: lookup failed: %s", server, repo, exc)
+            return RepoResult("clone_failed")
+        if canonical.split("/", 1)[0] != host:
+            log.error("corpus %s: %s resolves off its forge, to %s", server, repo, canonical)
             return RepoResult("clone_failed")
         if is_excluded(canonical, manifest.exclude):
             log.warning(
@@ -654,8 +741,9 @@ def _no_token(exc: BaseException) -> str:
 
 def run(pool_dir: Path, builder: Builder) -> int:
     """Build every due server. 2 if gitleaks or the corpus root is missing (nothing is
-    published), 1 if a manifest was malformed, else 0. A withheld or failed repo is a state in
-    `health`, not an error."""
+    published), 1 if a manifest was malformed or a server's build failed, else 0. One server's
+    failure never stops the others. A withheld or failed repo is a state in `health`, not an
+    error."""
     if shutil.which(builder.gitleaks) is None:
         log.error("corpus: no gitleaks (%s): nothing is published unscanned", builder.gitleaks)
         return 2
@@ -674,7 +762,13 @@ def run(pool_dir: Path, builder: Builder) -> int:
         if not builder.due(manifest):
             log.info("corpus %s: built within %d min", manifest.server, manifest.refresh_minutes)
             continue
-        builder.build(manifest)
+        try:
+            builder.build(manifest)
+        except Exception as exc:
+            log.error(
+                "corpus %s: the build failed: %s: %s", manifest.server, type(exc).__name__, exc
+            )
+            code = 1
     return code
 
 

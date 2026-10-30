@@ -62,6 +62,12 @@ def test_it29_builds_filters_and_withholds(
     )
     lib = forge.repo("lib", {"README.md": b"lib v1\n"})
     moved = forge.repo("moved", {"README.md": b"was public\n"})
+    # gitleaks' default config never scans these paths: the builder must scan them anyway.
+    vendored = github_token()
+    vend = forge.repo(
+        "vend", {"node_modules/pkg/index.js": f'module.exports = "{vendored}"\n'.encode()}
+    )
+    art = forge.repo("art", {"logo.svg": f"<svg><desc>{vendored}</desc></svg>\n".encode()})
     renamed: set[str] = set()
     credential = tmp_path / "corpus-dev.credential"
     credential.write_text(TOKEN + "\n")
@@ -70,13 +76,13 @@ def test_it29_builds_filters_and_withholds(
     builder = Builder(
         root,
         gitleaks=gitleaks,
-        credential=lambda server: credential,
+        credential=lambda server, host: credential,
         lookup=lambda repo, token: HIDDEN if repo in renamed else repo,
         clone_url=forge.url,
         clock=clock,
     )
     pool = tmp_path / "pool"
-    write_manifest(pool, repos=[app, lib, moved], exclude=[HIDDEN])
+    write_manifest(pool, repos=[app, lib, moved, vend, art], exclude=[HIDDEN])
 
     assert run(pool, builder) == 0
     current = root / SERVER / "current"
@@ -85,7 +91,10 @@ def test_it29_builds_filters_and_withholds(
         app: "ok",
         lib: "ok",
         moved: "ok",
+        vend: "withheld",
+        art: "withheld",
     }
+    assert not (current / vend).exists() and not (current / art).exists()
     top = current / app
     assert {str(p.relative_to(top)) for p in top.rglob("*")} == {"README.md", "src", "src/main.py"}
     for p in [current.resolve(), *current.resolve().rglob("*")]:
@@ -108,12 +117,15 @@ def test_it29_builds_filters_and_withholds(
         app: "ok",
         lib: "withheld",
         moved: "excluded",
+        vend: "withheld",
+        art: "withheld",
     }
     assert (current / lib / "README.md").read_text() == "lib v1\n"  # its last good copy
     assert status["repos"][lib]["commit"] == first["repos"][lib]["commit"]
     assert not (current / moved).exists() and moved not in forge.cloned
     assert "github-pat" in caplog.text and "conf.py" in caplog.text
-    assert value not in caplog.text
+    assert value not in caplog.text and vendored not in caplog.text
     for p in root.rglob("*"):
         if p.is_file() and not p.is_symlink():
-            assert value.encode() not in p.read_bytes(), p
+            data = p.read_bytes()
+            assert value.encode() not in data and vendored.encode() not in data, p

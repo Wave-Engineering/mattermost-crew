@@ -50,7 +50,7 @@ def make_builder(
         return Builder(
             tmp_path / "corpus",
             gitleaks=gitleaks or str(fake_gitleaks),
-            credential=lambda server: credential,
+            credential=lambda server, host: credential,
             lookup=lookup or (lambda repo, token: repo),
             clone_url=forge.url,
             clock=clock,

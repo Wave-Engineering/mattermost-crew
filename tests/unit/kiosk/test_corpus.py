@@ -150,19 +150,29 @@ def test_forge_canonical_asks_each_forge_for_its_name(monkeypatch: pytest.Monkey
         def read(self) -> bytes:
             return json.dumps(self.body).encode()
 
-    def urlopen(request: Any, timeout: float) -> Reply:
-        asked.append((request.full_url, dict(request.header_items())))
-        if "api.github.com" in request.full_url:
-            return Reply({"full_name": "NewOwner/Repo"})
-        return Reply({"path_with_namespace": "grp/sub/moved"})
+    class Opener:
+        def open(self, request: Any, timeout: float) -> Reply:
+            asked.append((request.full_url, dict(request.header_items())))
+            if "api.github.com" in request.full_url:
+                return Reply({"full_name": "NewOwner/Repo"})
+            return Reply({"path_with_namespace": "grp/sub/moved"})
 
-    monkeypatch.setattr(corpus.urllib.request, "urlopen", urlopen)
+    handlers: list[Any] = []
+
+    def build_opener(*given: Any) -> Opener:
+        handlers.extend(given)
+        return Opener()
+
+    # Never the network: the opener is the only way out.
+    monkeypatch.setattr(corpus.urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(corpus.urllib.request, "urlopen", None)
     assert corpus.forge_canonical("github.com/old/repo", TOKEN) == "github.com/NewOwner/Repo"
     assert corpus.forge_canonical("gl.test/grp/sub/x", TOKEN) == "gl.test/grp/sub/moved"
     assert asked[0][0] == "https://api.github.com/repos/old/repo"
     assert asked[1][0] == "https://gl.test/api/v4/projects/grp%2Fsub%2Fx"
     assert TOKEN in asked[0][1]["Authorization"] and asked[1][1]["Private-token"] == TOKEN
     assert all(TOKEN not in url for url, _ in asked)
+    assert all(isinstance(h, corpus.SameHostRedirects) for h in handlers) and handlers
     with pytest.raises(LookupFailed):
         corpus.forge_canonical("github.com/a/b/c", TOKEN)
 
@@ -285,7 +295,8 @@ def test_a_repo_cannot_exempt_itself(
     builder = make_builder()
     assert states(builder.build(manifest(repo))) == {repo: "ok"}
     (seen,) = scans(tmp_path)
-    assert seen["files"] == {"a.py": "tok = 'x'  # gitleaks-allow\n", "b.py": "plain\n"}
+    # Flat names: no path the default config allowlists (node_modules/, *.svg, ...) survives.
+    assert seen["files"] == {"f000001": "tok = 'x'  # gitleaks-allow\n", "f000002": "plain\n"}
     assert seen["env"] == [] and seen["cwd_entries"] == []
     assert (current(builder) / repo / "a.py").read_text() == "tok = 'x'  # gitleaks:allow\n"
 
@@ -417,6 +428,7 @@ def test_credential_never_in_argv(
     assert seen_tokens == [TOKEN]  # the lookup got it, as a header value
     clone = next(argv for argv, _ in calls if "clone" in argv)
     assert clone[-2].startswith("file://") and TOKEN not in clone[-2]
+    assert "http.followRedirects=false" in clone
     for argv, env in calls:
         assert all(TOKEN not in a for a in argv)
         assert all(TOKEN not in v for v in env.values())
@@ -436,6 +448,124 @@ def test_the_askpass_helper_answers_from_the_file(tmp_path: Path, credential: Pa
     password = subprocess.run([helper, "Password for 'https://x': "], env=env, capture_output=True)
     assert (user.stdout, password.stdout) == (b"oauth2\n", f"{TOKEN}\n".encode())
     assert TOKEN not in (home / "askpass").read_text()
+
+
+def test_each_forge_gets_only_its_own_token(
+    tmp_path: Path, forge: Forge, make_builder: MakeBuilder
+) -> None:
+    """The credential is per (server, forge host). A host with none is never asked, and a
+    lookup that lands on another host is refused."""
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    other = "elsewhere.test/org/b"
+    asked: list[tuple[str, str]] = []
+    keys: list[tuple[str, str]] = []
+    builder = make_builder(lookup=lambda r, t: asked.append((r, t)) or r)
+    real = builder.credential
+    builder.credential = lambda s, h: (
+        keys.append((s, h)) or (real(s, h) if h == "forge.test" else tmp_path / "none")
+    )
+    status = builder.build(manifest(repo, other))
+    assert states(status) == {repo: "ok", other: "clone_failed"}
+    assert keys == [(SERVER, "forge.test"), (SERVER, "elsewhere.test")]
+    assert asked == [(repo, TOKEN)]  # elsewhere.test was never sent anything
+    assert corpus.CREDENTIAL.format(server="dev", host="gitlab.example") == (
+        "/etc/crewkiosk/corpus-dev-gitlab.example.credential"
+    )
+
+    builder.lookup = lambda r, t: "elsewhere.test/org/a"
+    assert states(builder.build(manifest(repo))) == {repo: "clone_failed"}
+
+
+def test_lookup_redirects_stay_on_the_forge() -> None:
+    handler = corpus.SameHostRedirects()
+    req = corpus.urllib.request.Request(
+        "https://gl.test/api/v4/projects/a%2Fb", headers={"PRIVATE-TOKEN": TOKEN}
+    )
+    same = handler.redirect_request(req, None, 301, "moved", {}, "https://gl.test/api/v4/x")
+    assert same is not None and same.full_url == "https://gl.test/api/v4/x"
+    for off in ("https://evil.test/api/v4/x", "http://gl.test/api/v4/x"):
+        with pytest.raises(corpus.urllib.error.HTTPError):
+            handler.redirect_request(req, None, 301, "moved", {}, off)
+
+
+def test_a_filesystem_error_fails_only_that_repo(
+    forge: Forge, make_builder: MakeBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk or a too-long name while writing one repo's tree: that repo is
+    `clone_failed` and served from its last good copy; the rest of the build goes on."""
+    bad = forge.repo("bad", {"README.md": b"bad\n"})
+    good = forge.repo("good", {"README.md": b"ok\n"})
+    builder = make_builder()
+    builder.build(manifest(bad, good))  # a clean first build: bad has a last good copy
+    real_fresh = builder._fresh
+
+    def fresh(m: Any, repo: str, work: Path, gen: Path) -> Any:
+        if repo == bad:
+            (gen / repo).mkdir(parents=True)  # a partial copy, which must not be published
+            (gen / repo / "half.md").write_text("half\n")
+            raise OSError(28, "No space left on device")
+        return real_fresh(m, repo, work, gen)
+
+    monkeypatch.setattr(builder, "_fresh", fresh)
+    status = builder.build(manifest(bad, good))
+    assert states(status) == {bad: "clone_failed", good: "ok"}
+    assert published(builder, bad) == {"README.md"}  # the last good copy, not the partial
+    assert published(builder, good) == {"README.md"}
+
+
+def test_nested_repos_are_refused(forge: Forge, make_builder: MakeBuilder) -> None:
+    outer = forge.repo("a", {"README.md": b"outer\n"})
+    inner = f"{outer}/b"
+    status = make_builder().build(manifest(outer, inner))
+    assert states(status) == {outer: "ok", inner: "clone_failed"}
+    assert inner not in forge.cloned
+
+
+def test_a_failed_build_leaves_no_half_generation(
+    forge: Forge, make_builder: MakeBuilder, monkeypatch: pytest.MonkeyPatch, clock: Clock
+) -> None:
+    repo = forge.repo("a", {"README.md": b"v1\n"})
+    builder = make_builder()
+    builder.build(manifest(repo))
+    live = current(builder).resolve()
+    clock.tick()
+
+    def boom(root: Path) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(corpus, "set_modes", boom)
+    with pytest.raises(OSError):
+        builder.build(manifest(repo))
+    assert current(builder).resolve() == live
+    assert sorted(p.name for p in (builder.root / SERVER).iterdir()) == sorted(
+        [live.name, "current"]
+    )
+
+
+def test_one_server_failing_never_stops_the_others(
+    tmp_path: Path,
+    forge: Forge,
+    make_builder: MakeBuilder,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    pool = tmp_path / "pool"
+    write_manifest(pool, server="aa", repos=[repo])
+    write_manifest(pool, server="bb", repos=[repo])
+    builder = make_builder()
+    real = builder.build
+
+    def build(m: Any) -> Any:
+        if m.server == "aa":
+            raise OSError(28, "No space left on device")
+        return real(m)
+
+    monkeypatch.setattr(builder, "build", build)
+    with caplog.at_level(logging.ERROR):
+        assert run(pool, builder) == 1
+    assert "corpus aa: the build failed" in caplog.text
+    assert (builder.root / "bb" / "current" / repo / "README.md").exists()
 
 
 def test_a_missing_credential_fails_every_repo(
