@@ -35,6 +35,7 @@
 # Kiosk research (#142), on a host with the crewkiosk-broker user:
 #   - crewkiosk-broker reads its own key, /etc/crewkiosk/broker-model.credential, and not the
 #     runner's; crewkiosk reads its own and not the broker's; the agent's user reads neither;
+#   - crewcorpus may traverse /etc/crewkiosk (ACL user:crewcorpus:--x) and not list it;
 #   - for each server in CREWKIOSK_RESEARCH_SERVERS, its linked unit points at the shared body,
 #     which sits in no unit search path, and loads with an empty root, no network, no new
 #     privileges, both keys hidden, crewkiosk's current uid, and exactly that server's two
@@ -63,6 +64,7 @@ KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
 KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
 KIOSK_MODEL_CONF=/etc/crewkiosk/model.conf
 BROKER_USER=crewkiosk-broker
+CORPUS_USER=crewcorpus
 BROKER_KEY=/etc/crewkiosk/broker-model.credential
 RESEARCH_BODY=/usr/local/share/crewkiosk/crewkiosk-research@.service
 SERVERS_TOML=/etc/crewchat/servers.toml
@@ -348,6 +350,16 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
     pass "the research-off runner ($KIOSK_USER) can read its own key, $KIOSK_CREDENTIAL"
   else
     fail "$KIOSK_USER cannot read its key $KIOSK_CREDENTIAL"
+  fi
+  # The corpus builder traverses /etc/crewkiosk to its forge credentials by an ACL: x, and no
+  # r, so it can't list the directory. A later chmod or chgrp must not silently undo either.
+  acl="$($SUDO getfacl -cp /etc/crewkiosk 2>/dev/null | grep -E "^user:${CORPUS_USER}:" || true)"
+  if [[ "$acl" == "user:${CORPUS_USER}:--x" ]] &&
+    sudo -n -u "$CORPUS_USER" test -x /etc/crewkiosk &&
+    ! sudo -n -u "$CORPUS_USER" ls /etc/crewkiosk >/dev/null 2>&1; then
+    pass "$CORPUS_USER may traverse /etc/crewkiosk (ACL --x) and not list it"
+  else
+    fail "/etc/crewkiosk: $CORPUS_USER's ACL is '${acl:-none}' (want user:${CORPUS_USER}:--x, traverse only)"
   fi
   search="$(systemd-analyze unit-paths)"
   kiosk_uid="$(id -u "$KIOSK_USER")"
