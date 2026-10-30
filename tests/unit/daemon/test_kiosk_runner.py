@@ -26,11 +26,13 @@ from typing import Any
 import pytest
 from crewchat.kiosk import (
     CLAUDE_FLAGS,
+    KIOSK_RESEARCH_SOCKET,
     KIOSK_RUN,
     KIOSK_SOCKET,
     KIOSK_USER,
     MAX_OUTPUT_BYTES,
     ClaudeCliRunner,
+    ResearchFrame,
     RunnerError,
     parse_reply,
 )
@@ -122,6 +124,39 @@ def test_runner_has_no_tools(tmp_path: Path) -> None:
     )
     assert re.search(r"^KIOSK_USER=crewkiosk$", WRAPPER.read_text(), re.M)
     assert re.search(r"^CREDENTIAL=/etc/crewkiosk/model.credential$", WRAPPER.read_text(), re.M)
+
+
+def test_research_frame_on_the_wire(tmp_path: Path) -> None:
+    """#142: with a frame, the header line then the prompt, on the research socket only;
+    without one, today's bytes on today's socket. A frame the runner would refuse is never
+    sent."""
+    seen: list[bytes] = []
+    frame = ResearchFrame("dev", "p1", "a" * 32)
+    nowhere = str(tmp_path / "nowhere.sock")
+    answer = serve(
+        tmp_path,
+        reply_with(b"ok\nresearched\n", seen),
+        lambda path: ClaudeCliRunner(socket=nowhere, research_socket=path).answer(
+            "PROMPT", frame=frame
+        ),
+    )
+    assert answer == "researched"
+    assert seen == [b"crewkiosk/1 server=dev post=p1 answer=" + b"a" * 32 + b"\nPROMPT"]
+    (tmp_path / "kiosk.sock").unlink()
+    serve(
+        tmp_path,
+        reply_with(b"ok\nplain\n", seen),
+        lambda path: ClaudeCliRunner(socket=path, research_socket=nowhere).answer("PROMPT"),
+    )
+    assert seen[1] == b"PROMPT"
+    assert ClaudeCliRunner().research_socket == KIOSK_RESEARCH_SOCKET
+    assert KIOSK_RESEARCH_SOCKET == "/run/crewkiosk/research.sock"
+    with pytest.raises(RunnerError, match="no research frame"):
+        asyncio.run(
+            ClaudeCliRunner(research_socket=nowhere).answer(
+                "P", frame=ResearchFrame("dev", "p\nx", "a" * 32)
+            )
+        )
 
 
 def test_runner_failure_is_an_error(tmp_path: Path) -> None:

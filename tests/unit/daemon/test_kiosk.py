@@ -13,6 +13,7 @@ import builtins
 import io
 import json
 import os
+import re
 import stat
 from collections.abc import Callable
 from pathlib import Path
@@ -26,10 +27,15 @@ from crewchat.doorbell import DoorbellEvent
 from crewchat.filters import KioskQueue
 from crewchat.kiosk import (
     KIOSK_HEADER,
+    KIOSK_RESEARCH_HEADER,
     NO_BRIEF_REPLY,
     BriefStore,
     Kiosk,
     KioskPoster,
+    Research,
+    ResearchFrame,
+    render_research,
+    research_header,
     strip_mentions,
 )
 
@@ -387,3 +393,129 @@ async def until(cond: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition never held")
+
+
+# -- research (#142) ------------------------------------------------------------------------
+REPO = "forge.example.lan/partner-org/site-manifests"
+AUDIT = [
+    {"op": "corpus_search", "args": {"repo": REPO, "query": "pins"}, "bytes": 812, "ok": True},
+    {"op": "corpus_read", "args": {"repo": REPO, "path": "site.yaml"}, "bytes": 4096, "ok": True},
+]
+
+
+class FakeResearchRunner(FakeRunner):
+    def __init__(self, answer: str = "site.yaml pins X as of abc123.") -> None:
+        super().__init__(answer)
+        self.frames: list[ResearchFrame | None] = []
+
+    async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str:
+        self.frames.append(frame)
+        return await super().answer(prompt)
+
+
+class FakeAudit:
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    async def audit(self, answer_id: str) -> list[dict[str, Any]]:
+        self.asked.append(answer_id)
+        return [{**line, "answer_id": answer_id} for line in AUDIT]
+
+
+def researching(w: World, repo: str = REPO) -> tuple[FakeResearchRunner, FakeAudit]:
+    """`w`'s server with kiosk_research on: its answers go to a research runner."""
+    runner, audit = FakeResearchRunner(), FakeAudit()
+    w.kiosk.research_for = lambda dev, sid: (
+        Research(runner, audit, lambda: repo) if sid == SID else None
+    )
+    return runner, audit
+
+
+def test_research_frame_header(mm: Any, run: Any, tmp_path: Path) -> None:
+    """Research on: each answer is framed with its server, its post and a fresh answer_id.
+    Research off: the runner is called as today, with no frame."""
+    w = World(mm, tmp_path)
+    runner, _audit = researching(w)
+    w.briefs[DEV] = BRIEF
+    asks = [w.post(w.outsider, "@babel one"), w.post(w.outsider, "@babel two")]
+    for ask in asks:
+        run(w.kiosk.handle(DEV, w.event(ask)))
+    frames = [f for f in runner.frames if f is not None]
+    assert [(f.server, f.post) for f in frames] == [(SID, a.post_id) for a in asks]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", f.answer) for f in frames)
+    assert frames[0].answer != frames[1].answer
+    assert frames[0].header() == (
+        f"crewkiosk/1 server={SID} post={asks[0].post_id} answer={frames[0].answer}\n".encode()
+    )
+    for bad in (
+        ResearchFrame("Dev", "p1", "0" * 32),
+        ResearchFrame(SID, "p-1", "0" * 32),
+        ResearchFrame(SID, "p1", "0" * 31),
+    ):
+        with pytest.raises(kiosk_mod.RunnerError):
+            bad.header()
+
+    plain = World(mm, tmp_path / "plain")  # FakeRunner.answer takes no frame at all
+    plain.briefs[DEV] = BRIEF
+    assert run(plain.kiosk.handle(DEV, plain.event(plain.post(plain.outsider, "@babel hi"))))
+    assert plain.runner.prompts[0].startswith(KIOSK_HEADER)
+
+
+def test_research_prompt_contract(mm: Any, run: Any, tmp_path: Path) -> None:
+    """The research header: the three ops, cite repo, path and commit, what a repo declares
+    and not what runs, no answer means a human, the brief first, and the expert's repo."""
+    w = World(mm, tmp_path)
+    runner, _audit = researching(w)
+    w.briefs[DEV] = BRIEF
+    run(w.kiosk.handle(DEV, w.event(w.post(w.outsider, "@babel what does dev pin?"))))
+    prompt = runner.prompts[0]
+    assert prompt.startswith(KIOSK_RESEARCH_HEADER) and not prompt.startswith(KIOSK_HEADER)
+    for rule in (
+        "Answer from the brief below first.",
+        "corpus_search, corpus_read and corpus_list",
+        "Cite the repo, the path and the commit for every fact",
+        "Say what a repo declares, never what is running",
+        "what's deployed can lag a merge",
+        "say so, and point the outsider to a human",
+        f"Start with the expert's own repo, {REPO}.",
+    ):
+        assert rule in prompt, rule
+    assert prompt.index(BRIEF) < prompt.index("<conversation>")
+    assert research_header("") == KIOSK_RESEARCH_HEADER  # no pooled repo: none named
+
+
+def test_transcript_research_field(mm: Any, run: Any, tmp_path: Path) -> None:
+    """The broker's audit lines for the answer go in its record as `research`; a record
+    without one still loads; the review renders one line per op as `op(args) → bytes`."""
+    w = World(mm, tmp_path)
+    runner, audit = researching(w)
+    w.briefs[DEV] = BRIEF
+    w.transcript.parent.mkdir(parents=True)
+    old = {"ts": 1.0, "thread": "t0", "post_id": "p0", "asker_id": "a", "question": "q"}
+    w.transcript.write_text(json.dumps({**old, "answer": "OLD"}) + "\n")
+    run(w.kiosk.handle(DEV, w.event(w.post(w.outsider, "@babel what does dev pin?"))))
+    frame = runner.frames[0]
+    assert frame is not None and audit.asked == [frame.answer]
+    old_rec, rec = (json.loads(x) for x in w.transcript.read_text().splitlines())
+    assert "research" not in old_rec
+    assert rec["research"] == [{**line, "answer_id": frame.answer} for line in AUDIT]
+
+    events: list[DoorbellEvent] = []
+    w.kiosk.deliver = lambda dev, event: events.append(event) is None
+    assert w.kiosk.review_since_cursor(DEV, SID) == 2
+    first, second = events[0].payload["entries"]
+    assert "research" not in first
+    assert second["research"] == [
+        f'corpus_search({{"query": "pins", "repo": "{REPO}"}}) → 812',
+        f'corpus_read({{"path": "site.yaml", "repo": "{REPO}"}}) → 4096',
+    ]
+
+
+def test_render_research_bounds_each_line() -> None:
+    """A long op's args are cut, a refused one is marked, and nothing else is a line."""
+    long = render_research({"op": "corpus_search", "args": {"query": "x" * 500}, "bytes": 1})
+    assert long is not None and long.endswith("...) → 1")
+    assert len(long) < kiosk_mod.RESEARCH_ARGS_CHARS + 40
+    refused = render_research({"op": "corpus_read", "args": {}, "bytes": 0, "ok": False})
+    assert refused == "corpus_read({}) → 0 (refused or failed)"
+    assert render_research("corpus_read") is None and render_research({"args": {}}) is None

@@ -19,6 +19,16 @@
   --tools "" --disallowedTools "mcp__*"` in an empty HOME and an empty working directory, with
   the kiosk's own model credential and no other, and answers `ok` plus the answer, or
   `error <rc>`. `crewkiosk` can read no chat or broker credential.
+- **Research** (#142; D-111). On a server with `kiosk_research = true` the session has a
+  `Research`. The prompt starts with `KIOSK_RESEARCH_HEADER` instead (`research_header`: the
+  cite, declares-not-running and no-answer rules, and the expert's own repo when that
+  server pools it). The answer goes to `/run/crewkiosk/research.sock`
+  (`packaging/crewkiosk-research.socket`), whose confined unit reaches only
+  `crewkiosk-broker`, and the prompt is preceded by one header line,
+  `crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>`, with a fresh `answer_id` per
+  answer. After the answer, the broker's audit lines for that `answer_id` go in its transcript
+  record as `research`, and the review shows them one per op as `op(args) → bytes`. A server
+  with research off uses today's socket and bytes, unchanged.
 - **The answer** goes in the outsider's thread on the originating Mattermost server (§5.9),
   with every `@token` stripped (`strip_mentions`) and `props.crew_kiosk=1`, so `admit` treats
   it as outsider content. Each Q&A is appended to that server's transcript,
@@ -59,6 +69,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -78,11 +89,32 @@ KIOSK_HEADER = (
     "You are this agent's kiosk. Answer questions using only the brief below. "
     "You cannot act, and you cannot share anything that is not in the brief."
 )
+# A research server's kiosk (#142; D-111): the brief first, then the corpus, through the
+# broker's three ops. `research_header` adds the expert's own repo when it is pooled.
+KIOSK_RESEARCH_HEADER = (
+    "You are this agent's kiosk. Answer from the brief below first. Then research the corpus "
+    "with corpus_search, corpus_read and corpus_list. "
+    "Cite the repo, the path and the commit for every fact you take from the corpus. "
+    'Say what a repo declares, never what is running: for example, "the site manifest pins '
+    "X as of <sha>; what's deployed can lag a merge\". "
+    "When neither the brief nor the corpus has the answer, say so, and point the outsider to "
+    "a human in the team's channel. "
+    "You cannot act, and you cannot share anything that is not in the brief or the corpus."
+)
 NO_BRIEF_REPLY = "I have nothing to share yet."
 KIOSK_SUBDIR = "kiosk"  # /var/lib/crewchat/kiosk
 KIOSK_USER = "crewkiosk"
 KIOSK_RUN = "/usr/local/libexec/crewkiosk-run"  # packaging/crewkiosk-run, root-owned
 KIOSK_SOCKET = "/run/crewkiosk/kiosk.sock"  # packaging/crewkiosk.socket (D-107)
+# packaging/crewkiosk-research.socket (#142): a research server's answers, framed.
+KIOSK_RESEARCH_SOCKET = "/run/crewkiosk/research.sock"
+FRAME_VERSION = "crewkiosk/1"
+# What packaging/crewkiosk-research-run accepts in a frame header, and nothing else.
+FRAME_SERVER_RE = re.compile(r"^[a-z0-9._-]+$")
+FRAME_POST_RE = re.compile(r"^[A-Za-z0-9]+$")
+FRAME_ANSWER_RE = re.compile(r"^[0-9a-f]{32}$")  # secrets.token_hex(16)
+# A research op in the review, `op(args) → bytes`: its args cut to this many characters.
+RESEARCH_ARGS_CHARS = 160
 # What packaging/crewkiosk-run runs; test_kiosk_runner holds the wrapper to exactly this,
 # followed by `--model <pin>` from /etc/crewkiosk/model.conf (#116).
 CLAUDE_FLAGS = (
@@ -110,6 +142,8 @@ REVIEW_TEXT = (
     "Kiosk review: review these exchanges and raise anything notable to your human partner."
 )
 REVIEW_FIELDS = ("ts", "thread", "asker_id", "question", "answer")
+# A research record's audit lines, rendered for the review one per op (`render_research`).
+RESEARCH_FIELD = "research"
 # One review event's entries, encoded: well inside the shim's 1 MiB reply frame.
 REVIEW_MAX_BYTES = 256 * 1024
 # A transcript's head (#110): this many hex digits of the digest of its first record.
@@ -135,6 +169,25 @@ def strip_mentions(text: str) -> str:
     return "\n".join(line.strip() for line in out.splitlines()).strip()
 
 
+def research_header(repo: str) -> str:
+    """`KIOSK_RESEARCH_HEADER`, naming the expert's own repo to start from when it is pooled."""
+    if not repo:
+        return KIOSK_RESEARCH_HEADER
+    return f"{KIOSK_RESEARCH_HEADER} Start with the expert's own repo, {repo}."
+
+
+def render_research(line: Any) -> str | None:
+    """One audit line for the review, `op(args) → bytes`; None for anything not a line."""
+    if not isinstance(line, dict) or not isinstance(line.get("op"), str):
+        return None
+    args = line.get("args")
+    shown = json.dumps(args, sort_keys=True) if isinstance(args, dict) else ""
+    if len(shown) > RESEARCH_ARGS_CHARS:
+        shown = shown[: RESEARCH_ARGS_CHARS - 3] + "..."
+    out = f"{line['op']}({shown}) → {line.get('bytes', 0)}"
+    return out if line.get("ok", True) is not False else f"{out} (refused or failed)"
+
+
 # -- runners --------------------------------------------------------------------------------
 class RunnerError(Exception):
     """The runner gave no answer."""
@@ -142,6 +195,48 @@ class RunnerError(Exception):
 
 class Runner(Protocol):
     async def answer(self, prompt: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class ResearchFrame:
+    """The first line on the research socket (#142): which server, post and answer this is.
+    The broker scopes by socket, never by it; the runner uses it to pick that server's
+    sockets and to name the answer to the broker."""
+
+    server: str
+    post: str
+    answer: str
+
+    def header(self) -> bytes:
+        """The header line; a `RunnerError` for any part the runner would refuse."""
+        if (
+            not FRAME_SERVER_RE.fullmatch(self.server)
+            or not FRAME_POST_RE.fullmatch(self.post)
+            or not FRAME_ANSWER_RE.fullmatch(self.answer)
+        ):
+            raise RunnerError(f"no research frame for ({self.server!r}, {self.post!r})")
+        line = f"{FRAME_VERSION} server={self.server} post={self.post} answer={self.answer}\n"
+        return line.encode()
+
+
+class ResearchRunner(Protocol):
+    async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str: ...
+
+
+class AuditSource(Protocol):
+    """The broker's audit lines for one answer (`KioskBrokerClient.audit`)."""
+
+    async def audit(self, answer_id: str) -> list[dict[str, Any]]: ...
+
+
+@dataclass(frozen=True)
+class Research:
+    """What a research server's session needs (#142): the runner it frames its answers to,
+    the broker it reads their audit from, and the expert's pooled repo ("" for none)."""
+
+    runner: ResearchRunner
+    broker: AuditSource
+    repo: Callable[[], str]
 
 
 def parse_reply(reply: bytes) -> str:
@@ -167,23 +262,36 @@ class ClaudeCliRunner:
     an answer that takes longer than `timeout_s`, is a `RunnerError`: the kiosk logs it and
     posts nothing."""
 
-    def __init__(self, *, socket: str = KIOSK_SOCKET, timeout_s: float = RUNNER_TIMEOUT_S):
+    def __init__(
+        self,
+        *,
+        socket: str = KIOSK_SOCKET,
+        research_socket: str = KIOSK_RESEARCH_SOCKET,
+        timeout_s: float = RUNNER_TIMEOUT_S,
+    ):
         self.socket = socket
+        self.research_socket = research_socket
         self.timeout_s = timeout_s
 
-    async def answer(self, prompt: str) -> str:
+    async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str:
+        """With a `frame`, the answer goes through the research socket, the header line
+        first; without one, today's socket and bytes, unchanged."""
         try:
-            return parse_reply(await asyncio.wait_for(self._exchange(prompt), self.timeout_s))
+            return parse_reply(
+                await asyncio.wait_for(self._exchange(prompt, frame), self.timeout_s)
+            )
         except TimeoutError:
             raise RunnerError(f"the kiosk runner timed out after {self.timeout_s:.0f}s") from None
 
-    async def _exchange(self, prompt: str) -> bytes:
+    async def _exchange(self, prompt: str, frame: ResearchFrame | None = None) -> bytes:
+        head = frame.header() if frame is not None else b""
+        path = self.research_socket if frame is not None else self.socket
         try:
-            reader, writer = await asyncio.open_unix_connection(self.socket)
+            reader, writer = await asyncio.open_unix_connection(path)
         except OSError as exc:
-            raise RunnerError(f"the kiosk runner is unavailable at {self.socket}: {exc}") from exc
+            raise RunnerError(f"the kiosk runner is unavailable at {path}: {exc}") from exc
         try:
-            writer.write(prompt.encode())
+            writer.write(head + prompt.encode())
             await writer.drain()
             writer.write_eof()  # the prompt ends here; the CLI reads stdin to EOF
             reply = bytearray()
@@ -222,6 +330,14 @@ class Turn:
     text: str
 
 
+@dataclass(frozen=True)
+class KioskAnswer:
+    """The answer to post, and on a research server the broker's audit lines for it."""
+
+    text: str
+    research: list[dict[str, Any]] | None = None
+
+
 class KioskSession:
     """One expert's kiosk on one server (R-31): every outsider there, one transcript."""
 
@@ -234,12 +350,15 @@ class KioskSession:
         briefs: BriefStore,
         kiosk_dir: Path,
         clock: Callable[[], float] = time.time,
+        research: Research | None = None,
     ) -> None:
         if not SAFE_PART_RE.fullmatch(dev_name) or not SAFE_PART_RE.fullmatch(server_id):
             raise ValueError(f"unsafe kiosk session key ({dev_name!r}, {server_id!r})")
         self.dev_name = dev_name
         self.server_id = server_id
         self.runner = runner
+        # Set on a research server (#142): its answers go framed to the research runner.
+        self.research = research
         self.briefs = briefs
         self.clock = clock
         self.transcript = kiosk_dir / f"{dev_name}-{server_id}.jsonl"
@@ -288,46 +407,61 @@ class KioskSession:
         turns.sort(key=lambda t: t.ts)
         return turns
 
-    def prompt(self, brief: str, history: Sequence[Turn]) -> str:
+    def prompt(self, brief: str, history: Sequence[Turn], header: str = KIOSK_HEADER) -> str:
         convo = "\n\n".join(
             f"{'Outsider' if t.who == 'outsider' else 'Kiosk'}: {t.text}" for t in history
         )
         return (
-            f"{KIOSK_HEADER}\n\n<brief>\n{brief}\n</brief>\n\n"
+            f"{header}\n\n<brief>\n{brief}\n</brief>\n\n"
             f"<conversation>\n{convo}\n</conversation>\n\n"
             "Answer the outsider's last message."
         )
 
-    async def ask(self, msg: InboundMessage, thread_posts: Sequence[InboundMessage]) -> str:
-        """The answer to post, mentions stripped. No brief: the fixed reply, no runner call."""
+    async def ask(self, msg: InboundMessage, thread_posts: Sequence[InboundMessage]) -> KioskAnswer:
+        """The answer to post, mentions stripped. No brief: the fixed reply, no runner call.
+        On a research server the answer is framed with a fresh answer_id, and the broker's
+        audit lines for it come back with it."""
         brief = self.briefs.brief(self.dev_name)
         if not brief:
-            return NO_BRIEF_REPLY
-        raw = await self.runner.answer(self.prompt(brief, self.history(msg, thread_posts)))
+            return KioskAnswer(NO_BRIEF_REPLY)
+        history = self.history(msg, thread_posts)
+        research: list[dict[str, Any]] | None = None
+        if self.research is None:
+            raw = await self.runner.answer(self.prompt(brief, history))
+        else:
+            frame = ResearchFrame(self.server_id, msg.post_id, secrets.token_hex(16))
+            header = research_header(self.research.repo())
+            raw = await self.research.runner.answer(
+                self.prompt(brief, history, header), frame=frame
+            )
+            research = await self.research.broker.audit(frame.answer)
         answer = strip_mentions(raw)[:MAX_ANSWER_CHARS]
         if not answer:
             raise RunnerError("the kiosk runner gave an empty answer")
-        return answer
+        return KioskAnswer(answer, research)
 
-    def record(self, msg: InboundMessage, answer: str, ts: float = 0.0) -> None:
+    def record(self, msg: InboundMessage, answer: KioskAnswer, ts: float = 0.0) -> None:
         """Append the Q&A to this server's transcript, and remember the answer. `ts` is the
         answer post's own time when the server gave one, so history orders it against the
-        thread's posts on one clock."""
+        thread's posts on one clock. A research answer's audit lines go in as `research`."""
         thread = msg.root_id or msg.post_id
         ts = ts or self.clock()
-        rec = {
+        rec: dict[str, Any] = {
             "ts": ts,
             "thread": thread,
             "post_id": msg.post_id,
             "asker_id": msg.author_id,
             "question": msg.text,
-            "answer": answer,
+            "answer": answer.text,
         }
+        if answer.research is not None:
+            rec[RESEARCH_FIELD] = answer.research
         self.transcript.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
         fd = os.open(self.transcript, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
-        self._answers.setdefault((thread, msg.author_id), []).append(Turn(ts, "kiosk", answer))
+        turn = Turn(ts, "kiosk", answer.text)
+        self._answers.setdefault((thread, msg.author_id), []).append(turn)
         self.answered.add(msg.post_id)
 
 
@@ -345,11 +479,14 @@ class Kiosk:
         state_dir: Path = STATE_DIR,
         clock: Callable[[], float] = time.time,
         deliver: Deliver | None = None,
+        research_for: Callable[[str, str], Research | None] | None = None,
     ) -> None:
         self.queue = queue
         self.briefs = briefs
         self.backends = backends
         self.runner = runner
+        # (dev, server) -> its Research when that server has kiosk_research on (#142).
+        self.research_for = research_for or (lambda _dev, _server: None)
         self.kiosk_dir = state_dir / KIOSK_SUBDIR
         self.clock = clock
         # Puts a review on the working agent's doorbell queue (`Doorbell.deliver`, R-33).
@@ -412,6 +549,7 @@ class Kiosk:
                 briefs=self.briefs,
                 kiosk_dir=self.kiosk_dir,
                 clock=self.clock,
+                research=self.research_for(dev_name, server_id),
             )
             self.sessions[key] = sess
             log.info("kiosk: started %s on %s", dev_name, server_id)
@@ -440,7 +578,9 @@ class Kiosk:
             except Exception as exc:  # the question itself still goes in
                 log.warning("kiosk: thread %s unreadable for %s: %s", thread, dev_name, exc)
         answer = await sess.ask(msg, posts)
-        posted: InboundMessage = await backend.send_kiosk(dev_name, msg.channel, answer, thread)
+        posted: InboundMessage = await backend.send_kiosk(
+            dev_name, msg.channel, answer.text, thread
+        )
         sess.record(msg, answer, posted.ts)
         return posted
 
@@ -521,7 +661,11 @@ class Kiosk:
                 log.warning("kiosk transcript %s: skipped a malformed line", transcript)
                 lines.append((None, pos))
                 continue
-            lines.append(({k: rec[k] for k in REVIEW_FIELDS if k in rec}, pos))
+            entry = {k: rec[k] for k in REVIEW_FIELDS if k in rec}
+            if isinstance(rec.get(RESEARCH_FIELD), list):
+                ops = (render_research(x) for x in rec[RESEARCH_FIELD])
+                entry[RESEARCH_FIELD] = [op for op in ops if op is not None]
+            lines.append((entry, pos))
         return lines, offset, head
 
     def review_since_cursor(self, dev_name: str, server_id: str) -> int:

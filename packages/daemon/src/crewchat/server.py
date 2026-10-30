@@ -237,6 +237,8 @@ def build_handlers(
     config: ServersConfig,
     registry: Registry,
     health_sources: Mapping[str, HealthSource] | None = None,
+    *,
+    kiosk_metrics: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
 ) -> dict[str, Handler]:
     """`register`, `health` and `ping`; the chat ops are `crewchat.chat`'s.
 
@@ -246,7 +248,9 @@ def build_handlers(
     hold gets `not_registered`, so the shim's retry re-registers it after a restart (#112);
     without it, `health` is the daemon's liveness check. With a kiosk research server, it
     also reports `kiosk_research: {<server_id>: {"pool_repos": N}}` (#139), with that
-    server's last corpus build under `corpus` once crewkiosk-corpus has run (#140).
+    server's last corpus build under `corpus` once crewkiosk-corpus has run (#140), and
+    crewkiosk-broker's daily overhead metrics for it under `metrics` (`kiosk_metrics`, #142),
+    absent while the broker can't be read.
     """
     started = datetime.now(UTC).isoformat()
     sources = dict(health_sources or {})
@@ -303,6 +307,10 @@ def build_handlers(
         result: dict[str, Any] = {"backends": backends}
         research = registry.pool.health() if registry.pool is not None else {}
         if research:
+            metrics = await kiosk_metrics() if kiosk_metrics is not None else None
+            for server_id, entry in research.items():
+                if metrics is not None and isinstance(metrics.get(server_id), dict):
+                    entry["metrics"] = metrics[server_id]  # #142: the broker's overhead
             result["kiosk_research"] = research  # #139: each research server's pool size
         return result
 

@@ -84,6 +84,19 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
     return sorted(pool.values())
 
 
+def expert_repo(
+    config: ServersConfig, agents: Iterable[AgentTokens], server_id: str, dev_name: str
+) -> str:
+    """`dev_name`'s own repo as that server's pool spells it, or "" when it isn't pooled
+    there: the research kiosk starts with it (#142), and never with a repo it can't read."""
+    agents = list(agents)
+    own = next((a.repo for a in agents if a.dev_name == dev_name), "")
+    if not own:
+        return ""
+    key = _canon(own).casefold()
+    return next((r for r in pool_repos(config, agents, server_id) if r.casefold() == key), "")
+
+
 def exclude_keys(server: MattermostServer) -> list[str]:
     """`corpus_exclude` as the keys repos are compared by, sorted: casefolded, no `.git`. A
     repo is excluded when its key, or its key without `.wiki`, is one of them."""

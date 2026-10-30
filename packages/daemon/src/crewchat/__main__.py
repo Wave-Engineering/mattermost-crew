@@ -32,10 +32,11 @@ from crewchat.adapters.mattermost import MattermostBackend
 from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
-from crewchat.corpus_pool import PoolManifest
+from crewchat.corpus_pool import PoolManifest, expert_repo
 from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
 from crewchat.filters import Filters, KioskQueue, SwitchCache
-from crewchat.kiosk import ClaudeCliRunner, Kiosk
+from crewchat.kiosk import ClaudeCliRunner, Kiosk, Research
+from crewchat.kiosk_broker import KioskBrokerClient
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
 from crewchat.server import (
@@ -176,13 +177,29 @@ async def serve(
     store.adapters.insert(0, doorbell)
     # The kiosk (Story 3.5): answers the KIOSK queue from the briefs the shims push, through
     # the `crewkiosk` CLI runner (D-096). Sessions start on each expert's first outsider.
+    # A research server's answers go framed through the research socket, and the broker's
+    # audit of each comes back into its transcript (#142).
+    runner = ClaudeCliRunner()
+    kiosk_broker = KioskBrokerClient()
+    research_servers = {s.id for s in config.mattermost if s.kiosk_research}
+
+    def research_for(dev_name: str, server_id: str) -> Research | None:
+        if server_id not in research_servers:
+            return None
+        return Research(
+            runner,
+            kiosk_broker,
+            lambda: expert_repo(config, store.agents(), server_id, dev_name),
+        )
+
     kiosk_answers = Kiosk(
         kiosk,
         context.briefs,
         chat_backends,
-        ClaudeCliRunner(),
+        runner,
         state_dir=state_dir,
         deliver=doorbell.deliver,
+        research_for=research_for,
     )
     # Social engaged on a server (Story 3.6, R-33): each of that crew's agents there gets its
     # kiosk review on its doorbell queue.
@@ -191,7 +208,12 @@ async def serve(
             server_id, registry.agents_on(crew, server_id)
         )
     )
-    handlers = build_handlers(config, registry, health_sources)
+    handlers = build_handlers(
+        config,
+        registry,
+        health_sources,
+        kiosk_metrics=kiosk_broker.metrics if research_servers else None,
+    )
     handlers.update(
         build_chat_handlers(registry, chat_backends, threads, context, uploads, filters=filters)
     )
