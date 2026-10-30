@@ -4,6 +4,26 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **An idle session registers again after a daemon restart, with no tool call** (#137). From
+  this release on, #129's claim in 0.2.4 holds: the shim's timer pings every 15 s, and
+  registers again when the daemon has forgotten the agent, so an armed doorbell rides through
+  the restart. It didn't on malory's 0.2.3 → 0.2.5 upgrade. Every shim had started against
+  the 0.2.3 daemon, which has no `ping`. On the first `unsupported` answer each shim stopped
+  pinging for good, so the upgrade, itself a restart, brought none of them back until a call.
+  The shim now asks again every 15 s whatever the answer. An unexpected error in a timer tick
+  is logged, and no longer stops the timer in silence.
+
+**Upgrading:** a running shim keeps the code it started with. A shim started before the daemon
+first had `ping` (0.2.4 or 0.2.5 clients against a 0.2.3 daemon) has already stopped pinging,
+and still won't ride through the next daemon restart. Install the clients, then reconnect the
+crewchat MCP server in each such session (`/mcp`), *before* restarting the daemon. A session
+that isn't reconnected recovers as it does today: its doorbell exits 2 on `not_registered`, and
+`chat_health()` registers it again.
+
 ## [0.2.5] — 2026-10-29
 
 The broker puts every bot it mints into its crew's team and default channels, so an agent shows

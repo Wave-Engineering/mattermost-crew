@@ -38,7 +38,8 @@ and the daemon acts on the agent's behalf with what it holds itself.
 - **Ping (#129).** The timer sends `ping{dev_name}` every `PING_EVERY` (15 s). A
   `not_registered` answer re-registers and force-pushes, so an idle session comes back after a
   daemon restart with no tool call, and its doorbell, waiting through the restart, delivers.
-  A daemon without the op (`unsupported`) is not asked again.
+  A daemon without the op (`unsupported`) is asked again every `PING_EVERY` too: the upgrade
+  that brings the op is itself a restart, and a shim that stopped asking missed it (#137).
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
   and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
@@ -346,7 +347,7 @@ class Shim:
         self.registered_at: datetime | None = None
         self.registration: dict[str, Any] = {}
         self.pinged_at: datetime | None = None
-        self.ping_supported = True
+        self._said_unsupported = False  # `unsupported` is logged at INFO once, then DEBUG
         self._brief = _FileState()
         self._squawks = _FileState()
         self._squawked: set[str] = set()
@@ -427,9 +428,10 @@ class Shim:
         """Every `PING_EVERY`, ask the daemon whether it still holds the agent, and register
         again when it doesn't (#129). A restarted daemon has lost every registration, and
         without this an idle session stays unregistered until its next tool call, so its
-        doorbell can't arm. A daemon older than `ping` answers `unsupported` and is never
-        asked again; one that is down is asked again on the next tick."""
-        if not self.ping_supported or self.registered_at is None:
+        doorbell can't arm. A daemon older than `ping` answers `unsupported`, and is asked
+        again like any other: never latch it off, because the upgrade that brings `ping` is a
+        restart, the one this exists for (#137). One that is down is asked on the next tick."""
+        if self.registered_at is None:
             return  # unregistered: `ensure_registered` retries the register itself
         now = self.clock()
         if self.pinged_at is not None and now - self.pinged_at < PING_EVERY:
@@ -437,14 +439,16 @@ class Shim:
         self.pinged_at = now
         try:
             await self.transport("ping", {"dev_name": self.dev_name})
+            log.debug("ping: the daemon holds %s", self.dev_name)
             return
         except DaemonUnreachable as exc:
-            log.debug("ping: %s", exc)
+            log.debug("ping: unreachable: %s", exc)
             return
         except DaemonError as exc:
             if exc.code == "unsupported":
-                self.ping_supported = False
-                log.info("ping: the daemon has no ping op; relying on calls to re-register")
+                level = logging.DEBUG if self._said_unsupported else logging.INFO
+                log.log(level, "ping: the daemon has no ping op yet; asking again next time")
+                self._said_unsupported = True
                 return
             if exc.code != "not_registered":
                 raise
@@ -481,6 +485,7 @@ class Shim:
     async def tick(self) -> None:
         """The timer's work: the daily re-register, the ping, and the file pushes."""
         async with self._lock:
+            log.debug("tick")  # the timer is running: a field check tells this link apart
             try:
                 await self.ensure_registered()
                 await self.ping()
@@ -496,7 +501,12 @@ class Shim:
     ) -> None:
         while True:
             await sleep(interval_s)
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception:
+                # An unexpected error must not end the task: nothing awaits it, so the timer
+                # would stop in silence and an idle session would never re-register again.
+                log.exception("tick failed; the timer carries on")
 
     # -- calls ----------------------------------------------------------------------------------
     async def _forward(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
