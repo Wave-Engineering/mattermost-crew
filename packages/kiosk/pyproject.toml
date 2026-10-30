@@ -3,11 +3,13 @@ name = "crewkiosk"
 version = "0.2.5"
 description = "The kiosk's research side: the corpus builder, and in later releases its broker and relay (#136)."
 requires-python = ">=3.12"
-# Stdlib only: the corpus builder runs as its own system user and needs no more (#140).
+# Stdlib only: the corpus builder and the broker each run as their own system user and need no
+# more (#140, #141). crewkiosk/relay.py is also installed alone, outside the package.
 dependencies = []
 
 [project.scripts]
 crewkiosk-corpus = "crewkiosk.corpus:main"
+crewkiosk-broker = "crewkiosk.broker:main"
 
 [build-system]
 requires = ["hatchling"]

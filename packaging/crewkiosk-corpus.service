@@ -27,5 +27,5 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/crewcorpus
 ProtectHome=yes
 PrivateTmp=yes
-# No chat or broker state or config, and not the kiosk's model credential.
-InaccessiblePaths=-/etc/crewchat -/var/lib/crewchat -/etc/crewbroker -/var/lib/crewbroker -/etc/crewkiosk/model.credential
+# No chat or broker state or config, and neither model key (the runner's or the broker's).
+InaccessiblePaths=-/etc/crewchat -/var/lib/crewchat -/etc/crewbroker -/var/lib/crewbroker -/etc/crewkiosk/model.credential -/etc/crewkiosk/broker-model.credential

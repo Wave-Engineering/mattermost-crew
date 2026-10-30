@@ -1,0 +1,49 @@
+# crewkiosk-broker, the research kiosk's only door (#141; D-111, D-112): the typed corpus ops
+# and the model proxy, one pair of sockets per research server, and the daemon's control socket.
+#
+#   systemctl enable --now crewkiosk-broker-control.socket crewkiosk-broker.service
+#   systemctl reload crewkiosk-broker      # re-read the pool manifests, model.conf and the key
+#
+# Needs:
+#   - the crewkiosk-broker user (its primary group is crewkiosk-broker, which owns each
+#     /var/lib/crewcorpus/<server> directory), a member of crewcorpus (the pool manifests) and
+#     crewkiosk (model.conf, and the socket group the kiosk connects with);
+#   - packaging/crewcorpus.tmpfiles.conf and packaging/crewchat-pool.tmpfiles.conf;
+#   - rg (ripgrep) on PATH;
+#   - the broker's own model key, /etc/crewkiosk/broker-model.credential, 0600
+#     crewkiosk-broker:crewkiosk-broker, never the runner's model.credential. Its first line is
+#     the key alone, or ANTHROPIC_API_KEY=<key> (crewkiosk-run's rules). Without it the ops are
+#     served and every model call is refused.
+[Unit]
+Description=mattermost-crew kiosk broker
+Wants=network-online.target
+After=network-online.target crewkiosk-broker-control.socket
+Requires=crewkiosk-broker-control.socket
+
+[Service]
+Type=simple
+User=crewkiosk-broker
+Group=crewkiosk-broker
+SupplementaryGroups=crewcorpus crewkiosk
+ExecStart=/opt/mattermost-crew/.venv/bin/crewkiosk-broker
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RuntimeDirectory=crewkiosk-broker
+RuntimeDirectoryMode=0755
+# control.sock lives here too, made by the socket unit: a stop must not remove it.
+RuntimeDirectoryPreserve=yes
+StateDirectory=crewkiosk-broker
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/var/lib/crewcorpus /var/lib/crewchat-pool
+# No chat or broker state or config, and not the runner's model key nor the corpus tokens.
+InaccessiblePaths=-/etc/crewchat -/var/lib/crewchat -/etc/crewbroker -/var/lib/crewbroker -/etc/crewkiosk/model.credential
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
