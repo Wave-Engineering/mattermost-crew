@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -465,3 +466,186 @@ def test_wrapper_needs_its_credential(tmp_path: Path) -> None:
     proc = subprocess.run([str(script)], input=b"x", capture_output=True, timeout=30)
     assert proc.returncode == 65 and b"cannot read" in proc.stderr
     assert not (record / "argv").exists()
+
+
+# -- the research runner (#142) --------------------------------------------------------------
+RESEARCH = PACKAGING / "crewkiosk-research-run"
+RESEARCH_TOOLS = "mcp__kiosk__corpus_search,mcp__kiosk__corpus_read,mcp__kiosk__corpus_list"
+ANSWER = "0123456789abcdef0123456789abcdef"
+# Each step the runner takes appends its name to the log: the order is what's tested.
+FAKE_RELAY = """#!/bin/bash
+dir="$RECORD_DIR_PLACEHOLDER"
+echo "$1" >>"$dir/log"
+printf '%s\\n' "$@" >"$dir/relay-$1"
+case "$1" in
+  hello) [[ -e "$dir/refuse" ]] && exit 1; exit 0 ;;
+  http) exec python3 -c 'import socket,sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True: s.accept()[0].close()' "$3" ;;
+esac
+"""
+FAKE_RESEARCH_CLAUDE = """#!/bin/bash
+dir="$RECORD_DIR_PLACEHOLDER"
+echo claude >>"$dir/log"
+printf '%s\\n' "$@" >"$dir/argv"
+prev=""
+for arg in "$@"; do
+  [[ "$prev" == "--mcp-config" ]] && cp "$arg" "$dir/mcp.json"
+  prev="$arg"
+done
+ls -A "$HOME" >"$dir/home"
+env >"$dir/env"
+cat >"$dir/stdin"
+echo "the researched answer"
+"""
+
+
+def sandboxed_research(tmp_path: Path, user: str) -> tuple[Path, Path, Path, int]:
+    """The research runner with its fixed paths in `tmp_path`: (script, record dir, broker
+    dir, relay port). The broker dir holds server `dev`'s two sockets."""
+    record = tmp_path / "record"
+    record.mkdir()
+    fakes = {}
+    for name, body in (("claude", FAKE_RESEARCH_CLAUDE), ("relay", FAKE_RELAY)):
+        fakes[name] = tmp_path / name
+        fakes[name].write_text(body.replace("$RECORD_DIR_PLACEHOLDER", str(record)))
+        fakes[name].chmod(0o755)
+    broker_dir = tmp_path / "broker"
+    broker_dir.mkdir()
+    for sock in ("dev.sock", "dev.model.sock"):
+        bound = socket.socket(socket.AF_UNIX)
+        bound.bind(str(broker_dir / sock))
+        bound.close()  # the socket file stays: all the runner checks is that it is one
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port: int = s.getsockname()[1]
+    text = RESEARCH.read_text()
+    for name, value in (
+        ("KIOSK_USER", user),
+        ("CLAUDE", str(fakes["claude"])),
+        ("RELAY", str(fakes["relay"])),
+        ("BROKER_DIR", str(broker_dir)),
+        ("RELAY_PORT", str(port)),
+    ):
+        text, n = re.subn(rf"^{name}=.*$", f"{name}={value}", text, flags=re.M)
+        assert n == 1, name
+    script = tmp_path / "crewkiosk-research-run"
+    script.write_text(text)
+    script.chmod(0o755)
+    return script, record, broker_dir, port
+
+
+def run_research(script: Path, stdin: bytes) -> subprocess.CompletedProcess[bytes]:
+    env = {"PATH": os.environ["PATH"], "ANTHROPIC_API_KEY": "LEAKED-KEY", "CREWCHAT_TOKEN": "x"}
+    return subprocess.run([str(script)], input=stdin, capture_output=True, env=env, timeout=60)
+
+
+def header(server: str = "dev", post: str = "p1", answer: str = ANSWER) -> bytes:
+    return f"crewkiosk/1 server={server} post={post} answer={answer}\n".encode()
+
+
+def test_research_runner_argv(tmp_path: Path) -> None:
+    """Research mode: hello first, then the model relay, then claude with no native tools, a
+    strict MCP config naming only the relay, and no model key. Today's crewkiosk-run argv is
+    unchanged (test_runner_has_no_tools)."""
+    script, record, broker_dir, port = sandboxed_research(tmp_path, getpass.getuser())
+    proc = run_research(script, header() + b"THE-PROMPT")
+    assert proc.returncode == 0, proc.stderr
+    assert parse_reply(proc.stdout) == "the researched answer"
+    # The hello is answered before the relay to the model starts, and both before claude.
+    assert (record / "log").read_text().split() == ["hello", "http", "claude"]
+    relay = str(tmp_path / "relay")
+    assert (record / "relay-hello").read_text().split() == [
+        "hello",
+        str(broker_dir / "dev.sock"),
+        ANSWER,
+        "p1",
+    ]
+    assert (record / "relay-http").read_text().split() == [
+        "http",
+        str(broker_dir / "dev.model.sock"),
+        str(port),
+    ]
+    argv = (record / "argv").read_text().split("\n")[:-1]
+    mcp_file = argv[argv.index("--mcp-config") + 1]
+    assert argv == [
+        "-p",
+        "--restricted",
+        "--strict-mcp-config",
+        "--mcp-config",
+        mcp_file,
+        "--tools",
+        "",
+        "--allowedTools",
+        RESEARCH_TOOLS,
+        "--settings",
+        '{"switchModelsOnFlag":false}',
+        "--model",
+        "claude-haiku-5-5",
+    ]
+    assert json.loads((record / "mcp.json").read_text()) == {
+        "mcpServers": {
+            "kiosk": {
+                "type": "stdio",
+                "command": relay,
+                "args": ["mcp", str(broker_dir / "dev.sock"), ANSWER, "p1"],
+            }
+        }
+    }
+    assert (record / "stdin").read_bytes() == b"THE-PROMPT"  # the header is the runner's
+    assert (record / "home").read_text() == ""
+    env = recorded_env(record)
+    assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{port}/a/{ANSWER}"
+    assert env["ANTHROPIC_API_KEY"] == "broker"  # a placeholder: no model key in the kiosk
+    assert "CREWCHAT_TOKEN" not in env and "LEAKED-KEY" not in json.dumps(env)
+    assert all(env[v] == "claude-haiku-5-5" for v in MODEL_VARS)
+    assert not Path(mcp_file).exists()  # the scratch is gone afterwards
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        b"",
+        b"\n",
+        b"crewkiosk/2 server=dev post=p1 answer=" + ANSWER.encode() + b"\n",
+        header(server="Dev"),
+        header(server="dev/../x"),
+        header(post="p-1"),
+        header(answer=ANSWER[:-1]),
+        header(answer=ANSWER.upper()),
+        header()[:-1] + b" extra=1\n",
+        b"THE-PROMPT with no header\n",
+    ],
+)
+def test_research_runner_bad_header(tmp_path: Path, first: bytes) -> None:
+    """A malformed header exits 67, before any hello, relay or claude."""
+    script, record, _dir, _port = sandboxed_research(tmp_path, getpass.getuser())
+    proc = run_research(script, first + b"rest")
+    assert proc.returncode == 67 and proc.stdout == b"", proc.stderr
+    assert not (record / "log").exists()
+
+
+def test_research_runner_needs_the_brokers_sockets(tmp_path: Path) -> None:
+    """A server whose broker sockets aren't there exits 68; a hello the broker refuses, 69.
+    Neither starts the relay to the model or claude."""
+    script, record, broker_dir, _port = sandboxed_research(tmp_path, getpass.getuser())
+    proc = run_research(script, header(server="other") + b"x")
+    assert proc.returncode == 68 and not (record / "log").exists()
+    (broker_dir / "dev.model.sock").unlink()
+    (broker_dir / "dev.model.sock").write_text("")  # a file, not a socket
+    proc = run_research(script, header() + b"x")
+    assert proc.returncode == 68 and not (record / "log").exists()
+
+    (tmp_path / "refused").mkdir()
+    script, record, _dir, _port = sandboxed_research(tmp_path / "refused", getpass.getuser())
+    (record / "refuse").touch()
+    proc = run_research(script, header() + b"x")
+    assert proc.returncode == 69 and proc.stdout == b"", proc.stderr
+    assert (record / "log").read_text().split() == ["hello"]  # no model relay, no claude
+
+
+def test_research_runner_refuses_another_user(tmp_path: Path) -> None:
+    script, record, _dir, _port = sandboxed_research(tmp_path, "no-such-kiosk-user")
+    proc = run_research(script, header() + b"x")
+    assert proc.returncode == 64 and not (record / "log").exists()

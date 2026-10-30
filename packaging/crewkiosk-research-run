@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# The research kiosk's CLI runner (#142; D-111). Install root-owned, mode 0755, at
+# /usr/local/libexec/crewkiosk-research-run, beside crewkiosk-run. The daemon never runs it: it
+# connects to /run/crewkiosk/research.sock (packaging/crewkiosk-research.socket, Accept=yes), and
+# systemd starts one packaging/crewkiosk-research@.service instance per connection, as
+# crewkiosk, confined: no network but its own loopback, no filesystem but what the unit binds,
+# and of the broker's sockets only the ones under /run/crewkiosk-broker.
+#
+# Its stdin is one header line, then the prompt to EOF (the daemon half-closes):
+#   crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>
+# and it replies on stdout as crewkiosk-run does: `ok` and the answer, or `error <rc>`. Its own
+# refusals go to stderr, the instance's journal, and reach the daemon as no reply at all. It:
+#   - refuses to run as anyone but crewkiosk, and drops every inherited environment variable
+#     (crewkiosk-run's preamble, copied: that file stays as v0.2.5 shipped it);
+#   - parses the header strictly, and needs that server's two broker sockets,
+#     /run/crewkiosk-broker/<server>.sock and <server>.model.sock;
+#   - says hello to the broker for the answer and waits for its answer (`crewkiosk-relay
+#     hello`): the broker serves the model only to an answer a hello admitted, so the kiosk
+#     starts only once it is, and no model call can come first;
+#   - starts `crewkiosk-relay http <server>.model.sock 8417`, the kiosk's only way to a
+#     model, and waits for it to listen. 8417 is this instance's own loopback: the unit's
+#     PrivateNetwork gives each instance a network namespace of its own;
+#   - gives the CLI an empty HOME and working directory, fresh and removed afterwards, a strict
+#     MCP config naming one server, `kiosk`, the relay's mcp mode on <server>.sock, and no
+#     model key at all: ANTHROPIC_API_KEY is a placeholder and ANTHROPIC_BASE_URL is the
+#     relay, at /a/<answer_id>. The broker adds its own key and forces its own model;
+#   - runs `claude -p --restricted --strict-mcp-config --mcp-config <file> --tools ""
+#     --allowedTools <the three corpus ops> --settings '{"switchModelsOnFlag":false}'
+#     --model claude-haiku-5-5`. The model is pinned only to satisfy the CLI: the broker's
+#     proxy forces the model it is configured with, whatever the request names.
+# Exit codes, before the CLI runs: 64 the wrong user, 67 the header, 68 a broker socket, 69
+# the hello (not admitted), 70 the relay never listened.
+set -euo pipefail
+
+KIOSK_USER=crewkiosk
+CLAUDE=/usr/local/bin/claude
+RELAY=/usr/local/libexec/crewkiosk-relay
+BROKER_DIR=/run/crewkiosk-broker
+RELAY_PORT=8417
+KIOSK_PATH=/usr/local/bin:/usr/bin:/bin
+MODEL_PIN=claude-haiku-5-5
+HEADER_RE='^crewkiosk/1 server=([a-z0-9._-]+) post=([A-Za-z0-9]+) answer=([0-9a-f]{32})$'
+ALLOWED_TOOLS=mcp__kiosk__corpus_search,mcp__kiosk__corpus_read,mcp__kiosk__corpus_list
+
+if [[ "$(id -un)" != "$KIOSK_USER" ]]; then
+  echo "crewkiosk-research-run: must run as $KIOSK_USER" >&2
+  exit 64
+fi
+
+# Nothing inherited reaches the CLI.
+while IFS= read -r name; do
+  unset "$name" 2>/dev/null || true
+done < <(compgen -e)
+export PATH="$KIOSK_PATH"
+umask 077
+
+# The header: one line, exactly the daemon's shape, or nothing runs.
+header=""
+IFS= read -r header || true
+if [[ ! "$header" =~ $HEADER_RE ]]; then
+  echo "crewkiosk-research-run: a malformed header line" >&2
+  exit 67
+fi
+server="${BASH_REMATCH[1]}"
+post="${BASH_REMATCH[2]}"
+answer="${BASH_REMATCH[3]}"
+op_sock="$BROKER_DIR/$server.sock"
+model_sock="$BROKER_DIR/$server.model.sock"
+for sock in "$op_sock" "$model_sock"; do
+  if [[ ! -S "$sock" ]]; then
+    echo "crewkiosk-research-run: no broker socket $sock" >&2
+    exit 68
+  fi
+done
+
+scratch="$(mktemp -d -t crewkiosk.XXXXXXXX)"
+relay_pid=""
+cleanup() {
+  if [[ -n "$relay_pid" ]]; then
+    kill "$relay_pid" 2>/dev/null || true
+  fi
+  rm -rf "$scratch"
+}
+trap cleanup EXIT
+mkdir -m 0700 "$scratch/home" "$scratch/work" "$scratch/io"
+cat >"$scratch/io/prompt"
+
+# Admitted first: the broker answers the hello before anything else may reach it.
+if ! "$RELAY" hello "$op_sock" "$answer" "$post"; then
+  echo "crewkiosk-research-run: the broker did not admit answer $answer" >&2
+  exit 69
+fi
+
+"$RELAY" http "$model_sock" "$RELAY_PORT" &
+relay_pid=$!
+listening=0
+for _ in $(seq 1 200); do
+  if (: <"/dev/tcp/127.0.0.1/$RELAY_PORT") 2>/dev/null; then
+    listening=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$listening" -ne 1 ]]; then
+  echo "crewkiosk-research-run: the model relay never listened on $RELAY_PORT" >&2
+  exit 70
+fi
+
+# Every value below matched HEADER_RE or is fixed above: nothing in it needs JSON escaping.
+printf '{"mcpServers":{"kiosk":{"type":"stdio","command":"%s","args":["mcp","%s","%s","%s"]}}}\n' \
+  "$RELAY" "$op_sock" "$answer" "$post" >"$scratch/io/mcp.json"
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$RELAY_PORT/a/$answer"
+export ANTHROPIC_API_KEY=broker # a placeholder: the broker holds the key, the kiosk none
+export ANTHROPIC_MODEL="$MODEL_PIN"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_PIN"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_PIN"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_PIN"
+export ANTHROPIC_DEFAULT_FABLE_MODEL="$MODEL_PIN"
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL_PIN"
+export HOME="$scratch/home"
+cd "$scratch/work"
+
+rc=0
+"$CLAUDE" -p --restricted --strict-mcp-config --mcp-config "$scratch/io/mcp.json" --tools "" --allowedTools "$ALLOWED_TOOLS" --settings '{"switchModelsOnFlag":false}' --model "$MODEL_PIN" <"$scratch/io/prompt" >"$scratch/io/answer" || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  printf 'ok\n'
+  cat "$scratch/io/answer"
+else
+  echo "crewkiosk-research-run: claude exited $rc" >&2
+  printf 'error %d\n' "$rc"
+fi
