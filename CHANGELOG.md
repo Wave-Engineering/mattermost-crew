@@ -14,7 +14,8 @@ All notable changes to this project are recorded here. The format follows
   path on `register`. For each research server the daemon writes
   `/var/lib/crewchat-pool/<server_id>.json`: the repos of agents holding a token there, plus
   `corpus_extra`, minus `corpus_exclude`. Repos compare without regard to case or a trailing
-  `.git`, so an exclude wins however a repo is spelled, and it covers the repo's `.wiki`. A
+  `.git`, so an exclude wins however a repo is spelled, and it covers the repo's `.wiki`. The
+  manifest carries the excludes too, for the builder to check each repo's canonical path. A
   repo is kept only when its `host/org` matches a forge entry in an explicit `agents_allow`
   (D-112): an agent's repo, its own crew's for that server. So research on a server is a config
   error unless `kiosk = true` and every crew table on that server sets `agents_allow`.

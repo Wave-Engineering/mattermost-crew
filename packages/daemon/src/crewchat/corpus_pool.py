@@ -19,7 +19,9 @@ An exclude covers the repo's wiki too (`<repo>.wiki`, a repo of its own on GitHu
 A renamed or transferred repo whose old path still redirects is beyond the daemon's sight: the
 corpus builder resolves each repo's canonical path and checks the excludes again (#140).
 
-The file is `{"server", "generated_at", "refresh_minutes", "repos"}`, written atomically, mode
+The file is `{"server", "generated_at", "refresh_minutes", "repos", "exclude"}`, where
+`exclude` is `corpus_exclude` canonicalized (casefolded, no `.git`), for the builder's own check
+on each repo's canonical path, since it can't read the daemon's config. Written atomically, mode
 0640, into a directory the corpus user's group can read (`packaging/crewchat-pool.tmpfiles.conf`).
 It is rewritten only when its contents other than `generated_at` change. The daemon writes it
 at start and after each `register`; an agent that loses its token another way (a deactivated
@@ -64,7 +66,7 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
     # Forges resolve paths without regard to case, and clone `repo.git` as `repo`, so one repo
     # spelled two ways is one repo, and an exclude matches it however it is spelled: an
     # exclude always wins, over the repo's wiki too.
-    excluded = {_canon(r).casefold() for r in server.corpus_exclude}
+    excluded = set(exclude_keys(server))
     pool: dict[str, str] = {}
     canon = [(_canon(r), admitting) for r, admitting in candidates]
     for repo, admitting in sorted((c for c in canon if is_repo(c[0])), key=lambda c: c[0]):
@@ -74,6 +76,12 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
         if any(admits_repo(e, repo) for e in admitting):
             pool[key] = repo
     return sorted(pool.values())
+
+
+def exclude_keys(server: MattermostServer) -> list[str]:
+    """`corpus_exclude` as the keys repos are compared by, sorted: casefolded, no `.git`. A
+    repo is excluded when its key, or its key without `.wiki`, is one of them."""
+    return sorted({_canon(r).casefold() for r in server.corpus_exclude})
 
 
 def _canon(repo: str) -> str:
@@ -130,6 +138,7 @@ class PoolManifest:
             body = {
                 "server": server.id,
                 "refresh_minutes": server.corpus_refresh_minutes,
+                "exclude": exclude_keys(server),
                 "repos": repos,
             }
             # `health` counts what is on disk, never what failed to get there.

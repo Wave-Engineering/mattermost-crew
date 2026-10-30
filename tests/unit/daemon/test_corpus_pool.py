@@ -65,6 +65,7 @@ def test_pool_membership(
     got = manifest(tmp_path)
     assert got["repos"] == [f"{ORG}/docs", REPO_B, REPO_A]
     assert got["server"] == "dev" and got["refresh_minutes"] == 15
+    assert got["exclude"] == [f"{ORG}/secret-infra"]  # for #140's check on canonical paths
     assert got["generated_at"] == "2026-10-30T00:00:00+00:00"
     assert daemon.pool.health() == {"dev": {"pool_repos": 3}}
 
@@ -216,11 +217,12 @@ def test_exclude_and_dedupe_ignore_case(
 def test_exclude_written_with_git_suffix_still_wins(
     make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
 ) -> None:
-    raw = research(servers_toml, corpus_exclude=[f"{ORG}/secret-infra.git"])
+    raw = research(servers_toml, corpus_exclude=[f"{ORG}/Secret-Infra.git"])
     daemon = wired(make_daemon, raw, tmp_path)
     register(daemon, "infra", repo=f"{ORG}/secret-infra")
     register(daemon, "babel", repo=f"{REPO_B}.git")
     assert manifest(tmp_path)["repos"] == [REPO_B]
+    assert manifest(tmp_path)["exclude"] == [f"{ORG}/secret-infra"]  # canonical
 
 
 @pytest.mark.parametrize("wiki", [".wiki", ".WIKI", ".wiki.git"])
