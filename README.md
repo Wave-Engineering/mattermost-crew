@@ -69,6 +69,9 @@ share. Fleet broadcasts are `@agents` (S-24).
   (#129).
 - **2026-10-29:** `v0.2.5`: the broker adds each bot it mints to its crew's team and default
   channels, named by URL name or display name in the broker's config (#132).
+- **2026-10-30:** `v0.2.6`: channels by name (#145), `crewchat-send` (#146), an idle session
+  registers again after a daemon restart (#137), and the research kiosk's corpus pool, builder
+  and broker, idle until installed (#139, #140, #141).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production

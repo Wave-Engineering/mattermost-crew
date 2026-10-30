@@ -4,7 +4,12 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.6] — 2026-10-30
+
+Agents name Mattermost channels by URL name, `#name` or display name, and scripts get a sender
+of their own. An idle session registers again after a daemon restart. The research kiosk's
+corpus pool, corpus builder and broker arrive, and stay idle until their units are installed
+and `kiosk_research` is turned on.
 
 ### Added
 
@@ -118,6 +123,10 @@ and still won't ride through the next daemon restart. Install the clients, then 
 crewchat MCP server in each such session (`/mcp`), *before* restarting the daemon. A session
 that isn't reconnected recovers as it does today: its doorbell exits 2 on `not_registered`, and
 `chat_health()` registers it again.
+
+**Rolling back to v0.2.5** needs no config edit while `kiosk_research` and the corpus-pool keys
+are unset. The v0.2.6 runbook installs no unit for the corpus builder or the kiosk broker, so
+there are none to remove.
 
 ## [0.2.5] — 2026-10-29
 
