@@ -17,6 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SOCK=/run/crewkiosk/kiosk.sock
 STUB_MARK="crewkiosk-ci-stub"
+RESEARCH_SERVERS="itdev itother" # IT-31b's two servers
 
 log() { echo "kiosk-up: $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -41,6 +42,74 @@ printf 'base_url=%s\n' "${ANTHROPIC_BASE_URL:-}"
 printf 'model_env=%s\n' "${ANTHROPIC_MODEL:-}"
 printf 'arg=[%s]\n' "$@"
 printf 'prompt=%s\n' "$prompt"
+# In a research unit (#142), also what its namespace holds, for tests/integration/test_kiosk_confinement.py.
+if [[ "${ANTHROPIC_BASE_URL:-}" == */a/* ]]; then
+  exec /usr/bin/python3 -I -S -c '
+import json, os, socket
+def connect(path):
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(path)
+        return "connected"
+    except OSError as e:
+        return type(e).__name__
+    finally:
+        s.close()
+def read(path):
+    try:
+        if os.path.isdir(path):
+            return "listed:%d" % len(os.listdir(path))
+        with open(path, "rb") as f:
+            f.read(1)
+        return "read"
+    except OSError as e:
+        return type(e).__name__
+def tcp(host):
+    try:
+        socket.create_connection((host, 80), timeout=3).close()
+        return "connected"
+    except OSError as e:
+        return type(e).__name__
+def setuid_bins():
+    found = []
+    for d in ("/usr/bin", "/usr/sbin"):
+        for n in sorted(os.listdir(d)) if os.path.isdir(d) else ():
+            try:
+                if os.stat(os.path.join(d, n)).st_mode & 0o4000:
+                    found.append(os.path.join(d, n))
+            except OSError:
+                pass
+    return found
+def elevate(path):
+    # Each binary is asked for nothing but `id -u` where it can run one; the uid must not change.
+    import subprocess
+    argv = {"sudo": [path, "-n", "id", "-u"], "su": [path, "-c", "id -u", "root"]}.get(
+        os.path.basename(path), [path, "--help"])
+    try:
+        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=5)
+        return {"rc": r.returncode, "out": r.stdout.decode(errors="replace").strip()[:40]}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"rc": None, "out": type(e).__name__}
+status = dict(l.split(":", 1) for l in open("/proc/self/status").read().splitlines() if ":" in l)
+b = "/run/crewkiosk-broker"
+bins = setuid_bins()
+print("probe=" + json.dumps({
+    "uid": os.getuid(),
+    "no_new_privs": status.get("NoNewPrivs", "").strip(),
+    "setuid": {p: elevate(p) for p in bins if os.path.basename(p) in ("sudo", "su", "passwd", "mount")},
+    "root": sorted(os.listdir("/")),
+    "broker_dir": sorted(os.listdir(b)) if os.path.isdir(b) else None,
+    "connect": {n: connect(f"{b}/{n}") for s in ("itdev", "itother")
+        for n in (f"{s}.sock", f"{s}.model.sock")},
+    "control": connect("/run/crewkiosk-broker-control/control.sock"),
+    "read": {p: read(p) for p in ("/etc/passwd", "/etc/crewkiosk/model.credential",
+        "/etc/crewkiosk/broker-model.credential", "/home", "/opt/mattermost-crew",
+        "/var/lib/crewcorpus", "/var/lib/crewchat")},
+    "tcp": tcp("1.1.1.1"),
+    "dns": tcp("example.com"),
+}))
+'
+fi
 EOF
 # -D: a stock Ubuntu /usr/local has no libexec (GitHub's hosted image did; the ephemeral pool's doesn't).
 $SUDO install -D -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-run" /usr/local/libexec/crewkiosk-run
@@ -58,7 +127,31 @@ $SUDO systemctl restart crewkiosk.socket  # as the runbook's block: a re-run app
 $SUDO test -S "$SOCK" || die "no socket at $SOCK"
 log "crewkiosk.socket is listening on $SOCK"
 
+# The research kiosk (#142; D-113), as the runbook installs it: the runner, the relay and the
+# shared body, then two servers' units, so IT-31b can show each sees only its own broker sockets.
+log "installing the research runner, the relay, the unit body and two servers' units"
+$SUDO install -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-research-run" \
+  /usr/local/libexec/crewkiosk-research-run
+$SUDO install -m 0755 -o root -g root "${ROOT}/packages/kiosk/src/crewkiosk/relay.py" \
+  /usr/local/libexec/crewkiosk-relay
+$SUDO install -D -m 0755 -o root -g root "${ROOT}/packaging/crewkiosk-research-units" \
+  /usr/local/sbin/crewkiosk-research-units
+$SUDO install -D -m 0644 -o root -g root "${ROOT}/packaging/crewkiosk-research@.service" \
+  /usr/local/share/crewkiosk/crewkiosk-research@.service
+for server in $RESEARCH_SERVERS; do
+  $SUDO /usr/local/sbin/crewkiosk-research-units "$server" >/dev/null
+done
+$SUDO systemctl daemon-reload
+for server in $RESEARCH_SERVERS; do
+  $SUDO systemctl enable "crewkiosk-research-$server.socket"
+  $SUDO systemctl restart "crewkiosk-research-$server.socket"
+  $SUDO test -S "/run/crewkiosk/research-$server.sock" || die "no research socket for $server"
+done
+log "research sockets are listening for: $RESEARCH_SERVERS"
+
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   echo "CREWKIOSK_SOCKET=${SOCK}" >>"$GITHUB_ENV"
+  echo "CREWKIOSK_RESEARCH_SERVERS=${RESEARCH_SERVERS}" >>"$GITHUB_ENV"
 fi
 echo "export CREWKIOSK_SOCKET=${SOCK}"
+echo "export CREWKIOSK_RESEARCH_SERVERS='${RESEARCH_SERVERS}'"

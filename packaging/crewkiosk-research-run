@@ -22,7 +22,9 @@
 #     compares numbers;
 #   - before reading a byte, needs its stdin to be a connection accepted on
 #     /run/crewkiosk/research-<server>.sock: the kernel's word for which socket the daemon
-#     connected to, which holds even if a unit layout or a header is ever wrong (D-113);
+#     connected to, which holds even if a unit layout or a header is ever wrong (D-113). It asks
+#     fd 0, not sd_listen_fds' fd 3, because fd 0 is the one it reads (StandardInput=socket),
+#     and the environment that names fd 3 is dropped above;
 #   - parses the header strictly, needs it to name the same server, and needs that server's
 #     two broker sockets, /run/crewkiosk-broker/<server>.sock and <server>.model.sock;
 #   - says hello to the broker for the answer and waits for its answer (`crewkiosk-relay
