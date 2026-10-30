@@ -78,6 +78,7 @@ def test_it29_builds_filters_and_withholds(
     renamed: set[str] = set()
     credential = tmp_path / "corpus-dev.credential"
     credential.write_text(TOKEN + "\n")
+    credential.chmod(0o600)
     root = tmp_path / "corpus"
     root.mkdir()
     builder = Builder(

@@ -24,20 +24,31 @@ Per repo:
 4. **Scan** it with `gitleaks dir`. A finding or a gitleaks error withholds the repo, and its
    last good copy is served. Only the rule ids and file paths are logged, never a value. A repo
    may not exempt itself: `.gitleaks.toml` and `.gitleaksignore` never reach the tree, gitleaks
-   runs from an empty directory with no `GITLEAKS_*` variables, and it scans a flat copy, each
+   runs with no `GITLEAKS_*` variables, and it scans a flat copy from inside it (`.`), each
    file as `f<n>`, so its default path allowlist (`node_modules/`, `*.svg`, lock files) matches
    nothing, with `gitleaks:allow` neutralized. A file keeps the suffix a path-scoped rule needs
    (`.yaml`, `.tf`, `.php`, `nuget.config`), as `f000001.yaml`. A missing gitleaks publishes
-   nothing at all.
+   nothing at all. A repo's last good copy is served only if it still passes the denylist and
+   gitleaks today: a rule added since is applied to it too.
 
-A filesystem error fails that one repo, and a failed build fails that one server: neither stops
-the rest. A repo whose path lies under another pooled repo's is refused.
+A repo that resolves into another org than its manifest entry's (a transfer) is `excluded`,
+like one that resolves to an excluded path: the daemon admitted the entry by its host/org, and
+no allowlist vouched for the new one. Each exclude entry is resolved too, so one written under a
+repo's old name still covers it once renamed. If an exclude can't be resolved (anything but a
+404), nothing from its forge is served that build, not even a last good copy.
+
+A filesystem or any other error fails that one repo, and a failed build fails that one server:
+neither stops the rest. A repo whose path lies under another pooled repo's is refused. A file
+whose name isn't UTF-8 is left out.
 
 Each server is published as a new generation, `gen-<utc>-<n>`, with dirs 0555 and files 0444,
 and `current` is swapped onto it atomically. Generations older than the previous one are
-removed. `status/<server>.json` (0644) records each repo's state for the daemon's `health`.
-It never holds a secret, a finding's value or a credential. A server is rebuilt once its
-`refresh_minutes` have passed since its last build, or sooner if its manifest's repos change.
+removed, and the previous one, kept for a reader mid-read, loses at once any repo the new one
+doesn't serve. `status/<server>.json` (0644) records each repo's state for the daemon's
+`health`. It never holds a secret, a finding's value, a credential or an exclude. A server is
+rebuilt once its `refresh_minutes` have passed since its last build, or sooner if its manifest
+changes. A server with no manifest (research turned off) has its corpus and status removed.
+Credential files must be 0600 or 0400.
 
 `/var/lib/crewcorpus` is 2751 `crewcorpus:crewkiosk-broker` (`packaging/crewcorpus.tmpfiles.conf`).
 The daemon can reach `status/` through it, and each `<server>` directory inherits the broker's
@@ -54,6 +65,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,6 +97,8 @@ STATUS_MODE = 0o644
 # The daemon's `crewchat.config.REPO_ENTRY_RE`, copied: the builder can't import the daemon.
 REPO_ENTRY_RE = re.compile(r"^[a-z0-9.-]+(/[A-Za-z0-9._-]+){2,}$")
 SERVER_RE = re.compile(r"^[a-z0-9._-]+$")
+# `<root>/status` is world-traversable, and `.` and `..` are no directory of their own.
+RESERVED_SERVERS = frozenset({"status", ".", ".."})
 MANIFEST_KEYS = frozenset({"server", "generated_at", "refresh_minutes", "repos", "exclude"})
 
 # Matched, casefolded, against every path component, the basename among them.
@@ -121,6 +135,10 @@ class ManifestError(ValueError):
 
 class LookupFailed(RuntimeError):
     pass
+
+
+class NotFound(LookupFailed):
+    """The forge has no repo by that name that the token can see (404)."""
 
 
 class GitFailed(RuntimeError):
@@ -182,6 +200,8 @@ def load_manifest(path: Path) -> Manifest:
     refresh, repos, exclude = data["refresh_minutes"], data["repos"], data["exclude"]
     if not isinstance(server, str) or not SERVER_RE.fullmatch(server):
         raise ManifestError(f"{path}: bad server {server!r}")
+    if server in RESERVED_SERVERS:
+        raise ManifestError(f"{path}: {server!r} is a reserved name")
     if path.name != f"{server}.json":
         raise ManifestError(f"{path}: names server {server!r}")
     if not isinstance(generated, str):
@@ -236,7 +256,8 @@ def forge_canonical(repo: str, token: str) -> str:
         with opener.open(request, timeout=LOOKUP_TIMEOUT_S) as reply:
             data = json.loads(reply.read())
     except urllib.error.HTTPError as exc:
-        raise LookupFailed(f"{repo}: the forge answered {exc.code}") from None
+        kind = NotFound if exc.code == 404 else LookupFailed
+        raise kind(f"{repo}: the forge answered {exc.code}") from None
     except (OSError, ValueError) as exc:
         raise LookupFailed(f"{repo}: {type(exc).__name__}") from None
     name = data.get(key) if isinstance(data, dict) else None
@@ -250,8 +271,12 @@ def https_url(repo: str) -> str:
 
 
 def read_token(credential: Path) -> str:
-    """The credential's first line. Raises OSError, or ValueError when it is empty."""
+    """The credential's first line. Raises OSError, or ValueError when it is empty or any
+    group or other user can read it."""
     with credential.open(encoding="utf-8") as fh:
+        mode = stat.S_IMODE(os.fstat(fh.fileno()).st_mode)
+        if mode & 0o077:
+            raise ValueError(f"{credential} is mode {mode:04o}: make it 0600 or 0400")
         token = fh.readline().strip()
     if not token:
         raise ValueError(f"{credential} is empty")
@@ -306,7 +331,8 @@ class Git:
             "clone",
             "--depth",
             "1",
-            "--filter=blob:limit=5m",
+            # `blob:limit=<n>` leaves out blobs of n bytes or more: keep exactly MAX_FILE_BYTES.
+            f"--filter=blob:limit={MAX_FILE_BYTES + 1}",
             "--no-checkout",
             "--single-branch",
             "--quiet",
@@ -339,12 +365,13 @@ def is_text(data: bytes) -> bool:
 
 def extract(git: Git, clone: Path, tree: Path) -> tuple[int, int]:
     """Write HEAD's kept files under `tree`, from the object store. Returns (files, bytes)."""
+    # Only the `?<oid>` lines, as bytes: the others carry paths, which need not be UTF-8.
     missing = {
-        line[1:]
-        for line in git.run("rev-list", "--objects", "--missing=print", "HEAD", cwd=clone)
-        .decode()
-        .splitlines()
-        if line.startswith("?")
+        line[1:].decode("ascii")
+        for line in git.run(
+            "rev-list", "--objects", "--missing=print", "HEAD", cwd=clone
+        ).splitlines()
+        if line.startswith(b"?")
     }
     entries: list[tuple[str, str]] = []
     listing = git.run("ls-tree", "-r", "-z", "--full-tree", "HEAD", cwd=clone)
@@ -352,8 +379,11 @@ def extract(git: Git, clone: Path, tree: Path) -> tuple[int, int]:
         if not record:
             continue
         meta, _, raw_path = record.partition(b"\t")
-        mode, kind, oid = meta.decode().split(" ")
-        path = os.fsdecode(raw_path)
+        mode, kind, oid = meta.decode("ascii").split(" ")
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # a name no op could be asked for, nor a status file or log hold
         # 120000 is a symlink and 160000 a submodule: neither is copied.
         if kind != "blob" or mode not in {"100644", "100755"} or oid in missing:
             continue
@@ -425,10 +455,12 @@ def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
     rewrite with `gitleaks:allow` neutralized if it carries the marker. The default config
     allowlists paths (`node_modules/`, `vendor/`, `*.svg`, lock files and more), so a file
     scanned under its own path could ship unscanned; under `f<n>` no path matches. A file
-    keeps a `RULE_SUFFIX` so the rules scoped to it still fire. Findings are mapped back to
-    the tree's paths. The report keeps only rule ids and paths."""
-    shadow, empty, report = work / "scan", work / "empty", work / "leaks.json"
-    empty.mkdir()
+    keeps a `RULE_SUFFIX` so the rules scoped to it still fire. gitleaks runs from inside the
+    copy and scans `.`, so every path it matches is `f<n>`, never one under the server's
+    directory, whose name is the server id's: a server named `node_modules` would otherwise
+    match the allowlist. The copy holds no `.gitleaks.toml` for it to load. Findings are mapped
+    back to the tree's paths. The report keeps only rule ids and paths."""
+    shadow, report = work / "scan", work / "leaks.json"
     shadow.mkdir()
     names: dict[str, str] = {}
     for n, src in enumerate(sorted(p for p in tree.rglob("*") if p.is_file()), 1):
@@ -451,10 +483,12 @@ def scan(gitleaks: str, tree: Path, work: Path) -> Scan:
         "json",
         "--report-path",
         str(report),
-        str(shadow),
+        ".",
     ]
     try:
-        done = subprocess.run(argv, cwd=empty, env=env, capture_output=True, timeout=GIT_TIMEOUT_S)
+        done = subprocess.run(
+            argv, cwd=shadow, env=env, capture_output=True, timeout=GIT_TIMEOUT_S
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return Scan(False, f"gitleaks failed: {type(exc).__name__}")
     if done.returncode == 0:
@@ -562,7 +596,9 @@ class Builder:
         return data if isinstance(data, dict) else {}
 
     def due(self, manifest: Manifest) -> bool:
-        """Its refresh interval has passed since its last build, or its repos changed."""
+        """Its refresh interval has passed since its last build, or its manifest changed. The
+        daemon rewrites a manifest, and its `generated_at`, only when what it says changes, so
+        a new `generated_at` catches a change to `exclude` alone."""
         status = self.read_status(manifest.server)
         try:
             built = datetime.fromisoformat(status["built_at"])
@@ -570,7 +606,54 @@ class Builder:
             return True
         if set(status.get("repos") or {}) != set(manifest.repos):
             return True
+        if status.get("manifest_at") != manifest.generated_at:
+            return True
         return self.clock() - built >= timedelta(minutes=manifest.refresh_minutes)
+
+    def resolve_excludes(self, manifest: Manifest) -> tuple[frozenset[str], frozenset[str]]:
+        """The manifest's exclude keys plus each one's canonical path today, and the hosts
+        whose excludes could not be resolved. A 404 means nothing by that name can be cloned,
+        so it adds nothing. A host with no credential is never cloned from at all."""
+        keys, blocked = set(manifest.exclude), set()
+        for entry in sorted(manifest.exclude):
+            host = entry.split("/", 1)[0]
+            try:
+                token = read_token(self.credential(manifest.server, host))
+            except (OSError, ValueError):
+                continue
+            try:
+                canonical = self.lookup(entry, token)
+            except NotFound:
+                continue
+            except LookupFailed as exc:
+                log.error(
+                    "corpus %s: an exclude can't be resolved (%s): nothing from %s is served",
+                    manifest.server,
+                    exc,
+                    host,
+                )
+                blocked.add(host)
+                continue
+            if canonical.split("/", 1)[0] == host:
+                keys.add(canon_key(canonical))
+        return frozenset(keys), frozenset(blocked)
+
+    def orphans(self, servers: set[str]) -> list[str]:
+        """Servers with a corpus or a status here but no manifest: research was turned off."""
+        found: set[str] = set()
+        for p in self.root.iterdir():
+            if p.is_dir() and not p.is_symlink() and p.name not in RESERVED_SERVERS:
+                found.add(p.name)
+        status_dir = self.root / "status"
+        if status_dir.is_dir():
+            found |= {p.stem for p in status_dir.glob("*.json")}
+        return sorted(s for s in found if SERVER_RE.fullmatch(s) and s not in servers)
+
+    def remove_server(self, server: str) -> None:
+        remove_tree(self.root / server)
+        with contextlib.suppress(FileNotFoundError):
+            self.status_path(server).unlink()
+        log.warning("corpus %s: no manifest (research is off): its corpus is removed", server)
 
     def build(self, manifest: Manifest) -> dict[str, Any]:
         """Publish a new generation for `manifest`, swap `current` onto it, write the status."""
@@ -586,6 +669,7 @@ class Builder:
         swapped = False
         try:
             gen = self._new_gen(server_root, now)
+            exclude, blocked = self.resolve_excludes(manifest)
             nested = nested_repos(manifest.repos)
             results: dict[str, RepoResult] = {}
             for repo in manifest.repos:
@@ -594,8 +678,12 @@ class Builder:
                     log.error("corpus %s: %s nests inside another pooled repo", server, repo)
                     results[repo] = RepoResult("clone_failed")
                     continue
+                if repo.split("/", 1)[0] in blocked:
+                    # It may be the excluded repo under a new name: no last good copy either.
+                    results[repo] = RepoResult("clone_failed")
+                    continue
                 results[repo] = self._repo(
-                    manifest, repo, work, gen, previous.get(repo), last_gen, now
+                    manifest, exclude, repo, work, gen, previous.get(repo), last_gen, now
                 )
             set_modes(gen)
             link = server_root / "current.new"
@@ -607,10 +695,12 @@ class Builder:
             for old in server_root.glob("gen-*"):
                 if old.resolve() not in {gen.resolve(), last_gen}:
                     remove_tree(old)
-            # An excluded repo's last good copy goes now, not with the previous generation.
-            for repo, r in results.items():
-                if r.state == "excluded" and last_gen is not None:
-                    drop_published(last_gen, repo)
+            # The previous generation, kept for a reader mid-read, never serves a repo the new
+            # one doesn't: one excluded, blocked, failing today's checks or out of the manifest.
+            if last_gen is not None:
+                for repo in sorted(set(previous) | set(results)):
+                    if not (gen / repo).is_dir():
+                        drop_published(last_gen, repo)
         finally:
             remove_tree(work)
             if gen is not None and not swapped:
@@ -618,6 +708,7 @@ class Builder:
         status = {
             "server": server,
             "built_at": now.isoformat(),
+            "manifest_at": manifest.generated_at,
             "repos": {repo: vars(r) for repo, r in sorted(results.items())},
         }
         self._write_status(server, status)
@@ -635,6 +726,7 @@ class Builder:
     def _repo(
         self,
         manifest: Manifest,
+        exclude: frozenset[str],
         repo: str,
         work: Path,
         gen: Path,
@@ -642,13 +734,16 @@ class Builder:
         last_gen: Path | None,
         now: datetime,
     ) -> RepoResult:
-        """One repo, published into `gen`: fresh, its last good copy, or nothing. A filesystem
-        error (a full disk, a name too long) fails this repo only, never the build."""
+        """One repo, published into `gen`: fresh, its last good copy, or nothing. Any error (a
+        full disk, a name too long, anything unforeseen) fails this repo only, never the
+        build. The message of an error that is not an OSError is never logged: it might quote
+        a file's contents."""
         server = manifest.server
         try:
-            result = self._fresh(manifest, repo, work, gen)
-        except OSError as exc:
-            log.error("corpus %s: %s: %s", server, repo, exc.strerror or type(exc).__name__)
+            result = self._fresh(manifest, exclude, repo, work, gen)
+        except Exception as exc:
+            reason = exc.strerror if isinstance(exc, OSError) else None
+            log.error("corpus %s: %s: %s", server, repo, reason or type(exc).__name__)
             discard(gen / repo)
             result = RepoResult("clone_failed")
         if result.state == "ok":
@@ -658,6 +753,20 @@ class Builder:
             return result
         old = last_gen / repo if last_gen is not None else None
         if old is not None and old.is_dir() and isinstance(before, dict):
+            try:
+                stale = self._recheck(old, work)
+            except Exception as exc:
+                stale = f"the recheck failed: {type(exc).__name__}"
+            if stale is not None:
+                log.error(
+                    "corpus %s: %s is %s, and its last good copy fails today's checks (%s): "
+                    "serving nothing",
+                    server,
+                    repo,
+                    result.state,
+                    stale,
+                )
+                return RepoResult(result.state)
             try:
                 link_copy(old, gen / repo)
             except OSError as exc:
@@ -681,7 +790,21 @@ class Builder:
             )
         return result
 
-    def _fresh(self, manifest: Manifest, repo: str, work: Path, gen: Path) -> RepoResult:
+    def _recheck(self, old: Path, work: Path) -> str | None:
+        """Why a last good copy would fail today's denylist or gitleaks, or None if it
+        passes: a rule or a denylist entry added since it was built applies to it too."""
+        for p in sorted(old.rglob("*")):
+            rel = str(p.relative_to(old))
+            if p.is_file() and denied(rel):
+                return f"denylisted {rel}"
+        found = scan(self.gitleaks, old, Path(tempfile.mkdtemp(dir=work, prefix="recheck-")))
+        if found.clean:
+            return None
+        return f"{found.reason}: rules {', '.join(found.rules) or '-'}"
+
+    def _fresh(
+        self, manifest: Manifest, exclude: frozenset[str], repo: str, work: Path, gen: Path
+    ) -> RepoResult:
         server = manifest.server
         here = Path(tempfile.mkdtemp(dir=work, prefix="repo-"))
         host = repo.split("/", 1)[0]
@@ -700,7 +823,13 @@ class Builder:
         if canonical.split("/", 1)[0] != host:
             log.error("corpus %s: %s resolves off its forge, to %s", server, repo, canonical)
             return RepoResult("clone_failed")
-        if is_excluded(canonical, manifest.exclude):
+        if _org(canonical) != _org(repo):
+            # The daemon admitted `repo` by its host/org; nothing vouched for this one.
+            log.warning(
+                "corpus %s: %s resolves to %s, in another org: not cloned", server, repo, canonical
+            )
+            return RepoResult("excluded")
+        if is_excluded(canonical, exclude):
             log.warning(
                 "corpus %s: %s resolves to %s, which is excluded: not cloned",
                 server,
@@ -751,14 +880,20 @@ class Builder:
             raise
 
 
+def _org(repo: str) -> str:
+    """`host/org`, casefolded: what the daemon's allowlist admits a repo by."""
+    return "/".join(canon_key(repo).split("/")[:2])
+
+
 def _no_token(exc: BaseException) -> str:
     """An exception's message, which never carries the token: lookups raise their own."""
     return str(exc) if isinstance(exc, LookupFailed) else type(exc).__name__
 
 
 def run(pool_dir: Path, builder: Builder) -> int:
-    """Build every due server. 2 if gitleaks or the corpus root is missing (nothing is
-    published), 1 if a manifest was malformed or a server's build failed, else 0. One server's
+    """Build every due server, and remove the corpus of any server with no manifest. 2 if
+    gitleaks, the corpus root or a listable pool dir is missing (nothing is published or
+    removed), 1 if a manifest was malformed or a server's build failed, else 0. One server's
     failure never stops the others. A withheld or failed repo is a state in `health`, not an
     error."""
     if shutil.which(builder.gitleaks) is None:
@@ -768,8 +903,22 @@ def run(pool_dir: Path, builder: Builder) -> int:
         # Its mode and group are tmpfiles' to set (packaging/crewcorpus.tmpfiles.conf).
         log.error("corpus: no %s: install packaging/crewcorpus.tmpfiles.conf", builder.root)
         return 2
+    try:
+        # Listed, not globbed: an unreadable pool dir must never read as "no servers", which
+        # would remove every corpus below.
+        names = sorted(n for n in os.listdir(pool_dir) if n.endswith(".json"))
+    except OSError as exc:
+        log.error("corpus: cannot list %s: %s", pool_dir, exc.strerror or type(exc).__name__)
+        return 2
     code = 0
-    for path in sorted(pool_dir.glob("*.json")):
+    # A malformed manifest still names a server that has research on: its corpus stays.
+    for server in builder.orphans({n.removesuffix(".json") for n in names}):
+        try:
+            builder.remove_server(server)
+        except OSError as exc:
+            log.error("corpus %s: cannot remove its corpus: %s", server, exc.strerror)
+            code = 1
+    for path in (pool_dir / n for n in names):
         try:
             manifest = load_manifest(path)
         except ManifestError as exc:

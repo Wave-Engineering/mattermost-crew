@@ -68,6 +68,7 @@ FORGE_ENTRY_RE = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9._-]+$")
 NAME_ENTRY_PREFIX = "name:"
 DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
+RESERVED_SERVER_IDS = frozenset({"status", ".", ".."})
 CREW_KEYS = {"needs_list"}
 
 
@@ -248,6 +249,9 @@ def _mattermost(value: Any, source: str) -> list[MattermostServer]:
         sid, url = item.get("id"), item.get("url")
         if not isinstance(sid, str) or not NAME_RE.fullmatch(sid):
             raise ConfigError(f"{source}: mattermost id {sid!r} is not a server id")
+        if sid in RESERVED_SERVER_IDS:
+            # The corpus is /var/lib/crewcorpus/<id>, beside its world-traversable status/.
+            raise ConfigError(f"{source}: mattermost id {sid!r} is reserved")
         if not isinstance(url, str) or not url:
             raise ConfigError(f"{source}: mattermost {sid} needs a url")
         if any(s.id == sid for s in servers):

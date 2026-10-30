@@ -195,6 +195,8 @@ def test_server_research_keys_parse() -> None:
     ("change", "message"),
     [
         ({"kiosk_research": "yes"}, "kiosk_research must be true or false"),
+        ({"id": "status"}, "mattermost id 'status' is reserved"),
+        ({"id": ".."}, "mattermost id '..' is reserved"),
         ({"corpus_refresh_minutes": 0}, "corpus_refresh_minutes"),
         ({"corpus_refresh_minutes": True}, "corpus_refresh_minutes"),
         ({"corpus_extra": "forge.example.lan/a/b"}, "corpus_extra must be an array"),

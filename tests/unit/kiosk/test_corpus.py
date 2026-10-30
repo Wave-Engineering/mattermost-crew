@@ -53,6 +53,8 @@ def scans(tmp_path: Path) -> list[dict[str, Any]]:
         {"refresh_minutes": 0},
         {"refresh_minutes": True},
         {"server": "other", "filename": SERVER},  # names another server than its file
+        {"server": "status", "filename": "status"},  # reserved: the world-traversable dir
+        {"server": "..", "filename": ".."},
         {"extra": 1},
     ],
 )
@@ -98,16 +100,41 @@ def test_redirect_to_excluded_repo_is_not_cloned(
     builder = make_builder()
     builder.build(manifest(repo))
     first_gen = current(builder).resolve()
-    # The repo was renamed into an excluded one, and the old path still redirects there.
-    builder.lookup = lambda r, t: f"forge.test/Hidden/Secret-Repo{suffix}"
+    # The repo was renamed, within its org, into an excluded one; the old path still redirects.
+    builder.lookup = lambda r, t: (
+        r if r == "forge.test/org/secret-repo" else f"forge.test/Org/Secret-Repo{suffix}"
+    )
     forge.cloned.clear()
     with caplog.at_level(logging.WARNING):
-        status = builder.build(manifest(repo, exclude=("forge.test/hidden/secret-repo",)))
+        status = builder.build(manifest(repo, exclude=("forge.test/org/secret-repo",)))
     assert states(status) == {repo: "excluded"}
     assert forge.cloned == []
     assert not (current(builder) / repo).exists()
     assert not (first_gen / repo).exists()  # the previous generation drops it too
-    assert "forge.test/Hidden/Secret-Repo" in caplog.text and repo in caplog.text
+    assert "which is excluded" in caplog.text and "forge.test/Org/Secret-Repo" in caplog.text
+
+
+def test_a_transfer_to_another_org_is_excluded(
+    forge: Forge, make_builder: MakeBuilder, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The daemon admitted the entry by its host/org. A repo transferred into an org no
+    allowlist vouched for (a partner's, say) is never cloned, and its last good copy goes."""
+    repo = forge.repo("a", {"README.md": b"ours\n"})
+    builder = make_builder()
+    builder.build(manifest(repo))
+    first_gen = current(builder).resolve()
+    builder.lookup = lambda r, t: "forge.test/other-org/a"
+    forge.cloned.clear()
+    with caplog.at_level(logging.WARNING):
+        status = builder.build(manifest(repo))
+    assert states(status) == {repo: "excluded"}
+    assert forge.cloned == []
+    assert not (current(builder) / repo).exists() and not (first_gen / repo).exists()
+    assert "in another org" in caplog.text
+    # A rename within the org still builds.
+    renamed = forge.repo("b", {"README.md": b"renamed\n"})
+    builder.lookup = lambda r, t: renamed
+    assert states(builder.build(manifest(repo))) == {repo: "ok"}
 
 
 def test_failed_lookup_is_clone_failed_with_no_clone(
@@ -195,6 +222,34 @@ def test_size_and_text_filters(forge: Forge, make_builder: MakeBuilder) -> None:
     assert published(builder, repo) == {"edge.txt", "ok.md"}
     assert status["repos"][repo]["files"] == 2
     assert status["repos"][repo]["bytes"] == 5 * MB + len("café ✓\n".encode())
+
+
+def test_the_blob_filter_runs_and_keeps_exactly_5_mib(
+    forge: Forge, make_builder: MakeBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The forge honors the filter (as a real one does): a blob over 5 MiB is never fetched,
+    so extract sees it as missing and never sizes it; one of exactly 5 MiB is fetched."""
+    repo = forge.repo("a", {"big.txt": b"a" * (5 * MB + 1), "edge.txt": b"b" * (5 * MB)})
+
+    def oid(data: bytes) -> str:
+        done = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True)
+        return done.stdout.decode().strip()
+
+    sized: list[str] = []
+    real = corpus._sizes
+    monkeypatch.setattr(corpus, "_sizes", lambda g, c, oids: sized.extend(oids) or real(g, c, oids))
+    builder = make_builder()
+    builder.build(manifest(repo))
+    assert published(builder, repo) == {"edge.txt"}
+    assert oid(b"b" * (5 * MB)) in sized and oid(b"a" * (5 * MB + 1)) not in sized
+
+
+def test_a_non_utf8_file_name_is_left_out(forge: Forge, make_builder: MakeBuilder) -> None:
+    """Not a reason to fail the repo, let alone the server's build: that file alone is out."""
+    repo = forge.repo("a", {os.fsdecode(b"caf\xe9.txt"): b"x\n", "ok.md": b"ok\n"})
+    builder = make_builder()
+    assert states(builder.build(manifest(repo))) == {repo: "ok"}
+    assert published(builder, repo) == {"ok.md"}
 
 
 def test_denylist(forge: Forge, make_builder: MakeBuilder) -> None:
@@ -297,7 +352,12 @@ def test_a_repo_cannot_exempt_itself(
     (seen,) = scans(tmp_path)
     # Flat names: no path the default config allowlists (node_modules/, *.svg, ...) survives.
     assert seen["files"] == {"f000001": "tok = 'x'  # gitleaks-allow\n", "f000002": "plain\n"}
-    assert seen["env"] == [] and seen["cwd_entries"] == []
+    # gitleaks runs inside the flat copy and scans `.`: every path it sees is an f<n> name,
+    # never one under the server's directory (a server named node_modules is allowlisted).
+    assert seen["env"] == [] and seen["args"][-1] == "."
+    assert Path(seen["cwd"]).name == "scan" and sorted(seen["cwd_entries"]) == sorted(
+        seen["files"]
+    )
     assert (current(builder) / repo / "a.py").read_text() == "tok = 'x'  # gitleaks:allow\n"
 
 
@@ -400,6 +460,7 @@ def test_status_file(forge: Forge, make_builder: MakeBuilder) -> None:
     assert json.loads(path.read_text()) == {
         "server": SERVER,
         "built_at": "2026-10-30T12:00:00+00:00",
+        "manifest_at": "2026-10-30T12:00:00+00:00",  # the manifest's generated_at, for due()
         "repos": {
             repo: {
                 "state": "ok",
@@ -531,12 +592,12 @@ def test_a_filesystem_error_fails_only_that_repo(
     builder.build(manifest(bad, good))  # a clean first build: bad has a last good copy
     real_fresh = builder._fresh
 
-    def fresh(m: Any, repo: str, work: Path, gen: Path) -> Any:
+    def fresh(m: Any, exclude: Any, repo: str, work: Path, gen: Path) -> Any:
         if repo == bad:
             (gen / repo).mkdir(parents=True)  # a partial copy, which must not be published
             (gen / repo / "half.md").write_text("half\n")
             raise OSError(28, "No space left on device")
-        return real_fresh(m, repo, work, gen)
+        return real_fresh(m, exclude, repo, work, gen)
 
     monkeypatch.setattr(builder, "_fresh", fresh)
     status = builder.build(manifest(bad, good))
@@ -624,6 +685,195 @@ def test_a_missing_credential_fails_every_repo(
     credential.unlink()
     assert states(make_builder().build(manifest(repo))) == {repo: "clone_failed"}
     assert forge.cloned == []
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
+def test_a_credential_others_can_read_is_refused(
+    forge: Forge,
+    make_builder: MakeBuilder,
+    credential: Path,
+    caplog: pytest.LogCaptureFixture,
+    mode: int,
+) -> None:
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    credential.chmod(mode)
+    with caplog.at_level(logging.ERROR):
+        assert states(make_builder().build(manifest(repo))) == {repo: "clone_failed"}
+    assert forge.cloned == []
+    with pytest.raises(ValueError, match=f"mode {mode:04o}: make it 0600 or 0400"):
+        corpus.read_token(credential)
+    credential.chmod(0o400)
+    assert corpus.read_token(credential) == TOKEN
+
+
+def test_any_error_in_one_repo_fails_only_that_repo(
+    forge: Forge, make_builder: MakeBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad = forge.repo("bad", {"README.md": b"bad\n"})
+    good = forge.repo("good", {"README.md": b"ok\n"})
+    builder = make_builder()
+    real = builder._fresh
+
+    def fresh(m: Any, exclude: Any, repo: str, work: Path, gen: Path) -> Any:
+        if repo == bad:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return real(m, exclude, repo, work, gen)
+
+    monkeypatch.setattr(builder, "_fresh", fresh)
+    assert states(builder.build(manifest(bad, good))) == {bad: "clone_failed", good: "ok"}
+
+
+def test_a_repo_out_of_the_manifest_leaves_the_previous_generation_too(
+    forge: Forge, make_builder: MakeBuilder
+) -> None:
+    a = forge.repo("a", {"README.md": b"a\n"})
+    b = forge.repo("b", {"README.md": b"b\n"})
+    builder = make_builder()
+    builder.build(manifest(a, b))
+    first_gen = current(builder).resolve()
+    builder.build(manifest(a))  # the operator excluded b: the daemon dropped it
+    assert not (current(builder) / b).exists()
+    assert not (first_gen / b).exists() and (first_gen / a / "README.md").exists()
+
+
+def test_a_server_with_no_manifest_has_its_corpus_removed(
+    tmp_path: Path, forge: Forge, make_builder: MakeBuilder, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    pool = tmp_path / "pool"
+    write_manifest(pool, server="on", repos=[repo])
+    off = write_manifest(pool, server="off", repos=[repo])
+    bad = write_manifest(pool, server="bad", repos=[repo])
+    builder = make_builder()
+    assert run(pool, builder) == 0
+    bad.write_text("{not json")  # malformed, but research is still on: its corpus stays
+    off.unlink()  # research turned off on "off"
+    with caplog.at_level(logging.WARNING):
+        assert run(pool, builder) == 1
+    root = builder.root
+    assert not (root / "off").exists() and not (root / "status" / "off.json").exists()
+    assert (root / "on" / "current" / repo).is_dir() and (root / "bad" / "current").exists()
+    assert (root / "status" / "on.json").exists() and (root / "status").is_dir()
+    assert "corpus off: no manifest" in caplog.text
+
+
+def test_an_unlistable_pool_removes_nothing(
+    tmp_path: Path, forge: Forge, make_builder: MakeBuilder
+) -> None:
+    pool = tmp_path / "pool"
+    write_manifest(pool, repos=[forge.repo("a", {"README.md": b"hi\n"})])
+    builder = make_builder()
+    assert run(pool, builder) == 0
+    assert run(tmp_path / "no-pool", builder) == 2
+    assert (current(builder)).exists()
+
+
+def test_a_new_generated_at_is_due(forge: Forge, make_builder: MakeBuilder) -> None:
+    """The daemon rewrites a manifest only when it changes, so an exclude-only change shows
+    as a new generated_at: the build is due, though the repos and the interval are not."""
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    builder = make_builder()
+    m = manifest(repo)
+    builder.build(m)
+    assert not builder.due(m)
+    changed = corpus.Manifest(
+        m.server, "2026-10-30T12:05:00+00:00", m.refresh_minutes, m.repos, frozenset({"x/y/z"})
+    )
+    assert builder.due(changed)
+
+
+def test_an_exclude_covers_its_repo_under_a_new_name(
+    forge: Forge, make_builder: MakeBuilder
+) -> None:
+    """An exclude written under a repo's old name is resolved too: the repo, pooled under its
+    new name, stays out."""
+    new = forge.repo("new", {"README.md": b"hidden\n"})
+    builder = make_builder(lookup=lambda r, t: new if r == "forge.test/org/old" else r)
+    status = builder.build(manifest(new, exclude=("forge.test/org/old",)))
+    assert states(status) == {new: "excluded"}
+
+
+def test_an_unresolvable_exclude_serves_nothing_from_its_forge(
+    forge: Forge, make_builder: MakeBuilder, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Any repo on that forge might be the excluded one renamed: none is served, not even a
+    last good copy. A 404 (no such repo for this token) excludes nothing more."""
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    builder = make_builder()
+    builder.build(manifest(repo))
+    first_gen = current(builder).resolve()
+
+    def down(r: str, t: str) -> str:
+        if r == "forge.test/org/gone":
+            raise LookupFailed(f"{r}: the forge answered 503")
+        return r
+
+    builder.lookup = down
+    with caplog.at_level(logging.ERROR):
+        status = builder.build(manifest(repo, exclude=("forge.test/org/gone",)))
+    assert states(status) == {repo: "clone_failed"}
+    assert not (current(builder) / repo).exists() and not (first_gen / repo).exists()
+    assert "nothing from forge.test is served" in caplog.text
+
+    def missing(r: str, t: str) -> str:
+        if r == "forge.test/org/gone":
+            raise corpus.NotFound(f"{r}: the forge answered 404")
+        return r
+
+    builder.lookup = missing
+    assert states(builder.build(manifest(repo, exclude=("forge.test/org/gone",)))) == {repo: "ok"}
+
+
+@pytest.mark.parametrize("why", ["gitleaks", "denylist"])
+def test_a_last_good_copy_must_pass_todays_checks(
+    forge: Forge,
+    make_builder: MakeBuilder,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    why: str,
+) -> None:
+    """A rule or a denylist entry added since the copy was built applies to it: a repo that
+    now fails to clone serves nothing rather than a copy today's checks would refuse."""
+    repo = forge.repo("a", {"notes.md": b"hi\n"})
+    builder = make_builder()
+    builder.build(manifest(repo))
+    builder.lookup = lambda r, t: (_ for _ in ()).throw(LookupFailed("down"))
+    if why == "gitleaks":
+        monkeypatch.setenv("FAKE_GITLEAKS_EXIT", "1")
+    else:
+        monkeypatch.setattr(corpus, "DENYLIST", (*corpus.DENYLIST, "notes.*"))
+    with caplog.at_level(logging.ERROR):
+        status = builder.build(manifest(repo))
+    assert states(status) == {repo: "clone_failed"}
+    assert not (current(builder) / repo).exists()
+    assert "fails today's checks" in caplog.text
+
+
+def test_a_gitleaks_timeout_or_unreadable_report_withholds(
+    forge: Forge,
+    make_builder: MakeBuilder,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo = forge.repo("a", {"README.md": b"hi\n"})
+    # Exit 3, a finding, with no report written.
+    monkeypatch.setenv("FAKE_GITLEAKS_EXIT", "3")
+    with caplog.at_level(logging.ERROR):
+        assert states(make_builder().build(manifest(repo))) == {repo: "withheld"}
+    assert "its report is unreadable" in caplog.text
+    monkeypatch.delenv("FAKE_GITLEAKS_EXIT")
+    real = subprocess.run
+
+    def hang(argv: list[str], **kw: Any) -> Any:
+        if Path(argv[0]).name == "gitleaks":
+            raise subprocess.TimeoutExpired(argv, corpus.GIT_TIMEOUT_S)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(corpus.subprocess, "run", hang)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        assert states(make_builder().build(manifest(repo))) == {repo: "withheld"}
+    assert "gitleaks failed: TimeoutExpired" in caplog.text
 
 
 # -- the unit --------------------------------------------------------------------------------

@@ -95,6 +95,9 @@ class Forge:
         else:
             bare.parent.mkdir(parents=True, exist_ok=True)
             git("clone", "-q", "--bare", str(work), str(bare))
+            # As a real forge does: without it, a file:// clone ignores --filter, and the
+            # builder's missing-blob path would never run.
+            git("config", "uploadpack.allowFilter", "true", cwd=bare)
         return repo
 
     def head(self, repo: str) -> str:
