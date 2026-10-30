@@ -381,8 +381,10 @@ class ModelProxy:
             return
         answer_id, path, query, headers, body = request
         unspent = None if path != "/v1/messages" else 0  # refused before any turn was counted
-        # First: every later refusal is filed under the answer's record, and only an
-        # admitted answer has one.
+        # Admission first, before the slot cap or anything else that can refuse: each later
+        # refusal reaches the ledger as an admitted call, and the ledger files that under the
+        # answer's record, making one if there is none. Checked after the slot cap, an id no
+        # hello admitted could mint its own record with a refused call, and be admitted by it.
         if not self.budget.admitted(answer_id):
             writer.write(_error(403, "permission_error", "no such answer", retry=False))
             call = Call(answer_id, path, unspent, 403, 0, _ms(start), forwarded=False)

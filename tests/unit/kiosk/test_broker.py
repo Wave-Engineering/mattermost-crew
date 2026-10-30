@@ -1158,6 +1158,37 @@ def test_relay_pumps_http(sockdir: Path) -> None:
         pytest.fail("the relay still listens after it was killed")
 
 
+def test_relay_hello_reports_the_brokers_verdict(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#142: `crewkiosk-relay hello` exits 0 only once the real op server has admitted the
+    answer; refused, nothing listening, or a reply that isn't the broker's, it exits 1."""
+    ledger = Ledger(sockdir / "state", clock=Tick())
+
+    async def relay_hello(path: str, answer_id: str = AID) -> int:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", str(RELAY), "hello", path, answer_id, POST
+        )
+        return await asyncio.wait_for(proc.wait(), 30)
+
+    assert with_server(sockdir, op_server(corpus, ledger).handle, relay_hello) == 0
+    assert (SERVER, AID) in ledger.answers
+    monkeypatch.setattr(broker, "MAX_LIVE_PER_SERVER", 1)
+    (sockdir / "s.sock").unlink(missing_ok=True)
+    refused = with_server(sockdir, op_server(corpus, ledger).handle, lambda p: relay_hello(p, AID2))
+    assert refused == 1 and (SERVER, AID2) not in ledger.answers
+    assert asyncio.run(relay_hello(str(sockdir / "nowhere.sock"))) == 1
+
+    async def impostor(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        writer.write(b'{"jsonrpc":"2.0","id":0,"result":{"admitted":"yes"}}\n')
+        await writer.drain()
+        writer.close()
+
+    (sockdir / "s.sock").unlink(missing_ok=True)
+    assert with_server(sockdir, impostor, relay_hello) == 1
+
+
 def test_relay_usage() -> None:
     proc = subprocess.run(
         [sys.executable, "-I", str(RELAY), "shell", "id"], capture_output=True, timeout=30
