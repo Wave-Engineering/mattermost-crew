@@ -13,9 +13,9 @@ All notable changes to this project are recorded here. The format follows
   field. `CREWCHAT_SHIM_LOG` sets the level of the shim's own lines (`debug`, `info` or
   `warning`; `info` by default), and `CREWCHAT_SHIM_LOG_FILE`, an absolute path, appends the
   same lines to a file created 0600. `debug` shows the timer's `tick` and `ping:` lines; the
-  MCP library stays at INFO, because its DEBUG lines carry the text of every request. Set them in the MCP server's
-  environment for one session, then remove them: the file never rotates. A bad level or path
-  logs one WARNING, and the shim starts on stderr as before.
+  MCP library stays at INFO, because its DEBUG lines carry the text of every request. Set
+  them in the MCP server's environment for one session, then remove them: the file never
+  rotates. A bad level or path logs one WARNING, and the shim starts on stderr as before.
 
 - **The kiosk's corpus pool, per server** (#139, the first part of #136). A `[[mattermost]]`
   server can set `kiosk_research = true`, with `corpus_extra`, `corpus_exclude` (full repos,

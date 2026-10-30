@@ -1091,7 +1091,8 @@ def root_logger() -> Iterator[logging.Logger]:
             stream = getattr(handler, "stream", None)
             if stream is not None and stream is not mcp_shim.sys.stderr:
                 stream.close()  # a StreamHandler never closes its own stream
-    root.handlers[:] = handlers
+    # Only those still attached: pytest removes its own setup-phase handler between phases.
+    root.handlers[:] = [h for h in handlers if h in root.handlers]
     root.setLevel(levels[0])
     ours.setLevel(levels[1])
 
