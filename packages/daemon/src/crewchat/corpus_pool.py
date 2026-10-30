@@ -51,17 +51,25 @@ def pool_repos(config: ServersConfig, agents: Iterable[AgentTokens], server_id: 
         crew.brokers[server_id] for crew in config.crews.values() if server_id in crew.brokers
     ]
     held = [a.repo for a in agents if server_id in a.servers and a.repo and is_repo(a.repo)]
-    # Forges resolve paths without regard to case, so one repo spelled two ways is one repo,
-    # and an exclude matches it however it is spelled: an exclude always wins.
-    excluded = {r.casefold() for r in server.corpus_exclude}
+    # Forges resolve paths without regard to case, and clone `repo.git` as `repo`, so one repo
+    # spelled two ways is one repo, and an exclude matches it however it is spelled: an
+    # exclude always wins.
+    excluded = {_canon(r).casefold() for r in server.corpus_exclude}
     pool: dict[str, str] = {}
-    for repo in sorted([*server.corpus_extra, *held]):
+    for repo in sorted(_canon(r) for r in [*server.corpus_extra, *held]):
         key = repo.casefold()
         if key in excluded or key in pool:
             continue
         if any(admits_repo(e, repo) for e in entries):
             pool[key] = repo
     return sorted(pool.values())
+
+
+def _canon(repo: str) -> str:
+    """`repo` without any trailing `.git`, the name a forge clones it by."""
+    while repo.endswith(".git"):
+        repo = repo.removesuffix(".git")
+    return repo
 
 
 def _server(config: ServersConfig, server_id: str) -> MattermostServer:
@@ -97,8 +105,13 @@ class PoolManifest:
         for server in self.config.mattermost:
             path = self.path_for(server.id)
             if not server.kiosk_research:
-                with contextlib.suppress(FileNotFoundError):
+                try:
                     path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log.error("pool: cannot remove %s: %s", path, exc)
+                else:
                     log.info("pool: removed %s, research is off on %s", path, server.id)
                 continue
             repos = pool_repos(self.config, agents, server.id)

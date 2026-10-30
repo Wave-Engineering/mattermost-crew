@@ -204,6 +204,42 @@ def test_exclude_and_dedupe_ignore_case(
     register(daemon, "infra", repo=f"{ORG}/Secret-Infra")
     register(daemon, "babel", repo=f"{ORG}/Site-Manifests")
     assert manifest(tmp_path)["repos"] == [f"{ORG}/Site-Manifests"]
+    # A forge clones `repo.git` as `repo`: the suffix dodges no exclude, and pools no twin.
+    register(daemon, "infra", repo=f"{ORG}/secret-infra.git")
+    register(daemon, "other", repo=f"{ORG}/secret-infra.git.git")
+    register(daemon, "babel", repo=f"{REPO_A}.git")  # babel's repo is now REPO_A's spelling
+    assert manifest(tmp_path)["repos"] == [REPO_A]
+
+
+def test_exclude_written_with_git_suffix_still_wins(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    raw = research(servers_toml, corpus_exclude=[f"{ORG}/secret-infra.git"])
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "infra", repo=f"{ORG}/secret-infra")
+    register(daemon, "babel", repo=f"{REPO_B}.git")
+    assert manifest(tmp_path)["repos"] == [REPO_B]
+
+
+def test_unremovable_old_manifest_never_fails_register(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Research off with an old manifest the daemon can't remove: logged, and `register`
+    still succeeds."""
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    (pool / "dev.json").write_text("{}")
+    daemon = wired(make_daemon, servers_toml, pool)
+    pool.chmod(0o555)
+    try:
+        assert register(daemon, "babel", repo=REPO_A) is not None
+    finally:
+        pool.chmod(0o755)
+    assert (pool / "dev.json").exists()
+    assert any("cannot remove" in r.getMessage() for r in caplog.records)
 
 
 def test_pool_dir_is_setgid_crewcorpus() -> None:
