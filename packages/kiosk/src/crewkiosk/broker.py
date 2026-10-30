@@ -30,8 +30,9 @@ dropped 15 minutes after the answer's last line) and appended to
 
 **Caps:** the kiosk is untrusted, and mints its own answer ids (#142). An answer gets
 MAX_OPS_PER_ANSWER ops. At most MAX_LIVE_ANSWERS answers, across every server, hold lines in
-memory at once, and a server gets MAX_ANSWERS_PER_DAY answers a UTC day. A hello past either
-cap is refused, and makes no record. So the ledger's memory is at most MAX_LIVE_ANSWERS times
+memory at once, a server at most MAX_LIVE_PER_SERVER of them (so one kiosk can't starve the
+others), and a server gets MAX_ANSWERS_PER_DAY answers a UTC day. A hello past any of these
+caps is refused, and makes no record. So the ledger's memory is at most MAX_LIVE_ANSWERS times
 AUDIT_LINES lines, plus each server's day of answer records, whoever mints the ids; a unit
 test holds that to half the unit's MemoryMax. A refusal (an op past the cap, a hello past
 one, a model call the proxy refused) is audited once a day, per answer, or per server when
@@ -110,6 +111,9 @@ AUDIT_ARGS_MAX = 2048
 # and each server's day of records (well under 1 KB each). See the module docstring.
 MAX_OPS_PER_ANSWER = 200
 MAX_LIVE_ANSWERS = 128
+# A server's share of those: one hostile kiosk minting ids holds a quarter of the pool at
+# most, never all of it, so every other server's answers are still admitted.
+MAX_LIVE_PER_SERVER = 32
 MAX_ANSWERS_PER_DAY = 2_000
 # What a day's metrics count as refused: each kind audited once a day (see the docstring).
 REFUSALS = ("hellos", "ops", "model_calls")
@@ -188,13 +192,14 @@ class Ledger:
         self.days: dict[tuple[str, str], Day] = {}
         self.swept = float("-inf")
         self.live_full = False  # reached MAX_LIVE_ANSWERS; logged once each time
+        self.servers_full: set[str] = set()  # reached MAX_LIVE_PER_SERVER; logged once each time
 
     def _answer(
         self, server: str, answer_id: str, post_id: str | None
     ) -> tuple[Day, Answer | None]:
         """The day and the answer's live record, made if new. None for the answer while
-        MAX_LIVE_ANSWERS are live, or once the server's day holds MAX_ANSWERS_PER_DAY: past
-        either, an answer that isn't live gets no record."""
+        MAX_LIVE_ANSWERS are live, or the server's MAX_LIVE_PER_SERVER, or once the server's day
+        holds MAX_ANSWERS_PER_DAY: past any of them, an answer that isn't live gets no record."""
         now = self.clock()
         if now - self.swept >= EXPIRE_EVERY_S:
             self._expire(now)
@@ -205,7 +210,7 @@ class Ledger:
         key = (server, answer_id)
         a = self.answers.get(key)
         if a is None:
-            if len(self.answers) >= MAX_LIVE_ANSWERS:
+            if len(self.answers) >= MAX_LIVE_ANSWERS or self._live(server) >= MAX_LIVE_PER_SERVER:
                 self._expire(now)  # a quiet answer's place, freed now, not at the next sweep
             if len(self.answers) >= MAX_LIVE_ANSWERS:
                 if not self.live_full:
@@ -215,6 +220,16 @@ class Ledger:
                     )
                 return day, None
             self.live_full = False
+            if self._live(server) >= MAX_LIVE_PER_SERVER:
+                if server not in self.servers_full:
+                    self.servers_full.add(server)
+                    log.warning(
+                        "broker %s: %d answers live: no more until one goes quiet",
+                        server,
+                        MAX_LIVE_PER_SERVER,
+                    )
+                return day, None
+            self.servers_full.discard(server)
             # An answer back after going quiet resumes today's record, never replaces it.
             a = day.answers.get(answer_id)
             if a is None:
@@ -237,6 +252,10 @@ class Ledger:
             a.post_id = post_id
         a.last = now
         return day, a
+
+    def _live(self, server: str) -> int:
+        """The server's live answers: a scan, but of MAX_LIVE_ANSWERS keys at most."""
+        return sum(1 for s, _aid in self.answers if s == server)
 
     def hello(self, server: str, answer_id: str, post_id: str) -> bool:
         """Records the answer, or, past a cap, counts the refused hello (it makes no record),

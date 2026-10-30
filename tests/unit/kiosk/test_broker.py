@@ -1379,6 +1379,8 @@ def deep_size(obj: object, seen: set[int] | None = None) -> int:
         size += sum(deep_size(v, seen) for v in obj)
     for name in getattr(type(obj), "__slots__", ()):
         size += deep_size(getattr(obj, name), seen)
+    if hasattr(obj, "__dict__"):  # a plain dataclass, such as Day
+        size += deep_size(vars(obj), seen)
     return size
 
 
@@ -1409,11 +1411,20 @@ def test_the_ledger_fits_in_half_the_units_memory(tmp_path: Path) -> None:
     lines = sys.getsizeof(deque([None] * broker.AUDIT_LINES, maxlen=broker.AUDIT_LINES))
     day = broker.Day("2026-10-30")
     for n in range(broker.MAX_ANSWERS_PER_DAY):
+        # Each record its own post_id, floats and counts, as the broker makes them: shared
+        # objects would be counted once for all of them.
         refused = dict.fromkeys(("ops", "model_calls"), day.date)
-        day.answers[aid(n)] = broker.Answer(post, NOON, NOON, big, big, big, big, big, refused)
+        counts = [big + n * 10 + k for k in range(5)]
+        a = broker.Answer(f"{n:064d}", NOON + n + 0.25, NOON + n + 0.5, *counts, refused)
+        day.answers[aid(n)] = a
     record = deep_size(day.answers[aid(0)])
+    day_size = deep_size(day)
+    # A full day really was measured, never just the Day object around it.
+    assert day_size >= broker.MAX_ANSWERS_PER_DAY * 200, day_size
     worst = broker.MAX_LIVE_ANSWERS * (broker.AUDIT_LINES * line + lines + record)
-    worst += servers * deep_size(day)
+    # A sizing assumption, not a bound the broker enforces: the servers the unit's LimitNOFILE
+    # has room for. The broker opens as many as there are manifests.
+    worst += servers * day_size
     assert servers >= 40 and line > 4096  # what the caps were sized against
     assert worst <= limit // 2, (worst, limit)
     # An OOM-killed rg fails its own search; the default policy would stop the whole broker.
@@ -1612,6 +1623,66 @@ def test_live_answers_are_capped_across_servers(
     ledger.swept = tick.t  # the sweep isn't due: the full ledger runs it itself
     assert ledger.hello(SERVER, aid(4), POST)
     assert list(ledger.answers) == [(SERVER, aid(4))]
+
+
+def test_one_server_holds_at_most_its_share_of_live_answers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A kiosk minting ids on one server fills its MAX_LIVE_PER_SERVER, never the whole pool:
+    its next hello is refused, logged once and audited once, while another server's new
+    answer is still admitted."""
+    caplog.set_level(logging.WARNING, logger="crewkiosk.broker")
+    ledger = Ledger(tmp_path / "state", clock=Tick())
+    share = broker.MAX_LIVE_PER_SERVER
+    assert share < broker.MAX_LIVE_ANSWERS
+    assert all(ledger.hello(SERVER, aid(n), POST) for n in range(share))
+    assert not ledger.hello(SERVER, aid(1000), POST)
+    assert not ledger.hello(SERVER, aid(1001), POST)
+    assert ledger.hello(OTHER, aid(2000), POST)
+    assert ledger.hello(SERVER, aid(0), POST)  # a live answer is still served
+    assert [r.getMessage() for r in caplog.records].count(
+        f"broker {SERVER}: {share} answers live: no more until one goes quiet"
+    ) == 1
+    assert ledger.metrics()[SERVER]["refused"]["hellos"] == 2
+    audit = tmp_path / "state" / "audit" / f"{SERVER}.jsonl"
+    assert [json.loads(x)["op"] for x in audit.read_text().splitlines()] == ["hello"]
+
+
+@pytest.mark.parametrize("ending", ["raises", "cancelled"])
+def test_an_op_that_ends_badly_gives_its_place_back(
+    tmp_path: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """Whatever ends an op, an error it didn't expect or its session cancelled mid-op, its
+    reserved place under MAX_OPS_PER_ANSWER is released: the cap never leaks shut."""
+    monkeypatch.setattr(broker, "MAX_OPS_PER_ANSWER", 1)
+    ledger = Ledger(tmp_path / "state", clock=Tick())
+    op = OpServer(SERVER, corpus, ledger)
+    started, gate = threading.Event(), threading.Event()
+
+    def bad(name: str, args: object) -> dict[str, Any]:
+        started.set()
+        if ending == "raises":
+            raise RuntimeError("boom")
+        gate.wait(5)
+        return {}
+
+    params = {"name": "corpus_list", "arguments": {}}
+
+    async def main() -> dict[str, Any]:
+        monkeypatch.setattr(corpus, "call", bad)
+        task = asyncio.ensure_future(op._call(params, AID, POST))
+        if ending == "cancelled":
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+        with pytest.raises(RuntimeError if ending == "raises" else asyncio.CancelledError):
+            await task
+        gate.set()
+        assert ledger.answers[(SERVER, AID)].pending == 0
+        monkeypatch.setattr(corpus, "call", lambda name, args: {})
+        return await op._call(params, AID, POST)
+
+    assert asyncio.run(main())["isError"] is False  # the one op is still the answer's to run
 
 
 def test_the_op_cap_holds_for_sessions_calling_at_once(
@@ -1903,9 +1974,12 @@ def test_answers_a_day_are_capped(
     assert replies == []
 
 
-def test_live_answers_are_capped_by_the_socket(sockdir: Path, corpus: Corpus) -> None:
+def test_the_op_socket_holds_at_most_max_connections(
+    sockdir: Path, corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The op socket holds MAX_CONNECTIONS connections, each one answer: the 65th is closed
-    before it can make one."""
+    before it can make one. (The ledger's share of live answers is lifted out of the way.)"""
+    monkeypatch.setattr(broker, "MAX_LIVE_PER_SERVER", broker.MAX_CONNECTIONS + 1)
     ledger = Ledger(sockdir / "state", clock=Tick())
     op = op_server(corpus, ledger)
 
