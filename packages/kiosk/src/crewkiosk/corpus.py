@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
+import http.client
 import json
 import logging
 import os
@@ -243,7 +244,9 @@ def forge_canonical(repo: str, token: str) -> str:
     host, path = repo.split("/", 1)
     if host == "github.com":
         if path.count("/") != 1:
-            raise LookupFailed(f"{repo}: a GitHub repo is owner/name")
+            # Config allows deeper paths, but no GitHub repo has one: nothing by that name
+            # can be cloned, so it is a 404, never a reason to block github.com.
+            raise NotFound(f"{repo}: a GitHub repo is owner/name")
         url, key = f"https://api.github.com/repos/{path}", "full_name"
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     else:
@@ -258,7 +261,8 @@ def forge_canonical(repo: str, token: str) -> str:
     except urllib.error.HTTPError as exc:
         kind = NotFound if exc.code == 404 else LookupFailed
         raise kind(f"{repo}: the forge answered {exc.code}") from None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # HTTPException: BadStatusLine, LineTooLong or IncompleteRead, which urllib lets out.
         raise LookupFailed(f"{repo}: {type(exc).__name__}") from None
     name = data.get(key) if isinstance(data, dict) else None
     if not isinstance(name, str) or not is_repo(f"{host}/{name}"):
@@ -625,7 +629,7 @@ class Builder:
                 canonical = self.lookup(entry, token)
             except NotFound:
                 continue
-            except LookupFailed as exc:
+            except Exception as exc:  # LookupFailed, or one no lookup has raised yet
                 log.error(
                     "corpus %s: an exclude can't be resolved (%s): nothing from %s is served",
                     manifest.server,

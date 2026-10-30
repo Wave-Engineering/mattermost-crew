@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -200,8 +201,31 @@ def test_forge_canonical_asks_each_forge_for_its_name(monkeypatch: pytest.Monkey
     assert TOKEN in asked[0][1]["Authorization"] and asked[1][1]["Private-token"] == TOKEN
     assert all(TOKEN not in url for url, _ in asked)
     assert all(isinstance(h, corpus.SameHostRedirects) for h in handlers) and handlers
-    with pytest.raises(LookupFailed):
+    # No GitHub repo has a deeper path: a 404, never a reason to block github.com.
+    with pytest.raises(corpus.NotFound):
         corpus.forge_canonical("github.com/a/b/c", TOKEN)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.IncompleteRead(b"{"),
+        http.client.BadStatusLine("x"),
+        http.client.LineTooLong("header line"),
+    ],
+)
+def test_forge_canonical_maps_http_client_errors(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """urllib lets http.client's own errors out unwrapped: each is a failed lookup."""
+
+    class Opener:
+        def open(self, request: Any, timeout: float) -> Any:
+            raise error
+
+    monkeypatch.setattr(corpus.urllib.request, "build_opener", lambda *h: Opener())
+    with pytest.raises(LookupFailed, match=type(error).__name__):
+        corpus.forge_canonical("gl.test/grp/x", TOKEN)
 
 
 # -- what reaches the tree -------------------------------------------------------------------
@@ -822,6 +846,17 @@ def test_an_unresolvable_exclude_serves_nothing_from_its_forge(
 
     builder.lookup = missing
     assert states(builder.build(manifest(repo, exclude=("forge.test/org/gone",)))) == {repo: "ok"}
+
+    def broken(r: str, t: str) -> str:
+        if r == "forge.test/org/gone":
+            raise RuntimeError("a lookup error nothing maps yet")
+        return r
+
+    # Any other error blocks the forge too: it never escapes build() to keep the old generation.
+    builder.lookup = broken
+    status = builder.build(manifest(repo, exclude=("forge.test/org/gone",)))
+    assert states(status) == {repo: "clone_failed"}
+    assert not (current(builder) / repo).exists()
 
 
 @pytest.mark.parametrize("why", ["gitleaks", "denylist"])
