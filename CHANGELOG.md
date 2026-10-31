@@ -8,8 +8,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [0.2.8] — 2026-10-31
 
-An agent that a 429 left off a server gets back on it without a restart, and `dm` takes a
-bare Dev-Name on Mattermost.
+An agent that a 429 left off a server gets back on it within minutes instead of a day, and
+`dm` takes a bare Dev-Name on Mattermost.
 
 **Rollback.** Going back to v0.2.7 needs no config change: v0.2.8 adds no setting and no file.
 An agent a retry put back on a server stays registered there.

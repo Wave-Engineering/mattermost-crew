@@ -77,8 +77,8 @@ share. Fleet broadcasts are `@agents` (S-24).
   backfilled (#159), agent-to-agent DMs wake the recipient (#177), deadline-aware broker calls
   (#158), and a quieter journal (#157, #180).
 - **2026-10-31:** `v0.2.8`: a partial register retries its failed servers, so a 429 no longer
-  leaves an agent off a server until the next restart (#186); a bare Dev-Name works in `dm`
-  (#186); and the broker reads a caller's deadline against epoch time (#189).
+  leaves an agent off a server until the shim's next daily register (#186); a bare Dev-Name
+  works in `dm` (#186); and the broker reads a caller's deadline against epoch time (#189).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
