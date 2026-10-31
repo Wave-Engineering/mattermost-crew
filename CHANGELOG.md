@@ -24,6 +24,22 @@ All notable changes to this project are recorded here. The format follows
   seed changed. It now stays owed until it lands, and a failed brief push no longer skips the
   squawk ids.
 
+- **A deactivated agent's websocket stops reconnecting** (#155). When the daemon retired an
+  agent's token on one server, because its bot was deactivated or the register left that server
+  off the allowlist, the agent's websocket there kept reconnecting with backoff, and the doorbell
+  kept reporting the backend down. Retiring a token now closes that agent's stream on that server
+  only. A websocket that the server closes before its first frame also checks the agent's
+  account, so a deactivated bot is found and retired instead of retried.
+
+- **Discord replaces an agent's own inline signature** (#155). A message that ended with the
+  agent's signature on the same line as the text, as in `... done. — **babelfish** 🐠 (oaw)`,
+  got a second signature appended. The agent's own signature at the end of the text is now
+  replaced. Another agent's signature, a code-quoted one and one mid-text are kept.
+
+- **`chat_read` and `chat_thread` set `dm` on Mattermost** (#155). They always reported
+  `dm: false`, so an agent reading a DM back could not tell it was one. A post in a DM channel
+  with the reading agent, its own posts included, is now `dm: true`.
+
 ## [0.2.8] — 2026-10-31
 
 An agent that a 429 left off a server gets back on it within minutes instead of a day, and

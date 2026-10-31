@@ -19,7 +19,9 @@ import pwd
 import secrets
 import subprocess
 import sys
+import time
 import tomllib
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -265,3 +267,50 @@ def test_patched_role_held_only_by_configured_brokers(
     assert set(holders) == configured
     for roles in holders.values():
         assert "system_admin" not in roles
+
+
+def _log_lines(path: str) -> list[tuple[datetime, str]]:
+    """The daemon log's lines, each with its `asctime` (`2026-10-31 12:00:00,123 ...`)."""
+    out: list[tuple[datetime, str]] = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                out.append((datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f"), line))
+            except ValueError:
+                continue  # a traceback's continuation line
+    return out
+
+
+def test_deactivated_canary_stops_reconnecting(installed: dict[str, Any]) -> None:
+    """IT-35 (R-30, #127, #155): `make verify-install` registers `verify-canary` and then
+    deactivates its bot. The daemon retires the canary's token within 60 s, and in the 30 s
+    after that its websocket stays closed: no reconnect and no `backend down` for it."""
+    path = os.environ.get("CREWCHAT_CI_LOG", "").strip()
+    if not path:
+        reason = "no daemon log: run scripts/ci/daemon-up.sh"
+        if os.environ.get("CREWCHAT_INSTALLED_REQUIRED") == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
+    sid = installed["servers"]["mattermost"][0]["id"]
+    retire = f"retiring verify-canary's token on {sid}: its account is deactivated"
+    deadline = time.monotonic() + 60
+    retired: datetime | None = None
+    while retired is None:
+        retired = next((ts for ts, line in _log_lines(path) if retire in line), None)
+        if retired is None:
+            assert time.monotonic() < deadline, f"no {retire!r} in {path} within 60 s"
+            time.sleep(1)
+    window_end = retired + timedelta(seconds=30)
+    # The log's clock is this host's: wait until it has written past the window.
+    while datetime.now() <= window_end + timedelta(seconds=1):
+        time.sleep(1)
+    reconnects = [
+        line
+        for ts, line in _log_lines(path)
+        if retired < ts <= window_end
+        and (
+            f"websocket verify-canary on {sid}" in line
+            or f"backend mattermost:{sid} down for verify-canary" in line
+        )
+    ]
+    assert not reconnects, "".join(reconnects)

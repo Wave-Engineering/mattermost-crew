@@ -661,6 +661,8 @@ Spike Story 1.2 resolves each of these, and records each answer as a `[ledger]` 
 | IT-31b | research unit confinement | Two servers' units rendered by `crewkiosk-research-units` from the one body. Each instance runs as its server's own user, `crewkiosk-r-<server>`, and holds and reaches only its own two broker sockets. It reaches no other server's socket, no control socket (all 0666 outside), no `/etc/passwd`, no model key, no `/opt`, `/var/lib/crewcorpus` or `/var/lib/crewchat`, and no TCP, and gets no reply to a raw DNS query to `127.0.0.53` or `1.1.1.1`. NoNewPrivs is set, and setuid binaries are present, so none elevates. A header for another server gets no reply. With the mount wall out of the way, each server's sockets, owned as the broker owns them, open by path only to that server's user. And with the other server's instance running, no instance can signal it, read its `/proc/<pid>/environ`, or reach its sockets through `/proc/<pid>/root` (#142; D-113). Root and systemd: the installed-tests step | R-31, R-36 |
 | IT-32 | broker ↔ Mattermost | Two `mint`s with `current_token_id: null`: the first token answers 401 and its record is gone, and the second works. A recorded token revoked out of band is cleared as gone on the next `mint`, and the held token still works (#41, #151) | R-05, R-07 |
 | IT-33 | broker ↔ Mattermost | With the broker's `DMListener` stopped, the partner test user DMs `kiosk off` and then `social 1h`. A listener restarted on the same state directory backfills both: `switch_state` shows the kiosk off and social engaged, with two broker replies in the DM. A `social 1h` sent during a second outage, backfilled with the broker's clock 20 minutes past it, is answered `not applied:` and the state is unchanged, and the first two are not replayed (#159) | R-24 |
+| IT-34 | daemon ↔ Mattermost | A human DMs the agent's bot. `read` on that DM channel, and `thread` on the post, return it with `dm: true`; `read` on a public channel returns it `dm: false` (#155) | R-19 |
+| IT-35 | installed daemon ↔ broker ↔ Mattermost | After `make verify-install` deactivates `verify-canary`, the daemon log holds `retiring verify-canary's token on <sid>: its account is deactivated` within 60 s, and over the 30 s after it no `websocket verify-canary on` line and no `backend down` for the canary: the stream is closed, not retried (#155) | R-30 |
 
 ### 6.3 End-to-End Tests (Automated)
 
@@ -1941,7 +1943,7 @@ image that has it. That deploy is under its own yes-prod.
 | R-16 | `@agents` (and `@all` on Discord) | Story 2.3 | IT-07, E2E-01, E2E-03 | integration / e2e test | Pass |
 | R-17 | Crew and team tokens by our filter | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
 | R-18 | `.` kept in `@name.crew` | Story 2.3 | IT-07 | integration test | Pass |
-| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24 | integration test | Pass |
+| R-19 | "Reply to me" by thread, or a DM to the agent | Story 2.3, Story 2.4b | IT-07, IT-24, IT-34 | integration test | Pass |
 | R-20 | Three switch settings, crew only by default | Story 3.1 | IT-08, E2E-01 | integration / e2e test | Pass |
 | R-21 | Switch gates push and pull | Story 3.3 | IT-08, E2E-02 | integration / e2e test | Pass |
 | R-22 | Unresolvable crew dropped; membership by `minted_bot_ids` (D-100) | Stories 1.3, 3.3 | IT-08 | integration test | Pass |
@@ -1952,7 +1954,7 @@ image that has it. That deploy is under its own yes-prod.
 | R-27 | Backend down is loud; others flow | Story 3.2 | IT-12 | integration test | Pass |
 | R-28 | Cursor replay: queued exactly once, handed over at least once | Story 3.2 | IT-13 | integration test | Pass |
 | R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
-| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
+| R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03, IT-35 | integration test | Pass |
 | R-31 | Outsiders answered by a kiosk with no native tools while social is off; research only through the broker | Story 3.5, #142 | IT-21, IT-29, IT-31 (passed before b3df138; re-run at deploy: Known limit), IT-31b (systemd 255 only: Known limit), E2E-02 | integration / e2e test | Pass |
 | R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pass |
 | R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pass |

@@ -1,4 +1,4 @@
-"""Story 2.1 against the CI leg's Mattermost: IT-14 and IT-02.
+"""Story 2.1 against the CI leg's Mattermost: IT-14, IT-02 and IT-34.
 
 The module creates its own broker account and human partner, gives the broker the patched
 role, and drives a real `crewbroker.service.Broker` in process. The daemon side is wired as
@@ -10,6 +10,7 @@ the broker's own.
   own posts are dropped by user ID, whatever their text.
 - IT-02 (R-05, R-07): across a daemon-driven rotation, the agent's websocket reconnects with
   the new token, the old token is revoked, and no event is lost.
+- IT-34 (R-19): a pull sets `dm` on a post in a DM channel with the agent (#155).
 """
 
 from __future__ import annotations
@@ -319,6 +320,38 @@ def test_it02_rotation_reconnects_websocket_and_loses_no_event(
             assert during.post_id in seen
         finally:
             await inbox.close()
+            await d.backend.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_pull_reports_dm_in_a_dm_channel(
+    mattermost: Any, setup: dict[str, str], tmp_path: Path
+) -> None:
+    """IT-34 (R-19, #155): a human DMs the agent's bot. `read` on that DM channel, and
+    `thread` on the post, return it with `dm` set; `read` on a public channel does not."""
+    channel = setup["channel_id"]
+
+    async def scenario() -> None:
+        d = Daemon(mattermost, setup, tmp_path)
+        bot = await d.register("dmreader")
+        try:
+            direct = mm_request(
+                mattermost, "POST", "/channels/direct", json=[setup["admin_id"], bot]
+            )
+            assert direct.status_code in (200, 201), direct.text
+            dm_channel = direct.json()["id"]
+            posted = as_admin_post(mattermost, dm_channel, "a direct word")
+            public = as_admin_post(mattermost, channel, "a public word")
+
+            read = await d.backend.read("dmreader", dm_channel)
+            assert [(m.post_id, m.dm) for m in read] == [(posted["id"], True)]
+            thread = await d.backend.thread("dmreader", posted["id"])
+            assert [(m.post_id, m.dm) for m in thread] == [(posted["id"], True)]
+            pub = await d.backend.read("dmreader", channel)
+            mine = [m for m in pub if m.post_id == public["id"]]
+            assert [m.dm for m in mine] == [False]
+        finally:
             await d.backend.aclose()
 
     asyncio.run(scenario())
