@@ -40,8 +40,18 @@ server_id="${entry#*:}"
 sudo -u crewchat test -x "$BIN" || die "crewchat cannot run $BIN"
 sudo -u "$AGENT_USER" test -x "$BIN" || die "$AGENT_USER cannot run $BIN"
 
-log "writing /etc/crewchat/servers.toml"
 $SUDO install -d -m 0755 /etc/crewchat
+# One leg runs Discord enabled (#156), so its credential is checked like the others. Nothing
+# listens on port 9: the daemon runs Discord as degraded (D-106) and reaches no Discord.
+discord="enabled = false"
+if [[ "${CREWCHAT_CI_DISCORD:-}" == enabled ]]; then
+  log "writing a dummy /etc/crewchat/discord.credential"
+  echo "ci-dummy-discord-token" |
+    "${ROOT}/scripts/ci/put-file.sh" 0600 crewchat:crewchat /etc/crewchat/discord.credential
+  discord=$'enabled = true\nscreamhole_url = "http://127.0.0.1:9/api/v10"\nguild_id = "1"'
+fi
+
+log "writing /etc/crewchat/servers.toml"
 cat <<EOF | "${ROOT}/scripts/ci/put-file.sh" 0644 root:root /etc/crewchat/servers.toml
 default_crew = "${crew}"
 broker_timeout_s = 2
@@ -51,7 +61,7 @@ id = "${server_id}"
 url = "${MM_URL}"
 
 [discord]
-enabled = false
+${discord}
 
 [crews.${crew}]
 needs_list = "${crew}:needs"
