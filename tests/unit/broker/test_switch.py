@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from crewbroker.config import CrewConfig
-from crewbroker.mattermost import MattermostError, NotFound
+from crewbroker.mattermost import DeadlineExceeded, MattermostError, NotFound
 from crewbroker.service import (
     BROKER_PROP,
     Broker,
@@ -672,3 +672,25 @@ def test_refused_partner_does_not_hold_the_backfill(
     live = dm_post("a2", "trusted", clock.now)
     listener.handle(posted_event(live, seq=1))  # no backfill owed: the cursor follows it
     assert two_partners.dm_cursor.load() == live["create_at"]
+
+
+@pytest.mark.parametrize("status", [None, 429])
+def test_deadline_exceeded_holds_the_backfill(
+    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch, status: int | None
+) -> None:
+    """The listener's thread never sets a `call_deadline` (#158), but a `DeadlineExceeded`
+    that reached the backfill would still be a failed read: the cursor holds."""
+    cursor = ms(clock.now - timedelta(minutes=5))
+    broker.dm_cursor.save(cursor)
+    fake.history[DM_CHANNEL] = [dm_post("p1", "crew", clock.now - timedelta(seconds=30))]
+
+    def late(channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        raise DeadlineExceeded("GET", f"/channels/{channel_id}/posts", status, "deadline")
+
+    monkeypatch.setattr(fake, "posts_since", late)
+    listener = DMListener(broker, "http://mm", "tok")
+    listener.handle(HELLO)
+    assert fake.posts == [] and broker.dm_cursor.load() == cursor
+    # Still owed, so a live DM applies but moves no cursor past the unread one.
+    listener.handle(posted_event(dm_post("p2", "trusted", clock.now), seq=1))
+    assert broker.dm_cursor.load() == cursor
