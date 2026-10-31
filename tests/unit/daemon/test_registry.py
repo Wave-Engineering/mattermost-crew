@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from crewchat.adapters.base import NO_STATUS, InboundMessage, StatusSink, StreamCursor
 from crewchat.adapters.discord import DiscordBackend
+from crewchat.doorbell import CursorStore, Doorbell
 from crewchat.registry import RegisterError, Registry, account_name
 from crewchat.tokens import BrokerError, BrokerUnavailable
 
@@ -220,6 +222,50 @@ def test_register_retires_token_on_newly_disallowed_server(
     assert held not in prod.live and prod.ops("mint") == []
     on_disk = json.loads(restarted.store.path_for("babel").read_text(encoding="utf-8"))
     assert "prod" not in on_disk["servers"] and not on_disk["pending_revoke"]
+
+
+class Idle:
+    """A stream that yields nothing and stays open."""
+
+    async def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        await asyncio.Event().wait()
+        yield  # pragma: no cover - makes this an async generator
+
+
+def test_register_off_the_allowlist_closes_the_stream(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    tmp_path: Path,
+    run: Callable[[Any], Any],
+) -> None:
+    """#155: a register from a repo off a server's allowlist retires the token there and stops
+    the agent's doorbell task on that server, without reporting it down; dev keeps its task."""
+    raw = _two_servers(servers_toml)
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/partner-org"]
+    daemon = make_daemon(raw)
+    dev, prod = "mattermost:dev", "mattermost:prod"
+    bell = Doorbell({dev: Idle(), prod: Idle()}, CursorStore(tmp_path / "state"))
+    daemon.store.adapters.insert(0, bell)
+
+    async def scenario() -> None:
+        allowed = "forge.example.lan/partner-org"
+        await daemon.registry.register("babel", "oaw", "s1", project_key=allowed)
+        bell.attach("babel", [dev, prod])
+        await asyncio.sleep(0.01)
+        other = "forge.example.lan/other"
+        await daemon.registry.register("babel", "oaw", "s2", project_key=other)
+        assert bell.attached("babel") == [dev]
+        assert bell.queue("babel").empty()
+        await bell.aclose()
+
+    run(scenario())
+    assert daemon.store.token_for("babel", "prod") is None
 
 
 def test_register_retries_failed_retire_revoke(

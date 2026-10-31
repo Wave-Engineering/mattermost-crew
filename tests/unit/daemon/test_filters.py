@@ -943,6 +943,29 @@ def test_pull_never_kiosk(rig: Rig) -> None:
     assert all(v.kind == Kind.DROP for v in verdicts)
 
 
+@pytest.mark.parametrize("mode", ["trusted", "social"])
+def test_pull_filter_ignores_dm(rig: Rig, mode: str, run: Any) -> None:
+    """#155: `read` and `thread` now set `dm`. Only push addressing reads it (R-21), so a
+    pull verdict is the same either way, for every kind of author."""
+    rig.set_mode(mode, expires=NOW + timedelta(hours=1))
+    authors = [(KESSEL, None), (HUMAN, False), (ALLY_BOT, None), (RIVAL_BOT, None)]
+    authors.append((OUTSIDER, False))
+
+    async def scenario() -> list[tuple[Verdict, Verdict]]:
+        await rig.prime()
+        pairs = []
+        for author, is_bot in authors:
+            verdicts = []
+            for dm in (False, True):
+                msg = mm(author, "just chatting", is_bot=is_bot, dm=dm)
+                verdicts.append(await rig.admit(msg, "pull"))
+            pairs.append((verdicts[0], verdicts[1]))
+        return pairs
+
+    for plain, as_dm in run(scenario()):
+        assert (plain.kind, plain.reason) == (as_dm.kind, as_dm.reason)
+
+
 def test_marked_outsider_event_on_push(rig: Rig) -> None:
     rig.set_mode("social", expires=NOW + timedelta(hours=1))
     bell = Doorbell({}, CursorStore(None), admit=rig.filters.admit_event, kiosk=KioskQueue())

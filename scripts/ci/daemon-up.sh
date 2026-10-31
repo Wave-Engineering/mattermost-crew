@@ -10,8 +10,9 @@
 # broker, creates /run/crewchat (0755, crewchat, with the agents' default ACL) and
 # /var/lib/crewchat (0700, crewchat) as the unit's RuntimeDirectory, its agent-acl.conf drop-in
 # and its StateDirectory would, and starts `crewchat serve` as crewchat.
-# It exports CREWCHAT_BIN and CREWCHAT_SOCKET (into $GITHUB_ENV under Actions, and as export
-# lines on stdout). It needs root or sudo: never run it on a workstation.
+# It exports CREWCHAT_BIN, CREWCHAT_SOCKET and CREWCHAT_CI_LOG, the daemon's log for IT-35
+# (into $GITHUB_ENV under Actions, and as export lines on stdout). It needs root or sudo: never
+# run it on a workstation.
 set -euo pipefail
 
 : "${MM_URL:?source the env file from scripts/ci/mattermost-up.sh}"
@@ -83,7 +84,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   {
     echo "CREWCHAT_BIN=${BIN}"
     echo "CREWCHAT_SOCKET=${SOCK}"
+    echo "CREWCHAT_CI_LOG=${LOG}"
   } >>"$GITHUB_ENV"
 fi
 echo "export CREWCHAT_BIN='${BIN}'"
 echo "export CREWCHAT_SOCKET='${SOCK}'"
+echo "export CREWCHAT_CI_LOG='${LOG}'"

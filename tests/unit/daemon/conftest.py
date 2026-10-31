@@ -123,6 +123,9 @@ class FakeAdapter:
     async def close_agent(self, dev_name: str) -> None:
         self.events.append(("close", dev_name))
 
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        self.events.append(("close_server", dev_name, server_id))
+
 
 class Clock:
     def __init__(self, start: datetime) -> None:
@@ -239,6 +242,9 @@ class FakeMattermost:
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
         self.fail_connects = 0
+        # The next N upgrades succeed and then close before `hello`, as for a deactivated
+        # account (#155).
+        self.close_before_hello = 0
         # path fragment -> how many more requests whose path holds it get an error status:
         # 503, or the fragment's status in `error_status`; as a proxy's HTML page, with no
         # Mattermost error `id`, for a fragment in `error_html`
@@ -247,6 +253,8 @@ class FakeMattermost:
         self.error_html: set[str] = set()
         # team id -> the channels every user is in there (`GET /users/me/teams/{id}/channels`)
         self.teams: dict[str, list[dict[str, Any]]] = {}
+        # channel id -> its channel object (`GET /channels/{id}`, #155)
+        self.channels: dict[str, dict[str, Any]] = {}
         self._n = itertools.count(1)
 
     def _id(self, prefix: str) -> str:
@@ -306,6 +314,11 @@ class FakeMattermost:
         if self.fail_connects:
             self.fail_connects -= 1
             raise OSError("connection refused")
+        if self.close_before_hello:
+            self.close_before_hello -= 1
+            dropped = FakeWebSocket(self, "", token, uri)
+            await dropped.close()
+            return dropped
         user_id = self.tokens.get(token)
         if user_id is None:
             raise InvalidStatus(Response(401, "Unauthorized", Headers()))
@@ -374,6 +387,11 @@ class FakeMattermost:
         if request.method == "GET" and parts[:3] == ["users", "me", "teams"] and len(parts) == 5:
             channels = self.teams.get(parts[3], [])
             return httpx.Response(200, json=[dict(c) for c in channels])
+        if request.method == "GET" and parts[0] == "channels" and len(parts) == 2:
+            channel = self.channels.get(parts[1])
+            return httpx.Response(200, json=channel) if channel else httpx.Response(
+                404, json={"id": "app.channel.get.existing.app_error"}
+            )
         if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
             posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
             since = request.url.params.get("since")

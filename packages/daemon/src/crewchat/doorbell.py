@@ -440,7 +440,6 @@ class Doorbell:
 
     async def _run(self, dev_name: str, backend: str) -> None:
         source = self.sources[backend]
-        sink: StatusSink = partial(self.status, dev_name, backend)
         delays = restart_delays()
         me = asyncio.current_task()
 
@@ -449,6 +448,12 @@ class Doorbell:
             # may abandon it) or a replaced one (a later `attach`) stops at its next step,
             # rather than reporting or reopening a stream for an agent that has left (#152).
             return self._tasks.get((dev_name, backend)) is me
+
+        def sink(up: bool, reason: str) -> None:
+            # The stream's own reports stop with the task, too: a stream whose server was
+            # retired from inside it (#155) reports once more on its way out.
+            if owned():
+                self.status(dev_name, backend, up, reason)
 
         while owned():
             try:
@@ -514,6 +519,15 @@ class Doorbell:
         """`dev_name` left rotation: stop its tasks, before the adapters close its streams, so
         a stream closed on purpose is not restarted or reported down."""
         await self.detach(dev_name)
+
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        """`dev_name`'s token on `server_id` was retired (#155): stop that one task, before the
+        Mattermost adapter closes its stream. Called from inside that task (a remint on its
+        stream's refresh), it is only popped: `owned()` then ends it once the stream ends."""
+        task = self._tasks.pop((dev_name, f"mattermost:{server_id}"), None)
+        if task is None or task is asyncio.current_task():
+            return
+        await self._stop_task(task)
 
 
 def build_doorbell_handlers(

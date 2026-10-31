@@ -30,7 +30,9 @@
   `files[n]`, the embed as `embeds: [{title, description}]`, as today's `disc_send` does.
 - **The signature is the identity.** Discord has one shared bot, so each agent signs its posts
   `— **<dev-name>** <avatar> (<team>) ·p1` (D-059, spike 1.2 / D-095). `send` appends it to
-  every chunk of a long message, so each chunk can be echo-filtered on its own.
+  every chunk of a long message, so each chunk can be echo-filtered on its own. A signature
+  of this agent's that ends the text, on its own line or at the end of the last line, is
+  replaced, not doubled (#155).
 - **Inbound parsing** takes the author from the signature, as today's watcher does (`— **name**`,
   markdown code stripped first). The ` ·p<N>` suffix is optional: without it `proto` is 0 (R-14).
 - **Echo filter:** `stream` drops a message whose signature name is the receiving agent's
@@ -105,6 +107,12 @@ SCREAMHOLE_DOWN_STATUSES = frozenset({502, 503, 504})
 
 # `— **<name>**`, then the rest of that line: `<avatar> (<team>) ·p<N>`, each part optional.
 SIGNATURE_RE = re.compile(r"— \*\*(?P<name>[^*\n]+)\*\*(?P<rest>[^\n]*)")
+# A signature that ends a line: the name, at most one avatar token, an optional `(team)` and
+# `·pN`, and nothing after it (#155).
+TRAILING_SIGNATURE_RE = re.compile(
+    r"(?:^|[ \t]+)— \*\*(?P<name>[^*\n]+)\*\*(?:[ \t]+[^\s()]+)?(?:[ \t]+\([^()\n]*\))?"
+    r"(?:[ \t]+·p\d+)?[ \t]*$"
+)
 TEAM_RE = re.compile(r"\((?P<team>[^()\n]*)\)")
 PROTO_SUFFIX_RE = re.compile(r"(?:^|\s)·p(?P<proto>\d+)\s*$")
 FENCED_RE = re.compile(r"```[\s\S]*?```")
@@ -360,12 +368,21 @@ class DiscordBackend:
     def signed(self, dev_name: str, text: str) -> list[str]:
         """`text` in Discord-sized chunks, each ending with the agent's `·p1` signature.
 
-        A signature of this agent's that already ends the text is replaced, not doubled.
+        A signature of this agent's that ends the text, on its own line or at the end of the
+        last line, is replaced, not doubled (#155). Another agent's, one inside an inline code
+        span, and one with more text after it are kept.
         """
         body = text.rstrip()
         lines = body.split("\n")
-        if lines and is_own_signature(lines[-1], dev_name) and lines[-1].lstrip().startswith("—"):
-            body = "\n".join(lines[:-1]).rstrip()
+        m = TRAILING_SIGNATURE_RE.search(lines[-1])
+        if (
+            m is not None
+            and m.group("name").strip().lower() == dev_name.lower()
+            and lines[-1][: m.start()].count("`") % 2 == 0
+        ):
+            last = lines[-1][: m.start()].rstrip()
+            lines = lines[:-1] + ([last] if last else [])
+            body = "\n".join(lines).rstrip()
         sig = self.signature(dev_name)
         room = MAX_CHUNK - len(sig) - 2
         return [f"{chunk}\n\n{sig}" if chunk else sig for chunk in split_message(body, room)]
@@ -908,6 +925,9 @@ class DiscordBackend:
         agent = self._agents.get(dev_name)
         if agent is not None:
             agent.closed = True
+
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        """Not a Mattermost server: nothing to close."""
 
     async def aclose(self) -> None:
         for dev_name in list(self._agents):

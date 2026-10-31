@@ -56,8 +56,10 @@ class InboundMessage:
     kiosk: bool = False  # the post carries `props.crew_kiosk == 1` (§5.9)
     # A kiosk answer's `props.crew_kiosk_answers`: the question's post ID (#26).
     kiosk_answers: str = ""
-    # A direct message to the receiving agent: a DM channel whose members are the author and
-    # that agent (R-19). Set on the push path, the only one addressing reads (R-21).
+    # On push, a DM between the author and the receiving agent (R-19). On a Mattermost pull
+    # (`read`, `thread`), a post in a DM channel one of whose two members is the reading
+    # agent, its own posts included (#155). Always false on Discord. Only push addressing
+    # reads it (R-21).
     dm: bool = False
     # The server resolved the author's user object. False when it couldn't, and the filters
     # then drop the message as unresolvable (R-22).

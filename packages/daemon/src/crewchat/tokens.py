@@ -16,7 +16,9 @@
 **Only `register` calls `BrokerClient.mint`** (`crewchat.registry`). A 401 and the daily
 rotation both use `remint`, so neither refreshes the broker's `last_register` (R-30). The
 rotation sequence never revokes before the swap and the reconnect hook, so no websocket is
-left on a dead token (§4.8).
+left on a dead token (§4.8). A token retired on one server (the allowlist, #117, or a
+deactivated account, #127) closes that agent's doorbell task and stream on that server, and
+on no other (`Adapter.close_server`, #155).
 """
 
 from __future__ import annotations
@@ -161,6 +163,9 @@ class Adapter(Protocol):
 
     async def close_agent(self, dev_name: str) -> None:
         """Close `dev_name`'s websockets: it has left rotation."""
+
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        """Close `dev_name`'s connections to `server_id`: it no longer holds a token there."""
 
 
 @dataclass
@@ -383,6 +388,12 @@ class TokenStore:
             # Recorded before the revoke is tried, as in `_swap`, so a crash mid-revoke keeps it.
             agent.pending_revoke.setdefault(server_id, []).append(tok.token_id)
             self._persist(agent)
+            # Closed before the revoke, so no stream is left reconnecting on a dead token (#155).
+            for adapter in self.adapters:
+                try:
+                    await adapter.close_server(agent.dev_name, server_id)
+                except Exception:
+                    log.exception("close_server(%s, %s) failed", agent.dev_name, server_id)
         elif not agent.pending_revoke.get(server_id):
             return
         await self._revoke_pending(agent, server_id)

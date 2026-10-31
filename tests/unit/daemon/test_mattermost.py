@@ -165,6 +165,73 @@ def test_thread_dm_and_react(mm: Any, run: Any) -> None:
     assert mm.reactions == [{"user_id": me, "post_id": root["id"], "emoji_name": "thumbsup"}]
 
 
+DM_CHAN = "d" * 26
+
+
+def _dm_world(mm: Any) -> tuple[Tokens, str, str]:
+    """babel.oaw, and bj: a DM channel between them and a public channel."""
+    tokens = Tokens(mm)
+    me = tokens.add("babel.oaw")
+    human = mm.add_user("bj", is_bot=False)
+    mm.channels[DM_CHAN] = {"id": DM_CHAN, "type": "D", "name": "__".join(sorted([me, human]))}
+    mm.channels[CHAN] = {"id": CHAN, "type": "O", "name": "town-square"}
+    return tokens, me, human
+
+
+def _channel_lookups(mm: Any) -> int:
+    return sum(
+        1
+        for m, p, _ in mm.requests
+        if m == "GET" and p.count("/") == 2 and p.startswith("/channels/")
+    )
+
+
+def test_read_sets_dm_in_a_dm_channel(mm: Any, run: Any) -> None:
+    """#155: on pull, a post in a DM channel with the reading agent is `dm`, the agent's own
+    included; a public channel's is not. Each channel is looked up once per agent."""
+    tokens, me, human = _dm_world(mm)
+    b = backend(mm, tokens)
+    mm.add_post(human, DM_CHAN, "psst")
+    mm.add_post(me, DM_CHAN, "yes?")
+    mm.add_post(human, CHAN, "hello all")
+    first = run(b.read("babel.oaw", DM_CHAN))
+    assert [(m.text, m.dm) for m in first] == [("psst", True), ("yes?", True)]
+    assert [m.dm for m in run(b.read("babel.oaw", CHAN))] == [False]
+    run(b.read("babel.oaw", DM_CHAN))
+    assert _channel_lookups(mm) == 2
+    # Two other users' DM, which an admin's agent can read, is not a DM with this agent.
+    other = mm.add_user("kessel.oaw", is_bot=True)
+    theirs = "e" * 26
+    mm.channels[theirs] = {"id": theirs, "type": "D", "name": "__".join(sorted([human, other]))}
+    mm.add_post(human, theirs, "between us")
+    assert [m.dm for m in run(b.read("babel.oaw", theirs))] == [False]
+
+
+def test_thread_and_read_one_set_dm(mm: Any, run: Any) -> None:
+    """#155: `thread` and `read_one` on a DM post report it as `dm`."""
+    tokens, _, human = _dm_world(mm)
+    b = backend(mm, tokens)
+    root = mm.add_post(human, DM_CHAN, "psst")
+    assert [m.dm for m in run(b.thread("babel.oaw", root["id"]))] == [True]
+    assert run(b.read_one("babel.oaw", "", root["id"])).dm is True
+
+
+def test_dm_lookup_failure_is_false_and_uncached(
+    mm: Any, run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#155: a channel lookup the server refuses gives `dm: false` with a warning, and the
+    next read asks again."""
+    tokens, _, human = _dm_world(mm)
+    b = backend(mm, tokens)
+    mm.add_post(human, DM_CHAN, "psst")
+    channel = mm.channels.pop(DM_CHAN)  # the lookup is refused
+    with caplog.at_level("WARNING"):
+        assert [m.dm for m in run(b.read("babel.oaw", DM_CHAN))] == [False]
+    assert any(DM_CHAN in r.getMessage() for r in caplog.records)
+    mm.channels[DM_CHAN] = channel
+    assert [m.dm for m in run(b.read("babel.oaw", DM_CHAN))] == [True]
+
+
 def test_two_agents_post_as_two_authors(mm: Any, run: Any) -> None:
     """R-01: one daemon, two agents, two upstream client objects, two distinct authors."""
     tokens = Tokens(mm)

@@ -323,6 +323,83 @@ def test_failed_revoke_is_retried(daemon: Any, clock: Any) -> None:
     assert list(broker.live) == [daemon.store.agent("babel").servers["dev"].token_id]
 
 
+def _closes_and_revokes(events: list[Any]) -> list[tuple[str, ...]]:
+    return [
+        ("close_server", e[1], e[2]) if e[0] == "close_server" else ("revoke", e[1])
+        for e in events
+        if e[0] == "close_server" or (e[0] == "broker" and e[2] == "revoke")
+    ]
+
+
+def test_retire_server_closes_that_server_only(
+    make_daemon: Callable[[dict[str, Any]], Any],
+    servers_toml: dict[str, Any],
+    run: Callable[[Any], Any],
+) -> None:
+    """#155: a server retired for one agent has its streams closed before the revoke, on every
+    adapter, and the agent's other server is left alone."""
+    servers_toml["mattermost"].append({"id": "prod", "url": "http://mm2.invalid"})
+    servers_toml["crews"]["oaw"]["prod"] = {
+        "broker_socket": "/run/crewbroker/oaw-prod.sock",
+        "broker_user_id": "b-oaw-prod",
+    }
+    daemon = make_daemon(servers_toml)
+    second = FakeAdapterPair(daemon.events)
+    daemon.store.adapters.append(second)
+    run(daemon.registry.register("babel", "oaw", "s1"))
+    daemon.events.clear()
+
+    run(daemon.store.retire_server("babel", "oaw", "prod"))
+    assert _closes_and_revokes(daemon.events) == [
+        ("close_server", "babel", "prod"),
+        ("close_server", "babel", "prod"),
+        ("revoke", "oaw-prod"),
+    ]
+    assert daemon.store.token_for("babel", "dev") is not None
+
+
+class FakeAdapterPair:
+    """A second adapter, so the close is shown to reach every adapter, not only the first."""
+
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+
+    async def on_token_rotated(self, dev_name: str) -> None:
+        pass
+
+    async def close_agent(self, dev_name: str) -> None:
+        pass
+
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        self.events.append(("close_server", dev_name, server_id))
+
+
+def test_deactivated_remint_closes_the_server(daemon: Any, run: Callable[[Any], Any]) -> None:
+    """#155: the `deactivated` remint (#127) closes the agent's stream on that server, then
+    revokes."""
+    run(daemon.registry.register("babel", "oaw", "s1"))
+    old = daemon.store.agent("babel").servers["dev"]
+    daemon.broker().fail["remint"] = BrokerError("remint", "deactivated: babel.oaw was pruned")
+    daemon.events.clear()
+    with pytest.raises(BrokerError):
+        run(daemon.store.refresh("babel", "dev", old.token))
+    assert _closes_and_revokes(daemon.events) == [
+        ("close_server", "babel", "dev"),
+        ("revoke", "oaw-dev"),
+    ]
+
+
+def test_pending_revoke_retry_closes_nothing(daemon: Any, run: Callable[[Any], Any]) -> None:
+    """#155: a retire with no token held only retries the owed revoke: nothing is open there."""
+    run(daemon.registry.register("babel", "oaw", "s1"))
+    daemon.broker().fail["revoke"] = BrokerUnavailable("timeout")
+    run(daemon.store.retire_server("babel", "oaw", "dev"))
+    del daemon.broker().fail["revoke"]
+    daemon.events.clear()
+    run(daemon.store.retire_server("babel", "oaw", "dev"))
+    assert _closes_and_revokes(daemon.events) == [("revoke", "oaw-dev")]
+
+
 def ledger(daemon: Any) -> dict[str, list[str]]:
     path = daemon.store.root / RETIRED_FILE
     return json.loads(path.read_text())["pending"] if path.exists() else {}
