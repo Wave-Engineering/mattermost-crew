@@ -8,6 +8,10 @@
 - `TokenStore`: tokens by (dev_name, server_id), in memory and in
   `/var/lib/crewchat/tokens/<dev>.json` (file `0600`, directory `0700`, owner `crewchat`).
 - `Rotator`: the daily remint -> swap -> `on_token_rotated` -> revoke, paced at 5/s or less.
+- A dropped agent's tokens, or its old crew's after a crew change, go into a ledger
+  (`.retired-revokes.json` in the tokens directory) before their revoke is tried, and leave it
+  only once revoked. `retry_retired` works it off at daemon start and before each daily
+  rotation (#151).
 
 **Only `register` calls `BrokerClient.mint`** (`crewchat.registry`). A 401 and the daily
 rotation both use `remint`, so neither refreshes the broker's `last_register` (R-30). The
@@ -41,6 +45,9 @@ ROTATIONS_PER_S = 5.0
 RETRY_FIRST_S = 5 * 60.0
 RETRY_MAX_S = 3600.0
 MAX_REPLY_BYTES = 1024 * 1024
+# Retired tokens still owed a revoke, by "<crew>/<server_id>" (#151). A dot-file, so `load`
+# never reads it as an agent.
+RETIRED_FILE = ".retired-revokes.json"
 
 log = logging.getLogger("crewchat.tokens")
 
@@ -245,6 +252,7 @@ class TokenStore:
         self.adapters: list[Adapter] = list(adapters)
         self._agents: dict[str, AgentTokens] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._ledger_lock = asyncio.Lock()  # every agent's `_retire` shares `RETIRED_FILE`
         root.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
         os.chmod(root, DIR_MODE)
 
@@ -456,21 +464,78 @@ class TokenStore:
         self.path_for(dev_name).unlink(missing_ok=True)
 
     async def _retire(self, agent: AgentTokens) -> None:
-        """Best-effort revoke of every token `agent` holds or still owes a revoke for."""
+        """Revoke every token `agent` holds or still owes a revoke for. Each goes into the
+        ledger (`RETIRED_FILE`) before any revoke is tried, and stays there until it is
+        revoked, so one the broker didn't revoke outlives the agent and its file (#151)."""
         for server_id, tok in list(agent.servers.items()):
             agent.pending_revoke.setdefault(server_id, []).append(tok.token_id)
         agent.servers.clear()
-        for server_id in list(agent.pending_revoke):
+        async with self._ledger_lock:
+            ledger = self._load_retired()
+            for server_id, ids in agent.pending_revoke.items():
+                owed = ledger.setdefault(_ledger_key(agent.crew, server_id), [])
+                owed.extend(i for i in ids if i not in owed)
+            self._save_retired(ledger)
+            for server_id in list(agent.pending_revoke):
+                key = _ledger_key(agent.crew, server_id)
+                ledger[key] = await self._revoke_owed(agent.crew, server_id, ledger.get(key, []))
+            self._save_retired(ledger)
+
+    # -- retired tokens still owed a revoke (#151) -----------------------------------------
+    def _load_retired(self) -> dict[str, list[str]]:
+        path = self.root / RETIRED_FILE
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pending = data["pending"]
+            return {str(k): [str(i) for i in v] for k, v in dict(pending).items()}
+        except FileNotFoundError:
+            return {}
+        except (ValueError, KeyError, TypeError) as exc:
+            # Unreadable: start over, loudly. Losing the ledger only loses revokes that are
+            # owed, which a token's own expiry still bounds.
+            log.error("%s is unreadable (%s): starting a new ledger", path, exc)
+            return {}
+
+    def _save_retired(self, ledger: dict[str, list[str]]) -> None:
+        pending = {k: v for k, v in sorted(ledger.items()) if v}
+        write_private_json(self.root / RETIRED_FILE, {"pending": pending})
+
+    async def _revoke_owed(self, crew: str, server_id: str, owed: list[str]) -> list[str]:
+        """Try to revoke each of `owed` through (crew, server_id)'s broker; the ones left."""
+        client = self.brokers.get((crew, server_id))
+        if client is None:
+            if owed:
+                log.error(
+                    "no broker for crew %s on %s: %d revokes kept", crew, server_id, len(owed)
+                )
+            return list(owed)
+        left: list[str] = []
+        for token_id in owed:
             try:
-                client = self._client(agent, server_id)
+                await client.revoke(token_id)
+            except BrokerError as exc:
+                if exc.code != "not_found":  # not_found: the broker no longer holds it
+                    log.error("revoke retired %s (%s on %s): %s", token_id, crew, server_id, exc)
+                    left.append(token_id)
             except BrokerUnavailable as exc:
-                log.error("cannot revoke %s's tokens on %s: %s", agent.dev_name, server_id, exc)
-                continue
-            for token_id in agent.pending_revoke[server_id]:
-                try:
-                    await client.revoke(token_id)
-                except (BrokerError, BrokerUnavailable) as exc:
-                    log.error("revoke %s for %s: %s", token_id, agent.dev_name, exc)
+                log.error("revoke retired %s (%s on %s): %s", token_id, crew, server_id, exc)
+                left.append(token_id)
+        return left
+
+    async def retry_retired(self) -> int:
+        """Retry every revoke the ledger still owes; the number still owed after it. Run at
+        daemon start and before each daily rotation (#151)."""
+        async with self._ledger_lock:
+            ledger = self._load_retired()
+            for key in list(ledger):
+                crew, _, server_id = key.partition("/")
+                ledger[key] = await self._revoke_owed(crew, server_id, ledger[key])
+            self._save_retired(ledger)
+            return sum(len(v) for v in ledger.values())
+
+
+def _ledger_key(crew: str, server_id: str) -> str:
+    return f"{crew}/{server_id}"
 
 
 def _server_token(result: dict[str, Any], account: Any) -> ServerToken:
@@ -510,6 +575,13 @@ class Rotator:
         server's per-user rate limit (CT-06).
         """
         report = RotationReport()
+        try:
+            owed = await self.store.retry_retired()
+        except Exception:
+            log.exception("rotation: retrying retired revokes failed")
+        else:
+            if owed:
+                log.warning("rotation: %d retired tokens still owed a revoke", owed)
         cutoff = now - timedelta(days=self.idle_days)
         first = True
         for agent in self.store.agents():

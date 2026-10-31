@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from crewbroker.avatar import identicon_png
+from crewbroker.membership import DEADLINE_RESERVE_S
 from crewbroker.mint import (
     SquattedAccount,
     account_name,
@@ -40,6 +42,64 @@ def test_ensure_bot_creates_once(fake: Any, tmp_path: Path) -> None:
     assert fake.count("create_bot") == 1
     assert accounts.minted_bot_ids() == [first]
     assert stat.S_IMODE(accounts.path.stat().st_mode) == 0o600
+
+
+def test_create_writes_intent_first(
+    fake: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#151: `pending_create[name]` is on disk before `create_bot` runs, and the description
+    carries its nonce."""
+    accounts = AccountStore(tmp_path)
+    seen: list[str | None] = []
+    create = fake.create_bot
+
+    def create_bot(username: str, display_name: str, description: str) -> dict[str, Any]:
+        seen.append(AccountStore(tmp_path).pending_nonce(username))  # read from disk
+        return create(username, display_name, description)
+
+    monkeypatch.setattr(fake, "create_bot", create_bot)
+    bot_id = ensure_bot(fake, "babel.oaw", accounts, BROKER_ID)
+    (nonce,) = seen
+    assert nonce is not None
+    assert fake.bots[bot_id]["description"].endswith(f"ref {nonce}")
+    assert accounts.pending_nonce("babel.oaw") is None  # cleared by add_minted
+
+
+def test_crash_between_create_and_record_is_adopted(
+    fake: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#151: a crash after `create_bot` and before `add_minted` leaves a bot of ours that is
+    not on `minted_bot_ids`. The next `ensure_bot` adopts it rather than calling it squatted."""
+    accounts = AccountStore(tmp_path)
+
+    def crash(name: str, bot_user_id: str) -> None:
+        raise RuntimeError("the broker died here")
+
+    monkeypatch.setattr(accounts, "add_minted", crash)
+    with pytest.raises(RuntimeError):
+        ensure_bot(fake, "babel.oaw", accounts, BROKER_ID)
+    monkeypatch.undo()
+
+    restarted = AccountStore(tmp_path)
+    assert restarted.minted_bot_ids() == []
+    bot_id = ensure_bot(fake, "babel.oaw", restarted, BROKER_ID)
+    assert restarted.minted_bot_ids() == [bot_id]
+    assert restarted.pending_nonce("babel.oaw") is None
+    assert fake.count("create_bot") == 1
+    assert any("adopted babel.oaw" in r.getMessage() for r in caplog.records)
+
+
+def test_reassigned_bot_with_pending_name_stays_squatted(fake: Any, tmp_path: Path) -> None:
+    """#151: a pending nonce exists, but the bot under that name lacks it (a bot reassigned to
+    the broker account, IT-08): still squatted, never adopted."""
+    accounts = AccountStore(tmp_path)
+    accounts.begin_create("babel.oaw", "c0ffee00")
+    fake.add_user(
+        "babel.oaw", is_bot=True, owner_id=BROKER_ID, description="someone else's · ref 0"
+    )
+    with pytest.raises(SquattedAccount):
+        ensure_bot(fake, "babel.oaw", accounts, BROKER_ID)
+    assert accounts.minted_bot_ids() == []
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -131,3 +191,50 @@ def test_remint_does_not_record_register(broker: Broker, clock: Any) -> None:
     broker.mint({"dev_name": "babel", "crew": "oaw"})
     acct = broker.accounts.get("babel.oaw")
     assert acct is not None and acct.last_register == clock.now
+
+
+def test_mint_sets_avatar_once(broker: Broker, fake: Any) -> None:
+    """#151: the first `mint` sets the bot's identicon (D-098: only its owner can); the next
+    one doesn't set it again."""
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    acct = broker.accounts.get("babel.oaw")
+    assert acct is not None
+    assert fake.images[acct.bot_user_id] == identicon_png("babel.oaw")
+    assert broker.accounts.avatar_set("babel.oaw")
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    assert fake.count("set_user_image") == 1
+
+
+def test_recreated_bot_gets_its_avatar(broker: Broker, fake: Any) -> None:
+    """#151 review: a bot gone from the server (a dev-space wipe) is created again under the
+    same name, and the new bot gets the avatar too: the flag belongs to the old bot id."""
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    acct = broker.accounts.get("babel.oaw")
+    assert acct is not None
+    del fake.users[acct.bot_user_id], fake.bots[acct.bot_user_id]
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    again = broker.accounts.get("babel.oaw")
+    assert again is not None and again.bot_user_id != acct.bot_user_id
+    assert fake.count("set_user_image") == 2
+    assert fake.images[again.bot_user_id] == identicon_png("babel.oaw")
+
+
+def test_avatar_failure_does_not_fail_mint(broker: Broker, fake: Any) -> None:
+    """#151: `set_user_image` failing: the mint still returns its token, the flag stays unset,
+    and the next mint tries again."""
+    fake.image_fails = True
+    minted = broker.mint({"dev_name": "babel", "crew": "oaw"})
+    assert fake.token_works(minted["token"])
+    assert not broker.accounts.avatar_set("babel.oaw")
+    fake.image_fails = False
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    assert fake.count("set_user_image") == 2
+    assert broker.accounts.avatar_set("babel.oaw")
+
+
+def test_avatar_skipped_near_the_deadline(broker: Broker, fake: Any, clock: Any) -> None:
+    """#151: with less than `DEADLINE_RESERVE_S` left, the avatar waits for the next mint."""
+    deadline = clock.now.timestamp() + DEADLINE_RESERVE_S / 2
+    broker.mint({"dev_name": "babel", "crew": "oaw", "deadline": deadline})
+    assert fake.count("set_user_image") == 0
+    assert not broker.accounts.avatar_set("babel.oaw")

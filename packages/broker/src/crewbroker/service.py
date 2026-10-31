@@ -43,9 +43,10 @@ import websockets.sync.client
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from crewbroker import config as cfg
+from crewbroker.avatar import identicon_png
 from crewbroker.config import CrewConfig
 from crewbroker.mattermost import MattermostAPI, MattermostClient, MattermostError, NotFound
-from crewbroker.membership import Membership
+from crewbroker.membership import DEADLINE_RESERVE_S, Membership
 from crewbroker.mint import (
     SquattedAccount,
     account_name,
@@ -219,7 +220,24 @@ class Broker:
             answer["membership"] = self.membership.ensure(
                 name, bot_id, deadline, lambda: self.clock().timestamp()
             )
+        self._ensure_avatar(name, bot_id, deadline)
         return answer
+
+    def _ensure_avatar(self, name: str, bot_id: str, deadline: float | None) -> None:
+        """Set the bot's avatar once, an identicon of its name (#151; D-098: only its owner,
+        this broker, can). Skipped while the deadline is near; a failure is logged and never
+        fails the mint. Either way the flag stays unset, so the next `mint` tries again."""
+        if self.accounts.avatar_set(name):
+            return
+        if deadline is not None and deadline - self.clock().timestamp() < DEADLINE_RESERVE_S:
+            return
+        try:
+            self.client.set_user_image(bot_id, identicon_png(name))
+        except MattermostError as exc:
+            log.warning("avatar for %s not set; the next mint retries: %s", name, exc)
+            return
+        with self._lock:  # `accounts.json` is written whole: never beside another write
+            self.accounts.mark_avatar_set(name)
 
     def remint(self, args: dict[str, Any]) -> dict[str, Any]:
         """A fresh token for an existing account; the held one stays valid until `revoke`."""

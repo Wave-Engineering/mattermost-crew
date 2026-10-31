@@ -448,3 +448,30 @@ def user_by_name(mattermost: Any, username: str) -> str:
     resp = mm_request(mattermost, "GET", f"/users/username/{username}")
     assert resp.status_code == 200, resp.text
     return str(resp.json()["id"])
+
+
+def test_it32_supersede_revokes_unheld_token(
+    mattermost: Any, broker: Broker, clock: Clock
+) -> None:
+    """IT-32 (R-05, R-07; #41, #151): a `mint` whose daemon holds no token (`current_token_id:
+    null`) revokes the account's earlier token on a real server, so a token whose reply the
+    daemon never received stops working. A token already revoked out of band is cleared from
+    the ledger as gone, and the held one is kept."""
+    first = broker.mint({**args(broker, "sup"), "current_token_id": None})
+    second = broker.mint({**args(broker, "sup"), "current_token_id": None})
+    assert token_works(mattermost, first["token"]) is False  # a 401
+    assert token_works(mattermost, second["token"])
+    assert broker.tokens.get(first["token_id"]) is None
+
+    # A third token the broker recorded, then revoked behind its back with the admin token.
+    acct = broker.accounts.get(second["account"])
+    assert acct is not None
+    stray = mint.mint_token(
+        broker.client, acct.bot_user_id, broker.tokens, expiry_supported=False, now=clock()
+    )
+    resp = mm_request(mattermost, "POST", "/users/tokens/revoke", json={"token_id": stray.token_id})
+    assert resp.status_code == 200, resp.text
+    third = broker.mint({**args(broker, "sup"), "current_token_id": second["token_id"]})
+    assert broker.tokens.get(stray.token_id) is None  # its 404 counts as gone
+    assert token_works(mattermost, second["token"])  # held: kept
+    assert token_works(mattermost, third["token"])
