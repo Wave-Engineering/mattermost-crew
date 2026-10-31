@@ -45,6 +45,7 @@ from crewchat.kiosk import ClaudeCliRunner, Kiosk, Research
 from crewchat.kiosk_broker import KioskBrokerClient
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
+from crewchat.retry import RegisterRetry
 from crewchat.server import (
     CLIENTS_GROUP,
     SOCKET_PATH,
@@ -236,6 +237,7 @@ async def serve(
     handlers.update(
         build_chat_handlers(registry, chat_backends, threads, context, uploads, filters=filters)
     )
+    register_retry = RegisterRetry(registry)
     handlers.update(
         build_doorbell_handlers(
             registry,
@@ -245,6 +247,8 @@ async def serve(
             # Social already on when an agent registers (after a daemon start, or mid-social):
             # its kiosk review, which `social_listeners` alone would never send (R-33, #99).
             on_registered=lambda reg: kiosk_answers.on_registered(reg, cache),
+            # A server that didn't mint is retried in the background, not left for a day (#186).
+            retry=register_retry,
         )
     )
     server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
@@ -268,6 +272,7 @@ async def serve(
         await stop.wait()
     finally:
         await server.aclose()
+        await register_retry.aclose()
         await rotation
         await switch_refresh
         await doorbell.aclose()

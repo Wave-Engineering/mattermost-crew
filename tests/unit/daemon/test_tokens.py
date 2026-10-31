@@ -202,8 +202,8 @@ def test_switch_cache_keeps_last_good_crew_info(daemon: Any) -> None:
     assert asyncio.run(daemon.cache.refresh("otter", "dev")) is None
 
 
-def _mint_calls() -> list[tuple[str, str]]:
-    """Every `<expr>.mint(...)` call in the daemon package, as (file, enclosing function)."""
+def _mint_calls(attr: str = "mint") -> list[tuple[str, str]]:
+    """Every `<expr>.<attr>(...)` call in the daemon package, as (file, enclosing function)."""
     found: list[tuple[str, str]] = []
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -214,15 +214,20 @@ def _mint_calls() -> list[tuple[str, str]]:
                 if (
                     isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "mint"
+                    and node.func.attr == attr
                 ):
                     found.append((path.name, func.name))
     return found
 
 
 def test_only_register_calls_mint(daemon: Any, clock: Any) -> None:
-    # Statically: the one call site of BrokerClient.mint is Registry.register.
-    assert sorted(set(_mint_calls())) == [("registry.py", "register")]
+    # Statically: the one call site of BrokerClient.mint is Registry._mint_on, and only a
+    # register calls that: `register` itself, or its retry of the servers that failed (#186).
+    assert sorted(set(_mint_calls())) == [("registry.py", "_mint_on")]
+    assert sorted(set(_mint_calls("_mint_on"))) == [
+        ("registry.py", "register"),
+        ("registry.py", "retry_unavailable"),
+    ]
     # And no string-dispatched "mint" frame anywhere else.
     for path in PACKAGE.rglob("*.py"):
         if path.name != "tokens.py":
