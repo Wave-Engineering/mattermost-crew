@@ -40,8 +40,10 @@ the registration, and squawkie when it is configured (§4.2 step 3).
   a dropped message is not handed over, so its cursor does not move past it.
 - **Stopping** (#152). `detach` cancels each of the agent's tasks, all at once, cancels again
   every `DETACH_RECANCEL_S` a task that is still running, and abandons a task still running
-  after `DETACH_TIMEOUT_S` with one ERROR line carrying its stack. A stream that absorbs a
-  cancel can't hang `crewchat serve`'s shutdown.
+  after `DETACH_TIMEOUT_S` with one ERROR line carrying its stack. `aclose` detaches every
+  agent at once. `crewchat serve` runs on `__main__.run_bounded`, whose exit leaves an
+  abandoned task behind rather than waiting for it, so a stream that absorbs every cancel
+  can't hang the daemon's stop.
 """
 
 from __future__ import annotations
@@ -486,8 +488,8 @@ class Doorbell:
         await asyncio.gather(*(self._stop_task(t) for t in popped))
 
     async def aclose(self) -> None:
-        for dev_name in {d for d, _ in self._tasks}:
-            await self.detach(dev_name)
+        """Stop every agent's tasks, all agents at once: bounded by one `detach_timeout_s`."""
+        await asyncio.gather(*(self.detach(d) for d in {d for d, _ in self._tasks}))
 
     # -- token hooks (crewchat.tokens.Adapter) ----------------------------------------------
     async def on_token_rotated(self, dev_name: str) -> None:

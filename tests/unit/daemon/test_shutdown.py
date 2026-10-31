@@ -7,11 +7,12 @@ import asyncio
 import json
 import os
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
-from crewchat.__main__ import serve
+from crewchat.__main__ import run_bounded, serve
 from crewchat.server import DaemonServer
 
 CONFIG = """
@@ -255,3 +256,29 @@ def test_failed_read_while_an_op_waits_is_a_hangup(
 
     wait = asyncio.run(scenario())
     assert wait.cancelled
+
+
+def test_run_bounded_leaves_a_task_that_never_stops(caplog: pytest.LogCaptureFixture) -> None:
+    """#152: a task that absorbs every cancel (one `Doorbell.detach` abandoned) can't hang the
+    exit, as it would `asyncio.run`'s: it is logged and left behind, and the result returned."""
+
+    async def stubborn() -> None:
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+    left: list[asyncio.Task[None]] = []
+
+    async def main() -> int:
+        left.append(asyncio.create_task(stubborn(), name="doorbell babel x"))
+        await asyncio.sleep(0)
+        return 7
+
+    started = time.monotonic()
+    assert run_bounded(main(), timeout_s=0.2) == 7
+    assert time.monotonic() - started < 2
+    assert not left[0].done()  # left behind, not waited for
+    stuck = [r.getMessage() for r in caplog.records if "did not stop on exit" in r.getMessage()]
+    assert stuck == ["task doorbell babel x did not stop on exit; left behind"]

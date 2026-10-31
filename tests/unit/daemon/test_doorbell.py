@@ -707,6 +707,28 @@ def test_detach_stops_an_agents_tasks_concurrently(
     assert sorted(e.split()[4] for e in errors) == ["x", "y"]  # "doorbell task doorbell babel x"
 
 
+def test_aclose_stops_every_agent_concurrently(tmp_path: Path, run: Any) -> None:
+    """#152: `aclose` (the daemon's stop) waits one `detach_timeout_s` for all agents, not one
+    per agent."""
+    src = Stubborn()
+    bell = Doorbell({"x": src}, CursorStore(tmp_path), detach_timeout_s=0.2, detach_recancel_s=0.01)
+
+    async def scenario() -> float:
+        bell.attach(DEV, ["x"])
+        bell.attach("kessel", ["x"])
+        await asyncio.sleep(0.01)
+        tasks = doorbell_tasks(DEV) + doorbell_tasks("kessel")
+        assert len(tasks) == 2
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await bell.aclose()
+        took = loop.time() - started
+        await release([src], tasks)
+        return took
+
+    assert run(scenario()) < 0.35
+
+
 def test_cursor_replay_dedups_an_overlap(tmp_path: Path, run: Any) -> None:
     """A replay that overlaps what was queued delivers each event once; the restarted
     stream is handed a cursor that covers every ID already queued."""
