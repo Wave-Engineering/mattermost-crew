@@ -64,6 +64,11 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **The broker sets each bot's avatar** (#151, D-098): an identicon drawn from the account
+  name, set once per bot. **Each existing bot gets it on its own next mint (a register) after
+  the upgrade, replacing any avatar set on it by hand.** That is a one-time, visible change on
+  a live server. Set a hand-picked avatar again once the broker's has appeared, and the broker
+  leaves it alone.
 - **`crewkiosk-broker` admits answers, and bounds every call to its key** (#142).
   - It serves only an answer a hello admitted, one live or recorded in its server's day. Any
     other answer id is a 403 that spends nothing and makes no record. So the turns and counts
@@ -89,6 +94,11 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A container's bind mount of `/run/crewchat` survives a daemon restart** (#173).
+  `crewchat.service` now sets `RuntimeDirectoryPreserve=yes`, so a restart no longer deletes
+  the directory under a container that mounts it. Because the directory now outlives the
+  daemon, the daemon clears the uploads left from before a restart when it starts
+  (`UploadStore.clear_stale`), so they no longer hold tmpfs until reboot.
 - **An arrow in a squawk's own text no longer rings the doorbell** (#170). The daemon read a
   squawk's answer as everything after its last `→`, so "campaign→main" rang as answered. It now
   reads it as the kit's `sqtk-answer.jq` does (cc#1363): a squawk never edited has no answer,

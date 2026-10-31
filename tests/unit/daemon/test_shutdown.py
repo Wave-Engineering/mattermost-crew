@@ -66,6 +66,27 @@ def test_serve_stops_while_a_subscribe_waits(short_dir: Path, tmp_path: Path) ->
     assert not sock.exists()
 
 
+def test_serve_clears_stale_uploads_before_serving(short_dir: Path, tmp_path: Path) -> None:
+    """#173: an upload left from before a restart is gone by the time the socket is up."""
+    config = tmp_path / "servers.toml"
+    config.write_text(CONFIG)
+    sock = short_dir / "crewchat.sock"
+    stale = short_dir / "uploads" / ("a" * 32)
+    stale.parent.mkdir()
+    stale.write_bytes(b"old")
+
+    async def scenario() -> int:
+        daemon = asyncio.create_task(
+            serve(config, sock, tmp_path / "tokens", None, state_dir=tmp_path / "state")
+        )
+        await wait_for_socket(sock)
+        assert not stale.exists()
+        os.kill(os.getpid(), signal.SIGTERM)
+        return await asyncio.wait_for(daemon, 2)
+
+    assert asyncio.run(scenario()) == 0
+
+
 class Waiting:
     """A handler that waits until it's cancelled, as `subscribe` does on an empty queue."""
 

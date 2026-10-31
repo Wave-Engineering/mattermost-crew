@@ -99,7 +99,7 @@ docker run ... \
 ```
 
 Mount the directory, not the socket file: the daemon recreates the socket when it restarts, and a
-file mount would keep pointing at the old one. Never mount `/run/crewbroker`, `/etc/crewchat`,
+file mount would keep pointing at the old one. This works because crewchat.service keeps /run/crewchat across daemon restarts (RuntimeDirectoryPreserve=yes). On a host with an older unit, the bind mount goes empty at the first daemon restart; reinstall the unit, then restart the container. /run is still emptied on boot, so restart the containers after a host reboot. Never mount `/run/crewbroker`, `/etc/crewchat`,
 `/etc/crewbroker`, `/var/lib/crewchat` or `/var/lib/crewbroker` into an agent's container.
 
 ## Configure

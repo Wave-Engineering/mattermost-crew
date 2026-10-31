@@ -3,8 +3,8 @@
 #   systemctl enable --now crewchat
 #
 # Needs the crewchat user, the crewchat-clients group (crewchat is a member), and
-# /etc/crewchat/servers.toml. systemd creates /run/crewchat (RuntimeDirectory; /run is emptied
-# on every boot) and /var/lib/crewchat (StateDirectory, mode 0700). The daemon creates
+# /etc/crewchat/servers.toml. systemd creates /run/crewchat (RuntimeDirectory, kept across daemon
+# restarts; /run is emptied on every boot) and /var/lib/crewchat (StateDirectory, mode 0700). The daemon creates
 # /var/lib/crewchat/tokens and /var/lib/crewchat/threads (0700) and every file in them (0600), and gives its socket,
 # /run/crewchat/crewchat.sock, mode 0660 and group crewchat-clients. It reaches each broker's
 # socket under /run/crewbroker through the crewchat group (packaging/crewbroker.tmpfiles.conf).
@@ -28,6 +28,8 @@ ProtectSystem=strict
 RuntimeDirectory=crewchat
 # The agents' user must traverse /run/crewchat to reach the socket; the socket itself is 0660.
 RuntimeDirectoryMode=0755
+# Kept across restarts, so a container's bind mount of /run/crewchat stays valid (#173). /run still empties on boot.
+RuntimeDirectoryPreserve=yes
 StateDirectory=crewchat
 StateDirectoryMode=0700
 ReadWritePaths=/var/lib/crewchat /run/crewchat
