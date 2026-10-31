@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from crewbroker import mattermost
 from crewbroker.config import CrewConfig
-from crewbroker.mattermost import DeadlineExceeded
+from crewbroker.mattermost import DeadlineExceeded, NotFound
 from crewbroker.membership import DEADLINE_RESERVE_S, DEFERRED
 from crewbroker.service import (
     Broker,
@@ -630,6 +630,22 @@ def test_mint_rate_limited_past_deadline_is_expired(
     assert bounds == [deadline - DEADLINE_RESERVE_S] * 2
     assert len(broker.tokens.all()) == tokens_before
     assert getattr(mattermost._local, "deadline", None) is None  # restored after the op
+
+
+def test_remint_create_token_404_is_upstream_not_squatted(
+    broker: Broker, fake: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#158 review: only `get_bot`'s 404 means the bot is gone. A 404 from `create_token` is
+    an upstream failure, so the agent is not told its bot was squatted."""
+    held = broker.mint(_args(None))
+
+    def gone(user_id: str, description: str, expires_at_ms: int | None = None) -> Any:
+        raise NotFound("POST", f"/users/{user_id}/tokens", 404, "not found")
+
+    monkeypatch.setattr(fake, "create_token", gone)
+    frame = {"proto": 1, "id": "x", "op": "remint", "args": _args(held["token_id"])}
+    reply = handle_frame(broker, json.dumps(frame).encode(), True)
+    assert reply["ok"] is False and reply["error"].startswith("upstream: ")
 
 
 def test_deadline_must_be_epoch_seconds(broker: Broker) -> None:

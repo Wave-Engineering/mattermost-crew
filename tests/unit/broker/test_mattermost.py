@@ -174,6 +174,24 @@ def test_slow_create_token_is_recorded_past_the_deadline(tmp_path: Path) -> None
     assert token.token_id == "t1" and tokens.get("t1") is not None
 
 
+def test_uncapped_timeout_is_not_deadline_exceeded() -> None:
+    """#158 review: under `uncapped`, a timeout ends the call at the client's own timeout and
+    is a plain `MattermostError`. A `DeadlineExceeded` would tell `mint` that no token was made,
+    and the request may have made one."""
+    now = [1000.0]
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        now[0] += 10
+        raise httpx.ReadTimeout("slow", request=request)
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(slow), clock=lambda: now[0]
+    )
+    with call_deadline(1001.0), uncapped(), pytest.raises(MattermostError) as exc:
+        client.me()
+    assert not isinstance(exc.value, DeadlineExceeded)
+
+
 def test_uncapped_still_refuses_past_the_deadline() -> None:
     """`uncapped` drops only the cap: a 429 past the deadline still raises, without sleeping,
     and nothing is sent once it has passed."""
