@@ -296,7 +296,8 @@ def post_kiosk(props: Any) -> bool:
 
 
 def post_kiosk_answers(props: Any) -> str:
-    """A kiosk answer's `props.crew_kiosk_answers`: the question's post ID, or "" (#26)."""
+    """A kiosk answer's `props.crew_kiosk_answers`: the question's post ID, or ""
+    (mm:triage #26)."""
     if not post_kiosk(props):
         return ""
     value = props.get("crew_kiosk_answers")
@@ -640,7 +641,7 @@ class MattermostBackend:
     ) -> InboundMessage:
         """Upload `attachments` with the agent's own token (`POST /api/v4/files`), then post
         with their `file_ids`; `embed` is a message attachment (CT-01). A kiosk answer names
-        the question it `answers` (#26)."""
+        the question it `answers` (mm:triage #26)."""
         file_ids: list[str] = []
         for att in attachments:
             uploaded = await client.upload_file(channel, str(att.path), filename=att.name)
@@ -688,7 +689,7 @@ class MattermostBackend:
         self, dev_name: str, channel: str, text: str, thread: str, *, answers: str = ""
     ) -> InboundMessage:
         """The kiosk's answer, as `dev_name`, in `thread`: `props.crew_kiosk=1` (Story 3.5),
-        and `props.crew_kiosk_answers=<answers>`, the question's post ID (#26)."""
+        and `props.crew_kiosk_answers=<answers>`, the question's post ID (mm:triage #26)."""
         require_channel_name(channel)
 
         async def request(client: MattermostClient) -> InboundMessage:

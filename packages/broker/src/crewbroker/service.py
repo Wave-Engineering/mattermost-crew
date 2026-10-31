@@ -85,7 +85,7 @@ MAX_FRAME_BYTES = 64 * 1024
 # Every post the broker makes carries this prop, and the listener never answers a post that
 # does: two brokers (or a broker and itself) can't refuse each other in a loop.
 BROKER_PROP = "crew_broker"
-KIOSK_PROP = "crew_kiosk"  # a kiosk answer (§5.9): never a command to the broker (#52)
+KIOSK_PROP = "crew_kiosk"  # a kiosk answer (§5.9): never a command to the broker (mm:triage #52)
 WS_PING_S = 30.0
 WS_RECV_POLL_S = 1.0
 WS_BACKOFF_FIRST_S = 1.0
@@ -654,7 +654,7 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
 
     Only a user's own `posted` post in a DM channel counts: not the broker's own posts, not
     system posts, and never a post carrying `props.crew_broker` (another broker's reply) or
-    `props.crew_kiosk` (an agent's kiosk answer, #52).
+    `props.crew_kiosk` (an agent's kiosk answer, mm:triage #52).
     """
     if not isinstance(event, dict) or event.get("event") != "posted":
         return None

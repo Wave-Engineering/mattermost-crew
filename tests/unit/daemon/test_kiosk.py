@@ -273,7 +273,7 @@ def test_answer_mentions_stripped_and_tagged(mm: Any, run: Any, tmp_path: Path) 
 
 
 def test_answer_names_its_question(mm: Any, run: Any, tmp_path: Path) -> None:
-    """#26: the answer carries its question's post ID, and reads back with it."""
+    """mm:triage #26: the answer carries its question's post ID, and reads back with it."""
     w = World(mm, tmp_path)
     w.briefs[DEV] = BRIEF
     ask = w.post(w.outsider, "@babel which one?")
@@ -289,7 +289,7 @@ def test_answer_names_its_question(mm: Any, run: Any, tmp_path: Path) -> None:
 def test_crash_between_post_and_record_is_not_answered_again(
     mm: Any, run: Any, tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """#26: a daemon that died after posting and before recording finds its answer in the
+    """mm:triage #26: a daemon that died after posting and before recording finds its answer in the
     thread on the replay, and records it instead of answering again."""
     w = World(mm, tmp_path, FakeRunner("THE-ANSWER"))
     w.briefs[DEV] = BRIEF
@@ -314,7 +314,7 @@ def test_crash_between_post_and_record_is_not_answered_again(
 
 
 def test_foreign_kiosk_props_do_not_suppress_an_answer(mm: Any, run: Any, tmp_path: Path) -> None:
-    """#26: only the agent's own account can mark one of its answers."""
+    """mm:triage #26: only the agent's own account can mark one of its answers."""
     w = World(mm, tmp_path)
     w.briefs[DEV] = BRIEF
     ask = w.post(w.outsider, "@babel a question")
@@ -330,7 +330,7 @@ def test_foreign_kiosk_props_do_not_suppress_an_answer(mm: Any, run: Any, tmp_pa
 def test_unreadable_thread_still_answers(
     mm: Any, run: Any, tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """#26: a thread that can't be read still gets its question answered and recorded."""
+    """mm:triage #26: a thread that can't be read still gets its question answered and recorded."""
     w = World(mm, tmp_path)
     w.briefs[DEV] = BRIEF
 

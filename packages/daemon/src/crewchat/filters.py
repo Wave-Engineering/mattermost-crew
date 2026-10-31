@@ -32,7 +32,7 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
 - **Discord** is crew-equivalent: `DELIVER`, with the loop guard on push (R-15). **squawkie**
   events are exempt. Neither needs the broker, so both flow while it is down (R-27).
 - A post by any configured `broker_user_id` on that server is `DROP("broker")`, on push and
-  pull, first after the backend (#25).
+  pull, first after the backend (mm:triage #25).
 - **Mattermost membership.** A bot account is in crew X if and only if its user ID is in X's
   `minted_bot_ids` (X's broker lists only the bots it minted and still owns, D-100); a human
   is in X if and only if it is in X's `human_user_ids`. Username suffixes are never read. With
@@ -633,7 +633,7 @@ class Filters:
         broker_user_ids: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         self.registry = registry
-        # Each server's broker accounts, every crew's on this host (#25).
+        # Each server's broker accounts, every crew's on this host (mm:triage #25).
         self.broker_ids: dict[str, frozenset[str]] = {
             sid: frozenset(ids) for sid, ids in (broker_user_ids or {}).items()
         }

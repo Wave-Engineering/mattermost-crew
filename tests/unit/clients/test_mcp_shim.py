@@ -450,8 +450,8 @@ class FlakyBriefDaemon(RestartingDaemon):
 
 
 def test_failed_forced_brief_push_is_retried(tmp_path: Path) -> None:
-    """#47: a forced brief push that fails after a `not_registered` ping is pushed again on
-    the next tick, with no change to the seed."""
+    """mm:triage #47: a forced brief push that fails after a `not_registered` ping is pushed
+    again on the next tick, with no change to the seed."""
     daemon, clock = FlakyBriefDaemon(), Clock()
     shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
 
@@ -473,7 +473,7 @@ def test_failed_forced_brief_push_is_retried(tmp_path: Path) -> None:
 
 
 def test_brief_failure_does_not_skip_squawk_ids(tmp_path: Path) -> None:
-    """#47: a forced `sync_files` whose brief push fails still pushes the squawk ids, then
+    """mm:triage #47: a forced `sync_files` whose brief push fails still pushes the squawk ids, then
     raises the brief's error."""
     daemon = FlakyBriefDaemon()
     shim = make_shim(tmp_path, daemon)
@@ -490,8 +490,8 @@ def test_brief_failure_does_not_skip_squawk_ids(tmp_path: Path) -> None:
 
 
 def test_unforced_sync_unchanged_files_pushes_nothing(tmp_path: Path) -> None:
-    """#47 regression: after a sync that landed, an unforced sync with no file change sends
-    no frame."""
+    """mm:triage #47 regression: after a sync that landed, an unforced sync with no file
+    change sends no frame."""
     daemon = FakeDaemon()
     shim = make_shim(tmp_path, daemon)
 

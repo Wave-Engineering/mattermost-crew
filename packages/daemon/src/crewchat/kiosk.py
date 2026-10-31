@@ -40,7 +40,8 @@
   before `post_id` was kept still load; they just can't stop a replay. Each answer carries
   `props.crew_kiosk_answers=<question post_id>`, and a question missing from the transcript
   is first looked for in its thread: the agent's own kiosk answer to it there is recorded,
-  not answered again, which covers a daemon that died between the post and the record (#26).
+  not answered again, which covers a daemon that died between the post and the record
+  (mm:triage #26).
 
 `Kiosk` consumes the `KioskQueue` from Story 3.3: one worker per expert, started when that
 expert's first event arrives, answering its events in order.
@@ -594,7 +595,7 @@ class Kiosk:
             log.warning("kiosk: %s's own user id unreadable: %s", dev_name, exc)
             me = None
         if me is not None:
-            # Answered, but the daemon died before the record (#26). Only the agent's own
+            # Answered, but the daemon died before the record (mm:triage #26). Only the agent's own
             # account can mark one of its answers: anyone else's props don't count.
             done = next(
                 (
