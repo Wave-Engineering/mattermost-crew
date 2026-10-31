@@ -77,6 +77,7 @@ from crewchat.adapters.base import (
     NO_STATUS,
     Attachment,
     Embed,
+    Forbidden,
     InboundMessage,
     NotFound,
     StatusSink,
@@ -196,6 +197,17 @@ class AllUnreadable(ReplayFailed):
 
 UNREADABLE = (403, 404)  # a replay scope this account can't read yet: skipped, not an outage
 UNREADABLE_RETRY_S = 2.0  # the wait before retrying a replay that could read nothing
+
+
+def edit_refusal(exc: MattermostAPIError, post_id: str) -> Exception:
+    """An `edit`'s failure: Mattermost's own 404 is `NotFound` and its 403 `Forbidden`, so
+    the caller posts anew (#149). A proxy's (no `error_id`) stays an outage, as in
+    `unreadable`, so the caller retries instead."""
+    if exc.error_id is not None and exc.status_code == 404:
+        return NotFound(f"post {post_id}")
+    if exc.error_id is not None and exc.status_code == 403:
+        return Forbidden("not your post")
+    return exc
 
 
 def unreadable(exc: Exception) -> bool:
@@ -794,6 +806,37 @@ class MattermostBackend:
             await client.add_reaction(post_id, emoji.strip(":"))
 
         await self._call(dev_name, request)
+
+    async def edit(
+        self, dev_name: str, post_id: str, text: str, *, embed: Embed | None = None
+    ) -> InboundMessage:
+        """`PUT /api/v4/posts/{id}/patch` as the agent: its own post only (#149). The server
+        enforces the author too; the read first gives `forbidden` its own name. An `embed`
+        replaces the post's `props.attachments`, and its other props are kept."""
+        require_mm_id(post_id, "post_id")
+        me = await self.user_id(dev_name)
+
+        async def request(client: MattermostClient) -> InboundMessage:
+            try:
+                post = await client.get_post(post_id)
+            except MattermostAPIError as exc:  # a 403: a channel the agent isn't in
+                raise edit_refusal(exc, post_id) from exc
+            if str(post.get("user_id", "")) != me:
+                raise Forbidden("not your post")
+            body: dict[str, Any] = {"message": text}
+            if embed is not None:
+                props = post.get("props")
+                body["props"] = {
+                    **(props if isinstance(props, dict) else {}),
+                    "attachments": [embed_attachment(embed)],
+                }
+            try:
+                edited = await client.put(f"/posts/{post_id}/patch", json=body)
+            except MattermostAPIError as exc:
+                raise edit_refusal(exc, post_id) from exc
+            return await self.message(client, edited if isinstance(edited, dict) else post)
+
+        return await self._call(dev_name, request)
 
     # -- the stream -------------------------------------------------------------------------
     def ws_uri(self, agent: _Agent) -> str:

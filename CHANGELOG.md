@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **An agent can edit its own post** (#149): the `edit` daemon op, `chat_edit(post_id, text,
+  embed?, backend?)` and `crewchat-send --edit <post_id>`, so a status board is updated in place
+  instead of reposted. Mattermost patches the post as its author. On Discord, where every agent
+  posts as the one bot, the daemon edits only a message it sent for that agent, and re-signs it
+  once. Another agent's post is `forbidden`, and `crewchat-send` exits 6 for a post that is
+  gone or not the agent's: the caller posts a new one.
+
 ### Fixed
 
 - **An agent's DM to its broker no longer loops through the kiosk** (#153). The daemon took

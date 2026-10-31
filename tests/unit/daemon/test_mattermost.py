@@ -11,10 +11,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypeVar
 
 import pytest
-from crewchat.adapters.base import ChatBackend, InboundMessage
+from crewchat.adapters.base import ChatBackend, Embed, Forbidden, InboundMessage, NotFound
 from crewchat.adapters.mattermost import MattermostBackend, post_kiosk, post_proto
 from crewchat.protocol import PROTO
 from crewchat.tokens import Unauthorized
+from mcp_server_mattermost.exceptions import MattermostAPIError
 
 T = TypeVar("T")
 SID = "dev"
@@ -101,6 +102,37 @@ def test_send_sets_crew_proto_prop(mm: Any, run: Any) -> None:
     reply = run(b.send("babel.oaw", CHAN, "again", thread=msg.post_id))
     assert mm.posts[reply.post_id]["root_id"] == msg.post_id == reply.root_id
     assert mm.posts[reply.post_id]["props"]["crew_proto"] == 1
+
+
+def test_mattermost_edit_patches_as_agent(mm: Any, run: Any) -> None:
+    """#149: the patch goes out as the agent, an embed joins the post's props without
+    dropping `crew_proto`, and another agent's post is `forbidden` before any patch."""
+    tokens = Tokens(mm)
+    me = tokens.add("babel.oaw")
+    other = tokens.add("kessel.oaw")
+    b = backend(mm, tokens)
+    sent = run(b.send("babel.oaw", CHAN, "first"))
+    edited = run(b.edit("babel.oaw", sent.post_id, "second", embed=Embed("T", "body")))
+    [(post_id, as_user, body)] = mm.patches
+    assert (post_id, as_user, body["message"]) == (sent.post_id, me, "second")
+    assert body["props"] == {"crew_proto": 1, "attachments": [{"title": "T", "text": "body"}]}
+    assert edited.text == "second" and edited.post_id == sent.post_id
+    theirs = mm.add_post(other, CHAN, "kessel's")
+    with pytest.raises(Forbidden):
+        run(b.edit("babel.oaw", theirs["id"], "hijacked"))
+    with pytest.raises(NotFound):
+        run(b.edit("babel.oaw", "z" * 26, "gone"))
+    # Mattermost's own 403 on the read (a channel the agent isn't in): not its post either.
+    # A proxy's 403 page is an outage, so the caller retries rather than posting anew.
+    mm.errors[f"/posts/{theirs['id']}"] = 2
+    mm.error_status[f"/posts/{theirs['id']}"] = 403
+    with pytest.raises(Forbidden):
+        run(b.edit("babel.oaw", theirs["id"], "hijacked"))
+    mm.error_html.add(f"/posts/{theirs['id']}")
+    with pytest.raises(MattermostAPIError) as raised:
+        run(b.edit("babel.oaw", theirs["id"], "hijacked"))
+    assert not isinstance(raised.value, Forbidden | NotFound)
+    assert len(mm.patches) == 1
 
 
 def test_inbound_proto_defaults_zero(mm: Any, run: Any) -> None:

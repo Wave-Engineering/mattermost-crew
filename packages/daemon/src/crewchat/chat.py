@@ -1,4 +1,4 @@
-"""The chat ops: `send`, `dm`, `read`, `thread` and `react`; Discord's guild ops
+"""The chat ops: `send`, `dm`, `read`, `thread`, `react` and `edit`; Discord's guild ops
 `list_channels`, `resolve`, `create_channel` and `create_thread`; `upload` and
 `thread_backend`; plus the shim's pushes `kiosk_brief` and `squawk_ids` (Dev Spec §5.4;
 Stories 2.4, 2.4c).
@@ -16,6 +16,10 @@ backend other than the agent's default) is logged as `off-default: <dev> <backen
   `attachments: [upload_id]`. Each upload is deleted once its post was tried.
 - **Embeds** (R-15). `send`/`dm` take `embed`, today's `"title:body"`; a malformed one is
   `bad_request`. Neither an attachment nor an embed is ever silently dropped.
+- **`edit`** (#149) rewrites the agent's own post: `{dev_name, backend, post_id, text,
+  embed?}` answers `{backend, post_id}`. Another agent's post is `forbidden` and a gone one
+  `not_found`. Mattermost's server enforces the author; on Discord, where every agent posts as
+  the one bot, the adapter refuses a message it didn't send for that agent since it started.
 - **`thread_backend`** (R-12) answers which backend a post's thread is on, so a reply follows
   it after a restart of either side: the ID's shape decides the kind (a 17-20 digit snowflake
   is `discord`, a 26-character lowercase id is Mattermost); for Mattermost, the agent's
@@ -54,6 +58,7 @@ from crewchat.adapters.base import (
     ChannelResolver,
     ChatBackend,
     Embed,
+    Forbidden,
     GuildBackend,
     InboundMessage,
     NotFound,
@@ -203,6 +208,8 @@ def build_chat_handlers(
             return OpError("unavailable", str(exc))
         if isinstance(exc, NotFound):
             return OpError("not_found", f"{backend_name}: {exc}")
+        if isinstance(exc, Forbidden):
+            return OpError("forbidden", f"{backend_name}: {exc}")
         if isinstance(exc, UploadError):
             return OpError(exc.code, exc.detail)
         if isinstance(exc, ValueError | KeyError):
@@ -332,6 +339,17 @@ def build_chat_handlers(
         except Exception as exc:
             raise backend_error(backend_name, "react", exc) from exc
         return {}
+
+    async def edit(args: dict[str, Any]) -> dict[str, Any]:
+        dev_name, _reg, backend_name, backend = agent(args)
+        post_id = _str(args, "post_id")
+        assert post_id is not None
+        text, embed = _text(args), _embed(args)
+        try:
+            await backend.edit(dev_name, post_id, text, embed=embed)
+        except Exception as exc:
+            raise backend_error(backend_name, "edit", exc) from exc
+        return {"backend": backend_name, "post_id": post_id}
 
     # -- Discord's guild ops (today's disc_list, disc_resolve, disc_create_*) ----------------
     async def list_channels(args: dict[str, Any]) -> dict[str, Any]:
@@ -480,6 +498,7 @@ def build_chat_handlers(
         "read": read,
         "thread": thread,
         "react": react,
+        "edit": edit,
         "list_channels": list_channels,
         "resolve": resolve,
         "create_channel": create_channel,

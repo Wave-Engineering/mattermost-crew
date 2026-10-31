@@ -3,7 +3,7 @@
 A script runs it to post one message as the checkout's agent: the kit's page scripts
 (`notify-bj.sh`, `reseed-kick.sh`) and anything else in shell that must reach a person. It
 sends one `send` (or, with `--dm`, `dm`) frame to the daemon's socket and prints the post's
-ID.
+ID. With `--edit <post_id>` it rewrites that post, the agent's own, instead (`edit`, #149).
 
 - **Who.** The Dev-Name is read from `.claude/agent-identity.json` at the repo root, exactly as
   the doorbell reads it (the `git rev-parse --show-toplevel` of the working directory, or
@@ -17,7 +17,8 @@ ID.
 - **Where.** `<to>` is a channel ID or name, or a username with `--dm`. The backend is
   `--backend`; else, with `--thread`, the backend that thread is on (`thread_backend`, as the
   shim asks it); else the R-11 default (`home_backend`, then `~/.claude/chat-defaults.json`).
-  It never asks: no default is exit 3.
+  It never asks: no default is exit 3. `--edit` takes no `<to>`: the post's own backend
+  (`thread_backend`), or `--backend`.
 
 Exit codes. A caller branches on non-zero to fall back:
 
@@ -29,6 +30,10 @@ Exit codes. A caller branches on non-zero to fall back:
 | 3 | no default backend for this repo, and no `--backend` |
 | 4 | not registered: no live session for this agent on this host |
 | 5 | daemon unreachable: no socket, a refused or timed-out connect, or a bad reply |
+| 6 | `--edit`: that post can't be edited (gone, or not this agent's); post a new one |
+
+A caller that edits one live message (a status board) falls back on 6 to a fresh send, and
+caches the new post's ID in place of the old.
 
 Stderr carries one line per failure. It never carries the message text.
 """
@@ -67,6 +72,7 @@ EXIT_USAGE = 2
 EXIT_NO_DEFAULT = 3
 EXIT_NOT_REGISTERED = 4
 EXIT_UNREACHABLE = 5
+EXIT_CANT_EDIT = 6
 
 CONNECT_TIMEOUT_S = 10.0
 REPLY_TIMEOUT_S = 30.0  # a Discord post through scream-hole can take seconds
@@ -81,14 +87,17 @@ EXIT_CODES_HELP = """exit codes:
      or thread
   3  no default backend for this repo, and no --backend
   4  not registered: no live session for this agent on this host
-  5  daemon unreachable"""
+  5  daemon unreachable
+  6  --edit: that post can't be edited (gone, or not this agent's); post a new one"""
 
 
 class SendExit(Exception):
-    """A failure with its exit code. The message is the one stderr line."""
+    """A failure with its exit code. The message is the one stderr line; `error` is the
+    daemon's error code (`not_found`, ...), when the daemon refused."""
 
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, *, error: str = "") -> None:
         self.code = code
+        self.error = error
         super().__init__(message)
 
 
@@ -131,12 +140,15 @@ def request(sock_path: Path, op: str, args: dict[str, Any]) -> dict[str, Any]:
         raise SendExit(EXIT_UNREACHABLE, f"crewchat daemon sent a mismatched reply to {op}")
     if not reply.get("ok"):
         error = str(reply.get("error", "error"))
-        if error.split(":", 1)[0].strip() == "not_registered":
+        code = error.split(":", 1)[0].strip()
+        if code == "not_registered":
             raise SendExit(
                 EXIT_NOT_REGISTERED,
                 f"no registered session for {args.get('dev_name')} on this host",
             )
-        raise SendExit(EXIT_ERROR, f"crewchat {op}: {error}")
+        if op == "edit" and code in ("not_found", "forbidden"):
+            raise SendExit(EXIT_CANT_EDIT, f"crewchat {op}: {error}", error=code)
+        raise SendExit(EXIT_ERROR, f"crewchat {op}: {error}", error=code)
     result = reply.get("result")
     return result if isinstance(result, dict) else {}
 
@@ -221,6 +233,10 @@ def run(
             raise SendExit(EXIT_USAGE, "the message is read from STDIN, never argv")
         if ns.dm and ns.thread:
             raise SendExit(EXIT_USAGE, "--thread is a channel reply; a --dm has none")
+        if ns.edit is not None:
+            return run_edit(ns, stdin, stdout, defaults_file)
+        if ns.to is None:
+            raise SendExit(EXIT_USAGE, "name <to>: a channel ID or name, or a username with --dm")
         try:
             tid = thread_id(ns.thread) if ns.thread else None
         except ShimError as exc:
@@ -247,6 +263,43 @@ def run(
     return EXIT_SENT
 
 
+def run_edit(
+    ns: argparse.Namespace, stdin: TextIO, stdout: TextIO, defaults_file: Path | None
+) -> int:
+    """`--edit <post_id>`: the agent's own post, rewritten to STDIN's text (#149)."""
+    if ns.to is not None or ns.dm or ns.thread:
+        raise SendExit(EXIT_USAGE, "--edit takes only the post: no <to>, --dm or --thread")
+    try:
+        thread_id(ns.edit)  # a malformed `<channel>/<message>` is usage, before any frame
+    except ShimError as exc:
+        raise SendExit(EXIT_USAGE, str(exc)) from exc
+    root = ns.repo_root or find_repo_root(Path.cwd())
+    dev_name, identity = read_identity(root)
+    text = read_text(stdin)
+    try:
+        backend, off = resolve_backend(
+            ns.backend, ns.edit, identity, root, ns.socket, dev_name, defaults_file
+        )
+    except SendExit as exc:
+        if ns.backend is None and exc.error == "not_found":
+            raise SendExit(EXIT_CANT_EDIT, str(exc)) from exc  # the post is gone
+        raise
+    args: dict[str, Any] = {
+        "dev_name": dev_name,
+        "backend": backend,
+        "post_id": ns.edit,
+        "text": text,
+    }
+    if off:
+        args["off_default"] = True
+    result = request(ns.socket, "edit", args)
+    post_id = result.get("post_id")
+    if not isinstance(post_id, str) or not post_id:
+        raise SendExit(EXIT_ERROR, "crewchat answered with no post ID")
+    print(post_id, file=stdout)
+    return EXIT_SENT
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="crewchat-send",
@@ -254,11 +307,14 @@ def parser() -> argparse.ArgumentParser:
         epilog=EXIT_CODES_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("to", help="a channel ID or name, or a username with --dm")
+    p.add_argument("to", nargs="?", help="a channel ID or name, or a username with --dm")
     p.add_argument("text", nargs="*", help=argparse.SUPPRESS)  # refused: STDIN only
     p.add_argument("--backend", default=None, help="mattermost:<server-id> or discord")
     p.add_argument("--thread", default=None, help="reply on this thread (a post ID)")
     p.add_argument("--dm", action="store_true", help="<to> is a username: a direct message")
+    p.add_argument(
+        "--edit", default=None, metavar="POST_ID", help="rewrite this post, your own; no <to>"
+    )
     p.add_argument("--socket", type=Path, default=SOCKET_PATH)
     p.add_argument("--repo-root", type=Path, default=None)
     return p

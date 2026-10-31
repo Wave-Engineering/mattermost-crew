@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from crewchat_clients.send import (
     DAEMON_MAX_FRAME_BYTES,
+    EXIT_CANT_EDIT,
     EXIT_ERROR,
     EXIT_NO_DEFAULT,
     EXIT_NOT_REGISTERED,
@@ -249,6 +250,64 @@ def test_send_thread_follows_its_backend(repo: Path, short_dir: Path) -> None:
     assert lookup["args"] == {"dev_name": DEV, "post_id": "223456789012345678"}
     assert sent["args"]["backend"] == "discord"
     assert sent["args"]["thread"] == "123456789012345678"
+
+
+def test_send_edit_flag(repo: Path, short_dir: Path) -> None:
+    """#149: `--edit <post_id>` sends STDIN as the `edit` op, on the post's own backend; a
+    post that is gone or another agent's exits 6; `<to>`, `--dm` and `--thread` are usage."""
+    errors: list[str] = []
+
+    def respond(frame: dict[str, Any]) -> dict[str, Any]:
+        if frame["op"] == "thread_backend":
+            return {"id": frame["id"], "ok": True, "result": {"backend": MM}}
+        if errors:
+            return {"id": frame["id"], "ok": False, "error": errors.pop()}
+        return posted(frame)
+
+    sock = short_dir / "e.sock"
+    fake = FakeDaemon(sock, respond)
+    try:
+        assert send(repo, sock, ["--edit", POST_ID], stdin="fixed\n") == (
+            EXIT_SENT,
+            POST_ID + "\n",
+            "",
+        )
+        lookup, edit = fake.frames
+        assert lookup["op"] == "thread_backend"
+        assert edit["op"] == "edit"
+        assert edit["args"] == {"dev_name": DEV, "backend": MM, "post_id": POST_ID, "text": "fixed"}
+        for error in ("forbidden: mattermost:ci: not your post", "not_found: post"):
+            errors.append(error)
+            assert send(repo, sock, ["--edit", POST_ID])[0] == EXIT_CANT_EDIT
+        sent = len(fake.frames)
+        for extra in (["precheck"], ["--dm"], ["--thread", POST_ID]):
+            assert send(repo, sock, [*extra, "--edit", POST_ID])[0] == EXIT_USAGE
+        assert len(fake.frames) == sent
+    finally:
+        fake.close()
+
+
+def test_send_edit_of_an_unknown_post_exits_6(repo: Path, short_dir: Path) -> None:
+    """Naming no backend, a post the daemon can't place is gone: exit 6, no `edit` sent."""
+    sock = short_dir / "u.sock"
+    fake = FakeDaemon(sock, lambda f: {"id": f["id"], "ok": False, "error": "not_found: p"})
+    try:
+        assert send(repo, sock, ["--edit", POST_ID])[0] == EXIT_CANT_EDIT
+    finally:
+        fake.close()
+    assert [f["op"] for f in fake.frames] == ["thread_backend"]
+
+
+def test_send_edit_reads_the_error_code_not_its_text(repo: Path, short_dir: Path) -> None:
+    """Only the daemon's own `not_found` code is exit 6: a `bad_request` whose text quotes
+    "not_found" (the caller's ID, say) stays exit 1."""
+    sock = short_dir / "q.sock"
+    error = "bad_request: post_id 'x_not_found' is not an ID"
+    fake = FakeDaemon(sock, lambda f: {"id": f["id"], "ok": False, "error": error})
+    try:
+        assert send(repo, sock, ["--edit", POST_ID])[0] == EXIT_ERROR
+    finally:
+        fake.close()
 
 
 def test_send_not_registered_exits_4_without_registering(repo: Path, short_dir: Path) -> None:
