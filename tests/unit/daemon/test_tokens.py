@@ -627,7 +627,12 @@ def test_failing_rotation_retries_stop_at_the_next_daily_run(daemon: Any, clock:
 
         rotator.run_daily = run_daily  # type: ignore[method-assign]
         await rotation_loop(
-            rotator, stop, interval_s=24 * 3600, wait=fake.wait, monotonic=fake.monotonic
+            rotator,
+            stop,
+            interval_s=24 * 3600,
+            wait=fake.wait,
+            monotonic=fake.monotonic,
+            now=clock,
         )
 
     asyncio.run(scenario())
