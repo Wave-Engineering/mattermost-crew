@@ -53,9 +53,12 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
 
 **`LoopGuard.admit(msg, reg)`** (R-25). A bot account's message needs an opted-in conversation
 (the agent started it or posted in it, per `MyThreads`; or it was mentioned into it; or it is
-a DM) and an inline mention (`@<dev>`, `@<dev>.<crew>`, `@agents`, a crew or team token), and
-is dropped past `loop_guard_window` (default 20) bot messages in the conversation within the
-last hour. A human's message is admitted when it is addressed (R-16 to R-19).
+a DM) and an inline mention (`@<dev>`, `@<dev>.<crew>`, `@agents`, a crew or team token) or a
+DM to the agent, whose recipient is its address (D-117). It is dropped past
+`loop_guard_window` (default 20) bot messages in the conversation within the last hour; in a
+DM the conversation is the DM channel. A drop of a bot message addressed to the agent
+(`is_direct_address`) logs at INFO. A human's message is admitted when it is addressed (R-16
+to R-19).
 
 `KioskQueue` is the holding queue push `KIOSK` verdicts go to; Story 3.5 consumes it.
 """
@@ -447,16 +450,34 @@ class LoopGuard:
             self._mentioned.touch(key, lambda: True)  # mentioned into it (R-25)
         if not msg.is_bot:
             return addressed_to(msg, reg, roots, author_crew)
-        if self._count(key) > self.window:
+        # A DM's window is its channel: root posts there would each be a conversation (D-117).
+        window_key = (reg.dev_name, msg.backend, msg.channel) if msg.dm else key
+        if self._count(window_key) > self.window:
             log.info("loop guard: %s past %d bot messages in %s", reg.dev_name, self.window, conv)
             return False
         opted_in = msg.dm or conv in roots or key in self._mentioned
         mentioned = (
             direct
+            or msg.dm  # a DM's recipient is its address (D-117)
             or is_broadcast(toks, msg.backend)
             or bool(toks & group_tokens(reg, msg.backend, author_crew))
         )
-        return opted_in and mentioned
+        if opted_in and mentioned:
+            return True
+        reason = "no mention" if opted_in else "not opted in"
+        if is_direct_address(msg, reg, roots):
+            log.info(
+                "loop guard: dropped %s's message to %s in %s: %s",
+                msg.author_name,
+                reg.dev_name,
+                conv,
+                reason,
+            )
+        else:
+            log.debug(
+                "loop guard: dropped a bot message for %s in %s: %s", reg.dev_name, conv, reason
+            )
+        return False
 
 
 # -- the kiosk holding queue ----------------------------------------------------------------

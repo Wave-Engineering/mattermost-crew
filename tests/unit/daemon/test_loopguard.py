@@ -1,13 +1,15 @@
 """Story 3.3: the loop guard (R-25; IT-10's unit side).
 
 Messages from bot accounts need an opted-in conversation (the agent started it or posted in
-it, it was mentioned into it, or it is a DM) and an inline mention, and are dropped past
-`loop_guard_window` bot messages in the conversation's window. Human messages are admitted
-when addressed (R-16 to R-19), with no mention needed.
+it, it was mentioned into it, or it is a DM) and an inline mention or a DM to the agent
+(D-117), and are dropped past `loop_guard_window` bot messages in the conversation's window,
+a DM's being its channel. Human messages are admitted when addressed (R-16 to R-19), with no
+mention needed.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 
 import pytest
@@ -106,6 +108,35 @@ def test_loop_guard_counts_dropped_messages(guard: tuple[LoopGuard, Mono]) -> No
     assert g.admit(msg("@babel calmer now", root=MINE), REG) is True
 
 
+def test_loop_guard_dm_window_per_channel(guard: tuple[LoopGuard, Mono]) -> None:
+    """D-117: in a DM every root post is its own conversation, so the window is the channel.
+    Two agents trading root posts in one DM still hit `loop_guard_window`."""
+    g, mono = guard
+    verdicts = []
+    for _ in range(21):
+        mono.t += 1
+        verdicts.append(g.admit(msg("your turn", dm=True), REG))  # a new root post each time
+    assert verdicts == [True] * 20 + [False]
+    # Another DM channel has its own window.
+    other = dataclasses.replace(msg("hi", dm=True), channel="chan-2")
+    assert g.admit(other, REG) is True
+
+
+def test_loop_guard_logs_direct_drop_at_info(
+    guard: tuple[LoopGuard, Mono], caplog: pytest.LogCaptureFixture
+) -> None:
+    """D-117: a bot message addressed to the agent and dropped logs at INFO; others don't."""
+    g, _mono = guard
+    caplog.set_level("DEBUG", logger="crewchat.filters")
+    assert g.admit(msg("thanks, done", root=MINE), REG) is False  # babel's thread, no mention
+    infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert infos == ["loop guard: dropped kessel.oaw's message to babel in root-mine: no mention"]
+    caplog.clear()
+    assert g.admit(msg("chatter", root="d-other", backend="discord"), REG) is False
+    assert [r for r in caplog.records if r.levelname == "INFO"] == []
+    assert any(r.levelname == "DEBUG" for r in caplog.records)
+
+
 def test_loop_guard_window_configurable() -> None:
     threads = MyThreads()
     threads.add("babel", MINE, MM)
@@ -118,8 +149,8 @@ def test_loop_guard_requires_mention_and_optin(guard: tuple[LoopGuard, Mono]) ->
     g, _mono = guard
     # Opted in (babel's own thread) but no mention: dropped.
     assert g.admit(msg("thanks, done", root=MINE), REG) is False
-    # A DM is opted in, but still needs the mention.
-    assert g.admit(msg("hello", dm=True), REG) is False
+    # A DM is opted in, and its recipient is its address: no inline mention needed (D-117).
+    assert g.admit(msg("hello", dm=True), REG) is True
     assert g.admit(msg("@babel hello", dm=True), REG) is True
     # A mention but no opt-in: a broadcast in a thread babel never joined.
     assert g.admit(msg("@agents roll call", root="root-other"), REG) is False
