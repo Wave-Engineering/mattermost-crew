@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import pytest
@@ -35,7 +35,8 @@ class MattermostServer:
     """A running Mattermost server and a system admin's personal access token."""
 
     url: str
-    admin_token: str
+    # Kept out of the repr: a failing test prints its fixtures into the junit report.
+    admin_token: str = field(repr=False)
     expected_native_token_expiry: NativeTokenExpiry | None
 
     @property

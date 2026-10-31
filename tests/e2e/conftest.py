@@ -249,7 +249,7 @@ class Crew:
     instance: str
     broker_id: str
     partner_id: str
-    partner_token: str
+    partner_token: str = field(repr=False)  # a failing test's repr goes in reports/
     agents: tuple[str, ...]
     running: RunningBroker
 
@@ -274,9 +274,9 @@ class World:
     hung_crew: str
     hung: HungBroker
     outsider_id: str
-    outsider_token: str
+    outsider_token: str = field(repr=False)
     spoof_id: str
-    spoof_token: str
+    spoof_token: str = field(repr=False)
     servers_toml: Path
     record: CreationRecord  # every account and team the run creates goes in it (#157)
     channels: list[str] = field(default_factory=list)
