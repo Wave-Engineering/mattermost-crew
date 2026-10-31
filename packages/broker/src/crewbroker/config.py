@@ -9,8 +9,14 @@ One instance serves one crew on one Mattermost server. The file names:
     trusted = ["<crew>", ...]        # trusted crews, by name only
     team = "Oak and Wave"            # optional: the team each minted bot joins (#132)
     default_channels = ["town-square", "Agent Ops"]  # optional: its channels there, in order
+    membership_reconcile_s = 300     # optional: the reconcile pass's interval; 0 turns it off
+    channel_tag = "crew-oaw"         # optional: defaults to crew-<crew> (#167)
 
 `team` and `default_channels` take a URL name or a display name, as a person would type them.
+With `team` set, the broker also keeps every bot it owns in the team, the default channels and
+each channel whose header or purpose carries `channel_tag`, re-checked every
+`membership_reconcile_s` seconds (`crewbroker.membership`). Without `team`, neither key does
+anything.
 
 `trusted` is names only. Each trusted crew's membership (`broker_user_id`, `human_user_ids`,
 `minted_bot_ids`) comes from that crew's own broker, which the daemon calls directly; it is
@@ -27,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from crewbroker.mattermost import MattermostAPI
+from crewbroker.membership import SLUG_RE
 
 CONFIG_DIR = Path("/etc/crewbroker")
 STATE_ROOT = Path("/var/lib/crewbroker")
@@ -35,6 +42,7 @@ RUN_DIR = Path("/run/crewbroker")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 # Membership data belongs to a crew's own broker, never to a config file.
 MEMBERSHIP_KEYS = ("broker_user_id", "human_user_ids", "minted_bot_ids")
+DEFAULT_RECONCILE_S = 300
 
 
 class ConfigError(ValueError):
@@ -53,6 +61,10 @@ class CrewConfig:
     # manages none.
     team: str = ""
     default_channels: list[str] = field(default_factory=list)
+    # Tagged channels (#167): the reconcile pass's interval (0 is off), and the tag, which
+    # `parse_config` defaults to `crew-<crew>`.
+    membership_reconcile_s: int = DEFAULT_RECONCILE_S
+    channel_tag: str = ""
 
 
 def config_path(instance: str, config_dir: Path = CONFIG_DIR) -> Path:
@@ -114,6 +126,7 @@ def parse_config(
 
     trusted = _trusted(raw.get("trusted", []), source)
     team, channels = _membership(raw, source)
+    interval, tag = _reconcile(raw, source)
 
     crew = raw.get("crew")
     if crew is not None and not isinstance(crew, str):
@@ -139,7 +152,20 @@ def parse_config(
         broker_user_id=broker_user_id,
         team=team,
         default_channels=channels,
+        membership_reconcile_s=interval,
+        channel_tag=tag or f"crew-{crew}",
     )
+
+
+def _reconcile(raw: dict[str, Any], source: str) -> tuple[int, str]:
+    """`membership_reconcile_s` (an integer, 0 or more) and `channel_tag` (a URL-name slug)."""
+    interval = raw.get("membership_reconcile_s", DEFAULT_RECONCILE_S)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval < 0:
+        raise ConfigError(f"{source}: membership_reconcile_s must be an integer, 0 or more")
+    tag = raw.get("channel_tag", "")
+    if "channel_tag" in raw and not (isinstance(tag, str) and SLUG_RE.fullmatch(tag)):
+        raise ConfigError(f"{source}: channel_tag {tag!r} is not a slug (a-z0-9, - and _)")
+    return interval, tag
 
 
 def _membership(raw: dict[str, Any], source: str) -> tuple[str, list[str]]:

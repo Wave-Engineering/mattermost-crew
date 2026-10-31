@@ -18,7 +18,14 @@ from typing import Any
 import pytest
 from crewbroker.config import CrewConfig
 from crewbroker.membership import DEADLINE_RESERVE_S, DEFERRED
-from crewbroker.service import Broker, BrokerServer, OpError, call, handle_frame
+from crewbroker.service import (
+    Broker,
+    BrokerServer,
+    OpError,
+    call,
+    handle_frame,
+    start_membership_reconciler,
+)
 
 ALL_OPS: dict[str, dict[str, Any]] = {
     "mint": {"dev_name": "babel", "crew": "oaw"},
@@ -437,6 +444,64 @@ def test_deadline_near_skips_a_pending_lookup(
     reply = built.mint({**BABEL, "deadline": clock.now.timestamp() + DEADLINE_RESERVE_S / 2})
     assert [f["error"] for f in reply["membership"]["failed"]] == [DEFERRED] * 3
     assert _lookups(server) == lookups
+
+
+# -- tagged channels, kept by reconcile (#167) ------------------------------------------------
+TAGGED, TAGGED_ID = "precheck", "cid-precheck"
+
+
+def test_mint_joins_tagged_channels(joining: Broker, fake: Any) -> None:
+    """A mint adds the new bot to the tagged channels the last pass found, as well as the
+    default channels, so a new agent is in every crew channel at once."""
+    fake.add_channel(TAGGED_ID, TEAM_ID, TAGGED, "Precheck", header="crew-oaw")
+    assert joining.reconcile_membership() == {"added": [], "failed": []}  # no bots yet
+    reply = joining.mint(BABEL)
+    assert reply["membership"] == {"joined": [TEAM, PUBLIC, PRIVATE, TAGGED], "failed": []}
+    acct = joining.accounts.get("babel.oaw")
+    assert acct is not None and acct.bot_user_id in fake.members[TAGGED_ID]
+
+
+def test_reconcile_covers_only_bots_this_broker_owns(joining: Broker, fake: Any) -> None:
+    joining.mint(BABEL)
+    joining.mint({"dev_name": "kessel", "crew": "oaw"})
+    fake.add_channel(TAGGED_ID, TEAM_ID, TAGGED, "Precheck", purpose="CREW-OAW")
+    kessel = joining.accounts.get("kessel.oaw")
+    assert kessel is not None
+    fake.reassign(kessel.bot_user_id, "someone-else")
+    result = joining.reconcile_membership()
+    assert result == {"added": [{"account": "babel.oaw", "target": TAGGED}], "failed": []}
+    assert kessel.bot_user_id not in fake.members.get(TAGGED_ID, [])
+
+
+def test_reconcile_loop_runs_at_start_and_interval(
+    joining: Broker, broker: Broker, caplog: pytest.LogCaptureFixture
+) -> None:
+    passes: list[str] = []
+    waits: list[float] = []
+
+    def counted() -> None:
+        passes.append("pass")
+        if len(passes) == 2:
+            raise RuntimeError("boom")  # a failing pass is logged, and the loop goes on
+
+    def wait(seconds: float) -> bool:
+        waits.append(seconds)
+        return len(waits) == 3  # stop after the third wait
+
+    joining.reconcile_membership = counted  # type: ignore[method-assign]
+    stop = threading.Event()
+    with caplog.at_level(logging.ERROR, logger="crewbroker"):
+        thread = start_membership_reconciler(joining, stop, 300, wait)
+        assert thread is not None
+        thread.join(5)
+    assert passes == ["pass"] * 3  # at startup, then after each interval
+    assert waits == [300] * 3
+    assert "membership reconcile failed" in caplog.text
+    # 0 turns the loop off, and so does a broker with no `team`: no thread, no pass at all.
+    passes.clear()
+    assert start_membership_reconciler(joining, stop, 0, wait) is None
+    assert start_membership_reconciler(broker, threading.Event(), 300, wait) is None
+    assert passes == []
 
 
 def _args(held: str | None) -> dict[str, Any]:

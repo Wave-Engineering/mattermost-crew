@@ -123,7 +123,13 @@ class Broker:
         # doesn't is logged and reported on each mint, and never stops the broker.
         self.membership: Membership | None = None
         if config.team:
-            self.membership = Membership(client, config.team, config.default_channels)
+            self.membership = Membership(
+                client,
+                config.team,
+                config.default_channels,
+                tag=config.channel_tag or f"crew-{config.crew}",
+                broker_user_id=config.broker_user_id,
+            )
             self.membership.resolve()
 
     def _name(self, args: dict[str, Any]) -> str:
@@ -298,22 +304,41 @@ class Broker:
         `GET /bots` fails, so does `crew_info`: it never falls back to the unfiltered list.
         """
         with self._lock:
-            minted = self.accounts.minted_bot_ids()
             try:
-                bots = self.client.list_bots()
+                owned = self._owned_minted()
             except MattermostError as exc:
                 raise OpError("upstream", f"GET /bots failed: {exc}") from exc
-        owned = {
-            str(b.get("user_id"))
-            for b in bots
-            if b.get("owner_id") == self.config.broker_user_id
-        }
         return {
             "broker_user_id": self.config.broker_user_id,
             "human_user_ids": list(self.config.human_user_ids),
             "trusted": list(self.config.trusted),
-            "minted_bot_ids": [bot_id for bot_id in minted if bot_id in owned],
+            "minted_bot_ids": owned,
         }
+
+    def _owned_minted(self) -> list[str]:
+        """The bots on `minted_bot_ids` that `GET /bots` lists as this broker's. Call with the
+        lock held; a failed `GET /bots` raises."""
+        minted = self.accounts.minted_bot_ids()
+        owned = {
+            str(b.get("user_id"))
+            for b in self.client.list_bots()
+            if b.get("owner_id") == self.config.broker_user_id
+        }
+        return [bot_id for bot_id in minted if bot_id in owned]
+
+    def reconcile_membership(self) -> dict[str, list[Any]] | None:
+        """One reconcile pass over the bots this broker owns (#167); None with no `team`.
+
+        The scan runs before the bots are read, so a bot minted while it runs is either in the
+        list or was minted after it, and its own mint adds it to the channels found.
+        """
+        if self.membership is None:
+            return None
+        self.membership.refresh()
+        with self._lock:
+            bot_ids = self._owned_minted()
+            names = {a.bot_user_id: a.name for a in self.accounts.all()}
+        return self.membership.reconcile(bot_ids, names, refresh=False)
 
     def prune(self) -> list[str]:
         with self._lock:
@@ -491,6 +516,35 @@ def start_prune_scheduler(
     return thread
 
 
+def start_membership_reconciler(
+    broker: Broker,
+    stop: threading.Event,
+    interval_s: float,
+    wait: Callable[[float], bool] | None = None,
+) -> threading.Thread | None:
+    """Run a reconcile pass now and then every `interval_s`, until `stop` is set (#167).
+
+    None, and no pass at all, with an interval of 0 or no `team`. A pass that raises is
+    logged and retried at the next interval. `wait` defaults to `stop.wait`.
+    """
+    if interval_s <= 0 or broker.membership is None:
+        return None
+    pause = wait or stop.wait
+
+    def loop() -> None:
+        while not stop.is_set():
+            try:
+                broker.reconcile_membership()
+            except Exception:
+                log.exception("membership reconcile failed; retrying at the next interval")
+            if pause(interval_s):
+                return
+
+    thread = threading.Thread(target=loop, name="crewbroker-membership", daemon=True)
+    thread.start()
+    return thread
+
+
 @dataclass(frozen=True)
 class DirectMessage:
     channel_id: str
@@ -655,6 +709,7 @@ def serve(instance: str, *, config_dir: Path, state_root: Path, run_dir: Path) -
     server = BrokerServer(cfg.socket_path(instance, run_dir), broker, allowed_uid)
     stop = threading.Event()
     start_prune_scheduler(broker, stop)
+    start_membership_reconciler(broker, stop, config.membership_reconcile_s)
     start_dm_listener(DMListener(broker, config.server_url, credential), stop)
 
     def shutdown(_signum: int, _frame: object) -> None:

@@ -60,7 +60,9 @@ The host needs:
   `team_user` adds its own bot to the team and to any channel it is in, public or private
   (201), and gets 403 on a channel it is not in, public as well. A channel admin adds the broker
   account to each default channel once, and on a private channel only they can. On a partner's
-  production server that is the human partner's step, with the role patch (CP-03).
+  production server that is the human partner's step, with the role patch (CP-03). A channel
+  tagged `crew-<crew>` (#167) needs this only when it is private: the broker account joins a
+  tagged public channel itself.
 
 The install creates these OS users and groups. They are listed here so you can check a host
 before and after:
@@ -218,6 +220,11 @@ trusted = []
 # Each is a URL name (the last part of its URL) or its display name.
 # team = "oaw"
 # default_channels = ["general", "agent-ops", "Roll Call"]
+# Optional (#167), with team set: how often, in seconds, the broker re-checks that every bot it
+# owns is in the team, the default channels and each tagged channel (0 turns it off), and the
+# tag that marks a channel as the crew's. These are the defaults.
+# membership_reconcile_s = 300
+# channel_tag = "crew-oaw"   # crew-<crew>
 ```
 
 Required: `server_id`, `server_url` and `human_user_ids`. `crew` defaults to the first human
@@ -248,11 +255,36 @@ sudo journalctl -u crewbroker@<crew>-<server_id> --since -5m | grep membership:
 
 A name that matches nothing, or two display names that match one entry, is logged at ERROR and
 reported in every `mint`'s `membership.failed`. **The broker still starts and mints**, so a typo
-never stops an agent getting its token. Fix the file and restart that broker instance. Agents
-already registered join the new channels at their next daily `register`.
+never stops an agent getting its token. Fix the file and restart that broker instance. The
+restart's first reconcile pass adds the agents already registered to the new channels.
 
 Before you set the keys, add the broker account to every channel in the list (see the
 prerequisites). A private channel it isn't in can't be found by either name.
+
+**Give the crew a channel** (#167). Put the crew's tag, `crew-<crew>` (for example `crew-oaw`),
+anywhere in the channel's header or purpose, as a word of its own: `crew-oawx` or
+`old-crew-oaw` don't count, and case doesn't matter. Within `membership_reconcile_s` (5 minutes
+by default) every agent bot of that crew is a member, and every bot it mints later joins at
+once. No restart and no config change is needed.
+
+- **A public channel needs nothing else.** The broker account joins it itself, then adds its
+  bots, and the channel shows it joining.
+- **A private channel:** add the broker account to it first. A private
+  channel it isn't in is invisible to it.
+
+The broker only adds. Removing the tag, or removing a bot from the channel, takes no one out
+and is not undone while the broker runs; the next broker restart adds the crew's bots again
+to every channel still tagged. Each pass logs one INFO line, and one line for each add it
+makes:
+
+```text
+membership: reconcile: 12 bots, 3 channels (1 tagged), 12 added, 0 failed
+membership: reconcile: added babel.oaw to precheck
+```
+
+A tagged channel that refuses the broker is logged at WARNING, once per pass, naming it. The
+first pass after a start lists every pair as added, because the server answers an add for an
+existing member as it does for a new one.
 
 ### The credentials
 

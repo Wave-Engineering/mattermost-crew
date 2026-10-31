@@ -51,6 +51,9 @@ class FakeMattermost:
         self.lookup_down = False  # every name lookup answers `lookup_status`
         self.lookup_status = 503  # as if the server were down; 429 is a rate limit
         self.on_add: Callable[[str], None] | None = None  # called with each add's target
+        # As measured for #132: a `team_user` broker adds its bots only to a channel it is in,
+        # and joins a public channel itself. Off by default, as the #132 tests predate it.
+        self.channel_needs_broker = False
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
@@ -68,7 +71,16 @@ class FakeMattermost:
         return tid
 
     def add_channel(
-        self, cid: str, team_id: str, name: str, display: str, kind: str = "O", *, mine: bool = True
+        self,
+        cid: str,
+        team_id: str,
+        name: str,
+        display: str,
+        kind: str = "O",
+        *,
+        mine: bool = True,
+        header: str = "",
+        purpose: str = "",
     ) -> str:
         self.channels[cid] = {
             "id": cid,
@@ -77,6 +89,8 @@ class FakeMattermost:
             "display_name": display,
             "type": kind,
             "delete_at": 0,
+            "header": header,
+            "purpose": purpose,
         }
         if mine:
             self.my_ids.add(cid)
@@ -195,8 +209,13 @@ class FakeMattermost:
         if self.on_add is not None:
             self.on_add(target)
         path = f"/{kind}s/{target}/members"
+        denied = MattermostError("POST", path, 403, "no permission", "api.context.permissions")
         if target in self.add_fails:
-            raise MattermostError("POST", path, 403, "no permission", "api.context.permissions")
+            raise denied
+        if kind == "channel" and self.channel_needs_broker and target not in self.my_ids:
+            if user_id != self.me_id or self.channels[target]["type"] != "O":
+                raise denied
+            self.my_ids.add(target)  # the broker joins a public channel itself
         members = self.members.setdefault(target, [])
         if user_id in members:
             if self.exists_as_400:
