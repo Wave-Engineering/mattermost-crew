@@ -63,6 +63,31 @@ def effective_mode(state: SwitchState, now: datetime) -> tuple[Mode, bool]:
     return DEFAULT_MODE, False
 
 
+_RANK: dict[str, int] = {"crew": 0, "trusted": 1, "social": 2}
+
+
+def widens(before: SwitchState, after: SwitchState, now: datetime) -> bool:
+    """Whether `after` lets through, now or later, anyone `before` keeps out (#159).
+
+    It widens when the effective mode rises (crew < trusted < social), when the kiosk goes
+    from off to on, or, while social, when the expiry moves later or the mode it reverts to
+    rises. Whether a command widens depends on the state it lands on: `trusted` narrows a
+    social switch and widens a crew one.
+    """
+    was, _ = effective_mode(before, now)
+    mode, _ = effective_mode(after, now)
+    if _RANK[mode] > _RANK[was] or (after.kiosk_on and not before.kiosk_on):
+        return True
+    if mode != "social":
+        return False
+    # Both are social here, so both carry an expiry; a missing one counts as widening.
+    if before.expires_at is None or after.expires_at is None:
+        return True
+    return after.expires_at > before.expires_at or (
+        _RANK[safe_revert(after.revert_to)] > _RANK[safe_revert(before.revert_to)]
+    )
+
+
 def settle(state: SwitchState, now: datetime) -> SwitchState:
     """`state` with any lapse applied: `mode = revert_to` and no expiry.
 

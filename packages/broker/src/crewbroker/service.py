@@ -73,6 +73,7 @@ from crewbroker.switch import (
     apply_command,
     effective_mode,
     settle,
+    widens,
 )
 
 PROTO = 1
@@ -88,9 +89,8 @@ WS_RECV_POLL_S = 1.0
 WS_BACKOFF_FIRST_S = 1.0
 WS_BACKOFF_MAX_S = 60.0
 # The DM backfill (#159): a command older than this, sent while the broker was offline, is
-# refused rather than applied, unless it only narrows who gets through.
+# refused rather than applied, unless it widens nothing (`Broker.handle_late_dm`).
 BACKFILL_MAX_AGE_S = 600
-NARROWING_COMMANDS = {("crew",), ("kiosk", "off")}
 # A partner whose DM channel read the server answers with one of these doesn't exist, so has no
 # DMs to lose: the backfill skips them rather than holding every partner's DMs (#159). A 403 is
 # not here: DMs may exist that the broker may not read, often for every partner at once.
@@ -455,6 +455,18 @@ class Broker:
         Only the crew's human partners change anything (R-24); anyone else is refused and
         the stored state is not touched.
         """
+        reply = self._handle_dm(sender_user_id, text, late=False)
+        assert reply is not None  # only a late command is ever held back
+        return reply
+
+    def handle_late_dm(self, sender_user_id: str, text: str) -> str | None:
+        """`handle_dm` for a command the backfill found stale or overtaken (#159): applied only
+        if it widens nothing (`widens`) on the switch as it stands, else None and nothing
+        changes. Applied late, a widening command opens the crew when the partner believes
+        it closed; a narrowing one is what they asked for, whatever its words."""
+        return self._handle_dm(sender_user_id, text, late=True)
+
+    def _handle_dm(self, sender_user_id: str, text: str, *, late: bool) -> str | None:
         now = self.clock()
         lapsed_to: Mode | None = None
         with self._lock:
@@ -463,10 +475,16 @@ class Broker:
             else:
                 state = self.switch.load()
             new, reply = apply_command(state, sender_user_id, text, self.config, now)
-            if new != state:
+            held = late and widens(state, new, now)
+            if held:
+                new = state
+            elif new != state:
                 self.switch.save(new)
         if lapsed_to is not None:
             self._notify_lapse(lapsed_to)
+        if held:
+            log.info("switch: late %r from %s not applied: it widens", text, sender_user_id)
+            return None
         if new != state:
             log.info("switch: %s by %s", reply, sender_user_id)
         elif sender_user_id not in self.config.human_user_ids:
@@ -759,14 +777,17 @@ class DMListener:
         broker restart always loses. Every partner's channel is read first, and the posts are
         applied in `create_at` order: the partners share one switch, so the latest instruction
         must land last. A DM older than `BACKFILL_MAX_AGE_S`, or older than a partner DM
-        already handled, is answered "not applied" unless it only narrows
-        (`NARROWING_COMMANDS`): applied late, a `social 2h` would open the crew when the
-        partner believes it closed. If any read fails, nothing is applied, the cursor stays,
-        and the backfill stays owed: it is tried again before the next DM and at the next
-        `hello`. A partner the server says doesn't exist (`BACKFILL_SKIP_STATUSES`, such as a
-        deleted user) is logged and skipped instead, so one bad ID cannot hold the cursor and
-        every other partner's backfill forever. With no usable cursor, as on a fresh install,
-        it starts the cursor now and replays nothing. Never raises.
+        already handled, is late: it is applied only if it widens nothing on the switch as it
+        stands (`Broker.handle_late_dm`), and is otherwise answered "not applied". Applied
+        late, a `social 2h` would open the crew when the partner believes it closed; a late
+        `trusted` under social, or a shorter `social`, closes what the partner asked closed.
+        A command that fails stops the backfill there, still owed. If any read fails, nothing
+        is applied, the cursor stays, and the backfill stays owed: it is tried again before
+        the next DM and at the next `hello`. A partner the server says doesn't exist
+        (`BACKFILL_SKIP_STATUSES`, such as a deleted user) is logged and skipped instead, so
+        one bad ID cannot hold the cursor and every other partner's backfill forever. With no
+        usable cursor, as on a fresh install, it starts the cursor now and replays nothing.
+        Never raises.
         """
         cursor = self.broker.dm_cursor.load()
         now = self.broker.clock()
@@ -796,39 +817,50 @@ class DMListener:
                 if not post.get("delete_at"):
                     missed.append(dm)
         for dm in sorted(missed, key=lambda m: (m.create_at, m.post_id)):
+            late = ""
             stale = now.timestamp() - dm.create_at / 1000 > BACKFILL_MAX_AGE_S
-            superseded = dm.create_at < self._newest_partner_dm
-            words = tuple(dm.message.strip().lower().split())
-            if (stale or superseded) and words not in NARROWING_COMMANDS:
+            if stale or dm.create_at < self._newest_partner_dm:
                 sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
-                self._apply(dm, refuse=f"sent {sent.isoformat(timespec='seconds')}")
-            else:
-                self._apply(dm)
+                late = f"sent {sent.isoformat(timespec='seconds')}"
+            if not self._apply(dm, late=late):
+                return  # still owed: the retry applies it before anything sent after it
         self._owed = False
         self._save_cursor(self._newest_dm)
 
-    def _apply(self, dm: DirectMessage, *, refuse: str = "") -> None:
-        """Handle one DM once: apply it and reply, or with `refuse`, reply that it was not
-        applied. Then advance the cursor past it, unless a backfill is still owed."""
+    def _apply(self, dm: DirectMessage, *, late: str = "") -> bool:
+        """Handle one DM once: apply it and reply. With `late` (when it was sent, for a DM the
+        backfill found stale or overtaken), it is applied only if it widens nothing, and is
+        otherwise answered that it was not. Then advance the cursor past it, unless a backfill
+        is still owed. A command that fails is not handled: the backfill is owed again, so it
+        is retried before the next DM, and False is returned."""
         if dm.post_id:
             if dm.post_id in self._handled:
-                return
+                return True
             self._handled[dm.post_id] = None
             if len(self._handled) > HANDLED_DMS_MAX:
                 self._handled.popitem(last=False)
         try:
-            if refuse:
-                reply = f"not applied: {refuse} while the broker was offline; send it again"
+            if late:
+                reply = self.broker.handle_late_dm(dm.sender_user_id, dm.message)
+                if reply is None:
+                    reply = f"not applied: {late} while the broker was offline; send it again"
             else:
                 reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
+        except Exception:
+            log.exception("switch DM from %s failed; retried before the next DM", dm.sender_user_id)
+            self._handled.pop(dm.post_id, None)
+            self._owed = True
+            return False
+        try:
             self.broker.client.create_post(dm.channel_id, reply, props={BROKER_PROP: 1})
         except Exception:
-            log.exception("switch DM from %s failed", dm.sender_user_id)
+            log.exception("reply to the switch DM from %s failed", dm.sender_user_id)
         self._newest_dm = max(self._newest_dm, dm.create_at)
         if dm.sender_user_id in self.broker.config.human_user_ids:
             self._newest_partner_dm = max(self._newest_partner_dm, dm.create_at)
         if not self._owed:
             self._save_cursor(dm.create_at)
+        return True
 
     def _save_cursor(self, ms: int) -> None:
         """Move the cursor forward to `ms`; never back."""

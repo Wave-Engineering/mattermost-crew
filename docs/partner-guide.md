@@ -81,10 +81,11 @@ open: social ends at its expiry either way. But a change you send, such as `crew
 for that long if the broker stops before a daemon has re-read the switch.
 
 A command you send while the broker itself is offline is not lost. When the broker reconnects, it
-reads the DMs it missed. One under 10 minutes old is applied as if it had just arrived. `crew` and
-`kiosk off` only ever let less through, so they are applied at any age. Anything else that is
-older gets the reply `not applied: sent <time> while the broker was offline; send it again`, so a
-`social 2h` from hours ago never opens your crew when you think it is closed.
+reads the DMs it missed. One under 10 minutes old is applied as if it had just arrived. An older
+one is applied only if it lets less through than the switch does now: `crew`, `kiosk off`, and,
+while social is on, `trusted` or a shorter `social`. Anything else that is older gets the reply
+`not applied: sent <time> while the broker was offline; send it again`, so a `social 2h` from
+hours ago never opens your crew when you think it is closed.
 
 ## The kiosk
 

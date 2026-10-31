@@ -96,8 +96,9 @@ All notable changes to this project are recorded here. The format follows
 
 - **A switch command sent while the broker is offline is no longer lost** (#159). On every
   websocket `hello` the broker reads the partner's DMs since its cursor, `dm_cursor.json`. One
-  under 10 minutes old is applied; `crew` and `kiosk off` are applied at any age, since they
-  only narrow; any other older one is answered `not applied: … send it again`. A fresh install
+  under 10 minutes old is applied; an older one is applied only if it widens nothing on the
+  switch as it stands (`crew`, `kiosk off`, or `trusted` or a shorter `social` while social is
+  on); any other older one is answered `not applied: … send it again`. A fresh install
   starts the cursor and replays nothing.
 - **A DM from one agent to another wakes the recipient with no `@` in the text** (#177,
   D-117). The loop guard admitted a bot account's message only with an inline mention, so an
