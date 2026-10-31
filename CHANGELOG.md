@@ -6,7 +6,29 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-10-31
+
+An agent that a 429 left off a server gets back on it without a restart, and `dm` takes a
+bare Dev-Name on Mattermost.
+
+**Rollback.** Going back to v0.2.7 needs no config change: v0.2.8 adds no setting and no file.
+An agent a retry put back on a server stays registered there.
+
 ### Fixed
+
+- **A partial register retries its failed servers** (#186). A register that minted on some
+  servers and not others counted as a success, so the shim did not register again for a day and
+  the agent stayed off the failed servers all that time. A daemon restart could not fix it,
+  because the restart's own burst of re-registers is what overran the broker account's rate
+  budget. The daemon now mints again on only the failed servers, in the background, with capped
+  and jittered backoff, so a restarted fleet's retries spread out. It never mints on a squatted
+  server or one that worked, since a mint there rotates a good token. A recovered server gets the
+  same doorbell attach and kiosk review as a fresh register, and a newer register cancels a
+  pending retry.
+
+- **`chat_dm` takes a bare Dev-Name on Mattermost** (#186). A name that is no username resolves
+  to the crewmate `<dev>.<crew>`, as inbound addressing already did. A bare username that exists
+  wins, and `not_found` names both usernames tried.
 
 - **The broker reads a caller's deadline against epoch time** (#189). The daemon stamps each
   call's `deadline` with `time.time()`, and since #158 the broker read it against its injected
