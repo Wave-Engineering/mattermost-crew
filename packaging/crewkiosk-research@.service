@@ -19,8 +19,8 @@
 # secret: /usr/bin, /usr/lib and /usr/lib64 whole (with /bin, /lib and /lib64 as the merged-/usr
 # links), the loader cache, the CLI, and the two crewkiosk executables. These are bound whole
 # rather than file by file because a per-file list breaks on the next soname bump or coreutils
-# switch (malory's coreutils are uutils, symlinked into /usr/lib/cargo), and breaks silently,
-# as an unanswered kiosk. Measured on malory (systemd 259, 2026-10-30): `claude -p` starts in
+# switch (one host's coreutils are uutils, symlinked into /usr/lib/cargo), and breaks silently,
+# as an unanswered kiosk. Measured on a host on systemd 259 (2026-10-30): `claude -p` starts in
 # exactly this namespace and reaches its loopback base URL. Nothing of /etc but the loader
 # cache: no passwd, no resolv.conf, no TLS roots (the relay is plain HTTP on loopback), no
 # credential. No /home, /var, /opt or /srv, and of /run only the two bound sockets.

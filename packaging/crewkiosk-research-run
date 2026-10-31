@@ -4,7 +4,7 @@
 # connects to its server's research socket, /run/crewkiosk/research-<server>.sock
 # (crewkiosk-research-<server>.socket, Accept=yes, written by crewkiosk-research-units), and
 # systemd starts one instance of that server's linked crewkiosk-research@.service per
-# connection, as crewkiosk, confined: no network but its own loopback, no filesystem but what
+# connection, as that server's own user, crewkiosk-r-<server> (D-114), confined: no network but its own loopback, no filesystem but what
 # the unit binds, and of the broker's sockets only that server's two.
 #
 #   crewkiosk-research-run <server>
@@ -15,11 +15,11 @@
 #   crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>
 # and it replies on stdout as crewkiosk-run does: `ok` and the answer, or `error <rc>`. Its own
 # refusals go to stderr, the instance's journal, and reach the daemon as no reply at all. It:
-#   - refuses to run as anyone but crewkiosk, and drops every inherited environment variable
-#     (crewkiosk-run's preamble, adapted: that file stays as v0.2.5 shipped it). The namespace
-#     has no /etc/passwd, so no name lookup works in it: the unit's drop-in carries crewkiosk's
-#     uid as CREWKIOSK_UID, resolved by crewkiosk-research-units at install, and the runner
-#     compares numbers;
+#   - refuses to run as anyone but its server's user, and drops every inherited environment
+#     variable (crewkiosk-run's preamble, adapted: that file stays as v0.2.5 shipped it). The
+#     namespace has no /etc/passwd, so no name lookup works in it: the unit's drop-in carries
+#     crewkiosk-r-<server>'s uid as CREWKIOSK_UID, resolved by crewkiosk-research-units at
+#     install, and the runner compares numbers;
 #   - before reading a byte, needs its stdin to be a connection accepted on
 #     /run/crewkiosk/research-<server>.sock: the kernel's word for which socket the daemon
 #     connected to, which holds even if a unit layout or a header is ever wrong (D-113). It asks
@@ -59,7 +59,7 @@ ALLOWED_TOOLS=mcp__kiosk__corpus_search,mcp__kiosk__corpus_read,mcp__kiosk__corp
 
 kiosk_uid="${CREWKIOSK_UID:-}"
 if [[ ! "$kiosk_uid" =~ ^[1-9][0-9]*$ || "$(id -u)" != "$kiosk_uid" ]]; then
-  echo "crewkiosk-research-run: must run as crewkiosk, under its unit (CREWKIOSK_UID)" >&2
+  echo "crewkiosk-research-run: must run as its server's user, under its unit (CREWKIOSK_UID)" >&2
   exit 64
 fi
 

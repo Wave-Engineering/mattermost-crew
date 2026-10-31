@@ -22,6 +22,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -847,7 +848,9 @@ def test_research_units_refuse_a_bad_server(tmp_path: Path, server: str) -> None
 def test_ci_stub_claude_parses(tmp_path: Path) -> None:
     """scripts/ci/kiosk-up.sh's stub claude carries IT-31b's probe as Python inside a bash
     single-quoted string, where one stray apostrophe breaks the whole script: every kiosk,
-    research or not, then exits 2. Parse it here, and run its research-off half."""
+    research or not, then exits 2. Parse it here, and run its research-off half. Then run its
+    research half with the probe compiled, not run (it would reach for the network): an even
+    number of stray apostrophes passes `bash -n`, but not Python's compile."""
     text = (ROOT / "scripts" / "ci" / "kiosk-up.sh").read_text()
     match = re.search(r"^cat <<'EOF' \| [^\n]*/usr/local/bin/claude\n(.*?)^EOF$", text, re.M | re.S)
     assert match is not None
@@ -860,6 +863,21 @@ def test_ci_stub_claude_parses(tmp_path: Path) -> None:
         ["bash", str(stub)], input="q", capture_output=True, text=True, env=env, cwd=tmp_path
     )
     assert ran.returncode == 0 and "prompt=q" in ran.stdout, ran.stderr
+    python = "exec /usr/bin/python3 -I -S -c '"
+    assert match.group(1).count(python) == 1
+    compiled = tmp_path / "compiled"
+    compiled.write_text(
+        match.group(1).replace(
+            python,
+            f"exec {sys.executable} -I -S -c "
+            '\'import sys; compile(sys.argv[1], "probe", "exec"); print("probe=compiled")\' \'',
+        )
+    )
+    research = {**env, "ANTHROPIC_BASE_URL": "http://127.0.0.1:8417/a/1"}
+    ran = subprocess.run(
+        ["bash", str(compiled)], input="q", capture_output=True, text=True, env=research
+    )
+    assert ran.returncode == 0 and "probe=compiled" in ran.stdout, ran.stderr
 
 
 def shell_constant(script: Path, name: str) -> str:
@@ -883,6 +901,8 @@ def test_research_server_rules_cannot_drift() -> None:
     assert int(shell_constant(UNITS_SCRIPT, "SUN_PATH_MAX")) == SUN_PATH_MAX
     assert shell_constant(UNITS_SCRIPT, "RESEARCH_USER_PREFIX") == RESEARCH_USER_PREFIX
     assert int(shell_constant(UNITS_SCRIPT, "USER_NAME_MAX")) == USER_NAME_MAX
+    assert research_server_problem("x" * 20) is None
+    assert research_server_problem("x" * 21) is not None
     # And the broker gives each server's sockets that same user's group.
     assert kiosk_broker.SOCKET_GROUP == RESEARCH_USER_PREFIX + "{server}"
     paths = ("/run/crewkiosk-broker/{}.model.sock", f"{KIOSK_RESEARCH_DIR}/research-{{}}.sock")
@@ -892,11 +912,13 @@ def test_research_server_rules_cannot_drift() -> None:
 @needs_systemd_analyze
 @pytest.mark.parametrize(
     "server",
-    ["dev", "oaw_dev", "oaw-dev", "a.b", "control", "Dev", "", "x" * 74, "x" * 75, "x" * 80],
+    ["dev", "oaw_dev", "oaw-dev", "a.b", "control", "Dev", "", "x" * 20, "x" * 21, "x" * 80],
 )
 def test_research_units_agree_with_the_config(tmp_path: Path, server: str) -> None:
     """The same rule, by behaviour: the script writes units for exactly the ids the config
-    lets be research servers, right up to the socket path's length limit."""
+    lets be research servers, right up to the length limit. That limit is now the server's
+    user name, `crewkiosk-r-<server>` within useradd's 32 (20 characters, the most), which
+    falls well short of the socket path's."""
     script, body, unit_dir = units_script(tmp_path)
     proc = render(script, body, unit_dir, server)
     assert (proc.returncode == 0) == (research_server_problem(server) is None), proc.stderr

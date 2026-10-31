@@ -388,11 +388,29 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
       fail "no user $ruser for research server $server (re-run crewkiosk-research-units $server)"
       continue
     fi
+    # A running broker keeps the groups it started with. Started before crewkiosk-research-units
+    # added it to this server's group, it can't give the server's sockets that group, and so
+    # serves the server nothing.
+    broker_pid="$(systemctl show -p MainPID --value crewkiosk-broker.service 2>/dev/null || true)"
+    if [[ -n "$broker_pid" && "$broker_pid" != 0 ]]; then
+      gid="$(getent group -- "$ruser" | cut -d: -f3)"
+      if $SUDO grep '^Groups:' "/proc/$broker_pid/status" | tr -s '[:space:]' '\n' | grep -qxF -- "$gid"; then
+        pass "the running broker holds $ruser's group"
+      else
+        fail "the running broker lacks $ruser's group (gid $gid): systemctl restart crewkiosk-broker.service"
+      fi
+    fi
     # Its broker sockets, once the broker serves them: that server's group, 0660, and so no
-    # other server's kiosk, nor crewkiosk, can open them by path.
+    # other server's kiosk, nor crewkiosk, can open them by path. With the server's pool manifest
+    # written and the broker running, a missing socket is a server the broker failed to serve.
     for sock in "/run/crewkiosk-broker/${server}.sock" "/run/crewkiosk-broker/${server}.model.sock"; do
       if ! $SUDO test -S "$sock"; then
-        info "$sock is not served yet (no pool manifest for $server, or the broker is down)"
+        if $SUDO test -f "/var/lib/crewchat-pool/${server}.json" &&
+          systemctl is-active --quiet crewkiosk-broker.service; then
+          fail "$sock is missing, with $server's pool manifest written and the broker running (restart crewkiosk-broker.service; see its journal)"
+        else
+          info "$sock is not served yet (no pool manifest for $server, or the broker is down)"
+        fi
       elif [[ "$($SUDO stat -c '%G %a' -- "$sock")" == "$ruser 660" ]]; then
         pass "$sock is $ruser's alone (group $ruser, 0660)"
       else

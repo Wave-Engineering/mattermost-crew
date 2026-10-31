@@ -20,9 +20,9 @@ The variables every block reads:
 
 | Variable | What it is | Example |
 |---|---|---|
-| `CREWBROKER_INSTANCES` | each broker on this host, as `<crew>:<server_id>`, space-separated | `oaw:oaw-dev` |
+| `CREWBROKER_INSTANCES` | each broker on this host, as `<crew>:<server_id>`, space-separated | `oaw:oaw_dev` |
 | `AGENT_USER` | the agents' OS user (optional, default `agent`) | `agent` |
-| `CREWKIOSK_RESEARCH_SERVERS` | each `kiosk_research = true` server on this host, space-separated (optional; see [Install kiosk research](#install-kiosk-research)). A research server's id is `[a-z0-9_]+`: no `-` and no `.` | `oaw_lab` |
+| `CREWKIOSK_RESEARCH_SERVERS` | each `kiosk_research = true` server on this host, space-separated (optional; see [Install kiosk research](#install-kiosk-research)). A research server's id is `[a-z0-9_]+`: no `-` and no `.` | `oaw_dev` |
 
 Run every block as a user with `sudo` (the verify step needs `sudo -u` the agents' user too, or
 root; see [Verify the install](#verify-the-install)), from the root of a checkout of the release
@@ -31,7 +31,7 @@ tag:
 ```text
 git clone --branch <tag> https://github.com/Wave-Engineering/mattermost-crew
 cd mattermost-crew
-export CREWBROKER_INSTANCES="oaw:oaw-dev"
+export CREWBROKER_INSTANCES="oaw:oaw_dev"
 ```
 
 ## Prerequisites
@@ -124,7 +124,7 @@ my_threads_retention_days = 90
 
 # One table per Mattermost server, as an array. `id` is the server id every other table uses.
 [[mattermost]]
-id = "oaw-dev"
+id = "oaw_dev"
 url = "https://mm.example.lan"
 # The kiosk answers outsiders on this server only when this is true. Optional, default false,
 # whatever the broker's `kiosk on` switch says (#117).
@@ -158,8 +158,8 @@ needs_list = "bj:needs"
 # One table per crew and Mattermost server, for EVERY broker on this host, trusted crews'
 # brokers included. `broker_user_id` is that broker account's Mattermost user id. These entries
 # are the configured broker list: the only accounts that may hold the patched role (R-06).
-[crews.oaw.oaw-dev]
-broker_socket = "/run/crewbroker/oaw-oaw-dev.sock"
+[crews.oaw.oaw_dev]
+broker_socket = "/run/crewbroker/oaw-oaw_dev.sock"
 broker_user_id = "<the broker account's user id>"
 ```
 
@@ -208,7 +208,7 @@ Mode 0644, owned by root. One file per broker instance.
 
 ```toml
 crew = "oaw"
-server_id = "oaw-dev"
+server_id = "oaw_dev"
 server_url = "https://mm.example.lan"
 # The crew's human partners, by Mattermost user id. Only they can change the switch (R-24).
 human_user_ids = ["<the partner's user id>"]
@@ -266,8 +266,8 @@ For example, for the broker's token, without it passing through the shell's hist
 
 ```text
 sudo install -d -m 0755 /etc/crewbroker
-sudo install -m 0600 -o root -g root /dev/null /etc/crewbroker/oaw-oaw-dev.credential
-sudo tee /etc/crewbroker/oaw-oaw-dev.credential >/dev/null
+sudo install -m 0600 -o root -g root /dev/null /etc/crewbroker/oaw-oaw_dev.credential
+sudo tee /etc/crewbroker/oaw-oaw_dev.credential >/dev/null
 <paste the token, then Enter and Ctrl-D>
 ```
 
@@ -462,8 +462,10 @@ nothing. It installs three things:
 - **One research socket and unit per server.** Each is a linked copy of one shared body,
   written by `crewkiosk-research-units`.
 
-The research kiosk runs as `crewkiosk`, in an empty namespace with no network. It holds no model
-key: it reaches the model only through the broker.
+Each server's research kiosk runs as a user of its own, `crewkiosk-r-<server>`, which
+`crewkiosk-research-units` creates. It runs in an empty namespace with no network. Only that
+user's group may open that server's broker sockets, so one server's kiosk can't reach another's
+(D-114). It holds no model key: it reaches the model only through the broker.
 
 > **WARNING (D-113):** the unit body lives at
 > `/usr/local/share/crewkiosk/crewkiosk-research@.service`, outside every systemd unit search
@@ -631,10 +633,22 @@ that the daemon runs with no new privileges, that `/etc/crewkiosk/model.conf`, w
 one, is 0640 `root:crewkiosk`, and the same files with `crewkiosk` in place of the agents'
 user: `crewkiosk` may read its own model credential and nothing else (R-08). On a research host
 (with `crewkiosk-broker`), it checks both model keys as their users: `crewkiosk-broker` reads only
-its own key, and `crewkiosk` only the runner's. For each server in `CREWKIOSK_RESEARCH_SERVERS`, it
-checks that the linked unit points at the shared body and that the body is in no unit search path.
-It also checks that the unit loads with an empty root, no network, no new privileges, both keys
-hidden, `crewkiosk`'s current uid, and exactly that server's two broker sockets (D-113). Last, it
+its own key, and `crewkiosk` only the runner's, and that `crewcorpus` may traverse
+`/etc/crewkiosk` but not list it. For each server in `CREWKIOSK_RESEARCH_SERVERS`, it checks:
+
+- that the server's user, `crewkiosk-r-<server>`, exists, and that the running broker holds its
+  group (a broker started before the units were written does not, and serves that server
+  nothing);
+- that each of the server's two broker sockets is group `crewkiosk-r-<server>`, mode 0660. A
+  missing socket is reported, and fails once the server's pool manifest is written and the broker
+  is running;
+- that the linked unit points at the shared body, and that the body is in no unit search path;
+- that the unit loads as `crewkiosk-r-<server>`, with that user's current uid in its drop-in,
+  `ProtectProc=invisible`, an empty root, no network, no new privileges, both keys hidden, and
+  exactly that server's two broker sockets (D-113, D-114);
+- whether `PrivatePIDs=yes` is in effect, reported, not required: systemd 255 ignores it.
+
+Last, it
 deactivates the `verify-canary` bot on every broker instance with the broker's `deactivate`, and
 checks the server's `delete_at` came back above 0, so a verify leaves no active bot on the
 server. The next verify reactivates it.
@@ -707,6 +721,9 @@ for server in ${CREWKIOSK_RESEARCH_SERVERS:-}; do
   sudo rm -rf "/etc/systemd/system/crewkiosk-research-$server.socket" \
     "/etc/systemd/system/crewkiosk-research-$server@.service" \
     "/etc/systemd/system/crewkiosk-research-$server@.service.d"
+  # The group too: userdel keeps a user's group while crewkiosk-broker is still in it.
+  sudo userdel "crewkiosk-r-$server" 2>/dev/null || true
+  sudo groupdel "crewkiosk-r-$server" 2>/dev/null || true
 done
 sudo systemctl disable --now crewkiosk-broker.service crewkiosk-broker-control.socket \
   crewkiosk-corpus.timer 2>/dev/null || true
