@@ -531,23 +531,37 @@ class Shim:
 
     # -- pushes ---------------------------------------------------------------------------------
     async def sync_files(self, *, force: bool = False) -> None:
-        """Push the brief when the seed's mtime changed, and the squawk ids when they changed."""
+        """Push the brief when the seed's mtime changed, and the squawk ids when they changed.
+        `force` pushes both, and a forced push that fails stays owed until it lands (#47); one
+        failing never skips the other."""
+        if force:
+            self._brief = _FileState()
+            self._squawks = _FileState()
+        errors: list[ShimError] = []
         seed = self.repo_root / SEED_FILE
         mtime = file_mtime(seed)
-        if force or not self._brief.pushed or mtime != self._brief.mtime_ns:
+        if not self._brief.pushed or mtime != self._brief.mtime_ns:
             text = read_brief(seed)
-            await self.transport("kiosk_brief", {"dev_name": self.dev_name, "text": text})
-            self._brief = _FileState(mtime_ns=mtime, value=text, pushed=True)
+            try:
+                await self.transport("kiosk_brief", {"dev_name": self.dev_name, "text": text})
+                self._brief = _FileState(mtime_ns=mtime, value=text, pushed=True)
+            except ShimError as exc:
+                errors.append(exc)
 
         squawks = self.repo_root / SQUAWKS_FILE
         baseline = self.repo_root / BASELINE_FILE
         mtimes = (file_mtime(squawks), file_mtime(baseline))
-        if force or not self._squawks.pushed or mtimes != self._squawks.mtime_ns:
+        if not self._squawks.pushed or mtimes != self._squawks.mtime_ns:
             ids = read_squawk_ids(squawks)
             texts = read_squawk_texts(squawks, baseline, ids)
-            if force or not self._squawks.pushed or (ids, texts) != self._squawks.value:
-                await self.push_squawks(ids, texts)
-            self._squawks = _FileState(mtime_ns=mtimes, value=(ids, texts), pushed=True)
+            try:
+                if not self._squawks.pushed or (ids, texts) != self._squawks.value:
+                    await self.push_squawks(ids, texts)
+                self._squawks = _FileState(mtime_ns=mtimes, value=(ids, texts), pushed=True)
+            except ShimError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     async def push_squawks(self, ids: list[str], texts: dict[str, str]) -> None:
         """`squawk_ids`, with the texts fitted to the frame. Should the daemon still refuse it,

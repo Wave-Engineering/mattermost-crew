@@ -54,6 +54,8 @@ class InboundMessage:
     ts: float = 0.0  # creation time, seconds since the epoch
     is_bot: bool = False  # the author's user object `is_bot`, never a post prop
     kiosk: bool = False  # the post carries `props.crew_kiosk == 1` (§5.9)
+    # A kiosk answer's `props.crew_kiosk_answers`: the question's post ID (#26).
+    kiosk_answers: str = ""
     # A direct message to the receiving agent: a DM channel whose members are the author and
     # that agent (R-19). Set on the push path, the only one addressing reads (R-21).
     dm: bool = False

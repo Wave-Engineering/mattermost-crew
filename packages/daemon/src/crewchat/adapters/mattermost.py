@@ -275,6 +275,14 @@ def post_kiosk(props: Any) -> bool:
     return isinstance(props, dict) and _int_prop(props.get("crew_kiosk")) == 1
 
 
+def post_kiosk_answers(props: Any) -> str:
+    """A kiosk answer's `props.crew_kiosk_answers`: the question's post ID, or "" (#26)."""
+    if not post_kiosk(props):
+        return ""
+    value = props.get("crew_kiosk_answers")
+    return value if isinstance(value, str) and is_mm_id(value) else ""
+
+
 def embed_attachment(embed: Embed) -> dict[str, str]:
     """Today's Discord embed as a Mattermost message attachment, which both editions render
     (`props.attachments: [{title, text}]`, CT-01)."""
@@ -466,6 +474,7 @@ class MattermostBackend:
             ts=create_at / 1000.0 if isinstance(create_at, int | float) else 0.0,
             is_bot=user.get("is_bot") is True,
             kiosk=post_kiosk(props),
+            kiosk_answers=post_kiosk_answers(props),
             dm=dm,
             author_resolved=bool(user),
         )
@@ -578,9 +587,11 @@ class MattermostBackend:
         embed: Embed | None,
         *,
         kiosk: bool = False,
+        answers: str = "",
     ) -> InboundMessage:
         """Upload `attachments` with the agent's own token (`POST /api/v4/files`), then post
-        with their `file_ids`; `embed` is a message attachment (CT-01)."""
+        with their `file_ids`; `embed` is a message attachment (CT-01). A kiosk answer names
+        the question it `answers` (#26)."""
         file_ids: list[str] = []
         for att in attachments:
             uploaded = await client.upload_file(channel, str(att.path), filename=att.name)
@@ -591,6 +602,8 @@ class MattermostBackend:
         props: dict[str, Any] = {"crew_proto": PROTO}
         if kiosk:
             props["crew_kiosk"] = 1  # outsider content to every admit (§5.9, §5.11)
+            if answers:
+                props["crew_kiosk_answers"] = answers
         if embed is not None:
             props["attachments"] = [embed_attachment(embed)]
         post = await client.create_post(
@@ -623,9 +636,10 @@ class MattermostBackend:
         return await self._call(dev_name, request)
 
     async def send_kiosk(
-        self, dev_name: str, channel: str, text: str, thread: str
+        self, dev_name: str, channel: str, text: str, thread: str, *, answers: str = ""
     ) -> InboundMessage:
-        """The kiosk's answer, as `dev_name`, in `thread`: `props.crew_kiosk=1` (Story 3.5)."""
+        """The kiosk's answer, as `dev_name`, in `thread`: `props.crew_kiosk=1` (Story 3.5),
+        and `props.crew_kiosk_answers=<answers>`, the question's post ID (#26)."""
         require_channel_name(channel)
 
         async def request(client: MattermostClient) -> InboundMessage:
@@ -633,7 +647,9 @@ class MattermostBackend:
                 dev_name,
                 client,
                 channel,
-                lambda cid: self._post(client, cid, text, thread, (), None, kiosk=True),
+                lambda cid: self._post(
+                    client, cid, text, thread, (), None, kiosk=True, answers=answers
+                ),
             )
 
         return await self._call(dev_name, request)

@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from crewchat.adapters.base import InboundMessage
 from crewchat.chat import AgentContext, build_chat_handlers
+from crewchat.config import parse_config
 from crewchat.doorbell import CursorStore, Doorbell, DoorbellEvent, to_event
 from crewchat.filters import (
     DELIVER,
@@ -991,3 +992,76 @@ def test_team_token_needs_own_crew_author(rig: Rig) -> None:
     own, ally = run(scenario())
     assert own == DELIVER
     assert ally.reason == "unaddressed"
+
+
+# -- broker accounts (#25) ------------------------------------------------------------------
+def test_broker_post_dropped_on_push_and_pull(run: Any) -> None:
+    """#25: a configured broker account's post, ours or a trusted crew's, is never delivered
+    or sent to the kiosk, even as a human's DM to the agent."""
+    rig = Rig(broker_user_ids={SID: ["b-oaw", "b-ally"]})
+    rig.set_mode("crew")
+
+    async def scenario() -> list[Verdict]:
+        await rig.prime()
+        return [
+            await rig.admit(mm("b-oaw", "refused", is_bot=False, dm=True)),
+            await rig.admit(mm("b-oaw", "refused", is_bot=False, dm=True), "pull"),
+            await rig.admit(mm("b-ally", "refused", is_bot=False, dm=True)),
+            await rig.admit(mm("b-ally", "refused", is_bot=False, dm=True), "pull"),
+        ]
+
+    assert run(scenario()) == [Verdict(Kind.DROP, "broker")] * 4
+
+
+def test_broker_post_dropped_under_social_too(run: Any) -> None:
+    """#25: under `social` a broker's post is dropped, not delivered as an outsider's."""
+    rig = Rig(broker_user_ids={SID: ["b-oaw"]})
+    rig.set_mode("social", expires=NOW + timedelta(hours=1))
+
+    async def scenario() -> list[Verdict]:
+        await rig.prime()
+        return [
+            await rig.admit(mm("b-oaw", "@babel lapsed", is_bot=False)),
+            await rig.admit(mm(OUTSIDER, "@babel hi", is_bot=False)),
+        ]
+
+    broker, outsider = run(scenario())
+    assert broker == Verdict(Kind.DROP, "broker")
+    assert outsider == DELIVER_MARKED_OUTSIDER  # the mode is social: only the broker is dropped
+
+
+def test_broker_ids_are_per_server(run: Any) -> None:
+    """#25: a broker account is matched on its own server only."""
+    rig = Rig(broker_user_ids={SID2: ["b-oaw2"]})
+    rig.set_mode("crew")
+
+    async def scenario() -> list[Verdict]:
+        await rig.prime()
+        return [
+            await rig.admit(mm("b-oaw2", "x", is_bot=False, backend=MM), "pull"),
+            await rig.admit(mm("b-oaw2", "x", is_bot=False, backend=MM2), "pull"),
+        ]
+
+    other, own = run(scenario())
+    assert other.reason != "broker"
+    assert own == Verdict(Kind.DROP, "broker")
+
+
+def test_from_config_passes_broker_ids() -> None:
+    """#25: `from_config` collects every crew's broker on each server."""
+    config = parse_config(
+        {
+            "default_crew": "oaw",
+            "mattermost": [{"id": SID, "url": "https://mm.example"}],
+            "crews": {
+                crew: {
+                    "needs_list": f"{crew}:needs",
+                    SID: {"broker_socket": f"/run/{crew}.sock", "broker_user_id": f"b-{crew}"},
+                }
+                for crew in ("oaw", "ally")
+            },
+        }
+    )
+    rig = Rig()
+    filters = Filters.from_config(rig.registry, rig.cache, rig.threads, config)  # type: ignore[arg-type]
+    assert filters.broker_ids == {SID: frozenset({"b-oaw", "b-ally"})}

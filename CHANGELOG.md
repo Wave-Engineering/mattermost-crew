@@ -6,6 +6,24 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agent's DM to its broker no longer loops through the kiosk** (#153). The daemon took
+  the broker account for an outsider, so the broker's refusal went to the agent's kiosk, the
+  kiosk answered, the broker refused again, and so on for about ten rounds, each spending a
+  model call and a unit of the server's daily kiosk cap. A post by any configured broker
+  account is now dropped, on push and pull, and the broker no longer answers a kiosk answer.
+
+- **A kiosk question is answered once across a daemon crash** (#153). A daemon that died
+  between posting an answer and recording it answered the same question again after the
+  restart. Each answer now names its question (`props.crew_kiosk_answers`), and a replayed
+  question whose answer is already in its thread is recorded, not answered again.
+
+- **A failed kiosk brief push after a re-register is retried** (#153). A forced push that
+  failed was never sent again, so the kiosk answered "I have nothing to share yet." until the
+  seed changed. It now stays owed until it lands, and a failed brief push no longer skips the
+  squawk ids.
+
 ## [0.2.8] — 2026-10-31
 
 An agent that a 429 left off a server gets back on it within minutes instead of a day, and

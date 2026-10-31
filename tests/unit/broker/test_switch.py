@@ -345,6 +345,19 @@ def test_dm_from_event_filters() -> None:
     assert dm_from_event("nope", BROKER_ID) is None
 
 
+def test_dm_from_event_ignores_kiosk_answers(broker: Broker, fake: Any) -> None:
+    """#52: a kiosk answer, from a human's account or a bot's, is never a command: no reply,
+    no change to the switch."""
+    assert dm_from_event(posted(HUMAN_ID, "x", props={"crew_kiosk": 1}), BROKER_ID) is None
+    assert dm_from_event(posted("bot-id", "x", props={"crew_kiosk": 1}), BROKER_ID) is None
+    before = broker.switch.load()
+    listener = DMListener(broker, "https://mm.example", "tok")
+    listener.handle(json.dumps({"event": "hello", "seq": 0, "data": {"connection_id": "c1"}}))
+    listener.handle(json.dumps(posted(HUMAN_ID, "social 2h", seq=1, props={"crew_kiosk": 1})))
+    assert fake.posts == []
+    assert broker.switch.load() == before
+
+
 def test_listener_replies_in_the_dm(broker: Broker, fake: Any) -> None:
     listener = DMListener(broker, "https://mm.example", "tok")
     listener.handle(json.dumps({"event": "hello", "seq": 0, "data": {"connection_id": "c1"}}))

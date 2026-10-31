@@ -85,6 +85,7 @@ MAX_FRAME_BYTES = 64 * 1024
 # Every post the broker makes carries this prop, and the listener never answers a post that
 # does: two brokers (or a broker and itself) can't refuse each other in a loop.
 BROKER_PROP = "crew_broker"
+KIOSK_PROP = "crew_kiosk"  # a kiosk answer (§5.9): never a command to the broker (#52)
 WS_PING_S = 30.0
 WS_RECV_POLL_S = 1.0
 WS_BACKOFF_FIRST_S = 1.0
@@ -652,7 +653,8 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
     """A websocket event, as a DM to the broker it should answer, or None.
 
     Only a user's own `posted` post in a DM channel counts: not the broker's own posts, not
-    system posts, and never a post carrying `props.crew_broker` (another broker's reply).
+    system posts, and never a post carrying `props.crew_broker` (another broker's reply) or
+    `props.crew_kiosk` (an agent's kiosk answer, #52).
     """
     if not isinstance(event, dict) or event.get("event") != "posted":
         return None
@@ -682,7 +684,7 @@ def dm_from_post(post: Any, broker_user_id: str) -> DirectMessage | None:
     if sender == broker_user_id or post.get("type") or not isinstance(message, str):
         return None
     props = post.get("props")
-    if isinstance(props, dict) and props.get(BROKER_PROP):
+    if isinstance(props, dict) and (props.get(BROKER_PROP) or props.get(KIOSK_PROP)):
         return None
     post_id = post.get("id")
     create_at = post.get("create_at")

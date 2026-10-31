@@ -136,7 +136,7 @@ def test_it21_kiosk(mattermost: Any, world: dict[str, Any], tmp_path: Path) -> N
 
             # A crewmate's post in the thread, then the outsider follows up.
             await rig.send("kessel", f"internal: {CREWMATE_SECRET}", thread=root)
-            rig.post_as(rig.outsider_token, "@babel and who runs it?", root=root)
+            follow = rig.post_as(rig.outsider_token, "@babel and who runs it?", root=root)
             answers = await wait_answers(mattermost, root, 2)
 
             assert len(runner.prompts) == 2
@@ -154,6 +154,8 @@ def test_it21_kiosk(mattermost: Any, world: dict[str, Any], tmp_path: Path) -> N
                 assert post["props"]["crew_kiosk"] == 1
                 assert "@" not in post["message"]
             assert first[0]["message"].startswith("We build a chat daemon (answer 1)")
+            # Each answer names its question, and the real server keeps the prop (#26).
+            assert [p["props"]["crew_kiosk_answers"] for p in answers] == [root, follow]
 
             # Outsider content: a crewmate's pull omits the kiosk's answers under crew only.
             reads = await rig.read("kessel")
