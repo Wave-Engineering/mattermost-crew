@@ -8,7 +8,9 @@
   (#151).
 - `tokens.json`: the token-id ledger. Token ids, owners and times only; never a token.
 - `dm_cursor.json`: `last_create_at`, the `create_at` in ms of the newest DM to the broker it
-  has handled. On every websocket `hello` it backfills the DMs after it (#159).
+  has handled. On every websocket `hello` it backfills the DMs after it (#159). Beside it,
+  `newest_partner_dm` (ms) and `handled` (the last 500 post ids), so a restart that replays
+  DMs from a held cursor still knows which were overtaken and which were applied.
 
 Every file is written whole, through a mode-`0600` temporary file and an atomic rename, so a
 crash never leaves a half-written file and no other user can ever read one (R-08).
@@ -203,20 +205,46 @@ class TokenStore:
 
 
 class DMCursorStore:
-    """`dm_cursor.json`: where the DM backfill resumes (#159)."""
+    """`dm_cursor.json`: where the DM backfill resumes, and what it has already seen (#159).
+
+    The cursor holds behind DMs already applied while a backfill is owed, so a restart
+    replays them. `newest_partner_dm` and `handled` survive it too: without them a replayed
+    command overtaken before the restart would be judged as if nothing newer had come, and
+    a DM already applied would be applied again.
+    """
 
     def __init__(self, state_dir: Path) -> None:
         self.path = state_dir / "dm_cursor.json"
 
+    def _read(self) -> dict[str, Any]:
+        try:
+            data = read_json(self.path, {})
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def load(self) -> int:
         """The cursor in ms; 0 when the file is missing or unreadable."""
-        try:
-            value = read_json(self.path, {}).get("last_create_at")
-        except (OSError, ValueError):
-            return 0
+        value = self._read().get("last_create_at")
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return 0
         return value
 
+    def load_seen(self) -> tuple[int, list[str]]:
+        """The newest partner DM handled (ms) and the handled post ids, oldest first; 0 and
+        none for anything missing or unreadable."""
+        data = self._read()
+        newest = data.get("newest_partner_dm")
+        if isinstance(newest, bool) or not isinstance(newest, int) or newest < 0:
+            newest = 0
+        handled = data.get("handled")
+        if not isinstance(handled, list):
+            return newest, []
+        return newest, [h for h in handled if isinstance(h, str) and h]
+
     def save(self, ms: int) -> None:
-        write_private_json(self.path, {"last_create_at": ms})
+        write_private_json(self.path, {**self._read(), "last_create_at": ms})
+
+    def save_seen(self, newest_partner_dm: int, handled: list[str]) -> None:
+        data = {**self._read(), "newest_partner_dm": newest_partner_dm, "handled": handled}
+        write_private_json(self.path, data)

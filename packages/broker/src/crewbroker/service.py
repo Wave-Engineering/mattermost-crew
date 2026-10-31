@@ -738,12 +738,14 @@ class DMListener:
         self.connection_id = ""
         self.next_seq = 0
         # Post ids already handled, newest last: a DM the backfill applied and the websocket
-        # then replays (or the reverse) is handled once (#159).
-        self._handled: OrderedDict[str, None] = OrderedDict()
+        # then replays (or the reverse) is handled once (#159). Both it and the newest partner
+        # DM persist beside the cursor, which a restart can find held behind them.
+        newest_partner, handled = broker.dm_cursor.load_seen()
+        self._handled: OrderedDict[str, None] = OrderedDict.fromkeys(handled[-HANDLED_DMS_MAX:])
         # A backfill not yet completed: the cursor stays where it is until one is (#159).
         self._owed = False
         self._newest_dm = 0  # ms: the newest DM handled, from anyone
-        self._newest_partner_dm = 0  # ms: the newest from a human partner
+        self._newest_partner_dm = newest_partner  # ms: the newest from a human partner
 
     def uri(self) -> str:
         if not self.connection_id:
@@ -791,13 +793,15 @@ class DMListener:
         newer command, and its reply, told the partner that. A command that fails stops the
         backfill there, still owed: it is retried before the next DM and at the next `hello`.
         If that retry fails too, the next DM still applies, and the failed one, overtaken by
-        it, is judged late. If any read fails, nothing
-        is applied, the cursor stays, and the backfill stays owed: it is tried again before
-        the next DM and at the next `hello`. A partner the server says doesn't exist
-        (`BACKFILL_SKIP_STATUSES`, such as a deleted user) is logged and skipped instead, so
-        one bad ID cannot hold the cursor and every other partner's backfill forever. With no
-        usable cursor, as on a fresh install, it starts the cursor now and replays nothing.
-        Never raises.
+        it if it is a partner's, is judged late. What the backfill has seen persists beside
+        the cursor (`DMCursorStore.load_seen`), which can be held behind DMs already applied,
+        so a restart's replay still judges overtaken commands so and applies none twice.
+        If any read fails, nothing is applied, the cursor stays, and the backfill stays owed:
+        it is tried again before the next DM and at the next `hello`. A partner the server
+        says doesn't exist (`BACKFILL_SKIP_STATUSES`, such as a deleted user) is logged and
+        skipped instead, so one bad ID cannot hold the cursor and every other partner's
+        backfill forever. With no usable cursor, as on a fresh install, it starts the cursor
+        now and replays nothing. Never raises.
         """
         cursor = self.broker.dm_cursor.load()
         now = self.broker.clock()
@@ -847,6 +851,8 @@ class DMListener:
         False is returned."""
         if dm.post_id:
             if dm.post_id in self._handled:
+                # Handled before a restart, perhaps: the cursor may move past it now.
+                self._newest_dm = max(self._newest_dm, dm.create_at)
                 return True
             self._handled[dm.post_id] = None
             if len(self._handled) > HANDLED_DMS_MAX:
@@ -872,6 +878,10 @@ class DMListener:
         self._newest_dm = max(self._newest_dm, dm.create_at)
         if dm.sender_user_id in self.broker.config.human_user_ids:
             self._newest_partner_dm = max(self._newest_partner_dm, dm.create_at)
+        try:
+            self.broker.dm_cursor.save_seen(self._newest_partner_dm, list(self._handled))
+        except OSError:
+            log.exception("DM backfill state not saved")
         if not self._owed:
             self._save_cursor(dm.create_at)
         return True

@@ -20,6 +20,7 @@ from crewbroker.service import (
     dm_from_event,
     handle_frame,
 )
+from crewbroker.state import DMCursorStore
 from crewbroker.switch import (
     REFUSAL,
     SwitchState,
@@ -827,6 +828,53 @@ def test_backfill_judges_an_overtaken_command_where_it_lands(
     else:
         assert (state.mode, state.revert_to) == ("social", "crew")
     assert replies(fake)[-1].startswith("not applied") is not applied
+
+
+def test_backfill_remembers_what_it_saw_across_a_restart(
+    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """babelfish's case: the cursor holds behind a live DM while a backfill is owed, so a
+    restart replays it. The overtaken `trusted` is still refused, and the `social 1h`
+    already applied is not applied or answered again."""
+    cursor = ms(clock.now - timedelta(minutes=5))
+    broker.dm_cursor.save(cursor)
+    fake.history[DM_CHANNEL] = [dm_post("p1", "trusted", clock.now - timedelta(seconds=60))]
+    reads = fake.posts_since
+    down = {"on": True}
+
+    def flaky(channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        if down["on"]:
+            raise OSError("connection refused")
+        posts: list[dict[str, Any]] = reads(channel_id, since_ms)
+        return posts
+
+    monkeypatch.setattr(fake, "posts_since", flaky)
+    first = DMListener(broker, "http://mm", "tok")
+    first.handle(HELLO)
+    live = dm_post("p2", "social 1h", clock.now - timedelta(seconds=10))
+    first.handle(posted_event(live))
+    fake.history[DM_CHANNEL].append(live)
+    assert broker.dm_cursor.load() == cursor  # still owed: held behind the live DM
+
+    down["on"] = False
+    DMListener(broker, "http://mm", "tok").handle(HELLO)  # the restarted broker's
+    state = broker.switch.load()
+    assert (state.mode, state.revert_to) == ("social", "crew")
+    assert [r.split(":")[0] for r in replies(fake)] == ["switch", "not applied"]
+    assert broker.dm_cursor.load() == live["create_at"]
+
+
+def test_dm_cursor_store_keeps_the_cursor_and_what_was_seen(tmp_path: Path) -> None:
+    store = DMCursorStore(tmp_path)
+    assert store.load() == 0 and store.load_seen() == (0, [])
+    store.save(5)
+    store.save_seen(4, ["a", "b"])
+    store.save(7)
+    assert store.load() == 7 and store.load_seen() == (4, ["a", "b"])
+    store.path.write_text('{"last_create_at": 7, "newest_partner_dm": "x", "handled": 3}')
+    assert store.load() == 7 and store.load_seen() == (0, [])
+    store.path.write_text("{")
+    assert store.load() == 0 and store.load_seen() == (0, [])
 
 
 def test_backfill_applies_an_overtaken_narrowing_by_state(
