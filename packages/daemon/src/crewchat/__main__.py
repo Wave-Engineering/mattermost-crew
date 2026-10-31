@@ -65,7 +65,8 @@ from crewchat.uploads import UploadStore
 ROTATION_INTERVAL_S = 24 * 3600
 UPLOADS_SUBDIR = "uploads"  # /run/crewchat/uploads, beside the socket
 # One INFO line per request, every poll, from every agent's stream, rotates the journal within
-# hours (#157). These log a failed request at WARNING and above; our adapters log their own.
+# hours (#157). They log nothing above INFO, so WARNING silences them; our adapters log their
+# own failures and retries.
 QUIET_LOGGERS = ("httpx", "httpcore")
 
 log = logging.getLogger("crewchat")

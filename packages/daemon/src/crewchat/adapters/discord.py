@@ -491,7 +491,10 @@ class DiscordBackend:
                     wait = float(resp.json().get("retry_after", 1.0))
                 except (ValueError, AttributeError):
                     wait = 1.0
-                await self._sleep(min(max(wait, 0.0), RETRY_AFTER_MAX_S))
+                wait = min(max(wait, 0.0), RETRY_AFTER_MAX_S)
+                # httpx is silenced (#180), so a retried 429 shows only here.
+                log.warning("%s 429 on %s %s; retrying in %.1f s", service, method, path, wait)
+                await self._sleep(wait)
                 continue
             if resp.status_code >= 400:
                 raise DiscordError(service, resp.status_code, resp.text[:200])

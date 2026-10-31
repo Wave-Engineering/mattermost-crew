@@ -39,8 +39,6 @@ def test_configure_logging_quiets_httpx(capsys: pytest.CaptureFixture[str]) -> N
 
         logging.getLogger("httpx").info('HTTP Request: GET http://mm/api/v4/users/me "200 OK"')
         logging.getLogger("crewchat.tokens").info("rotated one token")
-        logging.getLogger("httpx").warning("a failed request")
     err = capsys.readouterr().err
     assert "HTTP Request:" not in err
     assert "crewchat.tokens INFO rotated one token" in err
-    assert "httpx WARNING a failed request" in err
