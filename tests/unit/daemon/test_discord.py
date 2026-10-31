@@ -146,6 +146,41 @@ def test_send_replaces_an_existing_own_signature(
     )
 
 
+SIG = "— **hailing-frequencies** 📡 (oaw) ·p1"
+
+
+def test_send_replaces_an_inline_own_signature(discord: FakeDiscord, credential: Path) -> None:
+    """#155: a signature at the end of the last line, as agents write one, is replaced."""
+    b = backend(discord, credential)
+    signed = b.signed(ME, "done. No action needed. — **hailing-frequencies** 📡 (oaw)")
+    assert signed == [f"done. No action needed.\n\n{SIG}"]
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        ("done. — **hailing-frequencies** 📡 (oaw) ·p1", "done."),
+        ("done. — **hailing-frequencies** (oaw)", "done."),
+        ("done. — **hailing-frequencies** 📡", "done."),
+        ("done. — **Hailing-Frequencies**", "done."),
+        ("done.\n— **hailing-frequencies** 📡 (oaw)", "done."),
+        ("— **hailing-frequencies** 📡 (oaw)", ""),
+        # Kept: another agent's, one in an inline code span, and one with more after it.
+        ("done. — **babelfish** 🐠 (oaw)", "done. — **babelfish** 🐠 (oaw)"),
+        ("try `x — **hailing-frequencies** 📡`", "try `x — **hailing-frequencies** 📡`"),
+        (
+            "as — **hailing-frequencies** said, it is fine",
+            "as — **hailing-frequencies** said, it is fine",
+        ),
+    ],
+)
+def test_inline_signature_forms(
+    discord: FakeDiscord, credential: Path, text: str, kept: str
+) -> None:
+    b = backend(discord, credential)
+    assert b.signed(ME, text) == [f"{kept}\n\n{SIG}" if kept else SIG]
+
+
 def test_long_send_signs_every_chunk(discord: FakeDiscord, credential: Path, run: Any) -> None:
     b = backend(discord, credential)
     text = " ".join(["word"] * 900)  # about 4,500 characters

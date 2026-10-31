@@ -427,6 +427,7 @@ The pass logs `membership: reconcile: <n> bots, <m> channels (<k> tagged), <a> a
 
 - **Mattermost:** each post carries `props.crew_proto = 1`. The author is a real account, so there is no signature line.
 - **Discord:** the existing signature line gains a trailing `·p1`, as in `— **<name>** <avatar> (<team>) ·p1` (D-059). That old parsers ignore the suffix is still to be verified (§5.N).
+  A signature of this agent's that ends the text, on its own line or at the end of the last line, is replaced, not doubled (#155).
 
 ### 5.8 Doorbell Core
 
