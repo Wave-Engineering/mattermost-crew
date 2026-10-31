@@ -82,7 +82,7 @@ server="$1"
 for path in "$BROKER_DIR/$server.model.sock" "$RESEARCH_DIR/research-$server.sock"; do
   ((${#path} <= SUN_PATH_MAX)) || die "server id '$server' is too long for $path"
 done
-research_user="$RESEARCH_USER_PREFIX$server"
+research_user="${RESEARCH_USER_PREFIX}shared" # REVERT CHECK, never merge: one uid for every server
 ((${#research_user} <= USER_NAME_MAX)) ||
   die "server id '$server' is too long for its user, $research_user"
 
