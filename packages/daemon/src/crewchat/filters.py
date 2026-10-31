@@ -31,6 +31,8 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
 
 - **Discord** is crew-equivalent: `DELIVER`, with the loop guard on push (R-15). **squawkie**
   events are exempt. Neither needs the broker, so both flow while it is down (R-27).
+- A post by any configured `broker_user_id` on that server is `DROP("broker")`, on push and
+  pull, first after the backend (#25).
 - **Mattermost membership.** A bot account is in crew X if and only if its user ID is in X's
   `minted_bot_ids` (X's broker lists only the bots it minted and still owns, D-100); a human
   is in X if and only if it is in X's `human_user_ids`. Username suffixes are never read. With
@@ -628,8 +630,13 @@ class Filters:
         state_dir: Path | None = None,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Monotonic = time.monotonic,
+        broker_user_ids: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         self.registry = registry
+        # Each server's broker accounts, every crew's on this host (#25).
+        self.broker_ids: dict[str, frozenset[str]] = {
+            sid: frozenset(ids) for sid, ids in (broker_user_ids or {}).items()
+        }
         self.cache = cache
         # The one persisted `MyThreads` from `serve()` (D-104): never a second instance.
         self.threads = threads
@@ -651,6 +658,9 @@ class Filters:
         config: ServersConfig,
         **kwargs: Any,
     ) -> Filters:
+        brokers: dict[str, list[str]] = {}
+        for b in config.broker_entries():
+            brokers.setdefault(b.server_id, []).append(b.broker_user_id)
         return cls(
             registry,
             cache,
@@ -658,6 +668,7 @@ class Filters:
             kiosk_rate_per_hour=config.kiosk_rate_per_hour,
             loop_guard_window=config.loop_guard_window,
             kiosk_caps={s.id: s.kiosk_daily_cap for s in config.mattermost if s.kiosk},
+            broker_user_ids=brokers,
             **kwargs,
         )
 
@@ -749,6 +760,8 @@ class Filters:
         server_id = server_of(msg.backend)
         if server_id is None:
             return DROP("unknown_backend")
+        if msg.author_id in self.broker_ids.get(server_id, frozenset()):
+            return DROP("broker")  # a broker's reply is infrastructure, never a message to an agent
         state = self.cache.switch_state(reg.crew, server_id)
         if state is None or self.cache.crew_info(reg.crew, server_id) is None:
             return DROP("no_cache")

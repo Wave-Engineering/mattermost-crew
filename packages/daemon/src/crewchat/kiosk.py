@@ -37,7 +37,10 @@
 - **Answered once.** A question whose `post_id` is already in the transcript is not answered
   again (#97). A `KIOSK` hand-off never moves the doorbell's cursor, so a restarted daemon's
   stream replays every outsider question since the agent's last event. Records written
-  before `post_id` was kept still load; they just can't stop a replay.
+  before `post_id` was kept still load; they just can't stop a replay. Each answer carries
+  `props.crew_kiosk_answers=<question post_id>`, and a question missing from the transcript
+  is first looked for in its thread: the agent's own kiosk answer to it there is recorded,
+  not answered again, which covers a daemon that died between the post and the record (#26).
 
 `Kiosk` consumes the `KioskQueue` from Story 3.3: one worker per expert, started when that
 expert's first event arrives, answering its events in order.
@@ -323,10 +326,12 @@ class KioskPoster(Protocol):
     read the thread it answers in."""
 
     async def send_kiosk(
-        self, dev_name: str, channel: str, text: str, thread: str
+        self, dev_name: str, channel: str, text: str, thread: str, *, answers: str = ""
     ) -> InboundMessage: ...
 
     async def thread(self, dev_name: str, post_id: str) -> list[InboundMessage]: ...
+
+    async def user_id(self, dev_name: str) -> str: ...
 
 
 # -- the session ----------------------------------------------------------------------------
@@ -579,14 +584,38 @@ class Kiosk:
             return None
         thread = msg.root_id or msg.post_id
         posts: list[InboundMessage] = []
-        if self.briefs.brief(dev_name):
-            try:
-                posts = await backend.thread(dev_name, thread)
-            except Exception as exc:  # the question itself still goes in
-                log.warning("kiosk: thread %s unreadable for %s: %s", thread, dev_name, exc)
-        answer = await sess.ask(msg, posts)
+        try:
+            posts = await backend.thread(dev_name, thread)
+        except Exception as exc:  # the question itself still goes in: a lost answer is worse
+            log.warning("kiosk: thread %s unreadable for %s: %s", thread, dev_name, exc)
+        try:
+            me: str | None = await backend.user_id(dev_name)
+        except Exception as exc:
+            log.warning("kiosk: %s's own user id unreadable: %s", dev_name, exc)
+            me = None
+        if me is not None:
+            # Answered, but the daemon died before the record (#26). Only the agent's own
+            # account can mark one of its answers: anyone else's props don't count.
+            done = next(
+                (
+                    p
+                    for p in posts
+                    if p.kiosk and p.kiosk_answers == msg.post_id and p.author_id == me
+                ),
+                None,
+            )
+            if done is not None:
+                log.info(
+                    "kiosk: %s already answered %s on %s (found in the thread)",
+                    dev_name,
+                    msg.post_id,
+                    server_id,
+                )
+                sess.record(msg, KioskAnswer(done.text), done.ts)
+                return None
+        answer = await sess.ask(msg, posts if self.briefs.brief(dev_name) else [])
         posted: InboundMessage = await backend.send_kiosk(
-            dev_name, msg.channel, answer.text, thread
+            dev_name, msg.channel, answer.text, thread, answers=msg.post_id
         )
         sess.record(msg, answer, posted.ts)
         return posted

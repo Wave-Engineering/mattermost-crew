@@ -434,6 +434,77 @@ def test_ping_reregisters_an_idle_session_after_a_daemon_restart(tmp_path: Path)
     asyncio.run(scenario())
 
 
+class FlakyBriefDaemon(RestartingDaemon):
+    """`fail_brief` makes the next `kiosk_brief` unreachable, once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_brief = False
+
+    async def __call__(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        if op == "kiosk_brief" and self.fail_brief:
+            self.fail_brief = False
+            self.frames.append(("kiosk_brief-failed", dict(args)))
+            raise DaemonUnreachable("crewchat daemon at /run/crewchat/crewchat.sock: refused")
+        return await super().__call__(op, args)
+
+
+def test_failed_forced_brief_push_is_retried(tmp_path: Path) -> None:
+    """#47: a forced brief push that fails after a `not_registered` ping is pushed again on
+    the next tick, with no change to the seed."""
+    daemon, clock = FlakyBriefDaemon(), Clock()
+    shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.tick()
+        pushed = daemon.of("kiosk_brief")
+        daemon.restart()
+        daemon.fail_brief = True
+        clock.now += timedelta(seconds=15)
+        await shim.tick()  # not_registered: register, then the forced brief push fails
+        assert len(daemon.of("kiosk_brief-failed")) == 1
+        assert daemon.of("kiosk_brief") == pushed
+        clock.now += timedelta(seconds=1)
+        await shim.tick()
+        assert daemon.of("kiosk_brief") == [*pushed, pushed[-1]]  # the same text, again
+
+    asyncio.run(scenario())
+
+
+def test_brief_failure_does_not_skip_squawk_ids(tmp_path: Path) -> None:
+    """#47: a forced `sync_files` whose brief push fails still pushes the squawk ids, then
+    raises the brief's error."""
+    daemon = FlakyBriefDaemon()
+    shim = make_shim(tmp_path, daemon)
+
+    async def scenario() -> None:
+        await shim.start()
+        squawks = len(daemon.of("squawk_ids"))
+        daemon.fail_brief = True
+        with pytest.raises(DaemonUnreachable):
+            await shim.sync_files(force=True)
+        assert len(daemon.of("squawk_ids")) == squawks + 1
+
+    asyncio.run(scenario())
+
+
+def test_unforced_sync_unchanged_files_pushes_nothing(tmp_path: Path) -> None:
+    """#47 regression: after a sync that landed, an unforced sync with no file change sends
+    no frame."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon)
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.sync_files()
+        sent = len(daemon.frames)
+        await shim.sync_files()
+        assert len(daemon.frames) == sent
+
+    asyncio.run(scenario())
+
+
 def test_ping_survives_a_daemon_that_is_down(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

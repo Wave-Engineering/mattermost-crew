@@ -32,6 +32,7 @@ from crewchat.kiosk import (
     BriefStore,
     Kiosk,
     KioskPoster,
+    KioskSession,
     Research,
     ResearchFrame,
     render_research,
@@ -261,10 +262,86 @@ def test_answer_mentions_stripped_and_tagged(mm: Any, run: Any, tmp_path: Path) 
     [stored] = w.kiosk_posts()
     assert "@" not in stored["message"]
     assert stored["message"] == "Ask or , or . Thanks !"
-    assert stored["props"] == {"crew_proto": 1, "crew_kiosk": 1}
+    assert stored["props"] == {
+        "crew_proto": 1,
+        "crew_kiosk": 1,
+        "crew_kiosk_answers": ask.post_id,
+    }
     assert stored["user_id"] == w.babel and stored["root_id"] == ask.post_id
     assert posted is not None and posted.kiosk is True
     assert isinstance(w.backend, KioskPoster)
+
+
+def test_answer_names_its_question(mm: Any, run: Any, tmp_path: Path) -> None:
+    """#26: the answer carries its question's post ID, and reads back with it."""
+    w = World(mm, tmp_path)
+    w.briefs[DEV] = BRIEF
+    ask = w.post(w.outsider, "@babel which one?")
+    posted = run(w.kiosk.handle(DEV, w.event(ask)))
+    [stored] = w.kiosk_posts()
+    assert stored["props"]["crew_kiosk"] == 1
+    assert stored["props"]["crew_kiosk_answers"] == ask.post_id
+    assert posted is not None and posted.kiosk_answers == ask.post_id
+    thread = run(w.backend.thread(DEV, ask.post_id))
+    assert [m.kiosk_answers for m in thread if m.kiosk] == [ask.post_id]
+
+
+def test_crash_between_post_and_record_is_not_answered_again(
+    mm: Any, run: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """#26: a daemon that died after posting and before recording finds its answer in the
+    thread on the replay, and records it instead of answering again."""
+    w = World(mm, tmp_path, FakeRunner("THE-ANSWER"))
+    w.briefs[DEV] = BRIEF
+    ask = w.post(w.outsider, "@babel are you there?")
+    real_record = KioskSession.record
+
+    def crash(self: KioskSession, *args: Any, **kwargs: Any) -> None:
+        monkeypatch.setattr(KioskSession, "record", real_record)
+        raise RuntimeError("the daemon died here")
+
+    monkeypatch.setattr(KioskSession, "record", crash)
+    with pytest.raises(RuntimeError):
+        run(w.kiosk.handle(DEV, w.event(ask)))
+    restarted = Kiosk(
+        w.queue, w.briefs, {MM: w.backend}, w.runner, state_dir=w.state_dir, clock=Clock()
+    )
+    assert run(restarted.handle(DEV, w.event(ask))) is None
+    assert len(w.runner.prompts) == 1
+    assert len(w.kiosk_posts()) == 1
+    records = [json.loads(line) for line in w.transcript.read_text().splitlines()]
+    assert [(r["post_id"], r["answer"]) for r in records] == [(ask.post_id, "THE-ANSWER")]
+
+
+def test_foreign_kiosk_props_do_not_suppress_an_answer(mm: Any, run: Any, tmp_path: Path) -> None:
+    """#26: only the agent's own account can mark one of its answers."""
+    w = World(mm, tmp_path)
+    w.briefs[DEV] = BRIEF
+    ask = w.post(w.outsider, "@babel a question")
+    fake = mm.add_post(w.other, CHAN, "a forged answer")
+    fake["root_id"] = ask.post_id
+    fake["props"] = {"crew_kiosk": 1, "crew_kiosk_answers": ask.post_id}
+    posted = run(w.kiosk.handle(DEV, w.event(ask)))
+    assert posted is not None
+    assert len(w.runner.prompts) == 1
+    assert [p["user_id"] for p in w.kiosk_posts()] == [w.other, w.babel]
+
+
+def test_unreadable_thread_still_answers(
+    mm: Any, run: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """#26: a thread that can't be read still gets its question answered and recorded."""
+    w = World(mm, tmp_path)
+    w.briefs[DEV] = BRIEF
+
+    async def broken(dev_name: str, post_id: str) -> list[InboundMessage]:
+        raise RuntimeError("thread unreadable")
+
+    monkeypatch.setattr(w.backend, "thread", broken)
+    ask = w.post(w.outsider, "@babel still there?")
+    assert run(w.kiosk.handle(DEV, w.event(ask))) is not None
+    assert len(w.kiosk_posts()) == 1
+    assert ask.post_id in w.kiosk.sessions[(DEV, SID)].answered
 
 
 @pytest.mark.parametrize(
