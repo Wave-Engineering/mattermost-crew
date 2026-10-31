@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-10-31
+
+Research kiosks answer from their server's corpus, each confined to its server. The broker
+keeps its bots in tagged channels, adopts orphans and sets avatars. A switch command or DM
+sent while the broker was offline is no longer lost, an agent's DM wakes its recipient, and
+the daemon's journal is no longer flooded by httpx request lines.
+
+**Rollback.** Going back to v0.2.6 needs no change to the broker's config: v0.2.6 ignores
+`channel_tag`, `membership_reconcile_s` and the broker's `dm_cursor.json`. **On the daemon, set
+`kiosk_research` off first if it is on**, because v0.2.6 has no research runner. Avatars the
+broker set stay set.
+
 ### Added
 
 - **The broker keeps its bots in every channel tagged `crew-<crew>`** (#167, D-116, which extends D-109).
@@ -91,9 +103,33 @@ All notable changes to this project are recorded here. The format follows
   social as well as lengthen it (the docs said it extends). Durations take no spaces, and 30
   days is allowed. The loop guard's window is a fixed hour, and the messages it drops count
   toward it.
+- **The daemon no longer logs every HTTP request** (#157, #180). The root logger runs at INFO, so
+  httpx logged one `HTTP Request:` line per poll from every agent's stream, and a busy host's
+  journal rotated within hours. `crewchat serve` sets `httpx` and `httpcore` to WARNING; the
+  `crewchat.*` loggers stay at INFO. Discord's write loop now logs each retried 429, the one
+  failure that had no line of its own.
 
 ### Fixed
 
+- **A broker call no longer runs past its request's deadline** (#158). A `call_deadline`
+  context bounds the thread's Mattermost calls: each request's timeout is capped at the time
+  left, and a call raises `DeadlineExceeded` rather than send past the deadline or wait out a
+  429 beyond it. `mint` and `remint` run under their request's deadline less a reserve, and
+  answer `expired` when it fires before a token exists. A token-creating request runs uncapped,
+  so its reply is never dropped and the token is always recorded. Prune and the DM listener
+  set no deadline and keep their plain retries.
+- **The daemon's shutdown and the doorbell no longer hang or misfire** (#152).
+  - Detaching an agent stops its tasks concurrently. One still running after 10 s is
+    abandoned, with one ERROR line and its stack.
+  - `crewchat serve` bounds its teardown the same way.
+  - An abandoned task never reports or reopens a stream for an agent that left.
+  - After a cache miss, the filter re-checks its lookup before weighing a failed round, so a
+    bot that an answering broker lists is admitted even while a trusted crew's broker hangs.
+  - `crewchat-doorbell` treats a `BrokenPipeError` on send as a daemon restart, and waits
+    through it instead of exiting 4.
+- **`crewkiosk-broker` reports its release as its MCP `serverInfo` version** (#184). It
+  reported a copy, `0.2.6`, that a version bump had to remember; it now reads the package's
+  own `__version__`.
 - **A switch command sent while the broker is offline is no longer lost** (#159). On every
   websocket `hello` the broker reads the partner's DMs since its cursor, `dm_cursor.json`. One
   under 10 minutes old is applied; an older one is applied only if it widens nothing on the

@@ -2299,3 +2299,10 @@ def test_stop_writes_the_metrics_when_the_control_socket_fails(
     asyncio.run(main())
     [metrics] = (tmp_path / "state" / "metrics").glob(f"{SERVER}-*.json")
     assert json.loads(metrics.read_text())["ops"] == 2
+
+
+def test_server_info_version_is_the_packages() -> None:
+    """serverInfo reports the release, not a copy a version bump can miss (v0.2.7 caught one)."""
+    import crewkiosk
+
+    assert crewkiosk.__version__ == broker.VERSION

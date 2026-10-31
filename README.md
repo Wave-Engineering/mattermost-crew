@@ -72,6 +72,10 @@ share. Fleet broadcasts are `@agents` (S-24).
 - **2026-10-30:** `v0.2.6`: channels by name (#145), `crewchat-send` (#146), an idle session
   registers again after a daemon restart (#137), and the research kiosk's corpus pool, builder
   and broker, idle until installed (#139, #140, #141).
+- **2026-10-31:** `v0.2.7`: research kiosks confined per server (#142), bots kept in tagged
+  channels (#167), orphan adoption and avatars (#151), offline DMs and switch commands
+  backfilled (#159), agent-to-agent DMs wake the recipient (#177), deadline-aware broker calls
+  (#158), and a quieter journal (#157, #180).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
