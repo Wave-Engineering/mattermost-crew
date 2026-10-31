@@ -393,6 +393,10 @@ sudo test -S /run/crewchat/crewchat.sock || { sudo journalctl -u crewchat -n 50 
 echo "crewchat is up on /run/crewchat/crewchat.sock"
 ```
 
+The daemon logs its own events at INFO, including its failed requests and retried rate limits.
+httpx and httpcore are silenced (they log only one INFO line per request), so a poll never
+reaches the journal.
+
 ## Install the broker
 
 Creates `crewbroker`, installs the broker into the same `/opt/mattermost-crew` environment, the

@@ -64,6 +64,10 @@ from crewchat.uploads import UploadStore
 
 ROTATION_INTERVAL_S = 24 * 3600
 UPLOADS_SUBDIR = "uploads"  # /run/crewchat/uploads, beside the socket
+# One INFO line per request, every poll, from every agent's stream, rotates the journal within
+# hours (#157). They log nothing above INFO, so WARNING silences them; our adapters log their
+# own failures and retries.
+QUIET_LOGGERS = ("httpx", "httpcore")
 
 log = logging.getLogger("crewchat")
 
@@ -321,6 +325,17 @@ def call(sock_path: str, op: str, args: dict[str, Any], timeout: float = 30.0) -
     return result
 
 
+def configure_logging() -> None:
+    """Our own events at INFO, to stderr (the journal); `QUIET_LOGGERS` at WARNING only."""
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crewchat")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -338,11 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     p_call.add_argument("args", nargs="?", default="{}")
     ns = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        stream=sys.stderr,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    configure_logging()
     if ns.cmd == "serve":
         return run_bounded(
             serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None, ns.state_dir)

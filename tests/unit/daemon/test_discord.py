@@ -254,12 +254,17 @@ def test_reply_and_mentions_are_mapped(discord: FakeDiscord, credential: Path, r
     assert msgs[-1].author_id == HUMAN["id"] and msgs[-1].ts > 0
 
 
-def test_429_waits_and_retries(discord: FakeDiscord, credential: Path, run: Any) -> None:
+def test_429_waits_and_retries(
+    discord: FakeDiscord, credential: Path, run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The retry says so: with httpx silenced (#180), nothing else would."""
     sleeps = Sleeps()
     b = backend(discord, credential, sleep=sleeps)
     discord.rate_limit_next = 1
-    msg = run(b.send(ME, C1, "hello"))
+    with caplog.at_level("WARNING", logger="crewchat.adapters.discord"):
+        msg = run(b.send(ME, C1, "hello"))
     assert msg.text.startswith("hello") and sleeps.waits == [0.25]
+    assert "429 on POST" in caplog.text and "retrying in 0.2 s" in caplog.text
 
 
 # -- the credential --------------------------------------------------------------------------
