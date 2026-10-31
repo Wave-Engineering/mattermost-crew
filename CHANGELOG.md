@@ -6,6 +6,13 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The broker reads a caller's deadline against epoch time** (#189). The daemon stamps each
+  call's `deadline` with `time.time()`, and since #158 the broker read it against its injected
+  clock instead. In production the two agree. In the E2E world, which moves that clock, every
+  mint after E2E-02 could be refused as `expired`, so E2E-03 was a race on every leg.
+
 ## [0.2.7] — 2026-10-31
 
 Research kiosks answer from their server's corpus, each confined to its server. The broker

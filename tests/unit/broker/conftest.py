@@ -339,4 +339,7 @@ def crew_config() -> CrewConfig:
 
 @pytest.fixture
 def broker(fake: FakeMattermost, crew_config: CrewConfig, tmp_path: Path, clock: Clock) -> Broker:
-    return Broker(crew_config, fake, tmp_path / "state", clock=clock)
+    # One fake time for both clocks, so a test's deadlines are on the clock it moves.
+    return Broker(
+        crew_config, fake, tmp_path / "state", clock=clock, epoch=lambda: clock.now.timestamp()
+    )
