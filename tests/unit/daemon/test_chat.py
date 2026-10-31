@@ -339,6 +339,19 @@ def test_clear_stale_removes_leftovers(tmp_path: Path, caplog: pytest.LogCapture
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
 
 
+def test_clear_stale_unlinks_a_symlink_without_following_it(tmp_path: Path) -> None:
+    """A symlink in the directory, even to a directory, is removed itself; its target stays."""
+    root = tmp_path / "uploads"
+    root.mkdir()
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "keep").write_bytes(b"x")
+    (root / "link").symlink_to(target)
+    assert UploadStore(root).clear_stale() == 1
+    assert list(root.iterdir()) == []
+    assert (target / "keep").exists()
+
+
 def test_clear_stale_on_missing_or_empty_dir_is_quiet(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
