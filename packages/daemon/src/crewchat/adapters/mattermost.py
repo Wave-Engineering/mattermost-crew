@@ -18,6 +18,10 @@ two distinct authors (R-01).
   websocket, it only stops its events (§4.8). The reconnect asks the server to resume the
   connection (`connection_id`, `sequence_number`), so events in the gap are still delivered
   while the server holds them; the doorbell's cursor replay covers the rest (R-28).
+- A token retired on one server (the allowlist, #117, or a deactivated account, #127) closes
+  that agent's doorbell task and stream on that server, and on no other (`close_server`,
+  #155). A websocket the server closes before its first frame sends the stream to
+  `GET /users/me`, whose 401 is what reaches a deactivated account's remint.
 - **Cursor replay** (R-28, Story 3.2). `stream(dev_name, cursor=...)` keeps the agent's position:
   the cursor's time at start, then the newest post it yielded. On every connect after the
   first, and on the first when a cursor was given, it reads the posts created since that
@@ -76,7 +80,7 @@ from crewchat.adapters.base import (
     StreamCursor,
 )
 from crewchat.protocol import PROTO
-from crewchat.tokens import Unauthorized
+from crewchat.tokens import BrokerError, Unauthorized
 
 PING_INTERVAL_S = 30.0  # CT-07
 PING_TIMEOUT_S = 30.0
@@ -965,10 +969,18 @@ class MattermostBackend:
             if agent.user_id is None:
                 try:
                     await self.user_id(dev_name)
-                except (KeyError, MattermostAPIError, Unauthorized, httpx.HTTPError) as exc:
+                except (
+                    KeyError,
+                    MattermostAPIError,
+                    Unauthorized,
+                    BrokerError,
+                    httpx.HTTPError,
+                ) as exc:
                     log.warning("stream %s: who am I: %s", dev_name, exc)
                     reason = "unauthorized" if isinstance(exc, Unauthorized) else str(exc)
                     on_status(False, f"cannot read the agent's user: {reason}")
+                    if agent.closed:  # a `deactivated` remint retired the token (#155)
+                        break
                     await self._sleep(next(delays))
                     continue
             ws = await self._open(dev_name, agent)
@@ -1008,6 +1020,11 @@ class MattermostBackend:
                 if not agent.rotated and not agent.closed:
                     log.warning("websocket %s on %s lost: %s", dev_name, self.server_id, exc)
                     on_status(False, f"connection lost: {exc}")
+                    if not agent.hello:
+                        # Closed before its first frame, as for a deactivated account: the
+                        # next pass asks `GET /users/me`, whose 401 refreshes, and a
+                        # `deactivated` remint retires the token and closes this stream (#155).
+                        agent.user_id = None
             finally:
                 agent.ws = None
                 with suppress(Exception):
@@ -1041,6 +1058,12 @@ class MattermostBackend:
         held = self._clients.pop(dev_name, None)
         if held is not None:
             await held.stack.aclose()
+
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        """`dev_name`'s token on `server_id` was retired (#155). One backend is one server, so
+        on this one it is `close_agent`; the store never closes another server's stream."""
+        if server_id == self.server_id:
+            await self.close_agent(dev_name)
 
     async def aclose(self) -> None:
         for dev_name in list(self._agents):

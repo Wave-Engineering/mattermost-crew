@@ -909,6 +909,9 @@ class DiscordBackend:
         if agent is not None:
             agent.closed = True
 
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        """Not a Mattermost server: nothing to close."""
+
     async def aclose(self) -> None:
         for dev_name in list(self._agents):
             await self.close_agent(dev_name)

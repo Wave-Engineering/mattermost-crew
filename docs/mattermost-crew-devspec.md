@@ -262,7 +262,7 @@ Agents on one host, including containers on a common host, are inside one trust 
 
 ### 4.8 Daily Upkeep
 
-1. The **daemon** rotates each agent registered in the last 30 days, paced under the rate limit (R-05, CT-06). It requests a new token (`remint`), swaps it in, reconnects that agent's websocket, then asks the broker to revoke the old token (`revoke`). Revocation does not close a websocket, so rotating without reconnecting would leave the agent deaf. An agent with no `register` in 30 days has its websocket closed and is dropped from rotation.
+1. The **daemon** rotates each agent registered in the last 30 days, paced under the rate limit (R-05, CT-06). It requests a new token (`remint`), swaps it in, reconnects that agent's websocket, then asks the broker to revoke the old token (`revoke`). Revocation does not close a websocket, so rotating without reconnecting would leave the agent deaf. An agent with no `register` in 30 days has its websocket closed and is dropped from rotation. A token retired on one server (the allowlist, #117, or a deactivated account, #127) closes that agent's doorbell task and stream on that server, and on no other (#155).
 2. The broker deactivates bot accounts with no `register` in 30 days (R-30).
 3. The kiosk takes a new brief whenever the shim pushes one after the seed is rewritten (R-32).
 

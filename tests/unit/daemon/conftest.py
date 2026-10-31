@@ -123,6 +123,9 @@ class FakeAdapter:
     async def close_agent(self, dev_name: str) -> None:
         self.events.append(("close", dev_name))
 
+    async def close_server(self, dev_name: str, server_id: str) -> None:
+        self.events.append(("close_server", dev_name, server_id))
+
 
 class Clock:
     def __init__(self, start: datetime) -> None:
@@ -239,6 +242,9 @@ class FakeMattermost:
         self.sockets: list[FakeWebSocket] = []
         self.connects: list[dict[str, Any]] = []
         self.fail_connects = 0
+        # The next N upgrades succeed and then close before `hello`, as for a deactivated
+        # account (#155).
+        self.close_before_hello = 0
         # path fragment -> how many more requests whose path holds it get an error status:
         # 503, or the fragment's status in `error_status`; as a proxy's HTML page, with no
         # Mattermost error `id`, for a fragment in `error_html`
@@ -306,6 +312,11 @@ class FakeMattermost:
         if self.fail_connects:
             self.fail_connects -= 1
             raise OSError("connection refused")
+        if self.close_before_hello:
+            self.close_before_hello -= 1
+            dropped = FakeWebSocket(self, "", token, uri)
+            await dropped.close()
+            return dropped
         user_id = self.tokens.get(token)
         if user_id is None:
             raise InvalidStatus(Response(401, "Unauthorized", Headers()))

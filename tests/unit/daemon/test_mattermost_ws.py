@@ -21,6 +21,7 @@ from crewchat.adapters.mattermost import (
     MattermostBackend,
     backoff_delays,
 )
+from crewchat.tokens import BrokerError, Unauthorized
 
 SID = "dev"
 DEV = "babel.oaw"
@@ -224,6 +225,93 @@ def test_close_agent_ends_the_stream(mm: Any, recording_sleep: Any, run: Any) ->
 
     run(scenario())
     assert len(mm.connects) == 1
+
+
+def test_close_server_ignores_another_server(mm: Any, recording_sleep: Any, run: Any) -> None:
+    """#155: a retire on another server leaves this backend's stream open; its own ends it."""
+    tokens = Tokens(mm)
+    me = tokens.add(DEV)
+    b = make(mm, tokens, recording_sleep)
+
+    async def scenario() -> None:
+        gen = b.stream(DEV)
+        task = asyncio.ensure_future(recv(gen))
+        await until(lambda: mm.open_sockets(me))
+        await b.close_server(DEV, "other")
+        await asyncio.sleep(0.01)
+        assert mm.open_sockets(me) and not task.done()
+        await b.close_server(DEV, SID)
+        with pytest.raises(StopAsyncIteration):
+            await task
+        await b.aclose()
+
+    run(scenario())
+    assert len(mm.connects) == 1
+
+
+class Deactivating(Tokens):
+    """The store's side of a `deactivated` remint: a 401 retires the token on this server,
+    which closes the backend's stream there (#127, #155), and the refresh fails."""
+
+    backend: MattermostBackend
+
+    async def call_with_refresh(self, dev: str, server_id: str, request: Any) -> Any:
+        try:
+            return await request(self.held[dev])
+        except Unauthorized:
+            self.refreshes += 1
+            await self.backend.close_server(dev, server_id)
+            raise BrokerError("remint", f"deactivated: {dev} was deactivated") from None
+
+
+def test_close_before_first_frame_probes_and_retires(
+    mm: Any, recording_sleep: Any, run: Any
+) -> None:
+    """#155: a websocket the server closes before `hello` sends the stream to `GET /users/me`;
+    its 401 and the `deactivated` remint end the stream, which then never reconnects."""
+    tokens = Deactivating(mm)
+    tokens.add(DEV)
+    b = make(mm, tokens, recording_sleep)
+    tokens.backend = b
+    status: list[tuple[bool, str]] = []
+
+    async def scenario() -> None:
+        await b.user_id(DEV)  # known from before the account was deactivated
+        mm.tokens.pop(tokens.held[DEV])
+        mm.close_before_hello = 10
+        gen = b.stream(DEV, on_status=lambda up, why: status.append((up, why)))
+        with pytest.raises(StopAsyncIteration):
+            await recv(gen)
+        connects = len(mm.connects)
+        await asyncio.sleep(0.01)
+        assert len(mm.connects) == connects == 1
+
+    run(scenario())
+    assert tokens.refreshes == 1
+    assert [r[1] for r in mm.requests].count("/users/me") == 2
+    assert any("deactivated" in why for up, why in status if not up)
+
+
+def test_drop_after_frames_does_not_probe(mm: Any, recording_sleep: Any, run: Any) -> None:
+    """#155: a connection that delivered frames and then dropped reconnects with no
+    `GET /users/me`."""
+    tokens = Tokens(mm)
+    me = tokens.add(DEV)
+    b = make(mm, tokens, recording_sleep)
+
+    async def scenario() -> None:
+        gen = b.stream(DEV)
+        task = asyncio.ensure_future(recv(gen))
+        await until(lambda: mm.open_sockets(me) and b._agents[DEV].hello)
+        asked = [r[1] for r in mm.requests].count("/users/me")
+        await mm.open_sockets(me)[0].close()
+        await until(lambda: len(mm.connects) == 2 and mm.open_sockets(me))
+        assert [r[1] for r in mm.requests].count("/users/me") == asked
+        await b.close_agent(DEV)
+        task.cancel()
+        await b.aclose()
+
+    run(scenario())
 
 
 def test_default_connect_pings_every_30s(monkeypatch: pytest.MonkeyPatch, run: Any) -> None:

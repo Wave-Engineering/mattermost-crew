@@ -650,6 +650,73 @@ async def release(sources: list[Stubborn], tasks: list[asyncio.Task[Any]]) -> No
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def test_close_server_stops_one_task(tmp_path: Path, run: Any) -> None:
+    """#155: a server retired for one agent stops that one task; another server's, and other
+    backends', keep running, and another server's id stops nothing."""
+    other = "mattermost:prod"
+    bell = Doorbell(
+        {MM: Scripted(), other: Scripted(), "discord": Scripted()},
+        CursorStore(tmp_path),
+        sleep=fast_sleep,
+    )
+
+    async def scenario() -> None:
+        bell.attach(DEV, [MM, other, "discord"])
+        await asyncio.sleep(0.01)
+        await asyncio.wait_for(bell.close_server(DEV, "elsewhere"), 1)
+        assert bell.attached(DEV) == sorted([MM, other, "discord"])
+        await asyncio.wait_for(bell.close_server(DEV, SID), 1)
+        assert bell.attached(DEV) == sorted([other, "discord"])
+        assert bell.queue(DEV).empty()  # stopped on purpose: no `backend.down`
+        await bell.aclose()
+
+    run(scenario())
+
+
+class ClosesItself:
+    """A stream that retires its own server mid-stream, as a `deactivated` remint on the
+    stream's refresh does, and then ends."""
+
+    def __init__(self) -> None:
+        self.bell: Doorbell | None = None
+        self.streams = 0
+        self.closed_from_inside = False
+
+    async def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        self.streams += 1
+        assert self.bell is not None
+        await asyncio.wait_for(self.bell.close_server(dev_name, SID), 1)
+        self.closed_from_inside = True
+        on_status(False, "the adapter ended the stream")
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+
+def test_close_server_from_inside_its_task(tmp_path: Path, run: Any) -> None:
+    """#155: `close_server` called from the task it stops returns at once; the task ends with
+    its stream, is not restarted, and queues no `backend.down`."""
+    src = ClosesItself()
+    bell = Doorbell({MM: src}, CursorStore(tmp_path), sleep=fast_sleep)
+    src.bell = bell
+
+    async def scenario() -> None:
+        bell.attach(DEV, [MM])
+        (task,) = doorbell_tasks(DEV)
+        await asyncio.wait_for(task, 1)
+        await asyncio.sleep(0.02)  # room for a restart, were there one
+        assert src.closed_from_inside and src.streams == 1
+        assert bell.attached(DEV) == [] and doorbell_tasks(DEV) == []
+        assert bell.queue(DEV).empty()
+
+    run(scenario())
+
+
 def test_detach_recancels_a_task_that_swallowed_one_cancel(tmp_path: Path, run: Any) -> None:
     """#152: a task that absorbed the first cancel is cancelled again, and ends."""
     src = Stubborn(swallow=1)
