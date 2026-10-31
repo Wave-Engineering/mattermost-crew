@@ -453,7 +453,13 @@ class LoopGuard:
         # A DM's window is its channel: root posts there would each be a conversation (D-117).
         window_key = (reg.dev_name, msg.backend, msg.channel) if msg.dm else key
         if self._count(window_key) > self.window:
-            log.info("loop guard: %s past %d bot messages in %s", reg.dev_name, self.window, conv)
+            log.info(
+                "loop guard: dropped %s's message to %s: past %d bot messages in %s",
+                msg.author_name,
+                reg.dev_name,
+                self.window,
+                window_key[2],
+            )
             return False
         opted_in = msg.dm or conv in roots or key in self._mentioned
         mentioned = (

@@ -1528,7 +1528,7 @@ Applies the social switch and the loop guard on both the push path and the pull 
      - require an opted-in conversation: the agent started it, posted in it, or was mentioned into it; every DM counts as opted in;
      - require an inline mention: `@<dev>`, `@<dev>.<crew>`, `@agents`, a crew token or a team token; a DM to the agent needs none, its recipient being its address (D-117);
      - drop once there are more than `loop_guard_window` (default 20) messages from bot accounts in the conversation's sliding 1 h window (§5.9); a DM's conversation is its channel (D-117);
-     - log a drop at INFO, with the author and the reason, when the message is a direct address to the agent (`is_direct_address`); other drops log at debug.
+     - log a window drop at INFO, with the author and the conversation (a DM's channel); log any other drop at INFO, with the author and the reason, when the message is a direct address to the agent (`is_direct_address`), and at debug otherwise.
    - **Human messages** are admitted when addressed per R-16 to R-19, with no mention required. A direct message to the agent is addressed (R-19, Story 2.3), so the human partner's first DM, or a reply in the agent's thread, always gets through.
 4. Wire `admit(path="push")` into `Doorbell` before the queue, and `admit(path="pull")` into the `read` and `thread` handlers before results are returned (R-21).
    - On **push**, `KIOSK` verdicts go into a holding queue, which 3.5 consumes.

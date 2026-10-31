@@ -108,15 +108,22 @@ def test_loop_guard_counts_dropped_messages(guard: tuple[LoopGuard, Mono]) -> No
     assert g.admit(msg("@babel calmer now", root=MINE), REG) is True
 
 
-def test_loop_guard_dm_window_per_channel(guard: tuple[LoopGuard, Mono]) -> None:
+def test_loop_guard_dm_window_per_channel(
+    guard: tuple[LoopGuard, Mono], caplog: pytest.LogCaptureFixture
+) -> None:
     """D-117: in a DM every root post is its own conversation, so the window is the channel.
-    Two agents trading root posts in one DM still hit `loop_guard_window`."""
+    Two agents trading root posts in one DM still hit `loop_guard_window`, and the drop's
+    INFO line names the author and the DM channel, not the post."""
     g, mono = guard
+    caplog.set_level("INFO", logger="crewchat.filters")
     verdicts = []
     for _ in range(21):
         mono.t += 1
         verdicts.append(g.admit(msg("your turn", dm=True), REG))  # a new root post each time
     assert verdicts == [True] * 20 + [False]
+    assert [r.getMessage() for r in caplog.records] == [
+        "loop guard: dropped kessel.oaw's message to babel: past 20 bot messages in chan"
+    ]
     # Another DM channel has its own window.
     other = dataclasses.replace(msg("hi", dm=True), channel="chan-2")
     assert g.admit(other, REG) is True
