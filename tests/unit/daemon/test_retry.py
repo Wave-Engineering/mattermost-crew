@@ -119,6 +119,52 @@ def test_a_newer_register_supersedes_the_retry(daemon: Any) -> None:
     assert first.unavailable == ["prod"] and newer.unavailable == ["prod"]
 
 
+def test_a_retry_queued_behind_a_newer_register_mints_nothing(daemon: Any) -> None:
+    """The register holds the store lock when the retry's mint starts waiting on it, so only
+    the check inside the lock sees the registration was replaced (`retry_unavailable`)."""
+    prod = daemon.broker("oaw", "prod")
+    real_call = prod.call
+
+    async def scenario() -> tuple[Registration, Registration]:
+        first = await daemon.registry.register("babel", "oaw", "s1")
+        prod.fail.clear()
+        entered, release = asyncio.Event(), asyncio.Event()
+        block = {"next_mint": True}
+
+        async def call(op: str, args: dict[str, Any]) -> dict[str, Any]:
+            if op == "mint" and block["next_mint"]:
+                block["next_mint"] = False
+                entered.set()
+                await release.wait()
+            return await real_call(op, args)
+
+        prod.call = call  # type: ignore[method-assign]
+        tasks: list[asyncio.Task[Registration]] = []
+
+        async def newer_holds_the_lock() -> None:
+            tasks.append(asyncio.create_task(daemon.registry.register("babel", "oaw", "s2")))
+            await asyncio.wait_for(entered.wait(), 2)
+
+        retry = RegisterRetry(daemon.registry, sleep=Sleeps({0: newer_holds_the_lock}))
+        retry.schedule(first, lambda r: None)
+        for _ in range(5):
+            await asyncio.sleep(0)  # the retry passes `_run`'s check and queues on the lock
+        assert daemon.registry.get("babel") is first and retry.pending("babel")
+        release.set()
+        newer = await asyncio.wait_for(tasks[0], 2)
+        await settle(retry)
+        return first, newer
+
+    first, newer = asyncio.run(scenario())
+    assert daemon.registry.get("babel") is newer
+    assert newer.backends == ["mattermost:dev", "mattermost:prod", "discord"]
+    # The failed register's mint and the newer register's: the stale retry added none, so
+    # it rotated nothing out, and it left the replaced registration as it was.
+    assert mints(daemon, "prod") == 2
+    assert prod.ops("revoke") == []
+    assert first.unavailable == ["prod"]
+
+
 def test_cancel_while_sleeping_ends_the_retry(daemon: Any) -> None:
     async def scenario() -> None:
         reg = await daemon.registry.register("babel", "oaw", "s1")
