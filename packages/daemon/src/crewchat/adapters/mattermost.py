@@ -12,7 +12,10 @@ two distinct authors (R-01).
   event becomes an `InboundMessage` whose `mentions` are the event's own `mentions` field,
   never parsed from the text (R-29). The agent's own posts are dropped by user ID, whatever
   their text says (R-04). Its `dm` is true when the event's channel is a direct-message
-  channel (`channel_type` `D`) whose two members are the author and the agent (R-19).
+  channel (`channel_type` `D`) whose two members are the author and the agent (R-19). On
+  pull (`read`, `thread`, `read_one`), `dm` is true for a post in a DM channel one of whose
+  two members is the reading agent, its own posts included: `GET /channels/{id}`, cached per
+  (agent, channel), since a channel's type and members never change (#155).
 - `on_token_rotated(dev_name)` closes the agent's websocket when its token changed, and the
   stream reopens it at once with the new token: revoking a token doesn't close an open
   websocket, it only stops its events (§4.8). The reconnect asks the server to resume the
@@ -379,6 +382,9 @@ class MattermostBackend:
         self._clients: dict[str, _Client] = {}
         self._agents: dict[str, _Agent] = {}
         self._users: dict[str, dict[str, Any]] = {}  # author ID -> user object, cached
+        # (Dev-Name, channel ID) -> a DM channel with that agent (#155). A channel's type and
+        # members never change, so it never expires.
+        self._dm_channels: dict[tuple[str, str], bool] = {}
         # (dev_name, name as given) -> (channel ID, expiry): per agent, as each resolves as
         # itself, so one agent never learns a private channel's ID from another's lookup (#145).
         self._channels: dict[tuple[str, str], tuple[str, float]] = {}
@@ -483,15 +489,43 @@ class MattermostBackend:
             author_resolved=bool(user),
         )
 
+    async def _pull_dm(
+        self, dev_name: str, client: MattermostClient, channel_id: str, me: str
+    ) -> bool:
+        """Is `channel_id` a DM channel one of whose two members is the agent `me` (#155)? On
+        pull, its own posts there count too. A failed lookup is False, and asked again."""
+        key = (dev_name, channel_id)
+        held = self._dm_channels.get(key)
+        if held is not None:
+            return held
+        try:
+            channel = await client.get_channel(channel_id)
+        except AuthenticationError:
+            raise  # the store's refresh path
+        except MattermostAPIError as exc:
+            log.warning("channel %s on %s: %s", channel_id, self.server_id, exc)
+            return False
+        members = str(channel.get("name", "")).split("__")
+        dm = channel.get("type") == "D" and len(members) == 2 and me in members
+        self._dm_channels[key] = dm
+        return dm
+
     async def _messages(
-        self, client: MattermostClient, result: Mapping[str, Any]
+        self, client: MattermostClient, result: Mapping[str, Any], *, dev_name: str, me: str
     ) -> list[InboundMessage]:
-        """A `{posts, order}` list, oldest first."""
+        """A `{posts, order}` list, oldest first, each with its pull `dm` (#155)."""
         posts = result.get("posts") or {}
         if not isinstance(posts, dict):
             return []
         ordered = sorted(posts.values(), key=lambda p: (p.get("create_at", 0), p.get("id", "")))
-        return [await self.message(client, p) for p in ordered]
+        return [
+            await self.message(
+                client,
+                p,
+                dm=await self._pull_dm(dev_name, client, str(p.get("channel_id", "")), me),
+            )
+            for p in ordered
+        ]
 
     # -- channel names (#145) ---------------------------------------------------------------
     async def _channel_id(self, dev_name: str, client: MattermostClient, channel: str) -> str:
@@ -663,6 +697,7 @@ class MattermostBackend:
         require_mm_id(post_id, "post_id")
         if channel:
             require_channel_name(channel)
+        me = await self.user_id(dev_name)
 
         async def request(client: MattermostClient) -> InboundMessage:
             channel_id = await self._channel_id(dev_name, client, channel) if channel else ""
@@ -673,7 +708,8 @@ class MattermostBackend:
             if channel_id and str(post.get("channel_id", "")) != channel_id:
                 self._forget_channel(dev_name, channel, channel_id)
                 raise NotFound(f"post {post_id} in {channel}")
-            return await self.message(client, post)
+            dm = await self._pull_dm(dev_name, client, str(post.get("channel_id", "")), me)
+            return await self.message(client, post, dm=dm)
 
         return await self._call(dev_name, request)
 
@@ -707,20 +743,24 @@ class MattermostBackend:
                 return await client.get_posts_since(channel_id, int(since * 1000))
             return await client.get_posts(channel_id, per_page=limit or DEFAULT_READ_LIMIT)
 
+        me = await self.user_id(dev_name)
+
         async def request(client: MattermostClient) -> list[InboundMessage]:
             result = await self._on_channel(
                 dev_name, client, channel, lambda cid: fetch(client, cid)
             )
-            return await self._messages(client, result)
+            return await self._messages(client, result, dev_name=dev_name, me=me)
 
         messages = await self._call(dev_name, request)
         return messages[-limit:] if limit else messages
 
     async def thread(self, dev_name: str, post_id: str) -> list[InboundMessage]:
         require_mm_id(post_id, "thread")
+        me = await self.user_id(dev_name)
 
         async def request(client: MattermostClient) -> list[InboundMessage]:
-            return await self._messages(client, await client.get_thread(post_id))
+            result = await client.get_thread(post_id)
+            return await self._messages(client, result, dev_name=dev_name, me=me)
 
         return await self._call(dev_name, request)
 

@@ -253,6 +253,8 @@ class FakeMattermost:
         self.error_html: set[str] = set()
         # team id -> the channels every user is in there (`GET /users/me/teams/{id}/channels`)
         self.teams: dict[str, list[dict[str, Any]]] = {}
+        # channel id -> its channel object (`GET /channels/{id}`, #155)
+        self.channels: dict[str, dict[str, Any]] = {}
         self._n = itertools.count(1)
 
     def _id(self, prefix: str) -> str:
@@ -385,6 +387,11 @@ class FakeMattermost:
         if request.method == "GET" and parts[:3] == ["users", "me", "teams"] and len(parts) == 5:
             channels = self.teams.get(parts[3], [])
             return httpx.Response(200, json=[dict(c) for c in channels])
+        if request.method == "GET" and parts[0] == "channels" and len(parts) == 2:
+            channel = self.channels.get(parts[1])
+            return httpx.Response(200, json=channel) if channel else httpx.Response(
+                404, json={"id": "app.channel.get.existing.app_error"}
+            )
         if request.method == "GET" and parts[0] == "channels" and parts[2:] == ["posts"]:
             posts = {k: p for k, p in self.posts.items() if p["channel_id"] == parts[1]}
             since = request.url.params.get("since")
