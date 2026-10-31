@@ -46,7 +46,14 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from crewbroker import config as cfg
 from crewbroker.avatar import identicon_png
 from crewbroker.config import CrewConfig
-from crewbroker.mattermost import MattermostAPI, MattermostClient, MattermostError, NotFound
+from crewbroker.mattermost import (
+    DeadlineExceeded,
+    MattermostAPI,
+    MattermostClient,
+    MattermostError,
+    NotFound,
+    call_deadline,
+)
 from crewbroker.membership import DEADLINE_RESERVE_S, Membership
 from crewbroker.mint import (
     SquattedAccount,
@@ -93,6 +100,12 @@ HANDLED_DMS_MAX = 500
 log = logging.getLogger("crewbroker")
 
 Clock = Callable[[], datetime]
+
+
+def _call_bound(deadline: float | None) -> float | None:
+    """The `call_deadline` for an op with the caller's `deadline` (#158): `DEADLINE_RESERVE_S`
+    early, so the reply still reaches the daemon in time."""
+    return deadline - DEADLINE_RESERVE_S if deadline is not None else None
 
 
 def utc_now() -> datetime:
@@ -209,18 +222,31 @@ class Broker:
         name = self._name(args)
         held = self._held(args)
         deadline = self._deadline(args)
+        with call_deadline(_call_bound(deadline)):
+            return self._mint(name, held, deadline)
+
+    def _mint(
+        self, name: str, held: str | EllipsisType | None, deadline: float | None
+    ) -> dict[str, Any]:
         with self._lock:
             self._check_deadline(deadline)
             try:
                 bot_id = ensure_bot(self.client, name, self.accounts, self.config.broker_user_id)
+                now = self.clock()
+                record_register(self.accounts, name, now)
+                token = mint_token(
+                    self.client, bot_id, self.tokens, expiry_supported=self._expiry(), now=now
+                )
             except SquattedAccount as exc:
                 log.error("mint refused: %s", exc)
                 raise OpError("squatted", str(exc)) from exc
-            now = self.clock()
-            record_register(self.accounts, name, now)
-            token = mint_token(
-                self.client, bot_id, self.tokens, expiry_supported=self._expiry(), now=now
-            )
+            except DeadlineExceeded as exc:
+                # No token was made: `create_token` runs `uncapped`, so its deadline only
+                # refuses to send it or to wait out a 429 (#158).
+                log.warning("mint of %s expired: %s", name, exc)
+                raise OpError("expired", str(exc)) from exc
+            # Past here a token exists: a deadline that fires leaves it to the next call's
+            # supersede (#41), and the steps below report their errors, never raise them.
             self._supersede(bot_id, held, token.token_id)
         log.info("mint: %s token %s", name, token.token_id)
         answer: dict[str, Any] = {"account": name, "token": token.token, "token_id": token.token_id}
@@ -255,26 +281,30 @@ class Broker:
         name = self._name(args)
         held = self._held(args)
         deadline = self._deadline(args)
-        with self._lock:
+        with call_deadline(_call_bound(deadline)), self._lock:
             self._check_deadline(deadline)
             acct = self.accounts.get(name)
             if acct is None:
                 raise OpError("not_found", f"{name} has never registered")
             try:
-                bot = self.client.get_bot(acct.bot_user_id)
-            except NotFound as exc:
-                raise OpError("squatted", f"{name} is no longer owned by this broker") from exc
-            if bot.get("owner_id") != self.config.broker_user_id:
-                raise OpError("squatted", f"{name} is no longer owned by this broker")
-            if bot.get("delete_at"):
-                raise OpError("deactivated", f"{name} was pruned; it must register again")
-            token = mint_token(
-                self.client,
-                acct.bot_user_id,
-                self.tokens,
-                expiry_supported=self._expiry(),
-                now=self.clock(),
-            )
+                try:
+                    bot = self.client.get_bot(acct.bot_user_id)
+                except NotFound as exc:
+                    raise OpError("squatted", f"{name} is no longer owned by this broker") from exc
+                if bot.get("owner_id") != self.config.broker_user_id:
+                    raise OpError("squatted", f"{name} is no longer owned by this broker")
+                if bot.get("delete_at"):
+                    raise OpError("deactivated", f"{name} was pruned; it must register again")
+                token = mint_token(
+                    self.client,
+                    acct.bot_user_id,
+                    self.tokens,
+                    expiry_supported=self._expiry(),
+                    now=self.clock(),
+                )
+            except DeadlineExceeded as exc:  # no token was made, as in `mint`
+                log.warning("remint of %s expired: %s", name, exc)
+                raise OpError("expired", str(exc)) from exc
             self._supersede(acct.bot_user_id, held, token.token_id)
         log.info("remint: %s token %s", name, token.token_id)
         return {"token": token.token, "token_id": token.token_id}
