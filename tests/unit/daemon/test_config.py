@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,30 @@ def test_server_research_refused(change: dict[str, Any], message: str) -> None:
     raw["mattermost"][0].update(change)
     with pytest.raises(ConfigError, match=message):
         parse_config(raw)
+
+
+@pytest.mark.parametrize(
+    ("sid", "message"),
+    [
+        ("oaw-dev", r"is \[a-z0-9_\]\+ \(no '-', no '\.'\), not 'oaw-dev'"),
+        ("dev.model", r"no '\.'"),
+        ("control", "serves no server 'control'"),
+        ("x" * 80, "too long for /run/crewkiosk-broker/x+\\.model\\.sock"),
+        ("x" * 21, "too long for its user, crewkiosk-r-x{21}$"),
+    ],
+)
+def test_research_server_id_refused(sid: str, message: str) -> None:
+    """#142: a research server's id is crewkiosk-research-units' own, or its units are never
+    written and every answer would frame to a socket that doesn't exist. The same id with
+    research off still loads."""
+    raw = _research(_raw(), id=sid)
+    raw["crews"]["oaw"][sid] = raw["crews"]["oaw"].pop("dev")
+    with pytest.raises(ConfigError, match=rf"mattermost {re.escape(sid)}\.kiosk_research: "):
+        parse_config(raw)
+    with pytest.raises(ConfigError, match=message):
+        parse_config(raw)
+    raw["mattermost"][0]["kiosk_research"] = False
+    parse_config(raw)
 
 
 def test_research_needs_allowlist_on_every_crew() -> None:

@@ -248,11 +248,12 @@ def test_it30_broker_end_to_end(stack: dict[str, Any]) -> None:
     proc, port = http_relay(run / "dev.model.sock")
     try:
         assert [message(port, AID) for _ in range(3)] == [200, 200, 429]  # max_turns 2
-        assert message(port, AID2) == 200
+        # AID2 said hello on the other server: on this one it was never admitted (#142).
+        assert message(port, AID2) == 403
     finally:
         proc.kill()
         proc.wait(timeout=10)
-    assert len(Model.seen) == 3
+    assert len(Model.seen) == 2  # the 429 and the 403 never left the broker
     for path, headers, body in Model.seen:
         assert path == "/v1/messages"
         assert headers["x-api-key"] == KEY  # the broker's key, never the kiosk's or the runner's
@@ -276,8 +277,10 @@ def test_it30_broker_end_to_end(stack: dict[str, Any]) -> None:
     assert asyncio.run(client.audit(AID)) == []
     metrics = asyncio.run(client.metrics())
     assert metrics is not None
-    assert metrics[DEV]["ops"] == 8 and metrics[DEV]["model_calls"] == 3  # AID 2, AID2 1
-    assert metrics[DEV]["input_tokens"] == 60 and metrics[DEV]["answers"] == 2
+    assert metrics[DEV]["ops"] == 8 and metrics[DEV]["model_calls"] == 2  # AID's two
+    # AID2's 403 made no record here: one answer on dev, and the 403 only counted as refused.
+    assert metrics[DEV]["input_tokens"] == 40 and metrics[DEV]["answers"] == 1
+    assert metrics[DEV]["refused"]["model_calls"] == 2  # the 429 and the 403
     assert metrics[OTHER]["ops"] == 2
     audit = stack["state"] / "audit" / f"{DEV}.jsonl"
     assert len(audit.read_text().splitlines()) == 12  # every line, also on disk

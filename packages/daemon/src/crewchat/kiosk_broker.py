@@ -4,7 +4,8 @@
 broker forgets once read, and `metrics()` each research server's daily overhead summary.
 The broker serves only the daemon's uid on that socket (`SO_PEERCRED`). A broker that is
 missing, slow or answers nonsense is logged at WARNING and reads as no lines and no metrics:
-an answer is never held up by its audit. Wiring this into the kiosk flow is #142.
+an answer is never held up by its audit. The kiosk reads each research answer's audit into
+its transcript, and `health` reports the metrics (#142).
 """
 
 from __future__ import annotations

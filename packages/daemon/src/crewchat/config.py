@@ -9,7 +9,7 @@
     loop_guard_window = 20               # optional; bot messages per conversation (R-25)
 
     [[mattermost]]
-    id = "oaw-dev"
+    id = "oaw_dev"                       # a research server's id has no '-' or '.'
     url = "https://mm.example.lan"
     kiosk = true                         # optional; the kiosk is off on a server unless set
     kiosk_daily_cap = 25                 # optional; kiosk answers per server per UTC day
@@ -32,8 +32,8 @@
     [crews.oaw]
     needs_list = "bj:needs"              # the sqtk list `register` returns (R-11)
 
-    [crews.oaw.oaw-dev]                  # one table per crew and Mattermost server
-    broker_socket = "/run/crewbroker/oaw-oaw-dev.sock"
+    [crews.oaw.oaw_dev]                  # one table per crew and Mattermost server
+    broker_socket = "/run/crewbroker/oaw-oaw_dev.sock"
     broker_user_id = "<the broker account's user id>"
     agents_allow = ["forge.example.lan/partner-org", "/home/agent/work", "name:helper"]  # optional
     agents_deny = ["name:scratch"]       # optional; always wins over agents_allow
@@ -71,6 +71,18 @@ NAME_ENTRY_PREFIX = "name:"
 DISCORD_CREDENTIAL_PATH = Path("/etc/crewchat/discord.credential")
 NAME_RE = re.compile(r"^[a-z0-9._-]+$")
 RESERVED_SERVER_IDS = frozenset({"status", ".", ".."})
+# A research server's id (#142, D-113), held to packaging/crewkiosk-research-units' rules, and
+# test_kiosk_runner holds the two together. The id names the server's broker sockets and its
+# systemd units: no `.` (`<x>.model` is server x's model socket), and no `-` (systemd-escape
+# alters it, and a dashed unit name picks up its prefixes' drop-ins). Never `control`, short
+# enough for both socket paths, and short enough that the server's own user, crewkiosk-r-<id>,
+# is a valid user name.
+RESEARCH_SERVER_RE = re.compile(r"^[a-z0-9_]+$")
+RESEARCH_RESERVED_IDS = frozenset({"control"})
+RESEARCH_SOCKET_PATHS = ("/run/crewkiosk-broker/{}.model.sock", "/run/crewkiosk/research-{}.sock")
+SUN_PATH_MAX = 107  # sun_path is 108 bytes, with its NUL
+RESEARCH_USER_PREFIX = "crewkiosk-r-"
+USER_NAME_MAX = 32  # useradd's limit
 CREW_KEYS = {"needs_list"}
 
 
@@ -320,6 +332,21 @@ def _repos(value: Any, where: str, source: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def research_server_problem(sid: str) -> str | None:
+    """Why `sid` can't be a research server, as crewkiosk-research-units would refuse it, or
+    None."""
+    if not RESEARCH_SERVER_RE.fullmatch(sid):
+        return f"a research server id is [a-z0-9_]+ (no '-', no '.'), not {sid!r}"
+    if sid in RESEARCH_RESERVED_IDS:
+        return f"crewkiosk-broker serves no server {sid!r}"
+    for path in RESEARCH_SOCKET_PATHS:
+        if len(path.format(sid)) > SUN_PATH_MAX:
+            return f"server id {sid!r} is too long for {path.format(sid)}"
+    if len(RESEARCH_USER_PREFIX + sid) > USER_NAME_MAX:
+        return f"server id {sid!r} is too long for its user, {RESEARCH_USER_PREFIX}{sid}"
+    return None
+
+
 def _research_rules(
     servers: list[MattermostServer], crews: dict[str, CrewEntry], source: str
 ) -> None:
@@ -328,6 +355,9 @@ def _research_rules(
     for server in servers:
         if not server.kiosk_research:
             continue
+        problem = research_server_problem(server.id)
+        if problem is not None:
+            raise ConfigError(f"{source}: mattermost {server.id}.kiosk_research: {problem}")
         if not server.kiosk:
             raise ConfigError(f"{source}: mattermost {server.id}.kiosk_research needs kiosk = true")
         for crew in crews.values():

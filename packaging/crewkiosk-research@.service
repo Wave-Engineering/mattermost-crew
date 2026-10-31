@@ -1,0 +1,82 @@
+# One research kiosk answer (#142; D-111, D-113): the confined unit body every research server
+# shares.
+#
+# WARNING (D-113): install this file at /usr/local/share/crewkiosk/crewkiosk-research@.service,
+# OUTSIDE every systemd unit search path, and never in one. Each server gets it as a linked
+# unit, crewkiosk-research-<server>@.service -> this file, written with that server's socket
+# and drop-in by packaging/crewkiosk-research-units, which refuses a body in a search path. In
+# one, the per-server symlinks become aliases: every instance takes this file's name and loads
+# one server's drop-in, so a connection to one server's socket mounts another server's broker
+# sockets. That was measured, not assumed (D-113).
+#
+# The drop-in, 10-server.conf, is the only per-server part: the two broker sockets it binds,
+# /run/crewkiosk-broker/<server>.sock and <server>.model.sock, and the ExecStart that passes
+# the server as crewkiosk-research-run's argv[1]. Everything else is here, so a package upgrade
+# carries it to every server.
+#
+# The namespace starts empty (TemporaryFileSystem=/:ro) and holds only what is bound below.
+# All of it is distro package content, the same on every Ubuntu host, and none of it is a
+# secret: /usr/bin, /usr/lib and /usr/lib64 whole (with /bin, /lib and /lib64 as the merged-/usr
+# links), the loader cache, the CLI, and the two crewkiosk executables. These are bound whole
+# rather than file by file because a per-file list breaks on the next soname bump or coreutils
+# switch (one host's coreutils are uutils, symlinked into /usr/lib/cargo), and breaks silently,
+# as an unanswered kiosk. Measured on a host on systemd 259 (2026-10-30): `claude -p` starts in
+# exactly this namespace and reaches its loopback base URL. Nothing of /etc but the loader
+# cache: no passwd, no resolv.conf, no TLS roots (the relay is plain HTTP on loopback), no
+# credential. No /home, /var, /opt or /srv, and of /run only the two bound sockets.
+[Unit]
+Description=mattermost-crew research kiosk answer (%p)
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=crewkiosk
+Group=crewkiosk
+# The server's drop-in replaces both with the server's own user, crewkiosk-r-<server>, and
+# gives the ExecStart: crewkiosk-research-run <server>.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077
+# The daemon's timeout is 120 s; this is the backstop.
+RuntimeMaxSec=150
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# No network but this instance's own loopback, where crewkiosk-relay http listens. Unix
+# sockets ignore PrivateNetwork: that is what the empty filesystem is for.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+# The filesystem: empty, then only what is bound.
+TemporaryFileSystem=/:ro
+MountAPIVFS=yes
+BindReadOnlyPaths=/usr/bin /usr/lib /usr/lib64 /usr/bin:/bin /usr/lib:/lib /usr/lib64:/lib64
+BindReadOnlyPaths=-/etc/ld.so.cache
+BindReadOnlyPaths=/usr/local/bin/claude
+BindReadOnlyPaths=/usr/local/libexec/crewkiosk-research-run /usr/local/libexec/crewkiosk-relay
+# HOME and the runner's scratch live in this /tmp, and go with the instance.
+TemporaryFileSystem=/tmp:mode=1777,nosuid,nodev /home:ro
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# Each server's instances run as that server's own user, so ProtectProc=invisible hides every
+# other server's processes, and the kernel's same-uid check refuses /proc/<pid>/root (another
+# server's broker sockets), /proc/<pid>/environ (its answer id) and kill(2) across servers.
+# IT-31b runs two servers' instances at once to prove it. A PID namespace per instance is a
+# second wall on systemd 257 or later. An older systemd warns and ignores the key, and the uid
+# wall still holds; verify-install reports which.
+PrivatePIDs=yes
+# None of these exists in the empty namespace. Hidden by name as well, so that no later bind,
+# here or in a drop-in, can bring them back: the daemon's control socket, and both model keys.
+# The research kiosk holds no model key at all; the broker adds its own.
+InaccessiblePaths=-/run/crewkiosk-broker-control -/etc/crewkiosk/model.credential -/etc/crewkiosk/broker-model.credential

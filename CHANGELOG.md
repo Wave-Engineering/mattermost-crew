@@ -4,6 +4,79 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Kiosks research their server's corpus, confined to that server** (#142, the last part of
+  #136; D-110 to D-113). R-31 is amended.
+  - **Framing.** On a `kiosk_research = true` server, the daemon frames each answer to that
+    server's own socket, `/run/crewkiosk/research-<server>.sock`. The header line comes first,
+    `crewkiosk/1 server=<id> post=<post_id> answer=<32 hex>`, under a research prompt: cite the
+    repo, path and commit; say what a repo declares, not what runs; no answer means a human.
+  - **The units.** Each research server has a socket and unit of its own, written by
+    `crewkiosk-research-units <server>`. Each unit is linked to one shared body,
+    `/usr/local/share/crewkiosk/crewkiosk-research@.service`, which must sit outside every
+    unit search path: the script refuses otherwise. In a search path, the links would be
+    aliases, and one server's connection would mount another server's sockets (measured,
+    D-113).
+  - **The namespace.** The unit starts from an empty root, with `/usr` package content, no
+    network but its loopback, and only that server's two broker sockets. Both model keys and
+    the broker's control socket are hidden by name.
+  - **A user per server.** Each server's kiosk runs as `crewkiosk-r-<server>`, which the units
+    script creates, and the broker gives that server's sockets that user's group, 0660. No
+    other server's kiosk, and not `crewkiosk`, can open them by path. Under
+    `ProtectProc=invisible`, none can see, signal or reach through `/proc` another server's
+    running kiosk. `PrivatePIDs=yes` adds a PID namespace on systemd 257 and later. An older
+    systemd ignores it, and the uid wall holds alone.
+  - **Research server ids** are `[a-z0-9_]+`, at most 20 characters, and never `control`. The
+    daemon's config refuses any other id with `kiosk_research = true`, by the units script's
+    own rules, and a test holds the two together.
+  - **`crewkiosk-research-run`.** It needs its stdin to be a connection accepted on that
+    server's socket, and a header naming the same server (argv[1], from the unit); otherwise it
+    exits 67. It checks its uid by number, from the unit's drop-in. It says hello, starts the
+    relay, and runs `claude -p --tools ""` with a strict MCP config naming only the relay. It
+    holds no model key.
+  - **The audit.** The broker's audit lines for the answer go in its transcript record as
+    `research`.
+  - **Research off** keeps `crewkiosk.socket`, `crewkiosk@.service` and `crewkiosk-run`
+    unchanged, apart from the #139/#140 hardening. A test pins them to v0.2.5's bytes.
+  - **Tests.** IT-31 has a real kiosk answer from two pooled repos, and a hostile model runs no
+    native tool. IT-31b confines two servers' units on one body.
+  - **Docs.** The runbook gains "Install kiosk research" and its operator inputs: the broker's
+    own model key, and one read-only forge token per server and forge host. `make
+    verify-install` checks both keys as their users, and each research unit as systemd loads
+    it.
+
+  **Upgrade note.** Installing these on a real host is a deploy: on a partner's production
+  server, the human partner's yes-prod. After recreating a server's `crewkiosk-r-<server>`
+  user, re-run `crewkiosk-research-units` for it and restart `crewkiosk-broker`. #138's
+  upgrade note still applies to an upgrade from v0.2.5 or earlier: reconnect each session's
+  crewchat MCP server before the daemon restarts.
+
+### Changed
+
+- **`crewkiosk-broker` admits answers, and bounds every call to its key** (#142).
+  - It serves only an answer a hello admitted, one live or recorded in its server's day. Any
+    other answer id is a 403 that spends nothing and makes no record. So the turns and counts
+    live in the ledger's answer records, bounded by its caps on answers.
+  - `count_tokens` isn't a turn, but it has a cap of its own, `max_turns` calls per answer,
+    so no call to the shared key is unbounded.
+  - A call made while the broker has no key is a 503, and spends none of the answer's turns.
+  - A hello sent as a request is answered `{"admitted": true}`, so the research runner knows
+    the answer is admitted before the kiosk starts.
+  - Each server's two sockets get that server's own group, `crewkiosk-r-<server>`, not
+    `crewkiosk`.
+
+### Fixed
+
+- **The corpus builder can reach its forge credentials** (#142). `crewkiosk-corpus` runs as
+  `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
+  `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could
+  ever be cloned. The research install gives `crewcorpus` the directory's `x` by ACL and nothing
+  more. It doesn't join `crewkiosk`, which would also let it list `/etc/crewkiosk` and read the
+  runner's `model.conf`.
+
 ## [0.2.6] — 2026-10-30
 
 Agents name Mattermost channels by URL name, `#name` or display name, and scripts get a sender

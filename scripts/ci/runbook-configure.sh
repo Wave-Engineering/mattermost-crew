@@ -13,6 +13,7 @@
 #   /etc/crewbroker/<crew>-<server_id>.toml          0644
 #   /etc/crewbroker/<crew>-<server_id>.credential    0600 (the install hands it to crewbroker)
 #   /etc/crewkiosk/model.credential                  0600 (a dummy; the install hands it over)
+#   /etc/crewkiosk/broker-model.credential           0600 (a second dummy, the broker's)
 # It creates no service user: the runbook's install blocks must do that themselves.
 #
 # It refuses to run unless CREWCHAT_RUNBOOK_IT=1: it changes the host, so it only runs on a
@@ -108,5 +109,9 @@ log "writing a dummy /etc/crewkiosk/model.credential"
 $SUDO install -d -m 0755 -o root -g root /etc/crewkiosk
 echo "sk-ci-dummy-kiosk-key" \
   | "${ROOT}/scripts/ci/put-file.sh" 0600 root:root /etc/crewkiosk/model.credential
+# The broker's own key, a second dummy, for "Install kiosk research" (#142).
+log "writing a dummy /etc/crewkiosk/broker-model.credential"
+echo "sk-ci-dummy-broker-key" \
+  | "${ROOT}/scripts/ci/put-file.sh" 0600 root:root /etc/crewkiosk/broker-model.credential
 
 log "configured ${instance} against ${MM_URL}"

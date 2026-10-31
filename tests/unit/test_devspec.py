@@ -6,8 +6,9 @@ import re
 from pathlib import Path
 
 DEVSPEC = Path(__file__).resolve().parents[2] / "docs" / "mattermost-crew-devspec.md"
-REQUIREMENTS = [f"R-{n:02d}" for n in range(1, 35)]
-ITEM = re.compile(r"\b(?:IT-\d{2}|E2E-\d{2})\b")
+REQUIREMENTS = [f"R-{n:02d}" for n in range(1, 37)]
+# IT-31b: a lettered item, a second test of the same IT (#142).
+ITEM = re.compile(r"\b(?:IT-\d{2}[a-z]?|E2E-\d{2})\b")
 STATUSES = ("Pass", "Fail")
 VRTM_HEADING = "### Appendix V: Verification Requirements Traceability Matrix (VRTM)"
 
@@ -47,7 +48,7 @@ def defined_items() -> set[str]:
 
 def test_vrtm_covers_every_requirement() -> None:
     matrix = vrtm()
-    assert sorted(matrix) == REQUIREMENTS, "Appendix V must have exactly one row per R-01 to R-34"
+    assert sorted(matrix) == REQUIREMENTS, "Appendix V must have exactly one row per R-01 to R-36"
     items = defined_items()
     for req, row in matrix.items():
         named = ITEM.findall(row["Verification Item"])

@@ -32,6 +32,20 @@
 #   - the running daemon has NoNewPrivs set: it reaches the kiosk without changing user;
 #   - crewkiosk cannot read any of the known credential files above.
 #
+# Kiosk research (#142), on a host with the crewkiosk-broker user:
+#   - crewkiosk-broker, with its unit's supplementary groups, reads its own key,
+#     /etc/crewkiosk/broker-model.credential, and not the runner's; crewkiosk reads its own and
+#     not the broker's; the agent's user reads neither;
+#   - crewcorpus may traverse /etc/crewkiosk (ACL user:crewcorpus:--x) and not list it;
+#   - crewkiosk-broker is active whenever any research server has its pool manifest written;
+#   - for each server in CREWKIOSK_RESEARCH_SERVERS: its user crewkiosk-r-<server> and its group
+#     exist, and the running broker holds that group; its broker sockets are group
+#     crewkiosk-r-<server>, 0660, and present once its manifest is written; its linked unit points
+#     at the shared body, which sits in no unit search path, and loads as crewkiosk-r-<server>
+#     with that user's current uid, an empty root, no network, no new privileges,
+#     ProtectProc=invisible, both keys hidden, and exactly that server's two broker sockets
+#     bound (D-113). Whether PrivatePIDs is in effect (systemd 257+) is reported, not required.
+#
 # The credentials that servers.toml names (Story 3.7): /etc/crewchat/discord.credential (or
 # `[discord] credential`) when Discord is enabled, and `[squawkie] credential` when set; and, on a
 # kiosk host, the kiosk's model credential /etc/crewkiosk/model.credential. Neither the agent's
@@ -54,6 +68,10 @@ KIOSK_USER=crewkiosk
 KIOSK_SOCKET=/run/crewkiosk/kiosk.sock
 KIOSK_CREDENTIAL=/etc/crewkiosk/model.credential
 KIOSK_MODEL_CONF=/etc/crewkiosk/model.conf
+BROKER_USER=crewkiosk-broker
+CORPUS_USER=crewcorpus
+BROKER_KEY=/etc/crewkiosk/broker-model.credential
+RESEARCH_BODY=/usr/local/share/crewkiosk/crewkiosk-research@.service
 SERVERS_TOML=/etc/crewchat/servers.toml
 # The daemon's own interpreter, which has tomllib (Python 3.12).
 CREWCHAT_PYTHON="$(dirname "$CREWCHAT_BIN")/python"
@@ -63,6 +81,7 @@ STATE_ROOT=/var/lib/crewbroker
 
 failures=0
 pass() { echo "verify-install: PASS $*"; }
+info() { echo "verify-install: INFO $*"; }
 fail() { echo "verify-install: FAIL $*" >&2; failures=$((failures + 1)); }
 
 SUDO=""
@@ -316,6 +335,146 @@ if id "$KIOSK_USER" >/dev/null 2>&1; then
     for file in "${config_credentials[@]}"; do
       no_read_as "$KIOSK_USER" "$file"
     done
+  fi
+fi
+
+# Kiosk research (#142; D-111, D-113), on a host with the crewkiosk-broker user. The two model
+# keys, as the users who hold them: the research-off runner (crewkiosk) opens only its own, and
+# the broker only its own. Each research server's runner is that server's own user,
+# crewkiosk-r-<server> (D-114), which no key's file mode names: its unit also hides both keys,
+# and each research unit is checked here as systemd loads it. What such a unit can actually reach
+# is IT-31b's, on this same body.
+if id "$BROKER_USER" >/dev/null 2>&1; then
+  # The broker as its unit runs it: it reaches /etc/crewkiosk (0750 root:crewkiosk) through the
+  # unit's SupplementaryGroups, which `sudo -u` would not give it.
+  broker_groups="$(systemctl show -P SupplementaryGroups crewkiosk-broker.service)"
+  as_broker() {
+    local groups=(--clear-groups)
+    [[ -z "$broker_groups" ]] || groups=(--groups "${broker_groups// /,}")
+    $SUDO setpriv --reuid "$BROKER_USER" --regid "$BROKER_USER" "${groups[@]}" -- "$@"
+  }
+  if as_broker test -r "$BROKER_KEY"; then
+    pass "$BROKER_USER (groups: ${broker_groups:-none}) can read its own key, $BROKER_KEY"
+  else
+    fail "$BROKER_USER (groups: ${broker_groups:-none}) cannot read its key $BROKER_KEY"
+  fi
+  if ! $SUDO test -e "$KIOSK_CREDENTIAL"; then
+    fail "$KIOSK_CREDENTIAL does not exist"
+  elif as_broker test -r "$KIOSK_CREDENTIAL"; then
+    fail "$KIOSK_CREDENTIAL is readable by $BROKER_USER"
+  else
+    pass "$KIOSK_CREDENTIAL exists and $BROKER_USER cannot read it"
+  fi
+  no_read_as "$KIOSK_USER" "$BROKER_KEY"
+  no_agent_read "$BROKER_KEY"
+  if sudo -n -u "$KIOSK_USER" test -r "$KIOSK_CREDENTIAL"; then
+    pass "the research-off runner ($KIOSK_USER) can read its own key, $KIOSK_CREDENTIAL"
+  else
+    fail "$KIOSK_USER cannot read its key $KIOSK_CREDENTIAL"
+  fi
+  # The corpus builder traverses /etc/crewkiosk to its forge credentials by an ACL: x, and no
+  # r, so it can't list the directory. A later chmod or chgrp must not silently undo either.
+  acl="$($SUDO getfacl -cp /etc/crewkiosk 2>/dev/null | grep -E "^user:${CORPUS_USER}:" || true)"
+  if [[ "$acl" == "user:${CORPUS_USER}:--x" ]] &&
+    sudo -n -u "$CORPUS_USER" test -x /etc/crewkiosk &&
+    ! sudo -n -u "$CORPUS_USER" ls /etc/crewkiosk >/dev/null 2>&1; then
+    pass "$CORPUS_USER may traverse /etc/crewkiosk (ACL --x) and not list it"
+  else
+    fail "/etc/crewkiosk: $CORPUS_USER's ACL is '${acl:-none}' (want user:${CORPUS_USER}:--x, traverse only)"
+  fi
+  search="$(systemd-analyze unit-paths)"
+  systemd_version="$(systemctl --version | awk 'NR == 1 { print $2 }')"
+  # A server with its pool manifest written is one the broker should be serving: a broker that
+  # is down, or in its restart back-off, serves it nothing. One FAIL names them all.
+  broker_active=no
+  systemctl is-active --quiet crewkiosk-broker.service && broker_active=yes
+  unserved=()
+  for server in ${CREWKIOSK_RESEARCH_SERVERS:-}; do
+    unit="crewkiosk-research-${server}@verify.service"
+    ruser="crewkiosk-r-${server}"
+    if ! kiosk_uid="$(id -u -- "$ruser" 2>/dev/null)"; then
+      fail "no user $ruser for research server $server (re-run crewkiosk-research-units $server)"
+      continue
+    fi
+    manifest=no
+    $SUDO test -f "/var/lib/crewchat-pool/${server}.json" && manifest=yes
+    [[ "$manifest" == yes && "$broker_active" == no ]] && unserved+=("$server")
+    # A running broker keeps the groups it started with. Started before crewkiosk-research-units
+    # added it to this server's group, it can't give the server's sockets that group, and so
+    # serves the server nothing.
+    broker_pid="$(systemctl show -p MainPID --value crewkiosk-broker.service 2>/dev/null || true)"
+    if [[ -n "$broker_pid" && "$broker_pid" != 0 ]]; then
+      gid="$(getent group -- "$ruser" | cut -d: -f3 || true)"
+      if [[ -z "$gid" ]]; then
+        fail "no group $ruser for research server $server (re-run crewkiosk-research-units $server)"
+      elif $SUDO grep '^Groups:' "/proc/$broker_pid/status" | tr -s '[:space:]' '\n' | grep -qxF -- "$gid"; then
+        pass "the running broker holds $ruser's group"
+      else
+        fail "the running broker lacks $ruser's group (gid $gid): systemctl restart crewkiosk-broker.service"
+      fi
+    fi
+    # Its broker sockets, once the broker serves them: that server's group, 0660, and so no
+    # other server's kiosk, nor crewkiosk, can open them by path. With the server's pool manifest
+    # written and the broker running, a missing socket is a server the broker failed to serve.
+    for sock in "/run/crewkiosk-broker/${server}.sock" "/run/crewkiosk-broker/${server}.model.sock"; do
+      if ! $SUDO test -S "$sock"; then
+        if [[ "$manifest" == yes && "$broker_active" == yes ]]; then
+          fail "$sock is missing, with $server's pool manifest written and the broker running (restart crewkiosk-broker.service; see its journal)"
+        elif [[ "$manifest" == no ]]; then
+          info "$sock is not served yet (no pool manifest for $server)"
+        fi
+      elif [[ "$($SUDO stat -c '%G %a' -- "$sock")" == "$ruser 660" ]]; then
+        pass "$sock is $ruser's alone (group $ruser, 0660)"
+      else
+        fail "$sock is $($SUDO stat -c '%U:%G %a' -- "$sock") (want group $ruser, 0660)"
+      fi
+    done
+    link="/etc/systemd/system/crewkiosk-research-${server}@.service"
+    if [[ "$(readlink -- "$link" || true)" != "$RESEARCH_BODY" ]]; then
+      fail "$link is not a link to $RESEARCH_BODY (re-run crewkiosk-research-units $server)"
+      continue
+    fi
+    if grep -qxF -- "$(dirname "$RESEARCH_BODY")" <<<"$search"; then
+      fail "$RESEARCH_BODY is in a unit search path (D-113)"
+    fi
+    declare -A prop=()
+    while IFS='=' read -r key value; do
+      prop["$key"]="$value"
+    done < <(systemctl show "$unit" -p LoadState -p User -p TemporaryFileSystem -p PrivateNetwork \
+      -p NoNewPrivileges -p InaccessiblePaths -p BindReadOnlyPaths -p Environment \
+      -p ProtectProc -p PrivatePIDs)
+    bad=()
+    [[ "${prop[LoadState]:-}" == loaded ]] || bad+=("LoadState=${prop[LoadState]:-}")
+    [[ "${prop[User]:-}" == "$ruser" ]] || bad+=("User=${prop[User]:-} (want $ruser)")
+    [[ "${prop[ProtectProc]:-}" == invisible ]] || bad+=("ProtectProc=${prop[ProtectProc]:-}")
+    [[ " ${prop[TemporaryFileSystem]:-} " == *" /:ro "* ]] || bad+=("no TemporaryFileSystem=/:ro")
+    [[ "${prop[PrivateNetwork]:-}" == yes ]] || bad+=("PrivateNetwork=${prop[PrivateNetwork]:-}")
+    [[ "${prop[NoNewPrivileges]:-}" == yes ]] || bad+=("NoNewPrivileges=${prop[NoNewPrivileges]:-}")
+    for key in "$KIOSK_CREDENTIAL" "$BROKER_KEY"; do
+      [[ " ${prop[InaccessiblePaths]:-} " == *" -${key} "* ]] || bad+=("$key not hidden")
+    done
+    # Of the broker's sockets, exactly this server's two (D-113).
+    broker_binds="$(tr ' ' '\n' <<<"${prop[BindReadOnlyPaths]:-}" | grep -F '/run/crewkiosk-broker' |
+      sed 's/^-//; s/:.*//' | sort | tr '\n' ' ')"
+    want="/run/crewkiosk-broker/${server}.model.sock /run/crewkiosk-broker/${server}.sock "
+    [[ "$broker_binds" == "$want" ]] || bad+=("broker binds: ${broker_binds:-none}")
+    [[ " ${prop[Environment]:-} " == *" CREWKIOSK_UID=${kiosk_uid} "* ]] ||
+      bad+=("CREWKIOSK_UID is not $kiosk_uid (re-run crewkiosk-research-units $server)")
+    if ((${#bad[@]} == 0)); then
+      pass "$unit: as $ruser, empty root, no network, both keys hidden, only $server's broker sockets"
+    else
+      fail "$unit: ${bad[*]}"
+    fi
+    # The uid is the wall between servers; a PID namespace is a second one, on systemd 257+.
+    if [[ "${prop[PrivatePIDs]:-}" == yes ]]; then
+      info "$unit: PrivatePIDs=yes in effect (systemd $systemd_version)"
+    else
+      info "$unit: PrivatePIDs not in effect (systemd $systemd_version; it needs 257): the uid wall holds alone"
+    fi
+    unset prop
+  done
+  if ((${#unserved[@]} > 0)); then
+    fail "crewkiosk-broker.service is not active, and these servers have pool manifests: ${unserved[*]} (see its journal)"
   fi
 fi
 

@@ -6,8 +6,10 @@
 #
 # Needs:
 #   - the crewkiosk-broker user (its primary group is crewkiosk-broker, which owns each
-#     /var/lib/crewcorpus/<server> directory), a member of crewcorpus (the pool manifests) and
-#     crewkiosk (model.conf, and the socket group the kiosk connects with);
+#     /var/lib/crewcorpus/<server> directory), a member of crewcorpus (the pool manifests),
+#     crewkiosk (model.conf) and each research server's crewkiosk-r-<server> group, which
+#     crewkiosk-research-units adds it to. It gives that server's two sockets that group, 0660
+#     (D-114), and takes up a new group only on a restart;
 #   - packaging/crewcorpus.tmpfiles.conf and packaging/crewchat-pool.tmpfiles.conf;
 #   - rg (ripgrep) on PATH;
 #   - the broker's own model key, /etc/crewkiosk/broker-model.credential, 0600

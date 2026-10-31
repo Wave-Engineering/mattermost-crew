@@ -4,5 +4,6 @@
 set -euo pipefail
 
 export CREWCHAT_INSTALLED_REQUIRED=1
-uv run pytest tests/integration/test_daemon_installed.py -q -p no:cacheprovider \
+uv run pytest tests/integration/test_daemon_installed.py tests/integration/test_kiosk_confinement.py \
+  -q -p no:cacheprovider \
   --junitxml=reports/junit-installed.xml

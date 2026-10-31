@@ -245,6 +245,46 @@ def test_exclude_covers_the_repos_wiki(
     assert manifest(tmp_path)["repos"] == [f"{REPO_A}.wiki"]
 
 
+def test_health_reports_the_brokers_metrics(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """#142: crewkiosk-broker's daily overhead per research server, under `metrics`; while
+    the broker can't be read, the pool's health alone."""
+    from crewchat.server import build_handlers
+
+    daemon = wired(make_daemon, research(servers_toml), tmp_path)
+    register(daemon, "babel", repo=REPO_A)
+    day = {"date": "2026-10-30", "ops": 4, "model_calls": 2}
+    replies: list[dict[str, Any] | None] = [{"dev": day, "gone": {"ops": 1}}, None]
+
+    async def metrics() -> dict[str, Any] | None:
+        return replies.pop(0)
+
+    health = build_handlers(daemon.config, daemon.registry, kiosk_metrics=metrics)["health"]
+    got = asyncio.run(health({}))["kiosk_research"]
+    assert got == {"dev": {"pool_repos": 1, "metrics": day}}  # never a server not configured
+    assert asyncio.run(health({}))["kiosk_research"] == {"dev": {"pool_repos": 1}}
+
+
+def test_expert_repo_is_the_pooled_one(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
+) -> None:
+    """#142: the research kiosk starts with the expert's own repo, as the pool spells it, and
+    never with one that server doesn't pool: excluded, unadmitted, or none at all."""
+    from crewchat.corpus_pool import expert_repo
+
+    raw = research(servers_toml, corpus_exclude=[f"{ORG}/secret-infra"])
+    daemon = wired(make_daemon, raw, tmp_path)
+    register(daemon, "babel", repo=f"{REPO_A}.git")
+    register(daemon, "infra", repo=f"{ORG}/secret-infra")
+    register(daemon, "nore", repo="")
+    agents = daemon.store.agents()
+    assert expert_repo(daemon.config, agents, "dev", "babel") == REPO_A
+    assert expert_repo(daemon.config, agents, "dev", "infra") == ""
+    assert expert_repo(daemon.config, agents, "dev", "nore") == ""
+    assert expert_repo(daemon.config, agents, "dev", "nobody") == ""
+
+
 def test_agent_repo_needs_its_own_crews_allow(
     make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any], tmp_path: Path
 ) -> None:
