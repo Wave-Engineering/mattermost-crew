@@ -18,6 +18,7 @@ import crewchat
 import pytest
 from crewchat.__main__ import rotation_loop
 from crewchat.tokens import (
+    RETIRED_FILE,
     RETRY_FIRST_S,
     RETRY_MAX_S,
     BrokerClient,
@@ -315,6 +316,91 @@ def test_failed_revoke_is_retried(daemon: Any, clock: Any) -> None:
     assert daemon.store.agent("babel").pending_revoke["dev"] == []
     assert old.token_id not in broker.live
     assert list(broker.live) == [daemon.store.agent("babel").servers["dev"].token_id]
+
+
+def ledger(daemon: Any) -> dict[str, list[str]]:
+    path = daemon.store.root / RETIRED_FILE
+    return json.loads(path.read_text())["pending"] if path.exists() else {}
+
+
+def test_retire_keeps_failed_revoke_in_ledger(daemon: Any) -> None:
+    """#151: a dropped agent whose revoke fails: its token is in the ledger, and its own file
+    is gone."""
+    register(daemon)
+    held = daemon.store.agent("babel").servers["dev"].token_id
+    daemon.broker().fail["revoke"] = BrokerUnavailable("timeout")
+    asyncio.run(daemon.store.drop("babel"))
+    assert not daemon.store.path_for("babel").exists()
+    assert ledger(daemon) == {"oaw/dev": [held]}
+    assert stat.S_IMODE((daemon.store.root / RETIRED_FILE).stat().st_mode) == 0o600
+
+
+def test_retry_retired_revokes_and_clears(daemon: Any) -> None:
+    """#151: `retry_retired` with the broker back revokes what is owed and empties the ledger.
+    A `not_found` (the broker no longer holds it) clears its entry too."""
+    register(daemon, dev="babel")
+    register(daemon, dev="kessel")
+    broker = daemon.broker()
+    babel = daemon.store.agent("babel").servers["dev"].token_id
+    kessel = daemon.store.agent("kessel").servers["dev"].token_id
+    broker.fail["revoke"] = BrokerUnavailable("timeout")
+    asyncio.run(daemon.store.drop("babel"))
+    asyncio.run(daemon.store.drop("kessel"))
+    assert ledger(daemon) == {"oaw/dev": [babel, kessel]}
+    del broker.fail["revoke"]
+    broker.live.pop(kessel)  # gone at the broker already: it answers not_found
+    assert asyncio.run(daemon.store.retry_retired()) == 0
+    assert babel not in broker.live
+    assert ledger(daemon) == {}
+
+
+def test_crew_change_failed_revoke_kept(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """#151: `install_minted` into a new crew, with the old crew's broker down: the old token
+    is in the ledger, though the agent object holding its `pending_revoke` is replaced."""
+    servers_toml["crews"]["ally"] = {
+        "needs_list": "bj:needs",
+        "dev": {"broker_socket": "/run/crewbroker/ally-dev.sock", "broker_user_id": "b-ally"},
+    }
+    daemon = make_daemon(servers_toml)
+    register(daemon, crew="oaw")
+    old = daemon.store.agent("babel").servers["dev"].token_id
+    daemon.broker("oaw").fail["revoke"] = BrokerUnavailable("timeout")
+    register(daemon, crew="ally")
+    assert daemon.store.agent("babel").crew == "ally"
+    assert ledger(daemon) == {"oaw/dev": [old]}
+
+
+def test_run_daily_retries_retired_first(daemon: Any, clock: Any) -> None:
+    """#151: the daily rotation works off the ledger before it rotates anyone."""
+    register(daemon, dev="gone")
+    register(daemon, dev="babel")
+    owed = daemon.store.agent("gone").servers["dev"].token_id
+    daemon.broker().fail["revoke"] = BrokerUnavailable("timeout")
+    asyncio.run(daemon.store.drop("gone"))
+    del daemon.broker().fail["revoke"]
+    daemon.events.clear()
+    asyncio.run(Rotator(daemon.store, sleep=NoSleep()).run_daily(clock.now))
+    ops = [
+        (e[2], e[3].get("token_id") or e[3].get("dev_name"))
+        for e in daemon.events
+        if e[0] == "broker"
+    ]
+    assert ops[0] == ("revoke", owed)
+    assert ("remint", "babel") in ops[1:]
+    assert ledger(daemon) == {}
+
+
+def test_ledger_file_not_loaded_as_agent(daemon: Any, servers_config: Any, tmp_path: Path) -> None:
+    """#151: `TokenStore.load` never reads the ledger as an agent's file."""
+    register(daemon)
+    daemon.broker().fail["revoke"] = BrokerUnavailable("timeout")
+    asyncio.run(daemon.store.drop("babel"))
+    assert (daemon.store.root / RETIRED_FILE).exists()
+    fresh = TokenStore(daemon.store.root, daemon.brokers)
+    fresh.load()
+    assert fresh.agents() == []
 
 
 def test_rotation_skips_unregistered_30_days(daemon: Any, clock: Any) -> None:

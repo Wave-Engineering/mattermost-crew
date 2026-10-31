@@ -53,6 +53,8 @@ class MattermostAPI(Protocol):
 
     def create_bot(self, username: str, display_name: str, description: str) -> dict[str, Any]: ...
 
+    def set_user_image(self, user_id: str, png: bytes) -> None: ...
+
     def enable_bot(self, bot_user_id: str) -> None: ...
 
     def disable_bot(self, bot_user_id: str) -> None: ...
@@ -115,11 +117,12 @@ class MattermostClient:
         *,
         json: Any = None,
         params: dict[str, Any] | None = None,
+        files: Any = None,
     ) -> Any:
         attempt = 0
         while True:
             try:
-                resp = self._http.request(method, path, json=json, params=params)
+                resp = self._http.request(method, path, json=json, params=params, files=files)
             except httpx.HTTPError as exc:
                 raise MattermostError(method, path, None, str(exc)) from exc
             if resp.status_code != 429 or attempt >= RATE_LIMIT_RETRIES:
@@ -177,6 +180,12 @@ class MattermostClient:
             json={"username": username, "display_name": display_name, "description": description},
         )
         return result
+
+    def set_user_image(self, user_id: str, png: bytes) -> None:
+        """Set `user_id`'s avatar. For a bot, only its owner can (D-098)."""
+        self._call(
+            "POST", f"/users/{user_id}/image", files={"image": ("avatar.png", png, "image/png")}
+        )
 
     def enable_bot(self, bot_user_id: str) -> None:
         self._call("POST", f"/bots/{bot_user_id}/enable")

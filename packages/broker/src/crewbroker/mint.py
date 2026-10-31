@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,11 @@ BOT_DESCRIPTION = "mattermost-crew participant"
 PROBE_DESCRIPTION = "crewbroker native-expiry probe"
 PROBE_TTL_MS = 3_600_000
 SUPERSEDE_PER_CALL = 5
+
+
+def bot_description(nonce: str) -> str:
+    """A minted bot's description: it carries the nonce `ensure_bot` recorded first (#151)."""
+    return f"{BOT_DESCRIPTION} · ref {nonce}"
 
 
 class SquattedAccount(Exception):
@@ -48,10 +54,16 @@ def ensure_bot(
     and this broker can read it as its owner. The broker can read `owner_id` only for bots it
     owns (D-100), so a 404 from `GET /bots/{id}` is squatted, never "not a bot, so create
     it". A pruned (disabled) bot of ours is re-enabled, so a pruned agent can register again.
+
+    Before `create_bot` it records a nonce (`begin_create`) that goes into the description.
+    A bot this broker owns, missing from `minted_bot_ids` but carrying that nonce, was created
+    just before a crash: it is adopted, not refused as squatted (#151).
     """
     user = client.get_user_by_username(name)
     if user is None:
-        bot = client.create_bot(name, name, BOT_DESCRIPTION)
+        nonce = secrets.token_hex(4)
+        accounts.begin_create(name, nonce)  # first, so a crash before `add_minted` is adoptable
+        bot = client.create_bot(name, name, bot_description(nonce))
         bot_id = str(bot["user_id"])
         accounts.add_minted(name, bot_id)
         return bot_id
@@ -59,14 +71,25 @@ def ensure_bot(
     user_id = str(user["id"])
     if not user.get("is_bot"):
         raise SquattedAccount(f"{name} is held by a human user ({user_id})")
+    pending: str | None = None  # set only for a bot not on `minted_bot_ids`
     if user_id not in accounts.minted_bot_ids():
-        raise SquattedAccount(f"{name} ({user_id}) was not minted by this broker")
+        pending = accounts.pending_nonce(name)
+        if pending is None:
+            raise SquattedAccount(f"{name} ({user_id}) was not minted by this broker")
     try:
         bot = client.get_bot(user_id)
     except NotFound as exc:
         raise SquattedAccount(f"{name} ({user_id}) is not owned by this broker") from exc
     if bot.get("owner_id") != broker_user_id:
         raise SquattedAccount(f"{name} ({user_id}) is owned by {bot.get('owner_id')}")
+    if pending is not None:
+        # Ours, and created with the nonce we wrote first: a crash came between `create_bot`
+        # and `add_minted`. A bot merely reassigned to the broker lacks it, so stays squatted
+        # (IT-08, D-100).
+        if not str(bot.get("description", "")).endswith(f"ref {pending}"):
+            raise SquattedAccount(f"{name} ({user_id}) was not minted by this broker")
+        accounts.add_minted(name, user_id)
+        log.warning("adopted %s (%s): created before a crash, not yet recorded", name, user_id)
     if bot.get("delete_at") or user.get("delete_at"):
         client.enable_bot(user_id)
         accounts.clear_pruned(name)

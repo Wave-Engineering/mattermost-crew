@@ -1,7 +1,11 @@
 """The broker's state files under `/var/lib/crewbroker/<crew>-<server_id>/`.
 
-- `accounts.json`: `minted_bot_ids` (every bot account this broker created) and, per account
-  name, its `bot_user_id`, `last_register` and `pruned_at`.
+- `accounts.json`: `minted_bot_ids` (every bot account this broker created); per account
+  name, its `bot_user_id`, `last_register`, `pruned_at` and `avatar_set`; and
+  `pending_create`, `{"<name>": "<nonce>"}`, the bots this broker is about to create. Each is
+  written before `create_bot` and cleared by `add_minted`, so a crash between the two leaves
+  the nonce the bot's description carries, and the bot is adopted rather than squatted
+  (#151).
 - `tokens.json`: the token-id ledger. Token ids, owners and times only; never a token.
 
 Every file is written whole, through a mode-`0600` temporary file and an atomic rename, so a
@@ -72,6 +76,7 @@ class AccountStore:
         data = read_json(self.path, {"minted_bot_ids": [], "accounts": {}})
         data.setdefault("minted_bot_ids", [])
         data.setdefault("accounts", {})
+        data.setdefault("pending_create", {})
         return data
 
     def minted_bot_ids(self) -> list[str]:
@@ -82,6 +87,26 @@ class AccountStore:
         if bot_user_id not in data["minted_bot_ids"]:
             data["minted_bot_ids"].append(bot_user_id)
         data["accounts"].setdefault(name, {})["bot_user_id"] = bot_user_id
+        data["pending_create"].pop(name, None)
+        write_private_json(self.path, data)
+
+    def begin_create(self, name: str, nonce: str) -> None:
+        """Record that bot `name` is about to be created with `nonce` in its description."""
+        data = self._load()
+        data["pending_create"][name] = nonce
+        write_private_json(self.path, data)
+
+    def pending_nonce(self, name: str) -> str | None:
+        nonce = self._load()["pending_create"].get(name)
+        return nonce if isinstance(nonce, str) else None
+
+    def avatar_set(self, name: str) -> bool:
+        entry = self._load()["accounts"].get(name)
+        return bool(entry and entry.get("avatar_set"))
+
+    def mark_avatar_set(self, name: str) -> None:
+        data = self._load()
+        data["accounts"].setdefault(name, {})["avatar_set"] = True
         write_private_json(self.path, data)
 
     def get(self, name: str) -> Account | None:

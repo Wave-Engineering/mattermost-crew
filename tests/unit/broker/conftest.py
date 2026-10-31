@@ -54,14 +54,23 @@ class FakeMattermost:
         # As measured for #132: a `team_user` broker adds its bots only to a channel it is in,
         # and joins a public channel itself. Off by default, as the #132 tests predate it.
         self.channel_needs_broker = False
+        self.images: dict[str, bytes] = {}  # user id -> the PNG `set_user_image` sent (#151)
+        self.image_fails = False
         self._ids = itertools.count(1)
 
     # -- helpers for tests ------------------------------------------------------------------
-    def add_user(self, username: str, *, is_bot: bool = False, owner_id: str = "") -> str:
+    def add_user(
+        self, username: str, *, is_bot: bool = False, owner_id: str = "", description: str = ""
+    ) -> str:
         uid = f"u{next(self._ids)}"
         self.users[uid] = {"id": uid, "username": username, "is_bot": is_bot, "delete_at": 0}
         if is_bot:
-            self.bots[uid] = {"user_id": uid, "owner_id": owner_id, "delete_at": 0}
+            self.bots[uid] = {
+                "user_id": uid,
+                "owner_id": owner_id,
+                "delete_at": 0,
+                "description": description,
+            }
         return uid
 
     def add_team(self, tid: str, name: str, display: str, *, mine: bool = True) -> str:
@@ -151,8 +160,15 @@ class FakeMattermost:
         self.calls.append(("create_bot", username))
         if self.get_user_by_username(username) is not None:
             raise MattermostError("POST", "/bots", 400, "username taken")
-        uid = self.add_user(username, is_bot=True, owner_id=self.me_id)
+        uid = self.add_user(username, is_bot=True, owner_id=self.me_id, description=description)
         return dict(self.bots[uid])
+
+    def set_user_image(self, user_id: str, png: bytes) -> None:
+        self.calls.append(("set_user_image", user_id))
+        if self.image_fails:
+            raise MattermostError("POST", f"/users/{user_id}/image", 500, "boom")
+        self.images[user_id] = png
+        self.users[user_id]["last_picture_update"] = 1
 
     def enable_bot(self, bot_user_id: str) -> None:
         self.calls.append(("enable_bot", bot_user_id))

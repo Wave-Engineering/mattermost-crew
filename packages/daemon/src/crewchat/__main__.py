@@ -127,6 +127,13 @@ async def serve(
     brokers = broker_clients(config)
     store = TokenStore(tokens_dir, brokers)
     store.load()
+    # Revokes owed by agents dropped before the last stop (#151). A broker still down keeps
+    # them for the next daily rotation; it never stops the daemon starting.
+    try:
+        if owed := await store.retry_retired():
+            log.warning("%d retired tokens still owed a revoke", owed)
+    except Exception:
+        log.exception("retrying retired revokes failed")
     # One adapter per configured Mattermost server (R-10). They hold websockets only for
     # agents whose stream is open; rotation reconnects those (§4.8).
     backends = [
