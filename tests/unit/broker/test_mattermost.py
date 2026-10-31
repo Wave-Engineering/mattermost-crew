@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,7 +15,10 @@ from crewbroker.mattermost import (
     MattermostError,
     NotFound,
     call_deadline,
+    uncapped,
 )
+from crewbroker.mint import clear_expiry_cache, mint_token, native_expiry_supported
+from crewbroker.state import TokenStore
 
 
 def test_list_bots_paginates_with_default_include_deleted() -> None:
@@ -143,6 +148,79 @@ def test_timeout_past_the_deadline_is_deadline_exceeded() -> None:
     with pytest.raises(MattermostError) as exc:
         client.me()
     assert not isinstance(exc.value, DeadlineExceeded)
+
+
+def test_slow_create_token_is_recorded_past_the_deadline(tmp_path: Path) -> None:
+    """#158 review: the request that creates a token is never cut short by the deadline. Its
+    reply carries the only copy of the secret, so a reply arriving past the deadline is still
+    recorded, and the next call's supersede can revoke it (#41)."""
+    now = [1000.0]
+    timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"]["read"])
+        now[0] += 3  # the server took 3 s; the deadline was 1 s away
+        return httpx.Response(200, json={"id": "t1", "token": "secret", "user_id": "b"})
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(handler), clock=lambda: now[0]
+    )
+    tokens = TokenStore(tmp_path)
+    with call_deadline(1001.0):
+        token = mint_token(
+            client, "b", tokens, expiry_supported=False, now=datetime(2026, 10, 31, tzinfo=UTC)
+        )
+    assert timeouts == [10.0]  # the client's own timeout, not the 1 s left
+    assert token.token_id == "t1" and tokens.get("t1") is not None
+
+
+def test_uncapped_still_refuses_past_the_deadline() -> None:
+    """`uncapped` drops only the cap: a 429 past the deadline still raises, without sleeping,
+    and nothing is sent once it has passed."""
+    sent: list[str] = []
+    waits: list[float] = []
+
+    def limited(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.path)
+        return httpx.Response(429, headers={"Retry-After": "5"}, json={})
+
+    client = MattermostClient(
+        "http://mm.invalid",
+        "tok",
+        transport=httpx.MockTransport(limited),
+        sleep=waits.append,
+        clock=lambda: 1000.0,
+    )
+    with call_deadline(1001.0), uncapped(), pytest.raises(DeadlineExceeded, match="429"):
+        client.me()
+    with call_deadline(999.0), uncapped(), pytest.raises(DeadlineExceeded):
+        client.me()
+    assert waits == [] and len(sent) == 1
+
+
+def test_expiry_probe_revokes_past_the_deadline() -> None:
+    """#158 review: the probe's revoke is sent even when its `create_token` used up the
+    deadline, so no probe token is left live on the broker's own account."""
+    now = [1000.0]
+    revoked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/users/tokens/revoke"):
+            revoked.append(json.loads(request.content)["token_id"])
+            return httpx.Response(200, json={"status": "OK"})
+        now[0] += 3
+        return httpx.Response(200, json={"id": "probe", "token": "s"})
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(handler), clock=lambda: now[0]
+    )
+    clear_expiry_cache()
+    try:
+        with call_deadline(1001.0):
+            assert native_expiry_supported(client, "http://mm.invalid", "broker") is False
+    finally:
+        clear_expiry_cache()
+    assert revoked == ["probe"]
 
 
 def test_no_deadline_keeps_retries() -> None:

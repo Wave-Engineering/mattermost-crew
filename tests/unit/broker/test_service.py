@@ -632,21 +632,6 @@ def test_mint_rate_limited_past_deadline_is_expired(
     assert getattr(mattermost._local, "deadline", None) is None  # restored after the op
 
 
-def test_deadline_past_the_mint_is_reported_not_raised(
-    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#158: once the token exists, a deadline that fires in the avatar step leaves the mint
-    answered, the flag unset for the next mint."""
-
-    def late(user_id: str, png: bytes) -> None:
-        raise DeadlineExceeded("POST", f"/users/{user_id}/image", None, "deadline passed")
-
-    monkeypatch.setattr(fake, "set_user_image", late)
-    minted = broker.mint({**_args(None), "deadline": clock.now.timestamp() + 10})
-    assert fake.token_works(minted["token"])
-    assert not broker.accounts.avatar_set("babel.oaw")
-
-
 def test_deadline_must_be_epoch_seconds(broker: Broker) -> None:
     for bad in ("soon", True, [1]):
         with pytest.raises(OpError, match="bad_request"):

@@ -229,7 +229,9 @@ class Broker:
             except SquattedAccount as exc:
                 log.error("mint refused: %s", exc)
                 raise OpError("squatted", str(exc)) from exc
-            except DeadlineExceeded as exc:  # no token yet: nothing for the daemon to lose
+            except DeadlineExceeded as exc:
+                # No token was made: `create_token` runs `uncapped`, so its deadline only
+                # refuses to send it or to wait out a 429 (#158).
                 log.warning("mint of %s expired: %s", name, exc)
                 raise OpError("expired", str(exc)) from exc
             # Past here a token exists: a deadline that fires leaves it to the next call's
@@ -274,7 +276,10 @@ class Broker:
             if acct is None:
                 raise OpError("not_found", f"{name} has never registered")
             try:
-                bot = self.client.get_bot(acct.bot_user_id)
+                try:
+                    bot = self.client.get_bot(acct.bot_user_id)
+                except NotFound as exc:
+                    raise OpError("squatted", f"{name} is no longer owned by this broker") from exc
                 if bot.get("owner_id") != self.config.broker_user_id:
                     raise OpError("squatted", f"{name} is no longer owned by this broker")
                 if bot.get("delete_at"):
@@ -286,9 +291,7 @@ class Broker:
                     expiry_supported=self._expiry(),
                     now=self.clock(),
                 )
-            except NotFound as exc:
-                raise OpError("squatted", f"{name} is no longer owned by this broker") from exc
-            except DeadlineExceeded as exc:  # no token yet
+            except DeadlineExceeded as exc:  # no token was made, as in `mint`
                 log.warning("remint of %s expired: %s", name, exc)
                 raise OpError("expired", str(exc)) from exc
             self._supersede(acct.bot_user_id, held, token.token_id)

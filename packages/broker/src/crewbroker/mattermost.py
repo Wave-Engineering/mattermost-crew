@@ -6,8 +6,9 @@ no others: `GET /bots/{id}` is 404 for a bot it does not own (D-100).
 
 A caller with a deadline sets it with `call_deadline` (#158). Inside it, `_call` caps each
 request's timeout at the time left, and raises `DeadlineExceeded` rather than send a request
-or wait out a 429 past it. The deadline is per thread, so the prune and DM-listener threads,
-which set none, keep the plain timeout and retries.
+or wait out a 429 past it. `uncapped` keeps the refusals but not the cap, for a request whose
+reply must not be dropped once it is sent. The deadline is per thread, so the prune and
+DM-listener threads, which set none, keep the plain timeout and retries.
 """
 
 from __future__ import annotations
@@ -61,6 +62,23 @@ def call_deadline(deadline: float | None) -> Iterator[None]:
         yield
     finally:
         _local.deadline = previous
+
+
+@contextmanager
+def uncapped() -> Iterator[None]:
+    """Inside `call_deadline`, a request once sent runs to the client's own timeout.
+
+    For a call whose reply must not be dropped: the one creating a token, whose secret is in
+    the reply only. A capped read timeout would leave a live token nothing records, so no
+    supersede could revoke it (#41, #158). The deadline still refuses to send, or to wait out
+    a 429, past it.
+    """
+    previous = getattr(_local, "uncapped", False)
+    _local.uncapped = True
+    try:
+        yield
+    finally:
+        _local.uncapped = previous
 
 
 class MattermostAPI(Protocol):
@@ -148,6 +166,7 @@ class MattermostClient:
         files: Any = None,
     ) -> Any:
         deadline: float | None = getattr(_local, "deadline", None)
+        capped = deadline is not None and not getattr(_local, "uncapped", False)
         attempt = 0
         while True:
             timeout = self.timeout
@@ -155,13 +174,14 @@ class MattermostClient:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     raise DeadlineExceeded(method, path, None, "the caller's deadline passed")
-                timeout = min(timeout, remaining)
+                if capped:
+                    timeout = min(timeout, remaining)
             try:
                 resp = self._http.request(
                     method, path, json=json, params=params, files=files, timeout=timeout
                 )
             except httpx.TimeoutException as exc:
-                if deadline is not None and self._clock() >= deadline:
+                if capped and deadline is not None and self._clock() >= deadline:
                     raise DeadlineExceeded(method, path, None, f"timed out: {exc}") from exc
                 raise MattermostError(method, path, None, str(exc)) from exc
             except httpx.HTTPError as exc:
