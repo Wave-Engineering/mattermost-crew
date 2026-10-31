@@ -449,46 +449,95 @@ def test_waits_through_a_daemon_restart(
     assert len(fakes[0].frames) == 4
 
 
+class FakeClock:
+    """The doorbell's clock (#156): a `now` that only `sleep` moves, so no assertion races a
+    loaded host's real time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    fake = FakeClock()
+    monkeypatch.setattr(doorbell, "_clock", fake)
+    monkeypatch.setattr(doorbell, "_sleep", fake.sleep)
+    return fake
+
+
 @pytest.mark.parametrize(
     ("replies", "want"),
     [((), EXIT_UNREACHABLE), (("nr",) * 1000, EXIT_NOT_REGISTERED)],
     ids=["down", "unregistered"],
 )
 def test_an_outage_past_the_grace_exits(
-    repo: Path, short_dir: Path, replies: tuple[str, ...], want: int
+    repo: Path, short_dir: Path, clock: FakeClock, replies: tuple[str, ...], want: int
 ) -> None:
     """A daemon still down after the grace is 4, an agent still unregistered is 2, as before
-    #129; only the wait is new."""
+    #129; only the wait is new. The last pause is capped at the grace, so it lasts exactly
+    that."""
     fake = FakeDaemon(short_dir / "d.sock", scripted(*replies)) if replies else None
     path = fake.path if fake else short_dir / "absent.sock"
-    start = time.monotonic()
+    start = clock.now
     try:
         code, out, err = ring(repo, path)
     finally:
         if fake:
             fake.close()
-    elapsed = time.monotonic() - start
     assert (code, out) == (want, "")
-    assert GRACE_S <= elapsed < GRACE_S + 2
+    assert GRACE_S <= clock.now - start <= GRACE_S + 1e-9
     assert f"for {GRACE_S:.0f} s" in err
 
 
 @pytest.mark.parametrize("replies", [(), ("nr",) * 1000], ids=["down", "unregistered"])
 def test_a_timeout_inside_an_outage_reports_the_outage(
-    repo: Path, short_dir: Path, monkeypatch: pytest.MonkeyPatch, replies: tuple[str, ...]
+    repo: Path,
+    short_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: FakeClock,
+    replies: tuple[str, ...],
 ) -> None:
     """The timeout ends first, mid-outage: the exit says what is wrong (4 or 2), not 3."""
     monkeypatch.setattr(doorbell, "RESTART_GRACE_S", 30.0)
     fake = FakeDaemon(short_dir / "d.sock", scripted(*replies)) if replies else None
     path = fake.path if fake else short_dir / "absent.sock"
-    start = time.monotonic()
+    start, real_start = clock.now, time.monotonic()
     try:
-        code, out, _ = ring(repo, path, {"CREWCHAT_DOORBELL_TIMEOUT": "0.3"})
+        code, out, _ = ring(repo, path, {"CREWCHAT_DOORBELL_TIMEOUT": "5"})
     finally:
         if fake:
             fake.close()
     assert (code, out) == ((EXIT_NOT_REGISTERED if replies else EXIT_UNREACHABLE), "")
-    assert time.monotonic() - start < 2
+    assert clock.now - start == pytest.approx(5)
+    assert time.monotonic() - real_start < 5
+
+
+def test_a_socket_timeout_mid_outage_reports_the_outage(
+    monkeypatch: pytest.MonkeyPatch, short_dir: Path
+) -> None:
+    """#156: a `subscribe` whose socket times out while an outage is recorded raises that
+    outage, not `TimedOut`, as the docstring promises."""
+    replies: list[Exception] = [
+        doorbell.NotRegistered("bell is not registered"),
+        doorbell.TimedOut("no event within 1 s"),
+    ]
+
+    def subscribe(*_args: Any, **_kw: Any) -> dict[str, Any]:
+        raise replies.pop(0)
+
+    monkeypatch.setattr(doorbell, "subscribe", subscribe)
+    clock = FakeClock()
+    with pytest.raises(doorbell.NotRegistered):
+        doorbell.wait_for_new(
+            short_dir / "d.sock", DEV, 10.0, None, grace_s=30.0, clock=clock, sleep=clock.sleep
+        )
+    assert replies == []
 
 
 def broken_pipe_on_send(monkeypatch: pytest.MonkeyPatch, times: int | None) -> None:
