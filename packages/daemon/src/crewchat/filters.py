@@ -363,13 +363,17 @@ class SwitchCache:
         return await asyncio.wait_for(asyncio.shield(self._round), self.round_wait_s)
 
     async def miss(
-        self, bot_id: str, server_id: str, crews: Collection[str] | None = None
+        self,
+        bot_id: str,
+        server_id: str,
+        crews: Callable[[], Collection[str] | None] | None = None,
     ) -> MissResult:
         """A bot account in no cached `minted_bot_ids`: re-fetch, at most once per bot per
         `refetch_per_bot_s`. `failed` when the round timed out or a broker on `server_id`
-        didn't answer, counting only `crews`' brokers when it is given (D-115: an untrusted
-        crew's broker being down changes nothing); `capped` when this bot was re-fetched for
-        too recently."""
+        didn't answer, counting only the brokers of the crews `crews()` names when it names
+        any (D-115: an untrusted crew's broker being down changes nothing). `crews` is called
+        after the round, which may have changed who is trusted. `capped` when this bot was
+        re-fetched for too recently."""
         now = self._mono()
         while self._bot_refetch:
             oldest, at = next(iter(self._bot_refetch.items()))
@@ -384,7 +388,8 @@ class SwitchCache:
         except TimeoutError:
             log.warning("crew_info re-fetch for bot %s timed out", bot_id)
             return "failed"
-        mine = [k for k in failed if k[1] == server_id and (crews is None or k[0] in crews)]
+        scope = crews() if crews is not None else None
+        mine = [k for k in failed if k[1] == server_id and (scope is None or k[0] in scope)]
         return "failed" if mine else "ok"
 
 
@@ -671,9 +676,16 @@ class Filters:
             return "outsider", None
         # A bot in no cached `minted_bot_ids`: re-fetch, then re-check (R-22). Only our own and
         # our trusted crews' brokers failing can matter (D-115); with our own crew uncached,
-        # which crews we trust is unknown, so every broker counts.
-        cached = self.cache.crew_info(reg.crew, server_id)
-        crews = None if cached is None else {reg.crew, *_trusted(cached, reg.crew)}
+        # which crews we trust is unknown, so every broker counts. The round can change who
+        # we trust, so the crews trusted before it and after it both count (fail closed).
+        before = self.cache.crew_info(reg.crew, server_id)
+
+        def crews() -> set[str] | None:
+            after = self.cache.crew_info(reg.crew, server_id)
+            if before is None or after is None:
+                return None
+            return {reg.crew, *_trusted(before, reg.crew), *_trusted(after, reg.crew)}
+
         if await self.cache.miss(msg.author_id, server_id, crews) == "failed":
             return DROP("refetch_failed")
         own = self.cache.crew_info(reg.crew, server_id)

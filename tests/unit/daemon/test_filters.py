@@ -441,6 +441,24 @@ def test_trusted_uncached_broker_still_drops() -> None:
     assert capped.kind == Kind.DROP and capped.reason == "uncached_crew"
 
 
+def test_crew_trusted_in_the_refetch_round_counts() -> None:
+    """D-115, fail closed: the miss's own round makes oaw trust rival, whose broker then hangs
+    with a valid last-good cache. Rival's failure counts, by the trust read after the round,
+    so a bot that may be rival's new one is dropped, not sent to the kiosk."""
+
+    async def scenario() -> Verdict:
+        rig = Rig()
+        await rig.prime()
+        assert rig.cache.crew_info("rival", SID) is not None  # last good, without the bot
+        rig.broker("oaw").info["trusted"] = ["ally", "ghost", "rival"]
+        rig.broker("rival").hang = True
+        rig.mono.t += 60  # past the round's minimum interval
+        return await rig.admit(mm("bot-unknown"))
+
+    verdict = run(scenario())
+    assert verdict.kind == Kind.DROP and verdict.reason == "refetch_failed"
+
+
 # -- cache misses ---------------------------------------------------------------------------
 def test_new_crewmate_cache_miss_never_kiosk(rig: Rig) -> None:
     async def scenario() -> tuple[Verdict, dict[BrokerKey, int]]:
