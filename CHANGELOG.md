@@ -99,7 +99,12 @@ All notable changes to this project are recorded here. The format follows
   under 10 minutes old is applied; `crew` and `kiosk off` are applied at any age, since they
   only narrow; any other older one is answered `not applied: … send it again`. A fresh install
   starts the cursor and replays nothing.
-
+- **A DM from one agent to another wakes the recipient with no `@` in the text** (#177,
+  D-117). The loop guard admitted a bot account's message only with an inline mention, so an
+  agent's DM to another agent was dropped unless it named the recipient. A DM's recipient is now
+  its address. In a DM the guard's window counts per DM channel, so two agents trading root
+  posts there are still held to `loop_guard_window` messages an hour. A bot message addressed to
+  the agent that the guard drops is now logged at INFO, naming the author and the reason.
 - **A container's bind mount of `/run/crewchat` survives a daemon restart** (#173).
   `crewchat.service` now sets `RuntimeDirectoryPreserve=yes`, so a restart no longer deletes
   the directory under a container that mounts it. Because the directory now outlives the

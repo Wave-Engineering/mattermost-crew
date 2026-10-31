@@ -543,10 +543,12 @@ def test_it10_loop_guard(mattermost: Any, world: dict[str, Any], tmp_path: Path)
             crew_token = await rig.send("kessel", f"@{rig.crew} thoughts?", thread=other.post_id)
             await rig.delivered(crew_token.post_id)
 
-            # A DM is opted in.
+            # A DM is opted in, and its recipient is its address: no mention needed (D-117).
             dm = rig.dm_channel(rig.partner_token, rig.partner_id, babel)
             kessel_dm = await rig.backend.dm("kessel", babel, "@babel in a DM")
             await rig.delivered(kessel_dm.post_id)
+            unmentioned = await rig.backend.dm("kessel", babel, "are you around?")
+            await rig.delivered(unmentioned.post_id)
 
             # The window: past `loop_guard_window` (3 here) bot messages in the
             # conversation, dropped. babel's thread already holds two.
