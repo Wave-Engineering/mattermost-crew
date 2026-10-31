@@ -38,14 +38,20 @@ the registration, and squawkie when it is configured (§4.2 step 3).
   Every other task keeps running throughout.
 - The queue holds at most `QUEUE_MAX` events. Past that an event is dropped, loudly in the log;
   a dropped message is not handed over, so its cursor does not move past it.
+- **Stopping** (#152). `detach` cancels each of the agent's tasks, all at once, cancels again
+  every `DETACH_RECANCEL_S` a task that is still running, and abandons a task still running
+  after `DETACH_TIMEOUT_S` with one ERROR line carrying its stack. `aclose` detaches every
+  agent at once. `crewchat serve` runs on `__main__.run_bounded`, whose exit leaves an
+  abandoned task behind rather than waiting for it, so a stream that absorbs every cancel
+  can't hang the daemon's stop.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import inspect
+import io
 import json
 import logging
 import os
@@ -70,6 +76,8 @@ RECENT_IDS = 1000  # the IDs a cursor remembers handing over, and the doorbell h
 QUEUE_MAX = 1000
 RESTART_FIRST_S = 1.0
 RESTART_MAX_S = 60.0
+DETACH_RECANCEL_S = 1.0  # how often `detach` cancels again a task that is still running
+DETACH_TIMEOUT_S = 10.0  # how long `detach` waits for one task in all before abandoning it
 
 log = logging.getLogger("crewchat.doorbell")
 
@@ -261,8 +269,12 @@ class Doorbell:
         kiosk: filters.KioskQueue | None = None,
         queue_max: int = QUEUE_MAX,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        detach_timeout_s: float = DETACH_TIMEOUT_S,
+        detach_recancel_s: float = DETACH_RECANCEL_S,
     ) -> None:
         self.sources = dict(sources)
+        self.detach_timeout_s = detach_timeout_s
+        self.detach_recancel_s = detach_recancel_s
         self.cursors = cursors
         self.admit = admit
         # Where push `KIOSK` verdicts wait for Story 3.5's kiosk; None drops them, loudly.
@@ -429,34 +441,69 @@ class Doorbell:
         source = self.sources[backend]
         sink: StatusSink = partial(self.status, dev_name, backend)
         delays = restart_delays()
-        while True:
+        me = asyncio.current_task()
+
+        def owned() -> bool:
+            # Still this (agent, backend)'s task. A detached one (`detach` pops it first, and
+            # may abandon it) or a replaced one (a later `attach`) stops at its next step,
+            # rather than reporting or reopening a stream for an agent that has left (#152).
+            return self._tasks.get((dev_name, backend)) is me
+
+        while owned():
             try:
                 stream = source.stream(
                     dev_name, cursor=self._cursor(dev_name, backend), on_status=sink
                 )
                 async for item in stream:
+                    if not owned():
+                        return
                     delays = restart_delays()
                     await self.offer(dev_name, backend, to_event(backend, item))
                 reason = "stream ended"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if not owned():
+                    return
                 log.exception("doorbell stream %s for %s failed", backend, dev_name)
                 reason = f"stream failed: {exc}"
+            if not owned():
+                return
             self.status(dev_name, backend, False, reason)
             await self._sleep(next(delays))
 
-    async def detach(self, dev_name: str) -> None:
-        """Stop every task of `dev_name`'s."""
-        for key in [k for k in self._tasks if k[0] == dev_name]:
-            task = self._tasks.pop(key)
+    async def _stop_task(self, task: asyncio.Task[None]) -> bool:
+        """Cancel `task`, again every `detach_recancel_s`, until it ends: True. A task still
+        running after `detach_timeout_s` is abandoned with one ERROR line and its stack: False.
+        A stream can absorb a cancel (an HTTP stack that turns it into an error it retries)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.detach_timeout_s
+        while not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                buf = io.StringIO()
+                task.print_stack(file=buf)
+                log.error(
+                    "doorbell task %s did not stop within %g s; abandoned:\n%s",
+                    task.get_name(),
+                    self.detach_timeout_s,
+                    buf.getvalue(),
+                )
+                return False
+            await asyncio.wait({task}, timeout=min(self.detach_recancel_s, remaining))
+        if not task.cancelled() and task.exception() is not None:
+            log.error("doorbell task %s failed", task.get_name(), exc_info=task.exception())
+        return True
+
+    async def detach(self, dev_name: str) -> None:
+        """Stop every task of `dev_name`'s, concurrently: bounded by one `detach_timeout_s`."""
+        popped = [self._tasks.pop(k) for k in [k for k in self._tasks if k[0] == dev_name]]
+        await asyncio.gather(*(self._stop_task(t) for t in popped))
 
     async def aclose(self) -> None:
-        for dev_name in {d for d, _ in self._tasks}:
-            await self.detach(dev_name)
+        """Stop every agent's tasks, all agents at once: bounded by one `detach_timeout_s`."""
+        await asyncio.gather(*(self.detach(d) for d in {d for d, _ in self._tasks}))
 
     # -- token hooks (crewchat.tokens.Adapter) ----------------------------------------------
     async def on_token_rotated(self, dev_name: str) -> None:

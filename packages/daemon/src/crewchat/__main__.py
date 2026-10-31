@@ -21,7 +21,7 @@ import socket
 import sys
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,13 @@ from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import CONFIG_PATH, ConfigError, load_config
 from crewchat.corpus_pool import PoolManifest, expert_repo
-from crewchat.doorbell import CursorStore, Doorbell, Source, build_doorbell_handlers
+from crewchat.doorbell import (
+    DETACH_TIMEOUT_S,
+    CursorStore,
+    Doorbell,
+    Source,
+    build_doorbell_handlers,
+)
 from crewchat.filters import Filters, KioskQueue, SwitchCache
 from crewchat.kiosk import ClaudeCliRunner, Kiosk, Research
 from crewchat.kiosk_broker import KioskBrokerClient
@@ -264,6 +270,32 @@ async def serve(
     return 0
 
 
+def run_bounded[R](main: Coroutine[Any, Any, R], timeout_s: float = DETACH_TIMEOUT_S) -> R:
+    """`asyncio.run`, but with an exit that can't hang (#152). `asyncio.run` cancels each task
+    still pending once and then waits for all of them with no bound, so a task that absorbed
+    its cancels (one `Doorbell.detach` abandoned) would hold the process forever. Here the
+    leftovers get `timeout_s`; one still running after it is logged and left behind."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(main)
+    finally:
+        try:
+            leftover = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for task in leftover:
+                task.cancel()
+            if leftover:
+                _, stuck = loop.run_until_complete(asyncio.wait(leftover, timeout=timeout_s))
+                for task in stuck:
+                    log.error("task %s did not stop on exit; left behind", task.get_name())
+            for shutdown in (loop.shutdown_asyncgens, loop.shutdown_default_executor):
+                with contextlib.suppress(TimeoutError):
+                    loop.run_until_complete(asyncio.wait_for(shutdown(), timeout_s))
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
 def call(sock_path: str, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
     """Send one request frame and return the response frame."""
     frame = {"proto": PROTO, "id": str(uuid.uuid4()), "op": op, "args": args}
@@ -304,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     if ns.cmd == "serve":
-        return asyncio.run(
+        return run_bounded(
             serve(ns.config, ns.socket, ns.tokens_dir, ns.group or None, ns.state_dir)
         )
     reply = call(ns.socket, ns.op, json.loads(ns.args))

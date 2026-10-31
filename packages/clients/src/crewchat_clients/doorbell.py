@@ -90,8 +90,9 @@ REPEAT_BACKOFF_S = (0.0, 0.05, 0.2, 1.0)
 # and coming back, then the shim's ping (every 15 s) registering the agent again.
 RESTART_GRACE_S = 60.0
 RESTART_BACKOFF_S = (0.25, 0.5, 1.0, 2.0)
-# A connect that fails like this is a daemon that is stopped or starting, not a broken host.
-DOWN_ERRORS = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError)
+# A connect that fails like this is a daemon that is stopped or starting, not a broken host, or
+# a daemon that closed between our connect and our send (its shutdown window).
+DOWN_ERRORS = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)
 
 
 class DoorbellExit(Exception):

@@ -602,6 +602,168 @@ class Scripted:
         await asyncio.Event().wait()  # then nothing more
 
 
+class Stubborn:
+    """A source whose stream absorbs cancels, as an HTTP stack that turns one into an error it
+    retries does: the first `swallow` of them (every one when None), until `release` is set."""
+
+    def __init__(self, swallow: int | None = None, *, fail_on_release: bool = False) -> None:
+        self.swallow = swallow
+        self.swallowed = 0
+        self.release = asyncio.Event()
+        # On release, end with an error rather than the cancel, as an HTTP stack does.
+        self.fail_on_release = fail_on_release
+        self.streams = 0
+
+    async def stream(
+        self,
+        dev_name: str,
+        *,
+        cursor: StreamCursor | None = None,
+        on_status: StatusSink = NO_STATUS,
+    ) -> AsyncIterator[InboundMessage]:
+        self.streams += 1
+        while True:
+            try:
+                await (self.release if self.fail_on_release else asyncio.Event()).wait()
+            except asyncio.CancelledError:
+                if not self.fail_on_release and (
+                    self.release.is_set() or self.swallowed == self.swallow
+                ):
+                    raise
+                self.swallowed += 1
+                continue
+            if self.fail_on_release:
+                raise ConnectionError("the stream broke")
+        yield  # pragma: no cover - makes this an async generator
+
+
+def doorbell_tasks(dev: str) -> list[asyncio.Task[Any]]:
+    return [t for t in asyncio.all_tasks() if t.get_name().startswith(f"doorbell {dev} ")]
+
+
+async def release(sources: list[Stubborn], tasks: list[asyncio.Task[Any]]) -> None:
+    """End abandoned tasks, so none outlives the loop."""
+    for src in sources:
+        src.release.set()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_detach_recancels_a_task_that_swallowed_one_cancel(tmp_path: Path, run: Any) -> None:
+    """#152: a task that absorbed the first cancel is cancelled again, and ends."""
+    src = Stubborn(swallow=1)
+    bell = Doorbell({"x": src}, CursorStore(tmp_path), detach_recancel_s=0.01)
+
+    async def scenario() -> None:
+        bell.attach(DEV, ["x"])
+        await asyncio.sleep(0.01)
+        (task,) = doorbell_tasks(DEV)
+        await asyncio.wait_for(bell.aclose(), 1)
+        assert task.done() and src.swallowed == 1
+        assert bell.attached(DEV) == []
+
+    run(scenario())
+
+
+def test_detach_abandons_a_task_that_never_stops_and_logs_it(
+    tmp_path: Path, run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#152: a task that absorbs every cancel is abandoned after `detach_timeout_s`, with one
+    ERROR line naming it, so `aclose` (and `crewchat serve`'s stop) can't hang."""
+    src = Stubborn()
+    bell = Doorbell({"x": src}, CursorStore(tmp_path), detach_timeout_s=0.1, detach_recancel_s=0.01)
+
+    async def scenario() -> None:
+        bell.attach(DEV, ["x"])
+        await asyncio.sleep(0.01)
+        tasks = doorbell_tasks(DEV)
+        await asyncio.wait_for(bell.aclose(), 1)
+        assert not tasks[0].done() and src.swallowed > 1
+        await release([src], tasks)
+
+    run(scenario())
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "did not stop" in errors[0] and f"doorbell {DEV} x" in errors[0]
+
+
+def test_detach_stops_an_agents_tasks_concurrently(
+    tmp_path: Path, run: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#152: one agent's detach waits one `detach_timeout_s` for all its tasks, not one each."""
+    srcs = [Stubborn(), Stubborn()]
+    bell = Doorbell(
+        {"x": srcs[0], "y": srcs[1]},
+        CursorStore(tmp_path),
+        detach_timeout_s=0.2,
+        detach_recancel_s=0.01,
+    )
+
+    async def scenario() -> float:
+        bell.attach(DEV, ["x", "y"])
+        await asyncio.sleep(0.01)
+        tasks = doorbell_tasks(DEV)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await bell.detach(DEV)
+        took = loop.time() - started
+        await release(srcs, tasks)
+        return took
+
+    assert run(scenario()) < 0.35
+    errors = [r.getMessage() for r in caplog.records if "did not stop" in r.getMessage()]
+    assert sorted(e.split()[4] for e in errors) == ["x", "y"]  # "doorbell task doorbell babel x"
+
+
+def test_an_abandoned_task_never_reopens_its_stream(tmp_path: Path, run: Any) -> None:
+    """#152: a task `detach` abandoned, whose stream later ends in an error, ends there: it
+    reports no outage and never calls `stream()` again for the agent that left."""
+    src = Stubborn(fail_on_release=True)
+    bell = Doorbell(
+        {"x": src},
+        CursorStore(tmp_path),
+        sleep=fast_sleep,
+        detach_timeout_s=0.05,
+        detach_recancel_s=0.01,
+    )
+
+    async def scenario() -> None:
+        bell.attach(DEV, ["x"])
+        await asyncio.sleep(0.01)
+        (orphan,) = doorbell_tasks(DEV)
+        await bell.close_agent(DEV)
+        assert not orphan.done() and src.swallowed > 1  # abandoned, still running
+        src.release.set()  # the stream now fails instead of waiting
+        await asyncio.wait_for(orphan, 1)
+        assert src.streams == 1  # never reopened
+        assert bell.queue(DEV).empty()  # and no `backend.down` for an agent that left
+
+    run(scenario())
+
+
+def test_aclose_stops_every_agent_concurrently(tmp_path: Path, run: Any) -> None:
+    """#152: `aclose` (the daemon's stop) waits one `detach_timeout_s` for all agents, not one
+    per agent."""
+    src = Stubborn()
+    bell = Doorbell({"x": src}, CursorStore(tmp_path), detach_timeout_s=0.2, detach_recancel_s=0.01)
+
+    async def scenario() -> float:
+        bell.attach(DEV, ["x"])
+        bell.attach("kessel", ["x"])
+        await asyncio.sleep(0.01)
+        tasks = doorbell_tasks(DEV) + doorbell_tasks("kessel")
+        assert len(tasks) == 2
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await bell.aclose()
+        took = loop.time() - started
+        await release([src], tasks)
+        return took
+
+    assert run(scenario()) < 0.35
+
+
 def test_cursor_replay_dedups_an_overlap(tmp_path: Path, run: Any) -> None:
     """A replay that overlaps what was queued delivers each event once; the restarted
     stream is handed a cursor that covers every ID already queued."""

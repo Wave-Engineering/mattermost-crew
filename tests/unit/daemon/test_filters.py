@@ -474,6 +474,57 @@ def test_crew_untrusted_by_the_refetch_round_still_counts() -> None:
     assert verdict.kind == Kind.DROP and verdict.reason == "refetch_failed"
 
 
+async def hanging_ally_with_new_bot(rig: Rig, *, mint: bool = True) -> int:
+    """#152's mixed case: oaw's broker answers and lists its newly minted `bot-new`, while
+    ally's, which oaw trusts, hangs (its 0.1 s timeout is inside the rig's 0.5 s round). The
+    count of oaw's `crew_info` calls so far."""
+    await rig.prime()
+    rig.broker("ally").hang = True
+    if mint:
+        rig.broker().info["minted_bot_ids"].append("bot-new")
+    return rig.broker().count()
+
+
+def test_own_new_bot_delivered_while_a_trusted_broker_hangs(rig: Rig) -> None:
+    """#152: a broker that answered lists the bot, so another broker's failure can't drop it."""
+
+    async def scenario() -> Verdict:
+        await hanging_ally_with_new_bot(rig)
+        return await rig.admit(mm("bot-new"))
+
+    assert run(scenario()) == DELIVER
+
+
+def test_unknown_bot_dropped_while_a_trusted_broker_hangs(rig: Rig) -> None:
+    """#152: a bot no answering broker lists may still be ally's: dropped, never the kiosk."""
+
+    async def scenario() -> Verdict:
+        await hanging_ally_with_new_bot(rig)
+        return await rig.admit(mm("bot-unknown"))
+
+    verdict = run(scenario())
+    assert verdict.kind == Kind.DROP and verdict.reason == "refetch_failed"
+
+
+def test_mixed_miss_one_round_for_both(rig: Rig) -> None:
+    """#152: an unknown bot's miss, then our new bot's 3 s later, minted after the first round,
+    so its own round fails on ally too: ours is delivered, and our broker is re-fetched at most
+    once per miss."""
+
+    async def scenario() -> tuple[Verdict, Verdict, int]:
+        before = await hanging_ally_with_new_bot(rig, mint=False)
+        unknown = await rig.admit(mm("bot-unknown"))
+        rig.broker().info["minted_bot_ids"].append("bot-new")
+        rig.mono.t += 3  # past the 2 s floor between rounds
+        ours = await rig.admit(mm("bot-new"))
+        return unknown, ours, rig.broker().count() - before
+
+    unknown, ours, refetched = run(scenario())
+    assert unknown.kind == Kind.DROP and unknown.reason == "refetch_failed"
+    assert ours == DELIVER
+    assert refetched <= 2
+
+
 # -- cache misses ---------------------------------------------------------------------------
 def test_new_crewmate_cache_miss_never_kiosk(rig: Rig) -> None:
     async def scenario() -> tuple[Verdict, dict[BrokerKey, int]]:

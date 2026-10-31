@@ -17,8 +17,10 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
   re-fetch every local broker's `crew_info` once and re-check before any verdict. A bot
   account is re-fetched for at most once per 30 s, and rounds across all bots are at least
   `refetch_min_interval_s` (default 2 s) apart: a miss while a round is in flight waits for
-  it, and a round that fails or times out gives `DROP` (R-22). The daemon never reads
-  `owner_id`: a bot token can't see it (D-100).
+  it, and a round that fails or times out gives `DROP` (R-22), unless a broker that answered
+  lists the bot: then it is admitted, whichever other broker failed (#152). A miss holds the
+  later posts on that agent's stream for at most one round (max `broker_timeout_s` + 1). The
+  daemon never reads `owner_id`: a bot token can't see it (D-100).
 - **Social engaged** (Story 3.6, R-33). Each `switch_state` fetch compares the broker's
   `effective_mode` with the one its previous fetch gave. A move to `social` from `crew` or
   `trusted` (or a first fetch that finds social) calls each `social_listeners(crew,
@@ -686,14 +688,15 @@ class Filters:
                 return None
             return {reg.crew, *_trusted(before, reg.crew), *_trusted(after, reg.crew)}
 
-        if await self.cache.miss(msg.author_id, server_id, crews) == "failed":
-            return DROP("refetch_failed")
+        missed = await self.cache.miss(msg.author_id, server_id, crews)
         own = self.cache.crew_info(reg.crew, server_id)
         if own is None:
             return DROP("no_cache")
         found = self._lookup(msg, reg, server_id)
         if found is not None:
-            return found
+            return found  # a broker that answered lists it: another's failure can't unmake that
+        if missed == "failed":
+            return DROP("refetch_failed")
         # Only a trusted crew's bot can be misclassified by a cache miss (D-115): an untrusted
         # crew's bots are outsiders whether its broker is cached or not.
         trusted = set(_trusted(own, reg.crew))
