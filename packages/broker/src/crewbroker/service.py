@@ -459,14 +459,20 @@ class Broker:
         assert reply is not None  # only a late command is ever held back
         return reply
 
-    def handle_late_dm(self, sender_user_id: str, text: str) -> str | None:
+    def handle_late_dm(
+        self, sender_user_id: str, text: str, *, overtaken: bool = False
+    ) -> str | None:
         """`handle_dm` for a command the backfill found stale or overtaken (#159): applied only
         if it widens nothing (`widens`) on the switch as it stands, else None and nothing
         changes. Applied late, a widening command opens the crew when the partner believes
-        it closed; a narrowing one is what they asked for, whatever its words."""
-        return self._handle_dm(sender_user_id, text, late=True)
+        it closed; a narrowing one is what they asked for, whatever its words. An `overtaken`
+        one must not widen where the switch ends up either: the newer command, and its reply,
+        told the partner that."""
+        return self._handle_dm(sender_user_id, text, late=True, overtaken=overtaken)
 
-    def _handle_dm(self, sender_user_id: str, text: str, *, late: bool) -> str | None:
+    def _handle_dm(
+        self, sender_user_id: str, text: str, *, late: bool, overtaken: bool = False
+    ) -> str | None:
         now = self.clock()
         lapsed_to: Mode | None = None
         with self._lock:
@@ -475,7 +481,7 @@ class Broker:
             else:
                 state = self.switch.load()
             new, reply = apply_command(state, sender_user_id, text, self.config, now)
-            held = late and widens(state, new, now)
+            held = late and widens(state, new, now, later=overtaken)
             if held:
                 new = state
             elif new != state:
@@ -781,7 +787,11 @@ class DMListener:
         stands (`Broker.handle_late_dm`), and is otherwise answered "not applied". Applied
         late, a `social 2h` would open the crew when the partner believes it closed; a late
         `trusted` under social, or a shorter `social`, closes what the partner asked closed.
-        A command that fails stops the backfill there, still owed. If any read fails, nothing
+        An overtaken one must also not widen where the switch ends up (`switch.landing`): a
+        newer command, and its reply, told the partner that. A command that fails stops the
+        backfill there, still owed: it is retried before the next DM and at the next `hello`.
+        If that retry fails too, the next DM still applies, and the failed one, overtaken by
+        it, is judged late. If any read fails, nothing
         is applied, the cursor stays, and the backfill stays owed: it is tried again before
         the next DM and at the next `hello`. A partner the server says doesn't exist
         (`BACKFILL_SKIP_STATUSES`, such as a deleted user) is logged and skipped instead, so
@@ -819,20 +829,22 @@ class DMListener:
         for dm in sorted(missed, key=lambda m: (m.create_at, m.post_id)):
             late = ""
             stale = now.timestamp() - dm.create_at / 1000 > BACKFILL_MAX_AGE_S
-            if stale or dm.create_at < self._newest_partner_dm:
+            overtaken = dm.create_at < self._newest_partner_dm
+            if stale or overtaken:
                 sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
                 late = f"sent {sent.isoformat(timespec='seconds')}"
-            if not self._apply(dm, late=late):
-                return  # still owed: the retry applies it before anything sent after it
+            if not self._apply(dm, late=late, overtaken=overtaken):
+                return  # still owed: retried before the next DM, and at the next `hello`
         self._owed = False
         self._save_cursor(self._newest_dm)
 
-    def _apply(self, dm: DirectMessage, *, late: str = "") -> bool:
+    def _apply(self, dm: DirectMessage, *, late: str = "", overtaken: bool = False) -> bool:
         """Handle one DM once: apply it and reply. With `late` (when it was sent, for a DM the
         backfill found stale or overtaken), it is applied only if it widens nothing, and is
-        otherwise answered that it was not. Then advance the cursor past it, unless a backfill
-        is still owed. A command that fails is not handled: the backfill is owed again, so it
-        is retried before the next DM, and False is returned."""
+        otherwise answered that it was not; `overtaken` also judges where the switch ends up.
+        Then advance the cursor past it, unless a backfill is still owed. A command that fails
+        is not handled: the backfill is owed again, so it is retried before the next DM, and
+        False is returned."""
         if dm.post_id:
             if dm.post_id in self._handled:
                 return True
@@ -841,7 +853,9 @@ class DMListener:
                 self._handled.popitem(last=False)
         try:
             if late:
-                reply = self.broker.handle_late_dm(dm.sender_user_id, dm.message)
+                reply = self.broker.handle_late_dm(
+                    dm.sender_user_id, dm.message, overtaken=overtaken
+                )
                 if reply is None:
                     reply = f"not applied: {late} while the broker was offline; send it again"
             else:
