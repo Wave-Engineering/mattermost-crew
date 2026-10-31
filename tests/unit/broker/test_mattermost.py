@@ -7,7 +7,13 @@ from typing import Any
 
 import httpx
 import pytest
-from crewbroker.mattermost import MattermostClient, MattermostError, NotFound
+from crewbroker.mattermost import (
+    DeadlineExceeded,
+    MattermostClient,
+    MattermostError,
+    NotFound,
+    call_deadline,
+)
 
 
 def test_list_bots_paginates_with_default_include_deleted() -> None:
@@ -77,6 +83,84 @@ def test_rate_limit_is_waited_out() -> None:
     with pytest.raises(MattermostError, match="429"):
         client.me()
     assert waits == [1.0] * 5
+
+
+def test_rate_limit_respects_deadline() -> None:
+    """#158: under `call_deadline`, a 429 whose wait would pass the deadline raises
+    `DeadlineExceeded` at once, without sleeping."""
+    waits: list[float] = []
+
+    def limited(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "5"}, json={})
+
+    client = MattermostClient(
+        "http://mm.invalid",
+        "tok",
+        transport=httpx.MockTransport(limited),
+        sleep=waits.append,
+        clock=lambda: 1000.0,
+    )
+    with call_deadline(1001.0), pytest.raises(DeadlineExceeded, match="429"):
+        client.me()
+    assert waits == []
+    with call_deadline(999.0), pytest.raises(DeadlineExceeded, match="deadline passed"):
+        client.me()  # already past: no request at all
+
+
+def test_request_timeout_capped_by_deadline() -> None:
+    """#158: each request's timeout is the smaller of the client's and the time left."""
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"id": "me"})
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(handler), clock=lambda: 1000.0
+    )
+    with call_deadline(1003.0):
+        client.me()
+    with call_deadline(1060.0):
+        client.me()
+    client.me()  # no deadline
+    assert [t["read"] for t in seen] == [3.0, 10.0, 10.0]
+
+
+def test_timeout_past_the_deadline_is_deadline_exceeded() -> None:
+    """#158: a request cut off by the capped timeout, once the deadline has passed, is a
+    `DeadlineExceeded`; without a deadline it stays a plain `MattermostError`."""
+    now = [1000.0]
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        now[0] += 5
+        raise httpx.ReadTimeout("slow", request=request)
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(slow), clock=lambda: now[0]
+    )
+    with call_deadline(1002.0), pytest.raises(DeadlineExceeded):
+        client.me()
+    with pytest.raises(MattermostError) as exc:
+        client.me()
+    assert not isinstance(exc.value, DeadlineExceeded)
+
+
+def test_no_deadline_keeps_retries() -> None:
+    """#158: outside `call_deadline` (prune, the DM listener) a 429 is still waited out."""
+    answers = iter([429, 200])
+    waits: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if next(answers) == 429:
+            return httpx.Response(429, headers={"Retry-After": "5"}, json={})
+        return httpx.Response(200, json={"id": "me"})
+
+    client = MattermostClient(
+        "http://mm.invalid", "tok", transport=httpx.MockTransport(handler), sleep=waits.append
+    )
+    with call_deadline(None):
+        assert client.me() == {"id": "me"}
+    assert waits == [5.0]
 
 
 def test_membership_adds_and_error_id() -> None:

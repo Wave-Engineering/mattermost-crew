@@ -3,12 +3,19 @@
 The broker account holds `system_user_access_token` patched with `create_bot`, `read_bots`
 and `manage_bots`, and nothing more (R-06). So it can read and manage the bots it owns, and
 no others: `GET /bots/{id}` is 404 for a bot it does not own (D-100).
+
+A caller with a deadline sets it with `call_deadline` (#158). Inside it, `_call` caps each
+request's timeout at the time left, and raises `DeadlineExceeded` rather than send a request
+or wait out a 429 past it. The deadline is per thread, so the prune and DM-listener threads,
+which set none, keep the plain timeout and retries.
 """
 
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, Protocol
 
 import httpx
@@ -36,6 +43,24 @@ class MattermostError(Exception):
 
 class NotFound(MattermostError):
     """The server answered 404."""
+
+
+class DeadlineExceeded(MattermostError):
+    """The caller's `call_deadline` passed, or a 429's wait would pass it."""
+
+
+_local = threading.local()
+
+
+@contextmanager
+def call_deadline(deadline: float | None) -> Iterator[None]:
+    """Bound this thread's calls by `deadline` (epoch seconds; None for no bound)."""
+    previous = getattr(_local, "deadline", None)
+    _local.deadline = deadline
+    try:
+        yield
+    finally:
+        _local.deadline = previous
 
 
 class MattermostAPI(Protocol):
@@ -97,9 +122,12 @@ class MattermostClient:
         timeout: float = DEFAULT_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.url = url.rstrip("/")
+        self.timeout = timeout
         self._sleep = sleep
+        self._clock = clock
         self._http = httpx.Client(
             base_url=f"{self.url}/api/v4",
             headers={"Authorization": f"Bearer {token}"},
@@ -119,17 +147,34 @@ class MattermostClient:
         params: dict[str, Any] | None = None,
         files: Any = None,
     ) -> Any:
+        deadline: float | None = getattr(_local, "deadline", None)
         attempt = 0
         while True:
+            timeout = self.timeout
+            if deadline is not None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise DeadlineExceeded(method, path, None, "the caller's deadline passed")
+                timeout = min(timeout, remaining)
             try:
-                resp = self._http.request(method, path, json=json, params=params, files=files)
+                resp = self._http.request(
+                    method, path, json=json, params=params, files=files, timeout=timeout
+                )
+            except httpx.TimeoutException as exc:
+                if deadline is not None and self._clock() >= deadline:
+                    raise DeadlineExceeded(method, path, None, f"timed out: {exc}") from exc
+                raise MattermostError(method, path, None, str(exc)) from exc
             except httpx.HTTPError as exc:
                 raise MattermostError(method, path, None, str(exc)) from exc
             if resp.status_code != 429 or attempt >= RATE_LIMIT_RETRIES:
                 break
-            # Live within the server's per-user rate limit (CT-06): wait out the window.
+            # Live within the server's per-user rate limit (CT-06): wait out the window, unless
+            # the wait would pass the caller's deadline.
+            wait = _retry_after(resp)
+            if deadline is not None and self._clock() + wait >= deadline:
+                raise DeadlineExceeded(method, path, 429, "rate limited past the caller's deadline")
             attempt += 1
-            self._sleep(_retry_after(resp))
+            self._sleep(wait)
         if resp.status_code == 404:
             raise NotFound(method, path, 404, _detail(resp), _error_id(resp))
         if not resp.is_success:

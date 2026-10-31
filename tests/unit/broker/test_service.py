@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from crewbroker import mattermost
 from crewbroker.config import CrewConfig
+from crewbroker.mattermost import DeadlineExceeded
 from crewbroker.membership import DEADLINE_RESERVE_S, DEFERRED
 from crewbroker.service import (
     Broker,
@@ -605,6 +607,44 @@ def test_late_request_past_its_deadline_is_refused(
         broker.remint({**_args(held["token_id"]), "deadline": sent + 2})
     assert fake.count("create_token") == tokens_before
     assert fake.token_works(newer["token"])
+
+
+def test_mint_rate_limited_past_deadline_is_expired(
+    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#158: `mint` and `remint` run under `call_deadline(deadline - DEADLINE_RESERVE_S)`, and
+    a `create_token` rate limited past it answers `expired` with no token recorded."""
+    held = broker.mint(_args(None))
+    deadline = clock.now.timestamp() + 2
+    bounds: list[float | None] = []
+
+    def rate_limited(user_id: str, description: str, expires_at_ms: int | None = None) -> Any:
+        bounds.append(mattermost._local.deadline)
+        raise DeadlineExceeded("POST", f"/users/{user_id}/tokens", 429, "rate limited")
+
+    monkeypatch.setattr(fake, "create_token", rate_limited)
+    tokens_before = len(broker.tokens.all())
+    for op in (broker.mint, broker.remint):
+        with pytest.raises(OpError, match="expired"):
+            op({**_args(held["token_id"]), "deadline": deadline})
+    assert bounds == [deadline - DEADLINE_RESERVE_S] * 2
+    assert len(broker.tokens.all()) == tokens_before
+    assert getattr(mattermost._local, "deadline", None) is None  # restored after the op
+
+
+def test_deadline_past_the_mint_is_reported_not_raised(
+    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#158: once the token exists, a deadline that fires in the avatar step leaves the mint
+    answered, the flag unset for the next mint."""
+
+    def late(user_id: str, png: bytes) -> None:
+        raise DeadlineExceeded("POST", f"/users/{user_id}/image", None, "deadline passed")
+
+    monkeypatch.setattr(fake, "set_user_image", late)
+    minted = broker.mint({**_args(None), "deadline": clock.now.timestamp() + 10})
+    assert fake.token_works(minted["token"])
+    assert not broker.accounts.avatar_set("babel.oaw")
 
 
 def test_deadline_must_be_epoch_seconds(broker: Broker) -> None:
