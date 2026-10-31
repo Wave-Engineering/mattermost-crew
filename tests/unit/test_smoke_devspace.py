@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -123,6 +124,7 @@ class FakeMattermost(ThreadingHTTPServer):
         self.users: dict[str, dict[str, Any]] = {}
         self.teams: dict[str, dict[str, Any]] = {}
         self.requests: list[tuple[str, str]] = []
+        self.token = "t"
 
     @property
     def url(self) -> str:
@@ -152,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         self.server.requests.append((self.command, self.path))
-        if self.headers.get("Authorization") != "Bearer t":
+        if self.headers.get("Authorization") != f"Bearer {self.server.token}":
             return self._reply(401)
         m = re.fullmatch(r"/api/v4/(users|teams|bots)/([a-z0-9]{26})(/disable)?", self.path)
         if m is None:
@@ -331,6 +333,34 @@ def test_cleanup_yes_deactivates_only_the_run(
     assert mm.users[world["partner-oaw9f9f"]]["delete_at"] == 0
     assert mm.teams[world["crew-e2e9f9f"]]["delete_at"] == 0
     assert "7 acted on, 4 skipped, 0 failed" in result.stdout
+
+
+def test_cleanup_keeps_the_token_off_curls_command_line(
+    mm: FakeMattermost, tmp_path: Path, world: dict[str, str]
+) -> None:
+    """An argv is any local user's to read in /proc: the admin token goes to curl on stdin."""
+    mm.token = "s3cr3tadmintoken"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv"
+    real_curl = shutil.which("curl")
+    shim = bin_dir / "curl"
+    shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{argv_log}"\nexec "{real_curl}" "$@"\n')
+    shim.chmod(0o755)
+    result = run(
+        "--cleanup",
+        RUN,
+        "--yes",
+        MM_URL=mm.url,
+        MM_ADMIN_TOKEN=mm.token,
+        SMOKE_TARGET="local",
+        SMOKE_REPORTS=str(tmp_path),
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+    )
+    assert "7 acted on, 4 skipped, 0 failed" in result.stdout, result.stderr
+    calls = argv_log.read_text()
+    assert calls.count("\n") == len(mm.requests)  # every request went through the shim
+    assert mm.token not in calls
 
 
 def test_cleanup_skips_what_is_already_deactivated_or_the_wrong_kind(

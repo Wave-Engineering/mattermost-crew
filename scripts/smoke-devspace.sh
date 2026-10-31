@@ -86,12 +86,17 @@ for tool in curl jq uv; do
   command -v "$tool" >/dev/null || die "$tool is not installed"
 done
 
+# The admin's auth header as a curl config, for `curl -K -`: on stdin, so the token is never
+# in an argv any local user can read in /proc. printf is a builtin: no process carries it.
+admin_auth() {
+  printf 'header = "Authorization: Bearer %s"\n' "$MM_ADMIN_TOKEN"
+}
+
 # One request as the admin: the body goes to $api_body, the HTTP status to stdout ("000" when
 # the server could not be reached). Not -f: a 404 is an answer here ("gone"), not a failure.
 api_body=""
 api() {
-  curl -sS -o "$api_body" -w '%{http_code}' -X "$1" \
-    -H "Authorization: Bearer ${MM_ADMIN_TOKEN}" "${MM_URL}/api/v4$2" || true
+  admin_auth | curl -K - -sS -o "$api_body" -w '%{http_code}' -X "$1" "${MM_URL}/api/v4$2" || true
 }
 
 # `--cleanup <run> [--yes]`: deactivate what run <run> recorded creating, and nothing else.
@@ -171,7 +176,7 @@ fi
 
 version="$(curl -fsS "${MM_URL}/api/v4/config/client?format=old" | jq -r '.Version // "unknown"')" \
   || die "no answer from ${MM_URL}/api/v4/config/client"
-curl -fsS -o /dev/null -H "Authorization: Bearer ${MM_ADMIN_TOKEN}" "${MM_URL}/api/v4/users/me" \
+admin_auth | curl -K - -fsS -o /dev/null "${MM_URL}/api/v4/users/me" \
   || die "MM_ADMIN_TOKEN is not accepted by ${MM_URL}"
 
 cd "$ROOT"
