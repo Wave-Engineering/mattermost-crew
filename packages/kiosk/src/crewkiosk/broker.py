@@ -79,7 +79,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from crewkiosk import ops, proxy
+from crewkiosk import __version__, ops, proxy
 from crewkiosk.corpus import CORPUS_ROOT, POOL_DIR, ManifestError, load_manifest
 
 log = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ MAX_LINE_BYTES = 1024 * 1024
 ANSWER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 POST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MCP_PROTOCOL = "2025-06-18"
-VERSION = "0.2.6"
+VERSION = __version__  # the package's own, so a release bump can't leave serverInfo behind
 CONTROL_TIMEOUT_S = 5
 HELLO_TIMEOUT_S = 10
 HELLO_REFUSED = -32001  # the error a refused hello request gets (crewkiosk-relay hello)
