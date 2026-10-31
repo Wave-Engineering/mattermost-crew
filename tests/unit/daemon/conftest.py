@@ -237,6 +237,7 @@ class FakeMattermost:
         self.posts: dict[str, dict[str, Any]] = {}
         self.reactions: list[dict[str, Any]] = []
         self.patches: list[tuple[str, str, dict[str, Any]]] = []  # (post id, as user, body)
+        self.walled: set[str] = set()  # posts in a channel no caller is in: a GET is a 403
         self.files: dict[str, dict[str, Any]] = {}  # file id -> {id, name, data, ...}
         self.hidden_from: dict[str, set[str]] = {}  # post id -> user ids it 404s for
         self.requests: list[tuple[str, str, str]] = []  # (method, path, token)
@@ -376,6 +377,8 @@ class FakeMattermost:
             found = self.posts.get(parts[1])
             if found is None or me in self.hidden_from.get(parts[1], set()):
                 return httpx.Response(404, json={"id": "app.post.get.app_error"})
+            if parts[1] in self.walled:
+                return httpx.Response(403, json={"id": "api.context.permissions.app_error"})
             return httpx.Response(200, json=found)
         if request.method == "PUT" and parts[0] == "posts" and parts[2:] == ["patch"]:
             # `PUT /posts/{id}/patch` (#149): the server lets only the author edit; `props`, when

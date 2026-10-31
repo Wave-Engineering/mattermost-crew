@@ -349,9 +349,10 @@ class DiscordBackend:
         self._agents: dict[str, _Agent] = {}
         # message ID -> channel ID, for `react`: an LRU, so it can't grow without bound.
         self._where: OrderedDict[str, str] = OrderedDict()
-        # message ID -> the agent that sent it. Every agent posts as the one bot, so this is
-        # what lets `edit` refuse another agent's post (#149). Lost on a restart.
-        self._owners: OrderedDict[str, str] = OrderedDict()
+        # message ID -> (the agent that sent it, its channel). Every agent posts as the one bot,
+        # so this is what lets `edit` refuse another agent's post (#149). It carries the channel
+        # too, since `_where` evicts on every message seen, not just sent. Lost on a restart.
+        self._owners: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._channels: list[str] = []
         self._channels_at: float | None = None
 
@@ -751,7 +752,7 @@ class DiscordBackend:
                 "POST", f"/channels/{target}/messages", body, files=files
             )
             if isinstance(last, dict) and last.get("id"):
-                self._own(str(last["id"]), dev_name)
+                self._own(str(last["id"]), dev_name, target)
         if not isinstance(last, dict):
             raise DiscordError("discord", 0, "send returned no message")
         if attachments and len(last.get("attachments") or []) < len(attachments):
@@ -822,8 +823,8 @@ class DiscordBackend:
             raise KeyError(f"no channel known for message {post_id}; pass <channel>/<message>")
         return channel, message
 
-    def _own(self, message: str, dev_name: str) -> None:
-        self._owners[message] = dev_name
+    def _own(self, message: str, dev_name: str, channel: str) -> None:
+        self._owners[message] = (dev_name, channel)
         self._owners.move_to_end(message)
         while len(self._owners) > OWNERS_MAX:
             self._owners.popitem(last=False)
@@ -835,9 +836,14 @@ class DiscordBackend:
         posts as the one bot, so the daemon checks ownership: a message this daemon didn't
         send for `dev_name` (another agent's, or one sent before a restart) is `Forbidden`,
         with no request made. An edit is one message: text too long for one is refused."""
-        channel, message = self._locate(post_id)
-        if self._owners.get(message) != dev_name:
+        if "/" in post_id:
+            channel, message = self._locate(post_id)
+        else:
+            channel, message = "", require_snowflake(post_id, "post_id")
+        owner, sent_in = self._owners.get(message, ("", ""))
+        if owner != dev_name:
             raise Forbidden("not your post")
+        channel = channel or sent_in
         chunks = self.signed(dev_name, text)
         if len(chunks) != 1:
             raise ValueError(f"an edit is one message: at most {MAX_CHUNK} characters, signed")

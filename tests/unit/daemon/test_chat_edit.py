@@ -31,8 +31,9 @@ def test_edit_refuses_foreign_discord_post(
         run(b.edit(ME, f"{C1}/{theirs.post_id}", "hijacked"))
     fresh = backend(discord, credential)
     mine = run(b.send(ME, C1, "before the restart"))
-    with pytest.raises(Forbidden):
-        run(fresh.edit(ME, f"{C1}/{mine.post_id}", "after"))
+    for ref in (f"{C1}/{mine.post_id}", mine.post_id):  # a bare ID too: forbidden, not unknown
+        with pytest.raises(Forbidden):
+            run(fresh.edit(ME, ref, "after"))
     assert discord.edits == []
     assert discord.messages[C1][0]["content"].startswith("mine, not yours")
 
@@ -55,6 +56,18 @@ def test_edit_resigns_once_on_discord(discord: FakeDiscord, credential: Path, ru
     with pytest.raises(ValueError, match="one message"):
         run(b.edit(ME, sent.post_id, "x" * MAX_CHUNK))
     assert len(discord.edits) == 2
+
+
+def test_edit_by_bare_id_outlives_the_seen_message_map(
+    discord: FakeDiscord, credential: Path, run: Any
+) -> None:
+    """A status board cached by its bare ID stays editable after a busy guild has pushed it
+    out of the seen-message map: the ownership record keeps its channel."""
+    b = backend(discord, credential)
+    sent = run(b.send(ME, C1, "board v1"))
+    b._where.clear()
+    run(b.edit(ME, sent.post_id, "board v2"))
+    assert discord.messages[C1][0]["content"].startswith("board v2")
 
 
 def test_edit_of_a_deleted_discord_post_is_not_found(

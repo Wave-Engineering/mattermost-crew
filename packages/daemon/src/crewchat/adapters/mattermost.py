@@ -810,6 +810,10 @@ class MattermostBackend:
                 post = await client.get_post(post_id)
             except NotFoundError as exc:
                 raise NotFound(f"post {post_id}") from exc
+            except MattermostAPIError as exc:
+                if exc.status_code == 403:  # a channel the agent isn't in: not its post
+                    raise Forbidden("not your post") from exc
+                raise
             if str(post.get("user_id", "")) != me:
                 raise Forbidden("not your post")
             body: dict[str, Any] = {"message": text}

@@ -298,6 +298,18 @@ def test_send_edit_of_an_unknown_post_exits_6(repo: Path, short_dir: Path) -> No
     assert [f["op"] for f in fake.frames] == ["thread_backend"]
 
 
+def test_send_edit_reads_the_error_code_not_its_text(repo: Path, short_dir: Path) -> None:
+    """Only the daemon's own `not_found` code is exit 6: a `bad_request` whose text quotes
+    "not_found" (the caller's ID, say) stays exit 1."""
+    sock = short_dir / "q.sock"
+    error = "bad_request: post_id 'x_not_found' is not an ID"
+    fake = FakeDaemon(sock, lambda f: {"id": f["id"], "ok": False, "error": error})
+    try:
+        assert send(repo, sock, ["--edit", POST_ID])[0] == EXIT_ERROR
+    finally:
+        fake.close()
+
+
 def test_send_not_registered_exits_4_without_registering(repo: Path, short_dir: Path) -> None:
     sock = short_dir / "n.sock"
     fake = FakeDaemon(

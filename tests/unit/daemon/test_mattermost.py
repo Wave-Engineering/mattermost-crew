@@ -121,6 +121,10 @@ def test_mattermost_edit_patches_as_agent(mm: Any, run: Any) -> None:
         run(b.edit("babel.oaw", theirs["id"], "hijacked"))
     with pytest.raises(NotFound):
         run(b.edit("babel.oaw", "z" * 26, "gone"))
+    # A post in a channel the agent isn't in reads as a 403: not its post either.
+    mm.walled.add(theirs["id"])
+    with pytest.raises(Forbidden):
+        run(b.edit("babel.oaw", theirs["id"], "hijacked"))
     assert len(mm.patches) == 1
 
 

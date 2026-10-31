@@ -92,10 +92,12 @@ EXIT_CODES_HELP = """exit codes:
 
 
 class SendExit(Exception):
-    """A failure with its exit code. The message is the one stderr line."""
+    """A failure with its exit code. The message is the one stderr line; `error` is the
+    daemon's error code (`not_found`, ...), when the daemon refused."""
 
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, *, error: str = "") -> None:
         self.code = code
+        self.error = error
         super().__init__(message)
 
 
@@ -145,8 +147,8 @@ def request(sock_path: Path, op: str, args: dict[str, Any]) -> dict[str, Any]:
                 f"no registered session for {args.get('dev_name')} on this host",
             )
         if op == "edit" and code in ("not_found", "forbidden"):
-            raise SendExit(EXIT_CANT_EDIT, f"crewchat {op}: {error}")
-        raise SendExit(EXIT_ERROR, f"crewchat {op}: {error}")
+            raise SendExit(EXIT_CANT_EDIT, f"crewchat {op}: {error}", error=code)
+        raise SendExit(EXIT_ERROR, f"crewchat {op}: {error}", error=code)
     result = reply.get("result")
     return result if isinstance(result, dict) else {}
 
@@ -279,7 +281,7 @@ def run_edit(
             ns.backend, ns.edit, identity, root, ns.socket, dev_name, defaults_file
         )
     except SendExit as exc:
-        if ns.backend is None and exc.code == EXIT_ERROR and "not_found" in str(exc):
+        if ns.backend is None and exc.error == "not_found":
             raise SendExit(EXIT_CANT_EDIT, str(exc)) from exc  # the post is gone
         raise
     args: dict[str, Any] = {
