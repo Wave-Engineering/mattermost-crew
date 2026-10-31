@@ -1919,7 +1919,7 @@ image that has it. That deploy is under its own yes-prod.
 | R-28 | Cursor replay: queued exactly once, handed over at least once | Story 3.2 | IT-13 | integration test | Pass |
 | R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
 | R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
-| R-31 | Outsiders answered by a kiosk with no native tools while social is off; research only through the broker | Story 3.5, #142 | IT-21, IT-29, IT-31 (passed before b3df138; re-run at deploy: Known limit), IT-31b, E2E-02 | integration / e2e test | Pass |
+| R-31 | Outsiders answered by a kiosk with no native tools while social is off; research only through the broker | Story 3.5, #142 | IT-21, IT-29, IT-31 (passed before b3df138; re-run at deploy: Known limit), IT-31b (systemd 255 only: Known limit), E2E-02 | integration / e2e test | Pass |
 | R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pass |
 | R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pass |
 | R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pass |

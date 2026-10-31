@@ -597,11 +597,14 @@ nowhere before this host. After this block and [Verify the install](#verify-the-
 1. Run IT-31 from the release checkout, as the deploying user, with the host's real `claude`
    and `rg` on `PATH`. It runs the real runner, relay and CLI unconfined, in temp dirs, against
    a stub model: it spends no model key and touches no installed file. Both tests must pass,
-   not skip.
+   not skip. `CREWKIOSK_CLAUDE` names the CLI the runners use, `/usr/local/bin/claude`, not
+   whichever `claude` the deploying user's `PATH` finds first, and `CREWKIOSK_RG_REQUIRED=1`
+   turns a missing `rg` into a failure instead of a skip.
 
    ```text
    uv sync --frozen
-   CREWKIOSK_CLAUDE="$(command -v claude)" uv run pytest -v tests/integration/test_kiosk_research.py
+   CREWKIOSK_CLAUDE=/usr/local/bin/claude CREWKIOSK_RG_REQUIRED=1 \
+     uv run pytest -v tests/integration/test_kiosk_research.py
    ```
 
 2. Check that `verify-install` reported `PrivatePIDs=yes in effect` for each research unit.
@@ -661,11 +664,13 @@ one, is 0640 `root:crewkiosk`, and the same files with `crewkiosk` in place of t
 user: `crewkiosk` may read its own model credential and nothing else (R-08). On a research host
 (with `crewkiosk-broker`), it checks both model keys as their users: `crewkiosk-broker` reads only
 its own key, and `crewkiosk` only the runner's, and that `crewcorpus` may traverse
-`/etc/crewkiosk` but not list it. For each server in `CREWKIOSK_RESEARCH_SERVERS`, it checks:
+`/etc/crewkiosk` but not list it. It fails once, naming them, if any research server has its
+pool manifest written while `crewkiosk-broker` is not active (down, or in its restart back-off).
+For each server in `CREWKIOSK_RESEARCH_SERVERS`, it checks:
 
-- that the server's user, `crewkiosk-r-<server>`, exists, and that the running broker holds its
-  group (a broker started before the units were written does not, and serves that server
-  nothing);
+- that the server's user and group, `crewkiosk-r-<server>`, exist, and that the running broker
+  holds that group (a broker started before the units were written does not, and serves that
+  server nothing);
 - that each of the server's two broker sockets is group `crewkiosk-r-<server>`, mode 0660. A
   missing socket is reported, and fails once the server's pool manifest is written and the broker
   is running;

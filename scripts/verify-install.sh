@@ -37,8 +37,10 @@
 #     /etc/crewkiosk/broker-model.credential, and not the runner's; crewkiosk reads its own and
 #     not the broker's; the agent's user reads neither;
 #   - crewcorpus may traverse /etc/crewkiosk (ACL user:crewcorpus:--x) and not list it;
-#   - for each server in CREWKIOSK_RESEARCH_SERVERS: its user crewkiosk-r-<server> exists; its
-#     broker sockets, once served, are group crewkiosk-r-<server>, 0660; its linked unit points
+#   - crewkiosk-broker is active whenever any research server has its pool manifest written;
+#   - for each server in CREWKIOSK_RESEARCH_SERVERS: its user crewkiosk-r-<server> and its group
+#     exist, and the running broker holds that group; its broker sockets are group
+#     crewkiosk-r-<server>, 0660, and present once its manifest is written; its linked unit points
 #     at the shared body, which sits in no unit search path, and loads as crewkiosk-r-<server>
 #     with that user's current uid, an empty root, no network, no new privileges,
 #     ProtectProc=invisible, both keys hidden, and exactly that server's two broker sockets
@@ -382,6 +384,11 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
   fi
   search="$(systemd-analyze unit-paths)"
   systemd_version="$(systemctl --version | awk 'NR == 1 { print $2 }')"
+  # A server with its pool manifest written is one the broker should be serving: a broker that
+  # is down, or in its restart back-off, serves it nothing. One FAIL names them all.
+  broker_active=no
+  systemctl is-active --quiet crewkiosk-broker.service && broker_active=yes
+  unserved=()
   for server in ${CREWKIOSK_RESEARCH_SERVERS:-}; do
     unit="crewkiosk-research-${server}@verify.service"
     ruser="crewkiosk-r-${server}"
@@ -389,15 +396,9 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
       fail "no user $ruser for research server $server (re-run crewkiosk-research-units $server)"
       continue
     fi
-    # A server with its pool manifest written is one the broker should be serving: a broker that
-    # is down, or in its restart back-off, serves it nothing.
     manifest=no
     $SUDO test -f "/var/lib/crewchat-pool/${server}.json" && manifest=yes
-    broker_active=no
-    systemctl is-active --quiet crewkiosk-broker.service && broker_active=yes
-    if [[ "$manifest" == yes && "$broker_active" == no ]]; then
-      fail "$server has its pool manifest, but crewkiosk-broker.service is not active (see its journal)"
-    fi
+    [[ "$manifest" == yes && "$broker_active" == no ]] && unserved+=("$server")
     # A running broker keeps the groups it started with. Started before crewkiosk-research-units
     # added it to this server's group, it can't give the server's sockets that group, and so
     # serves the server nothing.
@@ -472,6 +473,9 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
     fi
     unset prop
   done
+  if ((${#unserved[@]} > 0)); then
+    fail "crewkiosk-broker.service is not active, and these servers have pool manifests: ${unserved[*]} (see its journal)"
+  fi
 fi
 
 if ((failures > 0)); then
