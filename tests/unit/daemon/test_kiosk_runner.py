@@ -844,6 +844,24 @@ def test_research_units_refuse_a_bad_server(tmp_path: Path, server: str) -> None
     assert not unit_dir.exists()
 
 
+def test_ci_stub_claude_parses(tmp_path: Path) -> None:
+    """scripts/ci/kiosk-up.sh's stub claude carries IT-31b's probe as Python inside a bash
+    single-quoted string, where one stray apostrophe breaks the whole script: every kiosk,
+    research or not, then exits 2. Parse it here, and run its research-off half."""
+    text = (ROOT / "scripts" / "ci" / "kiosk-up.sh").read_text()
+    match = re.search(r"^cat <<'EOF' \| [^\n]*/usr/local/bin/claude\n(.*?)^EOF$", text, re.M | re.S)
+    assert match is not None
+    stub = tmp_path / "claude"
+    stub.write_text(match.group(1))
+    parsed = subprocess.run(["bash", "-n", str(stub)], capture_output=True, text=True)
+    assert parsed.returncode == 0, parsed.stderr
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    ran = subprocess.run(
+        ["bash", str(stub)], input="q", capture_output=True, text=True, env=env, cwd=tmp_path
+    )
+    assert ran.returncode == 0 and "prompt=q" in ran.stdout, ran.stderr
+
+
 def shell_constant(script: Path, name: str) -> str:
     """A `NAME=value` or `NAME='value'` line's value, with any trailing comment cut."""
     pattern = rf"^{name}=(?:'([^']*)'|(\S*))(?:\s+#.*)?$"

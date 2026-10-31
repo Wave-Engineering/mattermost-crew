@@ -106,7 +106,7 @@ def tcp(host):
     except OSError as e:
         return type(e).__name__
 def dns(server):
-    # A raw DNS query for example.com's A record, straight to a resolver: no resolv.conf, no
+    # A raw DNS query for the A record of example.com, straight to a resolver: no resolv.conf, no
     # glibc. Only a reply counts as getting through.
     query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
     try:
