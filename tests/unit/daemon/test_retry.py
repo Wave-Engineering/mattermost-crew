@@ -131,12 +131,64 @@ def test_cancel_while_sleeping_ends_the_retry(daemon: Any) -> None:
         retry.schedule(reg, lambda r: None)
         await asyncio.sleep(0)
         assert retry.pending("babel")
+        task = retry._tasks["babel"]
         retry.cancel("babel")
         await asyncio.sleep(0)
-        assert not retry.pending("babel")
+        assert task.cancelled() and not retry.pending("babel")
 
     asyncio.run(scenario())
     assert mints(daemon, "prod") == 1
+
+
+def test_a_register_during_a_retrys_mint_waits_for_it(daemon: Any) -> None:
+    """The mint in flight finishes under `shield`; the newer register queues on the store lock
+    behind it, then rotates the token it installed, so exactly one stays live."""
+    prod = daemon.broker("oaw", "prod")
+    real_call = prod.call
+    retry = RegisterRetry(daemon.registry, sleep=Sleeps())
+    handlers = build_doorbell_handlers(
+        daemon.registry,
+        Attaches(),  # type: ignore[arg-type]
+        build_handlers(daemon.config, daemon.registry)["register"],
+        retry=retry,
+    )
+
+    async def scenario() -> dict[str, Any]:
+        entered, release = asyncio.Event(), asyncio.Event()
+        block = {"next_mint": False}
+
+        async def call(op: str, args: dict[str, Any]) -> dict[str, Any]:
+            if op == "mint" and block["next_mint"]:
+                block["next_mint"] = False
+                entered.set()
+                await release.wait()
+            return await real_call(op, args)
+
+        prod.call = call  # type: ignore[method-assign]
+        await handlers["register"]({"dev_name": "babel", "session_id": "s1"})
+        prod.fail.clear()
+        block["next_mint"] = True  # the retry's mint blocks, holding the store lock
+        first = retry._tasks["babel"]
+        await asyncio.wait_for(entered.wait(), 2)
+        newer = asyncio.create_task(
+            handlers["register"]({"dev_name": "babel", "session_id": "s2"})
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert first.cancelled()  # the outer task, not the shielded mint
+        release.set()
+        result = await asyncio.wait_for(newer, 2)
+        await settle(retry)
+        return result
+
+    result = asyncio.run(scenario())
+    assert result["backends"] == ["mattermost:dev", "mattermost:prod", "discord"]
+    reg = daemon.registry.get("babel")
+    assert reg.session_id == "s2" and reg.unavailable == []
+    # register (failed), the retry's mint, then the newer register's: no fourth.
+    assert mints(daemon, "prod") == 3
+    assert len(prod.ops("revoke")) == 1  # the retry's token, rotated out
+    assert list(prod.live.values()) == ["babel.oaw"]
 
 
 def test_delays_are_capped_and_jittered() -> None:
