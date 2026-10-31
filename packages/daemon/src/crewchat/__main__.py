@@ -22,6 +22,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,8 @@ from crewchat.adapters.discord import DiscordBackend, read_credential
 from crewchat.adapters.mattermost import MattermostBackend
 from crewchat.adapters.squawkie import SQUAWKIE, SquawkieBackend
 from crewchat.chat import AgentContext, build_chat_handlers
-from crewchat.config import CONFIG_PATH, ConfigError, load_config
-from crewchat.corpus_pool import PoolManifest, expert_repo
+from crewchat.config import CONFIG_PATH, ConfigError, ServersConfig, load_config
+from crewchat.corpus_pool import POOL_DIR, PoolManifest, expert_repo
 from crewchat.doorbell import (
     DETACH_TIMEOUT_S,
     CursorStore,
@@ -41,7 +42,7 @@ from crewchat.doorbell import (
     build_doorbell_handlers,
 )
 from crewchat.filters import Filters, KioskQueue, SwitchCache
-from crewchat.kiosk import ClaudeCliRunner, Kiosk, Research
+from crewchat.kiosk import ClaudeCliRunner, Kiosk, Research, ResearchRunner
 from crewchat.kiosk_broker import KioskBrokerClient
 from crewchat.protocol import PROTO
 from crewchat.registry import Registry
@@ -121,24 +122,45 @@ async def rotation_loop(
             return
 
 
-async def serve(
-    config_path: Path,
+@dataclass
+class DaemonParts:
+    """The daemon, built and not yet running: what `build` wires and `run` runs (#157)."""
+
+    config: ServersConfig
+    store: TokenStore
+    backends: list[MattermostBackend]
+    discord: DiscordBackend | None
+    squawkie: SquawkieBackend | None
+    cache: SwitchCache
+    registry: Registry
+    threads: MyThreads
+    filters: Filters
+    kiosk_queue: KioskQueue
+    doorbell: Doorbell
+    kiosk: Kiosk
+    context: AgentContext
+    uploads: UploadStore
+    register_retry: RegisterRetry
+    server: DaemonServer
+
+
+def build(
+    config: ServersConfig,
     socket_path: Path,
     tokens_dir: Path,
-    group: str | None,
     state_dir: Path = STATE_DIR,
-) -> int:
-    config = load_config(config_path)
+    *,
+    clock: Callable[[], datetime] | None = None,
+    kiosk_runner: ResearchRunner | None = None,
+    pool_dir: Path = POOL_DIR,
+) -> DaemonParts:
+    """Wire the daemon from `config`, starting nothing (#157). `crewchat serve` and the E2E
+    world both run what this builds, so the two can't drift. `clock` and `kiosk_runner` are
+    for tests, and `pool_dir` keeps a test's pool manifests out of /var/lib."""
+    with_clock: dict[str, Any] = {"clock": clock} if clock is not None else {}
     brokers = broker_clients(config)
     store = TokenStore(tokens_dir, brokers)
     store.load()
-    # Revokes owed by agents dropped before the last stop (#151). A broker still down keeps
-    # them for the next daily rotation; it never stops the daemon starting.
-    try:
-        if owed := await store.retry_retired():
-            log.warning("%d retired tokens still owed a revoke", owed)
-    except Exception:
-        log.exception("retrying retired revokes failed")
     # One adapter per configured Mattermost server (R-10). They hold websockets only for
     # agents whose stream is open; rotation reconnects those (§4.8).
     backends = [
@@ -149,16 +171,16 @@ async def serve(
     discord: DiscordBackend | None = None
     if config.discord_enabled:
         if config.discord_screamhole_url is None:
-            raise ConfigError(f"{config_path}: discord is enabled but has no screamhole_url")
+            raise ConfigError("discord is enabled but has no screamhole_url")
         discord = DiscordBackend(
             config.discord_screamhole_url,
             config.discord_credential,
             guild_id=config.discord_guild_id,
         )
         chat_backends[discord.name] = discord
-    cache = SwitchCache.from_config(brokers, config)
+    cache = SwitchCache.from_config(brokers, config, **with_clock)
     # The kiosk's corpus pool manifests (#139): written now, and after each register.
-    pool = PoolManifest(config, store.agents)
+    pool = PoolManifest(config, store.agents, pool_dir)
     pool.refresh()
     registry = Registry(config, brokers, store, cache, identity_sink=discord, pool=pool)
     # The one persisted "my threads" set (D-104): every send and dm records into it, and
@@ -166,7 +188,9 @@ async def serve(
     # restart.
     threads = MyThreads.load(state_dir, config.my_threads_retention_days)
     # Membership, addressing, the loop guard and the switch, on push and pull (Story 3.3).
-    filters = Filters.from_config(registry, cache, threads, config, state_dir=state_dir)
+    filters = Filters.from_config(
+        registry, cache, threads, config, state_dir=state_dir, **with_clock
+    )
     kiosk = KioskQueue()  # push KIOSK verdicts, for Story 3.5's kiosk
     # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
     uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
@@ -199,7 +223,7 @@ async def serve(
     # the `crewkiosk` CLI runner (D-096). Sessions start on each expert's first outsider.
     # A research server's answers go framed through the research socket, and the broker's
     # audit of each comes back into its transcript (#142).
-    runner = ClaudeCliRunner()
+    runner = kiosk_runner if kiosk_runner is not None else ClaudeCliRunner()
     kiosk_broker = KioskBrokerClient()
     research_servers = {s.id for s in config.mattermost if s.kiosk_research}
 
@@ -252,39 +276,86 @@ async def serve(
         )
     )
     server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
-    await server.start(socket_path, group)
+    return DaemonParts(
+        config=config,
+        store=store,
+        backends=backends,
+        discord=discord,
+        squawkie=squawkie,
+        cache=cache,
+        registry=registry,
+        threads=threads,
+        filters=filters,
+        kiosk_queue=kiosk,
+        doorbell=doorbell,
+        kiosk=kiosk_answers,
+        context=context,
+        uploads=uploads,
+        register_retry=register_retry,
+        server=server,
+    )
 
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
-    rotation = asyncio.create_task(rotation_loop(Rotator(store), stop))
-    kiosk_answers.start()
+
+async def run(parts: DaemonParts, socket_path: Path, group: str | None, stop: asyncio.Event) -> int:
+    """Run what `build` wired until `stop` is set, then tear it all down (#157). Signals are
+    the caller's: `serve` sets `stop` on SIGTERM and SIGINT."""
+    # Revokes owed by agents dropped before the last stop (#151). A broker still down keeps
+    # them for the next daily rotation; it never stops the daemon starting.
+    try:
+        if owed := await parts.store.retry_retired():
+            log.warning("%d retired tokens still owed a revoke", owed)
+    except Exception:
+        log.exception("retrying retired revokes failed")
+    await parts.server.start(socket_path, group)
+    rotation = asyncio.create_task(rotation_loop(Rotator(parts.store), stop))
+    parts.kiosk.start()
     # `switch_state` and `crew_info` from every local broker, now and every 30 s (§5.9).
-    switch_refresh = asyncio.create_task(cache.run(stop))
+    switch_refresh = asyncio.create_task(parts.cache.run(stop))
     log.info(
         "serving %s: crews %s, servers %s",
         socket_path,
-        ", ".join(sorted(config.crews)),
-        ", ".join(s.id for s in config.mattermost),
+        ", ".join(sorted(parts.config.crews)),
+        ", ".join(s.id for s in parts.config.mattermost),
     )
     try:
         await stop.wait()
     finally:
-        await server.aclose()
-        await register_retry.aclose()
+        await parts.server.aclose()
+        await parts.register_retry.aclose()
         await rotation
-        await switch_refresh
-        await doorbell.aclose()
-        await kiosk_answers.aclose()
-        if squawkie is not None:
-            await squawkie.aclose()
-        for backend in backends:
+        # A refresh blocked on a hung broker must not hold up the stop.
+        switch_refresh.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await switch_refresh
+        await parts.doorbell.aclose()
+        await parts.kiosk.aclose()
+        if parts.squawkie is not None:
+            await parts.squawkie.aclose()
+        for backend in parts.backends:
             await backend.aclose()
-        if discord is not None:
-            await discord.aclose()
+        if parts.discord is not None:
+            await parts.discord.aclose()
         socket_path.unlink(missing_ok=True)
     return 0
+
+
+async def serve(
+    config_path: Path,
+    socket_path: Path,
+    tokens_dir: Path,
+    group: str | None,
+    state_dir: Path = STATE_DIR,
+) -> int:
+    config = load_config(config_path)
+    try:
+        parts = build(config, socket_path, tokens_dir, state_dir)
+    except ConfigError as exc:
+        raise ConfigError(f"{config_path}: {exc}") from None
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    return await run(parts, socket_path, group, stop)
 
 
 def run_bounded[R](main: Coroutine[Any, Any, R], timeout_s: float = DETACH_TIMEOUT_S) -> R:

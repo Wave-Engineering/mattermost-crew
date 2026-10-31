@@ -25,13 +25,15 @@ without them every E2E test skips, as the integration tests do.
 - Two agents per crew (`AGENTS`). Bot accounts are the brokers' and outlive a daemon, so each
   test's `Daemon` registers the agents it uses through its socket, as the shim does.
 
-**The daemon** (`Daemon`, one per test) is wired as `crewchat serve` wires it, from that
-`servers.toml`: `broker_clients` over the real broker sockets, the token store, the
-Mattermost adapter, the switch cache (its 30 s refresh loop running), the registry, the
-persisted my-threads, the filters, the doorbell with its cursors on disk, the kiosk (on a stub
-model runner, since CI has no Claude Code), the social-engaged kiosk review, and every op on a
-real `DaemonServer` socket. Agents register, send and push their kiosk brief over that socket,
-and wake on the real `crewchat-doorbell` one-shot. It does not run the daily token rotation.
+**The daemon** (`Daemon`, one per test) is `crewchat.__main__.build` and `run`, the same code
+`crewchat serve` runs, from that `servers.toml`, with the world's clock, a stub kiosk runner
+(CI has no Claude Code) and a pool directory under the world's root. So it has every part
+`serve` has: the real broker sockets, the token store, the Mattermost adapter, the switch cache
+and its 30 s refresh, the registry, the persisted my-threads, the filters, the doorbell with
+its cursors on disk, the kiosk and its social-engaged review, the daily token rotation (with
+no agent registered at its first pass, and its next a day away), and every op on a real
+`DaemonServer` socket. Agents register, send and push their kiosk brief over that socket, and
+wake on the real `crewchat-doorbell` one-shot.
 
 Every HTTP response the daemon and the brokers see goes through a `RateLimitCounter`, so a
 test can assert how many `429`s the server sent (E2E-03).
@@ -68,17 +70,17 @@ from crewbroker.service import (
     DMListener,
     start_dm_listener,
 )
-from crewchat.__main__ import call
+from crewchat.__main__ import build, call, run
 from crewchat.adapters.mattermost import MattermostBackend
-from crewchat.chat import AgentContext, build_chat_handlers
-from crewchat.config import load_config
-from crewchat.doorbell import CursorStore, Doorbell, DoorbellEvent, build_doorbell_handlers
+from crewchat.chat import AgentContext
+from crewchat.config import ServersConfig, load_config
+from crewchat.doorbell import Doorbell, DoorbellEvent
 from crewchat.filters import Filters, KioskQueue, SwitchCache
-from crewchat.kiosk import Kiosk
+from crewchat.kiosk import Kiosk, ResearchFrame
 from crewchat.registry import Registry
-from crewchat.server import DaemonServer, build_handlers
+from crewchat.server import DaemonServer
 from crewchat.threads import MyThreads
-from crewchat.tokens import TokenStore, broker_clients
+from crewchat.tokens import TokenStore
 
 from tests.integration.conftest import MattermostServer, mattermost_from_env
 from tests.integration.mmhttp import mm_request
@@ -546,13 +548,13 @@ class StubRunner:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    async def answer(self, prompt: str) -> str:
+    async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str:
         self.prompts.append(prompt)
         return f"We build a chat daemon (answer {len(self.prompts)})."
 
 
 class Daemon:
-    """The daemon, wired from `servers.toml` as `crewchat serve` wires it, for one test."""
+    """The daemon `crewchat serve` runs (`build` and `run`), from `servers.toml`, for one test."""
 
     def __init__(self, world: World) -> None:
         world._daemons += 1
@@ -567,74 +569,84 @@ class Daemon:
         self.runner = StubRunner()
 
         mint.clear_expiry_cache()
-        config = load_config(world.servers_toml)
-        self.config = config
-        self.brokers = broker_clients(config)
-        self.store = TokenStore(tokens, self.brokers)
-        self.store.load()
-        (server,) = config.mattermost
-        self.backend = MattermostBackend(
-            server.id, server.url, self.store.token_for, refresher=self.store
+        self.parts = build(
+            load_config(world.servers_toml),
+            self.sock,
+            tokens,
+            self.state_dir,
+            clock=world.clock,
+            kiosk_runner=self.runner,
+            pool_dir=self.root / "pool",
         )
         self.backend._shared_http().event_hooks["response"].append(
             world.counter.async_hook("daemon")
         )
-        self.store.adapters.append(self.backend)
-        backends = {self.backend.name: self.backend}
-        self.cache = SwitchCache.from_config(self.brokers, config, clock=world.clock)
-        self.registry = Registry(config, self.brokers, self.store, self.cache)
-        self.threads = MyThreads.load(self.state_dir, config.my_threads_retention_days)
-        self.filters = Filters.from_config(
-            self.registry, self.cache, self.threads, config, clock=world.clock
-        )
-        self.kiosk_queue = KioskQueue()
-        self.doorbell = Doorbell(
-            dict(backends),
-            CursorStore(self.state_dir),
-            admit=self.filters.admit_event,
-            kiosk=self.kiosk_queue,
-        )
-        self.store.adapters.insert(0, self.doorbell)
-        self.context = AgentContext()
-        self.kiosk = Kiosk(
-            self.kiosk_queue,
-            self.context.briefs,
-            backends,
-            self.runner,
-            state_dir=self.state_dir,
-            deliver=self.doorbell.deliver,
-        )
-        self.cache.social_listeners.append(
-            lambda crew, server_id: self.kiosk.on_social(
-                server_id, self.registry.agents_on(crew, server_id)
-            )
-        )
-        handlers = build_handlers(config, self.registry, {})
-        handlers.update(
-            build_chat_handlers(
-                self.registry, backends, self.threads, self.context, filters=self.filters
-            )
-        )
-        handlers.update(build_doorbell_handlers(self.registry, self.doorbell, handlers["register"]))
-        self.server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
+
+    # What the flows read, over the parts `build` wired.
+    @property
+    def config(self) -> ServersConfig:
+        return self.parts.config
+
+    @property
+    def store(self) -> TokenStore:
+        return self.parts.store
+
+    @property
+    def backend(self) -> MattermostBackend:
+        (backend,) = self.parts.backends
+        return backend
+
+    @property
+    def registry(self) -> Registry:
+        return self.parts.registry
+
+    @property
+    def cache(self) -> SwitchCache:
+        return self.parts.cache
+
+    @property
+    def threads(self) -> MyThreads:
+        return self.parts.threads
+
+    @property
+    def filters(self) -> Filters:
+        return self.parts.filters
+
+    @property
+    def kiosk_queue(self) -> KioskQueue:
+        return self.parts.kiosk_queue
+
+    @property
+    def doorbell(self) -> Doorbell:
+        return self.parts.doorbell
+
+    @property
+    def context(self) -> AgentContext:
+        return self.parts.context
+
+    @property
+    def kiosk(self) -> Kiosk:
+        return self.parts.kiosk
+
+    @property
+    def server(self) -> DaemonServer:
+        return self.parts.server
 
     async def __aenter__(self) -> Daemon:
-        await self.server.start(self.sock, group=None)
         self.stop = asyncio.Event()
-        self.kiosk.start()
-        # `switch_state` and `crew_info` from every broker, now and every 30 s (§5.9).
-        self.refresher = asyncio.create_task(self.cache.run(self.stop))
+        self.task = asyncio.create_task(run(self.parts, self.sock, None, self.stop))
+        for _ in range(100):
+            if self.sock.exists() or self.task.done():
+                break
+            await asyncio.sleep(0.1)
+        if self.task.done():
+            await self.task  # it failed to start: raise why
+        assert self.sock.exists(), f"the daemon's socket {self.sock} never appeared"
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         self.stop.set()
-        self.refresher.cancel()  # it may be waiting on the hung broker
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.refresher
-        await self.server.aclose()
-        await self.doorbell.aclose()
-        await self.kiosk.aclose()
-        await self.backend.aclose()
+        await self.task
         self.sock.unlink(missing_ok=True)
         await asyncio.to_thread(self.world.reset_switches)
 
