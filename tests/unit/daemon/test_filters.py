@@ -459,6 +459,23 @@ def test_crew_trusted_in_the_refetch_round_counts() -> None:
     assert verdict.kind == Kind.DROP and verdict.reason == "refetch_failed"
 
 
+def test_crew_untrusted_by_the_refetch_round_still_counts() -> None:
+    """D-115, fail closed, the other half: oaw trusts ally before the miss's round and not
+    after it, and ally's broker hangs in that round. Ally's failure still counts, by the trust
+    read before the round, so the unknown bot is dropped, not sent to the kiosk."""
+
+    async def scenario() -> Verdict:
+        rig = Rig()
+        await rig.prime()
+        rig.broker("oaw").info["trusted"] = ["ghost"]
+        rig.broker("ally").hang = True
+        rig.mono.t += 60  # past the round's minimum interval
+        return await rig.admit(mm("bot-unknown"))
+
+    verdict = run(scenario())
+    assert verdict.kind == Kind.DROP and verdict.reason == "refetch_failed"
+
+
 # -- cache misses ---------------------------------------------------------------------------
 def test_new_crewmate_cache_miss_never_kiosk(rig: Rig) -> None:
     async def scenario() -> tuple[Verdict, dict[BrokerKey, int]]:
