@@ -199,6 +199,17 @@ UNREADABLE = (403, 404)  # a replay scope this account can't read yet: skipped, 
 UNREADABLE_RETRY_S = 2.0  # the wait before retrying a replay that could read nothing
 
 
+def edit_refusal(exc: MattermostAPIError, post_id: str) -> Exception:
+    """An `edit`'s failure: Mattermost's own 404 is `NotFound` and its 403 `Forbidden`, so
+    the caller posts anew (#149). A proxy's (no `error_id`) stays an outage, as in
+    `unreadable`, so the caller retries instead."""
+    if exc.error_id is not None and exc.status_code == 404:
+        return NotFound(f"post {post_id}")
+    if exc.error_id is not None and exc.status_code == 403:
+        return Forbidden("not your post")
+    return exc
+
+
 def unreadable(exc: Exception) -> bool:
     """Whether `exc` is Mattermost saying the account can't read that scope (#103), so the
     replay skips it rather than going down. Mattermost's own errors always carry an `id`; a
@@ -808,12 +819,8 @@ class MattermostBackend:
         async def request(client: MattermostClient) -> InboundMessage:
             try:
                 post = await client.get_post(post_id)
-            except NotFoundError as exc:
-                raise NotFound(f"post {post_id}") from exc
-            except MattermostAPIError as exc:
-                if exc.status_code == 403:  # a channel the agent isn't in: not its post
-                    raise Forbidden("not your post") from exc
-                raise
+            except MattermostAPIError as exc:  # a 403: a channel the agent isn't in
+                raise edit_refusal(exc, post_id) from exc
             if str(post.get("user_id", "")) != me:
                 raise Forbidden("not your post")
             body: dict[str, Any] = {"message": text}
@@ -825,12 +832,8 @@ class MattermostBackend:
                 }
             try:
                 edited = await client.put(f"/posts/{post_id}/patch", json=body)
-            except NotFoundError as exc:
-                raise NotFound(f"post {post_id}") from exc
             except MattermostAPIError as exc:
-                if exc.status_code == 403:
-                    raise Forbidden("not your post") from exc
-                raise
+                raise edit_refusal(exc, post_id) from exc
             return await self.message(client, edited if isinstance(edited, dict) else post)
 
         return await self._call(dev_name, request)

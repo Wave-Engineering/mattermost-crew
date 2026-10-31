@@ -15,6 +15,7 @@ from crewchat.adapters.base import ChatBackend, Embed, Forbidden, InboundMessage
 from crewchat.adapters.mattermost import MattermostBackend, post_kiosk, post_proto
 from crewchat.protocol import PROTO
 from crewchat.tokens import Unauthorized
+from mcp_server_mattermost.exceptions import MattermostAPIError
 
 T = TypeVar("T")
 SID = "dev"
@@ -121,10 +122,16 @@ def test_mattermost_edit_patches_as_agent(mm: Any, run: Any) -> None:
         run(b.edit("babel.oaw", theirs["id"], "hijacked"))
     with pytest.raises(NotFound):
         run(b.edit("babel.oaw", "z" * 26, "gone"))
-    # A post in a channel the agent isn't in reads as a 403: not its post either.
-    mm.walled.add(theirs["id"])
+    # Mattermost's own 403 on the read (a channel the agent isn't in): not its post either.
+    # A proxy's 403 page is an outage, so the caller retries rather than posting anew.
+    mm.errors[f"/posts/{theirs['id']}"] = 2
+    mm.error_status[f"/posts/{theirs['id']}"] = 403
     with pytest.raises(Forbidden):
         run(b.edit("babel.oaw", theirs["id"], "hijacked"))
+    mm.error_html.add(f"/posts/{theirs['id']}")
+    with pytest.raises(MattermostAPIError) as raised:
+        run(b.edit("babel.oaw", theirs["id"], "hijacked"))
+    assert not isinstance(raised.value, Forbidden | NotFound)
     assert len(mm.patches) == 1
 
 
