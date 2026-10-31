@@ -74,6 +74,7 @@ class FakeDiscord:
         self.files: dict[tuple[str, str], bytes] = {}  # (message id, filename) -> content
         self.dm_channels: dict[str, str] = {}  # recipient -> channel
         self.reactions: list[tuple[str, str, str]] = []  # (channel, message, emoji)
+        self.edits: list[tuple[str, str, dict[str, Any]]] = []  # (channel, message, body)
         self.requests: list[tuple[str, str, str]] = []  # (service, method, path?query)
         self.direct_reads: list[str] = []
         self.rate_limit_next = 0
@@ -269,6 +270,20 @@ class FakeDiscord:
                 return httpx.Response(404, json={"message": "Unknown Message", "code": 10008})
             self.reactions.append((parts[1], parts[3], unquote(parts[5])))
             return httpx.Response(204)
+        if request.method == "PATCH" and len(parts) == 4 and parts[::2] == ["channels", "messages"]:
+            # An edit (#149): the bot's own message only, as Discord allows.
+            found = [m for m in self.messages.get(parts[1], []) if m["id"] == parts[3]]
+            if not found:
+                return httpx.Response(404, json={"message": "Unknown Message", "code": 10008})
+            if len(str(body.get("content", ""))) > 2000:
+                return httpx.Response(400, json={"message": "content too long"})
+            self.edits.append((parts[1], parts[3], body))
+            msg = found[0]
+            if "content" in body:
+                msg["content"] = str(body["content"])
+            if "embeds" in body:
+                msg["embeds"] = body["embeds"]
+            return httpx.Response(200, json=msg)
         return httpx.Response(404, json={"message": f"no route {request.method} {path}"})
 
     # -- transports -------------------------------------------------------------------------

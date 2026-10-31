@@ -97,6 +97,11 @@ class NotFound(Exception):
     """What the call names doesn't exist on the backend (`not_found: <what>` to the caller)."""
 
 
+class Forbidden(Exception):
+    """The agent may not do this to what the call names, e.g. edit another agent's post
+    (`forbidden: <why>` to the caller, #149)."""
+
+
 @dataclass(frozen=True)
 class Attachment:
     """A file the daemon holds for one post: its name as posted, and the daemon's own copy."""
@@ -175,6 +180,12 @@ class ChatBackend(Protocol):
 
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
         """Add `emoji` to `post_id`."""
+
+    async def edit(
+        self, dev_name: str, post_id: str, text: str, *, embed: Embed | None = None
+    ) -> InboundMessage:
+        """Rewrite `dev_name`'s own post `post_id` to `text` (and `embed`, when given). Another
+        agent's post is `Forbidden`, a gone one `NotFound` (#149)."""
 
     def stream(
         self,

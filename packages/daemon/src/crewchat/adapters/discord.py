@@ -69,6 +69,7 @@ from crewchat.adapters.base import (
     Attachment,
     BackendUnavailable,
     Embed,
+    Forbidden,
     InboundMessage,
     NotFound,
     StatusSink,
@@ -91,6 +92,7 @@ THREAD_ARCHIVE_MINUTES = 1440  # today's disc_create_thread default
 # shared bot token (R-08, #62).
 SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
 WHERE_MAX = 10_000  # message ID -> channel ID entries kept for `react`, least recent evicted
+OWNERS_MAX = 10_000  # message ID -> the agent that sent it, for `edit` (#149), oldest evicted
 # Today's disc_list / disc_create_channel `type` names.
 CHANNEL_TYPES = {"text": 0, "voice": 2, "category": 4}
 CHANNEL_TYPE_NAMES = {v: k for k, v in CHANNEL_TYPES.items()}
@@ -347,6 +349,9 @@ class DiscordBackend:
         self._agents: dict[str, _Agent] = {}
         # message ID -> channel ID, for `react`: an LRU, so it can't grow without bound.
         self._where: OrderedDict[str, str] = OrderedDict()
+        # message ID -> the agent that sent it. Every agent posts as the one bot, so this is
+        # what lets `edit` refuse another agent's post (#149). Lost on a restart.
+        self._owners: OrderedDict[str, str] = OrderedDict()
         self._channels: list[str] = []
         self._channels_at: float | None = None
 
@@ -745,6 +750,8 @@ class DiscordBackend:
             last = await self._discord_write(
                 "POST", f"/channels/{target}/messages", body, files=files
             )
+            if isinstance(last, dict) and last.get("id"):
+                self._own(str(last["id"]), dev_name)
         if not isinstance(last, dict):
             raise DiscordError("discord", 0, "send returned no message")
         if attachments and len(last.get("attachments") or []) < len(attachments):
@@ -800,11 +807,12 @@ class DiscordBackend:
             dev_name, str(channel["id"]), text, attachments=attachments, embed=embed
         )
 
-    async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
-        """Add `emoji` (a unicode emoji, or `name:id` for a custom one) to `post_id`."""
+    def _locate(self, post_id: str) -> tuple[str, str]:
+        """`post_id` (`<channel>/<message>`, or a message this daemon has seen) as its channel
+        and message IDs."""
         channel, _, message = post_id.rpartition("/")
         if channel:
-            # `<channel>/<message>`: both parts reach the PUT path, so both are checked (#62).
+            # `<channel>/<message>`: both parts reach the request path, so both are checked (#62).
             require_snowflake(channel, "the channel part of post_id")
             require_snowflake(message, "the message part of post_id")
         else:
@@ -812,6 +820,46 @@ class DiscordBackend:
             channel = self._where.get(post_id, "")  # server data, so trusted
         if not channel:
             raise KeyError(f"no channel known for message {post_id}; pass <channel>/<message>")
+        return channel, message
+
+    def _own(self, message: str, dev_name: str) -> None:
+        self._owners[message] = dev_name
+        self._owners.move_to_end(message)
+        while len(self._owners) > OWNERS_MAX:
+            self._owners.popitem(last=False)
+
+    async def edit(
+        self, dev_name: str, post_id: str, text: str, *, embed: Embed | None = None
+    ) -> InboundMessage:
+        """Rewrite `dev_name`'s own message, re-signed as `send` signs it (#149). Every agent
+        posts as the one bot, so the daemon checks ownership: a message this daemon didn't
+        send for `dev_name` (another agent's, or one sent before a restart) is `Forbidden`,
+        with no request made. An edit is one message: text too long for one is refused."""
+        channel, message = self._locate(post_id)
+        if self._owners.get(message) != dev_name:
+            raise Forbidden("not your post")
+        chunks = self.signed(dev_name, text)
+        if len(chunks) != 1:
+            raise ValueError(f"an edit is one message: at most {MAX_CHUNK} characters, signed")
+        body: dict[str, Any] = {"content": chunks[0]}
+        if embed is not None:
+            body["embeds"] = [{"title": embed.title, "description": embed.body}]
+        try:
+            edited = await self._discord_write(
+                "PATCH", f"/channels/{channel}/messages/{message}", body
+            )
+        except DiscordError as exc:
+            if exc.status == 404:
+                raise NotFound(f"message {message} in {channel}") from exc
+            raise
+        if not isinstance(edited, dict):
+            raise DiscordError("discord", 0, "edit returned no message")
+        edited.setdefault("channel_id", channel)
+        return self.message(edited)
+
+    async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
+        """Add `emoji` (a unicode emoji, or `name:id` for a custom one) to `post_id`."""
+        channel, message = self._locate(post_id)
         name = emoji.strip()
         if len(name) > 2 and name.startswith(":") and name.endswith(":"):
             name = name[1:-1]

@@ -5,9 +5,9 @@ The shim is a stdio MCP server that runs in the agent's session, as the agent's 
 **no credentials** (R-08): every chat tool forwards one frame to `/run/crewchat/crewchat.sock`,
 and the daemon acts on the agent's behalf with what it holds itself.
 
-- `chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react` and `chat_health` each
-  forward one frame. `chat_set_default(key, backend)` is the one local-only tool: it writes
-  `~/.claude/chat-defaults.json` and sends nothing to the daemon.
+- `chat_send`, `chat_read`, `chat_thread`, `chat_dm`, `chat_react`, `chat_edit` and
+  `chat_health` each forward one frame. `chat_set_default(key, backend)` is the one local-only
+  tool: it writes `~/.claude/chat-defaults.json` and sends nothing to the daemon.
 - **Default backend (R-11).** The shim resolves it (`crewchat_clients.defaults`) and always
   sends the resolved `backend` in the frame; the daemon does no resolution. With no default,
   an interactive session gets a structured question for its human, answered through
@@ -17,10 +17,10 @@ and the daemon acts on the agent's behalf with what it holds itself.
 - **Off-default (R-13).** A call that names a backend other than the default is sent with
   `off_default: true`, and the daemon logs `off-default: <dev> <backend>`.
 - **Replies (R-12).** The shim keeps no map of posts to backends. A `chat_send` with
-  `thread` (and `chat_thread`, `chat_react`) that names no backend asks the daemon
-  (`thread_backend`), so the reply goes to that thread's backend whatever the default is, and
-  across a restart of either side. A post the daemon can't place fails loudly; it never falls
-  back to the default.
+  `thread` (and `chat_thread`, `chat_react`, `chat_edit`) that names no backend asks the
+  daemon (`thread_backend`), so the reply goes to that thread's backend whatever the default
+  is, and across a restart of either side. A post the daemon can't place fails loudly; it
+  never falls back to the default.
 - **Backend names.** One form, as `register` lists them and every frame carries them:
   `mattermost:<server-id>` and `discord` (§5.4).
 - **Attachments and embeds (R-15).** `chat_send` and `chat_dm` take `attach_path` and `embed`
@@ -892,6 +892,28 @@ class Shim:
             args["off_default"] = True
         return await self._forward("react", args)
 
+    async def chat_edit(
+        self, post_id: str, text: str, embed: str | None = None, backend: str | None = None
+    ) -> dict[str, Any]:
+        """Rewrite the agent's own post `post_id` (#149): on the post's own backend unless
+        `backend` names one, as `chat_react` routes."""
+        discord_ref(post_id)  # a malformed `<channel>/<message>` fails here, before any frame
+        route = await self._route(backend, post_id)
+        if isinstance(route, dict):
+            return route
+        name, off = route
+        args: dict[str, Any] = {
+            "dev_name": self.dev_name,
+            "backend": name,
+            "post_id": post_id,
+            "text": text,
+        }
+        if embed is not None:
+            args["embed"] = embed
+        if off:
+            args["off_default"] = True
+        return await self._forward("edit", args)
+
     async def chat_health(self) -> dict[str, Any]:
         # With `dev_name`, a restarted daemon answers `not_registered` and `_forward`
         # re-registers (#112).
@@ -975,6 +997,8 @@ TOOLS: dict[str, str] = {
     "chat_thread": "Every message in the thread `post_id` belongs to.",
     "chat_dm": "A direct message to the user `to`; `attach_path` and `embed` as chat_send.",
     "chat_react": "Add the reaction `emoji` to the post `post_id`.",
+    "chat_edit": "Rewrite your own post `post_id` to `text` (`embed` is `title:body`), on the "
+    "post's own backend. Another agent's post is `forbidden`; a gone one `not_found`.",
     "chat_health": "Each configured backend's state.",
     "chat_set_default": "Record the human partner's answer: `key` (the repo's forge org, or its "
     "path) uses `backend` (mattermost:<server-id> or discord) by default. Local only.",

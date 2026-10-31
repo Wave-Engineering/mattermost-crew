@@ -1,5 +1,5 @@
 """Stories 2.4 and 2.4c: the thin MCP shim over the daemon's socket. IT-04, IT-05, IT-15,
-IT-16, IT-25 and IT-28.
+IT-16, IT-25, IT-28 and IT-36.
 
 The daemon side is wired as `crewchat serve` wires it, on a real unix socket: the registry, the
 token store, one `MattermostBackend` per configured server (over in-process brokers, as in
@@ -29,8 +29,12 @@ through `SocketTransport`, as an agent's session does.
   channel's URL name, `#name` or display name (a private channel's too), and `chat_resolve`
   answers its ID with no `guild_id`; an unknown name (`../users/me` too) is `not_found`, a
   control character is `bad_request`, and `type="user"` is `unsupported`.
+- IT-36 (#149): `chat_edit` rewrites the agent's own post in place, on Discord (re-signed,
+  one signature) and on Mattermost (patched as its author); a second agent's edit of it is
+  `forbidden` and changes nothing.
 
-IT-15 and IT-25 need no Mattermost and always run; the others skip without one.
+IT-15, IT-25 and IT-36's Discord leg need no Mattermost and always run; the others skip
+without one.
 """
 
 from __future__ import annotations
@@ -370,6 +374,82 @@ def test_it05_reply_follows_thread_and_named_backend_is_logged(
             assert stored["props"]["attachments"][0]["text"] == "file: and embed"
             assert stored["props"]["crew_proto"] == 1
             assert list((tmp_path / "uploads").iterdir()) == []  # deleted after use
+
+    asyncio.run(scenario())
+
+
+# -- IT-36 -------------------------------------------------------------------------------------
+def test_it36_edit_own_post_on_discord(tmp_path: Path, sock_dir: Path) -> None:
+    """IT-36 (#149): an agent edits its own Discord post in place, still signed once; another
+    agent on the same daemon can't, and nothing reaches Discord for it."""
+    discord = FakeDiscord()
+    chan = discord.add_channel("agent-ops")
+    sock = sock_dir / "crewchat.sock"
+    host = Host(tmp_path, discord)
+
+    async def scenario() -> None:
+        async with host.serving(sock):
+            shim, _ = make_shim(
+                make_repo(tmp_path / "a", "shim-it36", home_backend="discord"), sock, tmp_path
+            )
+            other, _ = make_shim(
+                make_repo(tmp_path / "b", "shim-it36b", home_backend="discord"), sock, tmp_path
+            )
+            await shim.start()
+            await other.start()
+            sent = await shim.chat_send(chan, "it36 board v1")
+            await shim.chat_edit(sent["post_id"], "it36 board v2", embed="IT-36: edited")
+            [msg] = discord.messages[chan]
+            assert msg["id"] == sent["post_id"]
+            assert msg["content"].startswith("it36 board v2\n\n— **shim-it36**")
+            assert msg["content"].count("— **") == 1
+            assert msg["embeds"] == [{"title": "IT-36", "description": "edited"}]
+            with pytest.raises(ShimError, match="forbidden"):
+                await other.chat_edit(sent["post_id"], "it36 hijacked")
+            assert discord.messages[chan][0]["content"].startswith("it36 board v2")
+            assert len(discord.edits) == 1
+
+    asyncio.run(scenario())
+
+
+def test_it36_edit_own_post_on_mattermost(
+    mattermost: Any,
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
+    sock_dir: Path,
+) -> None:
+    """IT-36 (#149), on a live Mattermost: the post is patched in place as its author; another
+    agent's edit is `forbidden` and leaves it unchanged."""
+    channel = setup["channel_id"]
+    sock = sock_dir / "crewchat.sock"
+    host = Host(tmp_path, FakeDiscord(), mattermost=mattermost, setup=setup, server_ids=["ci"])
+
+    async def scenario() -> None:
+        async with host.serving(sock):
+            shim, _ = make_shim(
+                make_repo(tmp_path / "a", "shim-it36", home_backend="mattermost:ci"),
+                sock,
+                tmp_path,
+            )
+            other, _ = make_shim(
+                make_repo(tmp_path / "b", "shim-it36b", home_backend="mattermost:ci"),
+                sock,
+                tmp_path,
+            )
+            await shim.start()
+            await other.start()
+            host.seat(shim.registration["account"])
+            host.seat(other.registration["account"])
+            sent = await shim.chat_send(channel, "it36 board v1")
+            got = await shim.chat_edit(sent["post_id"], "it36 board v2", embed="IT-36: edited")
+            assert got == {"backend": "mattermost:ci", "post_id": sent["post_id"]}
+            stored = post(mattermost, sent["post_id"])
+            assert stored["message"] == "it36 board v2"
+            assert stored["props"]["attachments"][0]["title"] == "IT-36"
+            assert stored["props"]["crew_proto"] == 1
+            with pytest.raises(ShimError, match="forbidden"):
+                await other.chat_edit(sent["post_id"], "it36 hijacked")
+            assert post(mattermost, sent["post_id"])["message"] == "it36 board v2"
 
     asyncio.run(scenario())
 

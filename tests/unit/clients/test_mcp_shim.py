@@ -986,6 +986,49 @@ def test_every_chat_tool_forwards_one_frame(tmp_path: Path) -> None:
     }
 
 
+def test_edit_routes_by_post_backend(tmp_path: Path) -> None:
+    """#149: naming no backend, `chat_edit` asks the daemon where the post is and edits it
+    there, as `chat_react` does (R-12); a named backend skips the lookup."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
+
+    async def scenario() -> None:
+        await shim.start()
+        sent = await shim.chat_send("c1", "hi", backend="discord")
+        start = len(daemon.frames)
+        await shim.chat_edit(sent["post_id"], "hi again")
+        assert daemon.ops()[start:] == ["thread_backend", "edit"]
+        await shim.chat_edit(R1, "named", backend="mattermost:ci")
+        assert daemon.ops()[-1] == "edit" and daemon.ops()[-2] != "thread_backend"
+
+    asyncio.run(scenario())
+    first, named = daemon.of("edit")
+    assert first["backend"] == "discord" and "off_default" not in first
+    assert named == {"dev_name": DEV, "backend": "mattermost:ci", "post_id": R1, "text": "named"}
+
+
+def test_shim_chat_edit(tmp_path: Path) -> None:
+    """#149: the text and embed go to the daemon as given; a post the daemon can't place is
+    refused, never edited on the default, and a malformed Discord reference fails before
+    any frame."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon, home_backend="mattermost:ci")
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.chat_edit(R1, "body", embed="Title:text", backend="mattermost:ci")
+        start = len(daemon.frames)
+        with pytest.raises(ShimError, match="Name the backend"):
+            await shim.chat_edit("p" * 26, "nowhere")
+        with pytest.raises(ShimError):
+            await shim.chat_edit("12/notasnowflake", "x")
+        assert daemon.ops()[start:] == ["thread_backend"]
+
+    asyncio.run(scenario())
+    [args] = daemon.of("edit")
+    assert (args["text"], args["embed"]) == ("body", "Title:text")
+
+
 # -- Discord's guild ops (D-108) ---------------------------------------------------------------
 GUILD = "900000000000000001"
 
@@ -1161,7 +1204,8 @@ def test_upload_chunks_fit_frame(tmp_path: Path) -> None:
 def test_mcp_server_lists_every_tool(tmp_path: Path) -> None:
     server = build_server(make_shim(tmp_path, FakeDaemon()), timers=False)
     names = {t.name for t in asyncio.run(server.list_tools())}
-    chat = {"chat_send", "chat_read", "chat_thread", "chat_dm", "chat_react", "chat_health"}
+    chat = {"chat_send", "chat_read", "chat_thread", "chat_dm", "chat_react", "chat_edit"}
+    chat |= {"chat_health"}
     guild = {"chat_list_channels", "chat_resolve", "chat_create_channel", "chat_create_thread"}
     assert names == chat | {"chat_set_default"} | guild
     assert not any(n.startswith("disc_") for n in names)  # removed before the first deploy

@@ -16,7 +16,7 @@ from typing import Any
 
 import crewchat
 import pytest
-from crewchat.adapters.base import BackendUnavailable, InboundMessage, NotFound
+from crewchat.adapters.base import BackendUnavailable, Forbidden, InboundMessage, NotFound
 from crewchat.chat import AgentContext, build_chat_handlers
 from crewchat.config import ConfigError, parse_config
 from crewchat.server import DaemonServer, build_handlers
@@ -78,6 +78,13 @@ class FakeBackend:
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
         self._check()
         self.calls.append(("react", dev_name, post_id, emoji))
+
+    async def edit(
+        self, dev_name: str, post_id: str, text: str, *, embed: Any = None
+    ) -> InboundMessage:
+        self._check()
+        self.calls.append(("edit", dev_name, post_id, text, embed))
+        return self._msg("c", text)
 
     async def stream(self, dev_name: str) -> AsyncIterator[InboundMessage]:
         if False:
@@ -212,6 +219,37 @@ def test_backend_failure_is_reported_not_raised(h: Harness) -> None:
     h.discord.fail = ValueError("a Discord DM needs a user ID")
     got = h.call("send", dev_name="babel", backend="discord", to="c", text="x")
     assert got["error"].startswith("bad_request: discord: a Discord DM")
+
+
+def test_edit_op_goes_to_the_named_backend(h: Harness) -> None:
+    """#149: `edit` acts on the named backend, with the text and parsed embed, and answers
+    the post ID as given."""
+    got = h.call(
+        "edit", dev_name="babel", backend="discord", post_id="1/2", text="new", embed="T:body"
+    )
+    assert got["result"] == {"backend": "discord", "post_id": "1/2"}
+    [(op, dev, post, text, embed)] = h.discord.calls
+    assert (op, dev, post, text) == ("edit", "babel", "1/2", "new")
+    assert (embed.title, embed.body) == ("T", "body")
+    assert h.mm.calls == []
+
+
+@pytest.mark.parametrize(
+    ("fail", "error"),
+    [
+        (Forbidden("not your post"), "forbidden: discord: not your post"),
+        (NotFound("message 2 in 1"), "not_found: discord: message 2 in 1"),
+    ],
+)
+def test_edit_op_errors(h: Harness, fail: Exception, error: str) -> None:
+    """#149: another agent's post is `forbidden`; a gone one `not_found`; no text is
+    `bad_request` before the backend is called."""
+    h.discord.fail = fail
+    got = h.call("edit", dev_name="babel", backend="discord", post_id="1/2", text="x")
+    assert got["ok"] is False and got["error"] == error
+    h.discord.fail = None
+    got = h.call("edit", dev_name="babel", backend="discord", post_id="1/2", text=" ")
+    assert got["error"].startswith("bad_request") and h.discord.calls == []
 
 
 def test_not_on_backend(daemon: Any, make_daemon: Any, servers_toml: dict[str, Any]) -> None:

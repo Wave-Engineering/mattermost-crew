@@ -77,6 +77,7 @@ from crewchat.adapters.base import (
     NO_STATUS,
     Attachment,
     Embed,
+    Forbidden,
     InboundMessage,
     NotFound,
     StatusSink,
@@ -794,6 +795,41 @@ class MattermostBackend:
             await client.add_reaction(post_id, emoji.strip(":"))
 
         await self._call(dev_name, request)
+
+    async def edit(
+        self, dev_name: str, post_id: str, text: str, *, embed: Embed | None = None
+    ) -> InboundMessage:
+        """`PUT /api/v4/posts/{id}/patch` as the agent: its own post only (#149). The server
+        enforces the author too; the read first gives `forbidden` its own name. An `embed`
+        replaces the post's `props.attachments`, and its other props are kept."""
+        require_mm_id(post_id, "post_id")
+        me = await self.user_id(dev_name)
+
+        async def request(client: MattermostClient) -> InboundMessage:
+            try:
+                post = await client.get_post(post_id)
+            except NotFoundError as exc:
+                raise NotFound(f"post {post_id}") from exc
+            if str(post.get("user_id", "")) != me:
+                raise Forbidden("not your post")
+            body: dict[str, Any] = {"message": text}
+            if embed is not None:
+                props = post.get("props")
+                body["props"] = {
+                    **(props if isinstance(props, dict) else {}),
+                    "attachments": [embed_attachment(embed)],
+                }
+            try:
+                edited = await client.put(f"/posts/{post_id}/patch", json=body)
+            except NotFoundError as exc:
+                raise NotFound(f"post {post_id}") from exc
+            except MattermostAPIError as exc:
+                if exc.status_code == 403:
+                    raise Forbidden("not your post") from exc
+                raise
+            return await self.message(client, edited if isinstance(edited, dict) else post)
+
+        return await self._call(dev_name, request)
 
     # -- the stream -------------------------------------------------------------------------
     def ws_uri(self, agent: _Agent) -> str:
