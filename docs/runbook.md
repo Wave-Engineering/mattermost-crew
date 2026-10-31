@@ -585,8 +585,35 @@ and re-run this block. To remove one, stop and disable its socket, remove
 `/etc/systemd/system/crewkiosk-research-<server>.socket`,
 `/etc/systemd/system/crewkiosk-research-<server>@.service` (a symlink) and
 `/etc/systemd/system/crewkiosk-research-<server>@.service.d/`, then `daemon-reload`, remove
-the user (`sudo userdel crewkiosk-r-<server>`, which takes its group too), and restart
-`crewkiosk-broker`.
+the user and then its group (`sudo userdel crewkiosk-r-<server>`, then
+`sudo groupdel crewkiosk-r-<server>`: `userdel` keeps the group while `crewkiosk-broker` is in
+it, and a group left behind makes the next `crewkiosk-research-units <server>` fail), and
+restart `crewkiosk-broker`.
+
+**At the first research deploy, on systemd 257 or later** (the Dev Spec's Known limit, #142).
+CI runs systemd 255, which ignores `PrivatePIDs=yes`, so the research runner under it has run
+nowhere before this host. After this block and [Verify the install](#verify-the-install):
+
+1. Run IT-31 from the release checkout, as the deploying user, with the host's real `claude`
+   and `rg` on `PATH`. It runs the real runner, relay and CLI unconfined, in temp dirs, against
+   a stub model: it spends no model key and touches no installed file. Both tests must pass,
+   not skip.
+
+   ```text
+   uv sync --frozen
+   CREWKIOSK_CLAUDE="$(command -v claude)" uv run pytest -v tests/integration/test_kiosk_research.py
+   ```
+
+2. Check that `verify-install` reported `PrivatePIDs=yes in effect` for each research unit.
+3. The confined runner under `PrivatePIDs=yes` is first exercised by the research kiosk's first
+   answer. Ask that server's kiosk one question as an outsider. Check that it cites a repo, a
+   path and a commit, that `health` counts the answer under `kiosk_research`, and that the
+   instance's journal (`journalctl -u 'crewkiosk-research-<server>@*'`) shows no refusal. On a
+   partner's production server, that question is part of the deploy, under its yes-prod.
+
+**Never run IT-31b on a deploy host.** It needs `scripts/ci/kiosk-up.sh`, which is CI only: it
+installs a stub `claude` and a dummy runner key. Running IT-31b on systemd 257 or later waits on
+a CI image that has it.
 
 ## Kiosk research pool
 

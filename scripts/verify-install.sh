@@ -338,9 +338,10 @@ fi
 
 # Kiosk research (#142; D-111, D-113), on a host with the crewkiosk-broker user. The two model
 # keys, as the users who hold them: the research-off runner (crewkiosk) opens only its own, and
-# the broker only its own. A research-mode runner is also crewkiosk, so a file mode can't stop it
-# opening the runner's key: its unit hides both keys, and each research unit is checked here as
-# systemd loads it. What such a unit can actually reach is IT-31b's, on this same body.
+# the broker only its own. Each research server's runner is that server's own user,
+# crewkiosk-r-<server> (D-114), which no key's file mode names: its unit also hides both keys,
+# and each research unit is checked here as systemd loads it. What such a unit can actually reach
+# is IT-31b's, on this same body.
 if id "$BROKER_USER" >/dev/null 2>&1; then
   # The broker as its unit runs it: it reaches /etc/crewkiosk (0750 root:crewkiosk) through the
   # unit's SupplementaryGroups, which `sudo -u` would not give it.
@@ -388,13 +389,24 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
       fail "no user $ruser for research server $server (re-run crewkiosk-research-units $server)"
       continue
     fi
+    # A server with its pool manifest written is one the broker should be serving: a broker that
+    # is down, or in its restart back-off, serves it nothing.
+    manifest=no
+    $SUDO test -f "/var/lib/crewchat-pool/${server}.json" && manifest=yes
+    broker_active=no
+    systemctl is-active --quiet crewkiosk-broker.service && broker_active=yes
+    if [[ "$manifest" == yes && "$broker_active" == no ]]; then
+      fail "$server has its pool manifest, but crewkiosk-broker.service is not active (see its journal)"
+    fi
     # A running broker keeps the groups it started with. Started before crewkiosk-research-units
     # added it to this server's group, it can't give the server's sockets that group, and so
     # serves the server nothing.
     broker_pid="$(systemctl show -p MainPID --value crewkiosk-broker.service 2>/dev/null || true)"
     if [[ -n "$broker_pid" && "$broker_pid" != 0 ]]; then
-      gid="$(getent group -- "$ruser" | cut -d: -f3)"
-      if $SUDO grep '^Groups:' "/proc/$broker_pid/status" | tr -s '[:space:]' '\n' | grep -qxF -- "$gid"; then
+      gid="$(getent group -- "$ruser" | cut -d: -f3 || true)"
+      if [[ -z "$gid" ]]; then
+        fail "no group $ruser for research server $server (re-run crewkiosk-research-units $server)"
+      elif $SUDO grep '^Groups:' "/proc/$broker_pid/status" | tr -s '[:space:]' '\n' | grep -qxF -- "$gid"; then
         pass "the running broker holds $ruser's group"
       else
         fail "the running broker lacks $ruser's group (gid $gid): systemctl restart crewkiosk-broker.service"
@@ -405,11 +417,10 @@ if id "$BROKER_USER" >/dev/null 2>&1; then
     # written and the broker running, a missing socket is a server the broker failed to serve.
     for sock in "/run/crewkiosk-broker/${server}.sock" "/run/crewkiosk-broker/${server}.model.sock"; do
       if ! $SUDO test -S "$sock"; then
-        if $SUDO test -f "/var/lib/crewchat-pool/${server}.json" &&
-          systemctl is-active --quiet crewkiosk-broker.service; then
+        if [[ "$manifest" == yes && "$broker_active" == yes ]]; then
           fail "$sock is missing, with $server's pool manifest written and the broker running (restart crewkiosk-broker.service; see its journal)"
-        else
-          info "$sock is not served yet (no pool manifest for $server, or the broker is down)"
+        elif [[ "$manifest" == no ]]; then
+          info "$sock is not served yet (no pool manifest for $server)"
         fi
       elif [[ "$($SUDO stat -c '%G %a' -- "$sock")" == "$ruser 660" ]]; then
         pass "$sock is $ruser's alone (group $ruser, 0660)"

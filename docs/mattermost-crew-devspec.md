@@ -1879,10 +1879,13 @@ CLI, which CI does not install, so CI skips it. It passed on a host on systemd 2
 `PrivatePIDs=yes`), and has not run since.
 
 **Known limit (#142).** CI runs systemd 255, which ignores `PrivatePIDs=yes`, so the research
-runner under `PrivatePIDs=yes` has run nowhere yet. That combination is first exercised at
-install: on a host on systemd 257 or later, IT-31 and IT-31b are to run there, as the install's
-own check, before the research kiosk answers anyone. That install, and the deploy, are under its
-own yes-prod.
+runner under `PrivatePIDs=yes` has run nowhere yet. The runbook's "At the first research
+deploy, on systemd 257 or later" step covers it, on that host: IT-31 re-run with the host's real
+`claude` (unconfined, so it checks the runner, relay and CLI, not the unit), `verify-install`
+reporting `PrivatePIDs=yes` in effect, and then the research kiosk's first answer, which is the
+first run of the confined runner under `PrivatePIDs=yes`. IT-31b does not run at deploy: its
+install, `scripts/ci/kiosk-up.sh`, is CI only. Its run on systemd 257 or later waits on a CI
+image that has it. That deploy is under its own yes-prod.
 
 | Req ID | Requirement (short) | Source | Verification Item | Verification Method | Status |
 |--------|-------------------|--------|------------------|-------------------|--------|
@@ -1916,9 +1919,9 @@ own yes-prod.
 | R-28 | Cursor replay: queued exactly once, handed over at least once | Story 3.2 | IT-13 | integration test | Pass |
 | R-29 | Server mention markers | Story 2.1 | IT-14 | integration test | Pass |
 | R-30 | Prune bot accounts with no register in 30 days | Stories 1.3, 1.4 | IT-03 | integration test | Pass |
-| R-31 | Outsiders answered by a kiosk with no native tools while social is off; research only through the broker | Story 3.5, #142 | IT-21, IT-29, IT-31, IT-31b, E2E-02 | integration / e2e test | Pass |
+| R-31 | Outsiders answered by a kiosk with no native tools while social is off; research only through the broker | Story 3.5, #142 | IT-21, IT-29, IT-31 (passed before b3df138; re-run at deploy: Known limit), IT-31b, E2E-02 | integration / e2e test | Pass |
 | R-32 | Kiosk sees only the `## Kiosk` section | Story 3.5 | IT-21 | integration test | Pass |
 | R-33 | Kiosk review on social engage | Story 3.6 | IT-22, E2E-02 | integration / e2e test | Pass |
 | R-34 | Kiosk can be turned off; outsiders then dropped | Stories 3.1, 3.3 | IT-18, IT-23 | integration test | Pass |
 | R-35 | Research pool: explicit allowlist, default branch, 5 MB text, scrubbed | #139, #140 | IT-29, IT-30 | integration test | Pass |
-| R-36 | Research only through the broker's typed ops; audit and metrics | #141, #142 | IT-30, IT-31, IT-31b | integration test | Pass |
+| R-36 | Research only through the broker's typed ops; audit and metrics | #141, #142 | IT-30, IT-31 (passed before b3df138; re-run at deploy: Known limit), IT-31b (systemd 255 only: Known limit) | integration test | Pass |

@@ -866,11 +866,15 @@ def test_ci_stub_claude_parses(tmp_path: Path) -> None:
     python = "exec /usr/bin/python3 -I -S -c '"
     assert match.group(1).count(python) == 1
     compiled = tmp_path / "compiled"
+    # Exactly the probe and the prompt: a stray pair of apostrophes that leaves a prefix which
+    # still compiles also leaves unquoted whitespace, which splits into extra words.
+    check = (
+        "import sys; assert len(sys.argv) == 3, sys.argv[2:]; "
+        'compile(sys.argv[1], "probe", "exec")'
+    )
     compiled.write_text(
         match.group(1).replace(
-            python,
-            f"exec {sys.executable} -I -S -c "
-            '\'import sys; compile(sys.argv[1], "probe", "exec"); print("probe=compiled")\' \'',
+            python, f"exec {sys.executable} -I -S -c '{check}; print(\"probe=compiled\")' '"
         )
     )
     research = {**env, "ANTHROPIC_BASE_URL": "http://127.0.0.1:8417/a/1"}
