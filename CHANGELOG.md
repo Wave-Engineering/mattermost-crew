@@ -8,7 +8,7 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
-- **The broker keeps its bots in every channel tagged `crew-<crew>`** (#167, extends D-109).
+- **The broker keeps its bots in every channel tagged `crew-<crew>`** (#167, D-116, which extends D-109).
   Put the tag in a channel's header or purpose, and within `membership_reconcile_s` (default
   300 s; 0 turns it off) every bot the crew's broker owns is a member. A bot minted later joins
   at once. The pass also re-checks the team and `default_channels`, so a channel added there

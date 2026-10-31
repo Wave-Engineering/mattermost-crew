@@ -261,7 +261,7 @@ restart's first reconcile pass adds the agents already registered to the new cha
 Before you set the keys, add the broker account to every channel in the list (see the
 prerequisites). A private channel it isn't in can't be found by either name.
 
-**Give the crew a channel** (#167). Put the crew's tag, `crew-<crew>` (for example `crew-oaw`),
+**Give the crew a channel** (#167, D-116). Put the crew's tag, `crew-<crew>` (for example `crew-oaw`),
 anywhere in the channel's header or purpose, as a word of its own: `crew-oawx` or
 `old-crew-oaw` don't count, and case doesn't matter. Within `membership_reconcile_s` (5 minutes
 by default) every agent bot of that crew is a member, and every bot it mints later joins at
