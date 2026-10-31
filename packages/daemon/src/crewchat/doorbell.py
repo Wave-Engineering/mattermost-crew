@@ -441,20 +441,34 @@ class Doorbell:
         source = self.sources[backend]
         sink: StatusSink = partial(self.status, dev_name, backend)
         delays = restart_delays()
-        while True:
+        me = asyncio.current_task()
+
+        def owned() -> bool:
+            # Still this (agent, backend)'s task. A detached one (`detach` pops it first, and
+            # may abandon it) or a replaced one (a later `attach`) stops at its next step,
+            # rather than reporting or reopening a stream for an agent that has left (#152).
+            return self._tasks.get((dev_name, backend)) is me
+
+        while owned():
             try:
                 stream = source.stream(
                     dev_name, cursor=self._cursor(dev_name, backend), on_status=sink
                 )
                 async for item in stream:
+                    if not owned():
+                        return
                     delays = restart_delays()
                     await self.offer(dev_name, backend, to_event(backend, item))
                 reason = "stream ended"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if not owned():
+                    return
                 log.exception("doorbell stream %s for %s failed", backend, dev_name)
                 reason = f"stream failed: {exc}"
+            if not owned():
+                return
             self.status(dev_name, backend, False, reason)
             await self._sleep(next(delays))
 

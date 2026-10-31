@@ -606,10 +606,13 @@ class Stubborn:
     """A source whose stream absorbs cancels, as an HTTP stack that turns one into an error it
     retries does: the first `swallow` of them (every one when None), until `release` is set."""
 
-    def __init__(self, swallow: int | None = None) -> None:
+    def __init__(self, swallow: int | None = None, *, fail_on_release: bool = False) -> None:
         self.swallow = swallow
         self.swallowed = 0
         self.release = asyncio.Event()
+        # On release, end with an error rather than the cancel, as an HTTP stack does.
+        self.fail_on_release = fail_on_release
+        self.streams = 0
 
     async def stream(
         self,
@@ -618,13 +621,19 @@ class Stubborn:
         cursor: StreamCursor | None = None,
         on_status: StatusSink = NO_STATUS,
     ) -> AsyncIterator[InboundMessage]:
+        self.streams += 1
         while True:
             try:
-                await asyncio.Event().wait()
+                await (self.release if self.fail_on_release else asyncio.Event()).wait()
             except asyncio.CancelledError:
-                if self.release.is_set() or self.swallowed == self.swallow:
+                if not self.fail_on_release and (
+                    self.release.is_set() or self.swallowed == self.swallow
+                ):
                     raise
                 self.swallowed += 1
+                continue
+            if self.fail_on_release:
+                raise ConnectionError("the stream broke")
         yield  # pragma: no cover - makes this an async generator
 
 
@@ -705,6 +714,32 @@ def test_detach_stops_an_agents_tasks_concurrently(
     assert run(scenario()) < 0.35
     errors = [r.getMessage() for r in caplog.records if "did not stop" in r.getMessage()]
     assert sorted(e.split()[4] for e in errors) == ["x", "y"]  # "doorbell task doorbell babel x"
+
+
+def test_an_abandoned_task_never_reopens_its_stream(tmp_path: Path, run: Any) -> None:
+    """#152: a task `detach` abandoned, whose stream later ends in an error, ends there: it
+    reports no outage and never calls `stream()` again for the agent that left."""
+    src = Stubborn(fail_on_release=True)
+    bell = Doorbell(
+        {"x": src},
+        CursorStore(tmp_path),
+        sleep=fast_sleep,
+        detach_timeout_s=0.05,
+        detach_recancel_s=0.01,
+    )
+
+    async def scenario() -> None:
+        bell.attach(DEV, ["x"])
+        await asyncio.sleep(0.01)
+        (orphan,) = doorbell_tasks(DEV)
+        await bell.close_agent(DEV)
+        assert not orphan.done() and src.swallowed > 1  # abandoned, still running
+        src.release.set()  # the stream now fails instead of waiting
+        await asyncio.wait_for(orphan, 1)
+        assert src.streams == 1  # never reopened
+        assert bell.queue(DEV).empty()  # and no `backend.down` for an agent that left
+
+    run(scenario())
 
 
 def test_aclose_stops_every_agent_concurrently(tmp_path: Path, run: Any) -> None:
