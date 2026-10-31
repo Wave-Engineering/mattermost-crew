@@ -125,6 +125,9 @@ SEED_FILE = Path(".claude/reseed-revive.md")
 SQUAWKS_FILE = Path(".claude/sqtk-mine.json")
 BASELINE_FILE = Path(".claude/sqtk-baseline.json")  # the drain hook's original texts
 MAX_SQUAWK_TEXT = 4096  # the daemon's limit; a longer original is left out (unknown)
+# The encoded `squawk_ids` args stay under this, well inside the daemon's 64 KiB frame: past
+# it the frame is refused whole and no id lands, so texts are dropped (longest first) to fit.
+SQUAWK_ARGS_BUDGET = 48 * 1024
 # CLAUDE_CODE_ENTRYPOINT values of a session with a human at the keyboard.
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli", "claude-vscode", "claude-desktop", "claude-jetbrains"})
 OUTSIDER_PREFIX = "[from outside the crew]"
@@ -245,7 +248,12 @@ class SocketTransport:
             reply = json.loads(line)
         except ValueError as exc:
             raise DaemonUnreachable(f"crewchat daemon sent a malformed reply to {op}") from exc
-        if not isinstance(reply, dict) or reply.get("id") != req_id:
+        if not isinstance(reply, dict):
+            raise DaemonUnreachable(f"crewchat daemon sent a mismatched reply to {op}")
+        # An error with no id is one the daemon gave before it could read the frame (a frame
+        # too large). The connection carries one frame, so it is this frame's error.
+        unread = reply.get("id") is None and not reply.get("ok")
+        if reply.get("id") != req_id and not unread:
             raise DaemonUnreachable(f"crewchat daemon sent a mismatched reply to {op}")
         if not reply.get("ok"):
             raise DaemonError(op, str(reply.get("error", "error")))
@@ -348,6 +356,30 @@ def read_squawk_texts(mine: Path, baseline: Path, ids: list[str]) -> dict[str, s
             if isinstance(sid, int | str) and not isinstance(sid, bool):
                 texts[str(sid)] = item["text"]
     return {i: texts[i] for i in ids if i in texts and len(texts[i]) <= MAX_SQUAWK_TEXT}
+
+
+def fit_squawk_texts(
+    dev_name: str, ids: list[str], texts: dict[str, str], budget: int = SQUAWK_ARGS_BUDGET
+) -> dict[str, str]:
+    """`texts` cut until the encoded `squawk_ids` args fit `budget`, longest dropped first. A
+    dropped text is unknown to the daemon, so that squawk's answer falls back to the last
+    arrow: worse, but the ids, and every other squawk's doorbell, still land."""
+
+    def size(kept: dict[str, str]) -> int:
+        args = {"dev_name": dev_name, "ids": ids, "texts": kept}
+        return len(json.dumps(args).encode())
+
+    # Each entry costs its `"id": "text"` plus a `, ` separator, as `json.dumps` writes it.
+    cost = {i: len(json.dumps({i: t}).encode()) for i, t in texts.items()}
+    kept, total = dict(texts), size(texts)
+    for i in sorted(kept, key=lambda i: (-cost[i], i)):
+        if total <= budget:
+            break
+        del kept[i]
+        total -= cost[i]
+    while kept and size(kept) > budget:  # the estimate's last few bytes, never more than once
+        del kept[max(kept, key=lambda i: (cost[i], i))]
+    return kept
 
 
 class Shim:
@@ -514,10 +546,24 @@ class Shim:
             ids = read_squawk_ids(squawks)
             texts = read_squawk_texts(squawks, baseline, ids)
             if force or not self._squawks.pushed or (ids, texts) != self._squawks.value:
-                await self.transport(
-                    "squawk_ids", {"dev_name": self.dev_name, "ids": ids, "texts": texts}
-                )
+                await self.push_squawks(ids, texts)
             self._squawks = _FileState(mtime_ns=mtimes, value=(ids, texts), pushed=True)
+
+    async def push_squawks(self, ids: list[str], texts: dict[str, str]) -> None:
+        """`squawk_ids`, with the texts fitted to the frame. Should the daemon still refuse it,
+        the ids go again without texts: the doorbell needs the ids, the texts only refine it."""
+        fitted = fit_squawk_texts(self.dev_name, ids, texts)
+        if len(fitted) < len(texts):
+            left_out = len(texts) - len(fitted)
+            log.warning("squawk_ids: %d of %d texts left out to fit", left_out, len(texts))
+        args: dict[str, Any] = {"dev_name": self.dev_name, "ids": ids, "texts": fitted}
+        try:
+            await self.transport("squawk_ids", args)
+        except DaemonError as exc:
+            if exc.code != "bad_request" or not fitted:
+                raise
+            log.warning("squawk_ids: refused with texts (%s); pushing the ids alone", exc.error)
+            await self.transport("squawk_ids", {**args, "texts": {}})
 
     async def start(self) -> None:
         """Register and push; a daemon that isn't up yet is retried before the first call."""

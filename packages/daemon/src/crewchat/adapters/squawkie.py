@@ -89,7 +89,8 @@ class SquawkEvent:
 # no answer field: an answer is typed after the squawk's `→` slot, so an arrow in the author's
 # own text ("campaign→main") must not start one. O is the author's original text, which the
 # shim pushes with the ids (`texts`). jq's `gsub("^\\s+|\\s+$"; "")` is `str.strip`: its `\s`
-# is Unicode whitespace.
+# is Unicode whitespace. One margin: Python also counts U+001C to U+001F as whitespace and
+# Oniguruma's `\s` doesn't, so those control characters are trimmed here and kept by jq.
 
 
 def prose_arrows(original: str) -> int:
@@ -177,10 +178,11 @@ def _settled(squawk: Mapping[str, Any], original: str | None = None) -> bool:
 
 
 def _original(squawk: Mapping[str, Any], texts: Mapping[str, str] | None) -> str | None:
-    """O for this squawk, from the shim's `texts`, keyed by the id as a string."""
-    if not texts:
+    """O for this squawk, from the shim's `texts`, keyed by the id as `_squawk_id` writes it."""
+    sid = _squawk_id(squawk)
+    if not texts or sid is None:
         return None
-    value = texts.get(str(squawk.get("id")))
+    value = texts.get(sid)
     return value if isinstance(value, str) else None
 
 
