@@ -284,7 +284,7 @@ def _log_lines(path: str) -> list[tuple[datetime, str]]:
 def test_deactivated_canary_stops_reconnecting(installed: dict[str, Any]) -> None:
     """IT-35 (R-30, #127, #155): `make verify-install` registers `verify-canary` and then
     deactivates its bot. The daemon retires the canary's token within 60 s, and in the 30 s
-    after that its websocket stays closed: no reconnect and no `backend down` for it."""
+    after that its stream stays closed: the log holds no connect attempt for it."""
     path = os.environ.get("CREWCHAT_CI_LOG", "").strip()
     if not path:
         reason = "no daemon log: run scripts/ci/daemon-up.sh"
@@ -304,13 +304,17 @@ def test_deactivated_canary_stops_reconnecting(installed: dict[str, Any]) -> Non
     # The log's clock is this host's: wait until it has written past the window.
     while datetime.now() <= window_end + timedelta(seconds=1):
         time.sleep(1)
+    # Every line a still-looping stream would write: a connect with no token left (the retire
+    # popped it), a 401 at the upgrade, a dropped or refused connection, a backend flip.
+    retries = (
+        "stream verify-canary: ",
+        f"websocket verify-canary on {sid}",
+        f"websocket 401 for verify-canary on {sid}",
+        f"backend mattermost:{sid} down for verify-canary",
+    )
     reconnects = [
         line
         for ts, line in _log_lines(path)
-        if retired < ts <= window_end
-        and (
-            f"websocket verify-canary on {sid}" in line
-            or f"backend mattermost:{sid} down for verify-canary" in line
-        )
+        if retired < ts <= window_end and any(r in line for r in retries)
     ]
     assert not reconnects, "".join(reconnects)

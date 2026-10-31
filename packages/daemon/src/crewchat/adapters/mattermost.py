@@ -1026,6 +1026,8 @@ class MattermostBackend:
             ws = await self._open(dev_name, agent)
             if ws is None:
                 on_status(False, agent.last_error or "connect failed")
+                if agent.closed:  # a 401's remint retired the token (#155)
+                    break
                 await self._sleep(next(delays))
                 continue
             try:

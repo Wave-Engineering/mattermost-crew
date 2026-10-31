@@ -263,6 +263,11 @@ class Deactivating(Tokens):
             await self.backend.close_server(dev, server_id)
             raise BrokerError("remint", f"deactivated: {dev} was deactivated") from None
 
+    async def refresh(self, dev: str, server_id: str, failed_token: str) -> None:
+        self.refreshes += 1
+        await self.backend.close_server(dev, server_id)
+        raise BrokerError("remint", f"deactivated: {dev} was deactivated")
+
 
 def test_close_before_first_frame_probes_and_retires(
     mm: Any, recording_sleep: Any, run: Any
@@ -290,6 +295,29 @@ def test_close_before_first_frame_probes_and_retires(
     assert tokens.refreshes == 1
     assert [r[1] for r in mm.requests].count("/users/me") == 2
     assert any("deactivated" in why for up, why in status if not up)
+
+
+def test_upgrade_401_deactivated_ends_without_backoff(
+    mm: Any, recording_sleep: Any, run: Any
+) -> None:
+    """#155: a 401 at the upgrade whose remint finds the account deactivated ends the stream
+    there, with no backoff sleep and no second connect."""
+    tokens = Deactivating(mm)
+    tokens.add(DEV)
+    b = make(mm, tokens, recording_sleep)
+    tokens.backend = b
+
+    async def scenario() -> None:
+        await b.user_id(DEV)  # known from before, so the upgrade is the first 401
+        mm.tokens.pop(tokens.held[DEV])
+        gen = b.stream(DEV)
+        with pytest.raises(StopAsyncIteration):
+            await recv(gen)
+
+    run(scenario())
+    assert tokens.refreshes == 1
+    assert len(mm.connects) == 1
+    assert recording_sleep.waits == []
 
 
 def test_drop_after_frames_does_not_probe(mm: Any, recording_sleep: Any, run: Any) -> None:
