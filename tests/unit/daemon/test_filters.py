@@ -452,7 +452,6 @@ def test_crew_trusted_in_the_refetch_round_counts() -> None:
         assert rig.cache.crew_info("rival", SID) is not None  # last good, without the bot
         rig.broker("oaw").info["trusted"] = ["ally", "ghost", "rival"]
         rig.broker("rival").hang = True
-        rig.mono.t += 60  # past the round's minimum interval
         return await rig.admit(mm("bot-unknown"))
 
     verdict = run(scenario())
@@ -469,7 +468,6 @@ def test_crew_untrusted_by_the_refetch_round_still_counts() -> None:
         await rig.prime()
         rig.broker("oaw").info["trusted"] = ["ghost"]
         rig.broker("ally").hang = True
-        rig.mono.t += 60  # past the round's minimum interval
         return await rig.admit(mm("bot-unknown"))
 
     verdict = run(scenario())
