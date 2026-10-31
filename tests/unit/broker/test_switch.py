@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from crewbroker.config import CrewConfig
+from crewbroker.mattermost import MattermostError, NotFound
 from crewbroker.service import (
     BROKER_PROP,
     Broker,
@@ -627,3 +628,35 @@ def test_failed_read_keeps_the_backfill_owed(
         "not applied: sent 2026-10-01T11:59:00+00:00 while the broker was offline; send it again"
     ]
     assert two_partners.dm_cursor.load() == live["create_at"]
+
+
+def test_refused_partner_does_not_hold_the_backfill(
+    two_partners: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partner the server refuses (a deleted or mistyped ID) never reads on a retry either:
+    they are skipped, and the other partner's missed DMs apply. A 5xx still holds."""
+    cursor = ms(clock.now - timedelta(minutes=5))
+    two_partners.dm_cursor.save(cursor)
+    missed = dm_post("a1", "crew", clock.now - timedelta(seconds=30))
+    fake.history[DM_CHANNEL] = [missed]
+    opens = fake.direct_channel
+    refusal: dict[str, MattermostError] = {
+        "exc": MattermostError("POST", "/channels/direct", 503, "unavailable")
+    }
+
+    def refuse_b(user_id: str, other_id: str) -> str:
+        if other_id == PARTNER_B:
+            raise refusal["exc"]
+        channel: str = opens(user_id, other_id)
+        return channel
+
+    monkeypatch.setattr(fake, "direct_channel", refuse_b)
+    two_partners.handle_dm(HUMAN_ID, "social 1d")
+    listener = DMListener(two_partners, "http://mm", "tok")
+    listener.handle(HELLO)
+    assert fake.posts == [] and two_partners.dm_cursor.load() == cursor  # 503: held
+
+    refusal["exc"] = NotFound("POST", "/channels/direct", 404, "user not found")
+    listener.handle(HELLO)
+    assert two_partners.switch.load().mode == "crew"
+    assert two_partners.dm_cursor.load() == missed["create_at"]

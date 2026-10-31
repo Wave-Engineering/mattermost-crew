@@ -84,6 +84,9 @@ WS_BACKOFF_MAX_S = 60.0
 # refused rather than applied, unless it only narrows who gets through.
 BACKFILL_MAX_AGE_S = 600
 NARROWING_COMMANDS = {("crew",), ("kiosk", "off")}
+# A partner whose DM channel the server refuses with one of these will not be read on a retry
+# either: the backfill skips them rather than holding every partner's DMs (#159).
+BACKFILL_SKIP_STATUSES = {400, 403, 404}
 HANDLED_DMS_MAX = 500
 
 log = logging.getLogger("crewbroker")
@@ -729,8 +732,10 @@ class DMListener:
         (`NARROWING_COMMANDS`): applied late, a `social 2h` would open the crew when the
         partner believes it closed. If any read fails, nothing is applied, the cursor stays,
         and the backfill stays owed: it is tried again before the next DM and at the next
-        `hello`. With no usable cursor, as on a fresh install, it starts the cursor now and
-        replays nothing. Never raises.
+        `hello`. A partner the server refuses outright (`BACKFILL_SKIP_STATUSES`, such as a
+        deleted user) is logged and skipped instead, so one bad ID cannot hold the cursor and
+        every other partner's backfill forever. With no usable cursor, as on a fresh install,
+        it starts the cursor now and replays nothing. Never raises.
         """
         cursor = self.broker.dm_cursor.load()
         now = self.broker.clock()
@@ -744,7 +749,10 @@ class DMListener:
             try:
                 channel = self.broker.client.direct_channel(broker_id, human)
                 posts = self.broker.client.posts_since(channel, cursor)
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, MattermostError) and exc.status in BACKFILL_SKIP_STATUSES:
+                    log.error("DM backfill skips %s, whom the server refuses: %s", human, exc)
+                    continue
                 log.exception("DM backfill from %s failed; retried before the next DM", human)
                 return
             for post in posts:
