@@ -147,8 +147,10 @@ def test_a_retry_queued_behind_a_newer_register_mints_nothing(daemon: Any) -> No
 
         retry = RegisterRetry(daemon.registry, sleep=Sleeps({0: newer_holds_the_lock}))
         retry.schedule(first, lambda r: None)
-        for _ in range(5):
-            await asyncio.sleep(0)  # the retry passes `_run`'s check and queues on the lock
+        await asyncio.sleep(0)  # the retry's task starts and makes the register task
+        # The register holds the lock in its prod mint. The retry waited on `entered` first,
+        # so it wakes first, passes `_run`'s check and starts its mint, before `release`.
+        await asyncio.wait_for(entered.wait(), 2)
         assert daemon.registry.get("babel") is first and retry.pending("babel")
         release.set()
         newer = await asyncio.wait_for(tasks[0], 2)
