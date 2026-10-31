@@ -89,6 +89,11 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A container's bind mount of `/run/crewchat` survives a daemon restart** (#173).
+  `crewchat.service` now sets `RuntimeDirectoryPreserve=yes`, so a restart no longer deletes
+  the directory under a container that mounts it. Because the directory now outlives the
+  daemon, the daemon clears the uploads left from before a restart when it starts
+  (`UploadStore.clear_stale`), so they no longer hold tmpfs until reboot.
 - **An arrow in a squawk's own text no longer rings the doorbell** (#170). The daemon read a
   squawk's answer as everything after its last `→`, so "campaign→main" rang as answered. It now
   reads it as the kit's `sqtk-answer.jq` does (cc#1363): a squawk never edited has no answer,

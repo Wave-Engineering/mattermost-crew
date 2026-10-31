@@ -158,6 +158,7 @@ async def serve(
     kiosk = KioskQueue()  # push KIOSK verdicts, for Story 3.5's kiosk
     # Attachments the shims stream in (`upload`), beside the socket under /run/crewchat.
     uploads = UploadStore(socket_path.parent / UPLOADS_SUBDIR)
+    uploads.clear_stale()  # the directory outlives a restart; its old uploads are untracked
     health_sources: dict[str, HealthSource] = {discord.name: discord} if discord else {}
     # What the shims push (the kiosk brief, the squawk ids): squawkie filters by the ids.
     context = AgentContext()

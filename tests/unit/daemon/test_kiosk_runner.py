@@ -229,6 +229,13 @@ def test_units_run_the_kiosk_as_crewkiosk() -> None:
     assert not (PACKAGING / "crewkiosk.sudoers").exists()
 
 
+def test_crewchat_service_preserves_its_runtime_directory() -> None:
+    """#173: a restart keeps /run/crewchat, so a container's bind mount of it stays valid."""
+    svc = unit("crewchat.service")["Service"]
+    assert svc["RuntimeDirectory"] == "crewchat"
+    assert svc["RuntimeDirectoryPreserve"] == "yes"
+
+
 # -- the wrapper -----------------------------------------------------------------------------
 def sandboxed_wrapper(tmp_path: Path, user: str) -> tuple[Path, Path, Path]:
     """The wrapper with its fixed paths pointed into `tmp_path`: (script, record dir, key).

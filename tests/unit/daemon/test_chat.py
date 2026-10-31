@@ -316,6 +316,59 @@ def test_upload_store_mode_and_expiry(tmp_path: Path) -> None:
             ].name == "passwd"
 
 
+def test_clear_stale_removes_leftovers(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """#173: the uploads a restart left behind (the directory outlives the daemon) all go,
+    a stray subdirectory too, and the store works as before afterwards."""
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / ("a" * 32)).write_bytes(b"old")
+    (root / ("b" * 32)).write_bytes(b"old")
+    (root / "stray").mkdir()
+    (root / "stray" / "inside").write_bytes(b"x")
+    store = UploadStore(root)
+    with caplog.at_level(logging.INFO, logger="crewchat.uploads"):
+        assert store.clear_stale() == 3
+    assert list(root.iterdir()) == []
+    cleared = [r for r in caplog.records if "cleared" in r.getMessage()]
+    assert len(cleared) == 1 and cleared[0].levelno == logging.INFO
+    assert "cleared 3 stale upload(s)" in cleared[0].getMessage()
+
+    root.rmdir()  # recreated, with its mode, by the next upload
+    done = store.chunk("babel", "a.txt", 0, b64(b"new"), True)
+    assert (root / done["upload_id"]).read_bytes() == b"new"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_clear_stale_on_missing_or_empty_dir_is_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="crewchat.uploads"):
+        assert UploadStore(tmp_path / "missing").clear_stale() == 0
+        (tmp_path / "empty").mkdir()
+        assert UploadStore(tmp_path / "empty").clear_stale() == 0
+    assert not [r for r in caplog.records if "cleared" in r.getMessage()]
+
+
+def test_clear_stale_refuses_with_live_uploads(tmp_path: Path) -> None:
+    """A startup-only step: once the store holds an upload, it refuses and deletes nothing."""
+    store = UploadStore(tmp_path / "uploads")
+    store.chunk("babel", "a.txt", 0, b64(b"half"), False)
+    (path,) = (tmp_path / "uploads").iterdir()
+    with pytest.raises(RuntimeError):
+        store.clear_stale()
+    assert path.exists()
+
+
+def test_constructing_a_store_deletes_nothing(tmp_path: Path) -> None:
+    """#173: never cleared in `__init__`, since a store built on the default path (as above)
+    must not wipe a live daemon's uploads."""
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "kept").write_bytes(b"x")
+    UploadStore(root)
+    assert (root / "kept").exists()
+
+
 class RichBackend(FakeBackend):
     """A FakeBackend that records attachments and embeds, reads one post and answers probes."""
 

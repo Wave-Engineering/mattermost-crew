@@ -13,6 +13,8 @@ each next chunk carries the next `seq`, and the one with `last: true` closes it 
 - An upload belongs to the agent that sent it: no other Dev-Name can attach it.
 - A finished upload is deleted once its post is made (`release`), and any upload, finished or
   not, is deleted 10 minutes after it started (`sweep`, on every call).
+- Uploads from before a restart are deleted when the daemon starts (clear_stale): the directory
+  outlives the daemon (RuntimeDirectoryPreserve=yes), and sweep only knows the uploads in memory.
 
 An unfinished upload is keyed by (Dev-Name, name): a shim sends one call at a time, and a
 new `seq` 0 for the same pair replaces whatever was in flight.
@@ -26,6 +28,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -124,6 +127,28 @@ class UploadStore:
             log.info("upload %s for %s expired", upload.upload_id, upload.dev_name)
             self._drop(upload)
         return len(old)
+
+    def clear_stale(self) -> int:
+        """Delete everything already in the directory, at daemon start; how many entries went.
+
+        A startup-only step (#173): never from `__init__`, since a store built on the default
+        path in a test would wipe a live daemon's uploads, and refused once this store holds
+        an upload.
+        """
+        if self._uploads:
+            raise RuntimeError("clear_stale runs only before the first upload")
+        try:
+            entries = list(self.directory.iterdir())
+        except FileNotFoundError:
+            return 0
+        for entry in entries:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        if entries:
+            log.info("cleared %d stale upload(s) from %s", len(entries), self.directory)
+        return len(entries)
 
     def chunk(self, dev_name: str, name: Any, seq: Any, data_b64: Any, last: Any) -> dict[str, Any]:
         """One `upload` frame. `{seq, size}` for a middle chunk; `{upload_id, size}` on `last`."""
