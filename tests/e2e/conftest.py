@@ -45,6 +45,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -82,6 +83,7 @@ from crewchat.server import DaemonServer
 from crewchat.threads import MyThreads
 from crewchat.tokens import TokenStore
 
+from tests.e2e.creation_record import CreationRecord
 from tests.integration.conftest import MattermostServer, mattermost_from_env
 from tests.integration.mmhttp import mm_request
 from tests.integration.test_filters import broker_account, login_user
@@ -194,11 +196,22 @@ class RunningBroker:
         run_dir: Path,
         clock: Clock,
         counter: RateLimitCounter,
+        record: CreationRecord,
     ) -> None:
         self.instance = instance
         credential = broker_cfg.credential_path(instance, config_dir).read_text().strip()
         self.client = BrokerMattermost(broker_cfg.read_server_url(instance, config_dir), credential)
         self.client._http.event_hooks["response"].append(counter.sync_hook(f"broker {instance}"))
+        # Every bot this broker mints goes in the run's creation record (#157), on the
+        # client itself, so each `ensure_bot` create is caught and crewbroker is unchanged.
+        create_bot = self.client.create_bot
+
+        def recorded_create_bot(username: str, display_name: str, description: str) -> Any:
+            result = create_bot(username, display_name, description)
+            record.add("bot", str(result["user_id"]), username)
+            return result
+
+        self.client.create_bot = recorded_create_bot  # type: ignore[method-assign]
         config = broker_cfg.load_config(instance, config_dir=config_dir, client=self.client)
         state = broker_cfg.state_dir(instance, state_root)
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -265,6 +278,7 @@ class World:
     spoof_id: str
     spoof_token: str
     servers_toml: Path
+    record: CreationRecord  # every account and team the run creates goes in it (#157)
     channels: list[str] = field(default_factory=list)
     _daemons: int = 0
 
@@ -415,13 +429,16 @@ def _write_servers_toml(path: Path, world_crews: list[tuple[str, Path, str]], ur
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _outsider_bot(mattermost: MattermostServer, username: str) -> tuple[str, str]:
+def _outsider_bot(
+    mattermost: MattermostServer, username: str, record: CreationRecord
+) -> tuple[str, str]:
     """A bot account the admin owns (not any broker), with a token: (user id, token)."""
     resp = mm_request(
         mattermost, "POST", "/bots", json={"username": username, "display_name": username}
     )
     assert resp.status_code == 201, resp.text
     bot_id = str(resp.json()["user_id"])
+    record.add("bot", bot_id, username)
     tok = mm_request(mattermost, "POST", f"/users/{bot_id}/tokens", json={"description": "e2e"})
     assert tok.status_code == 200, tok.text
     return bot_id, str(tok.json()["token"])
@@ -429,7 +446,16 @@ def _outsider_bot(mattermost: MattermostServer, username: str) -> tuple[str, str
 
 @pytest.fixture(scope="session")
 def e2e(mattermost: MattermostServer) -> Iterator[World]:
-    run = secrets.token_hex(2)
+    # `smoke-devspace.sh` chooses the suffix and prints it, so `--cleanup <run>` can find it.
+    run = os.environ.get("E2E_RUN") or secrets.token_hex(2)
+    if not re.fullmatch(r"[0-9a-f]{4}", run):
+        pytest.fail(f"E2E_RUN must be 4 lowercase hex digits, not {run!r}")
+    created = os.environ.get("E2E_CREATED")
+    record = CreationRecord(Path(created) if created else None, run)
+
+    def add_user(user_id: str, username: str) -> None:
+        record.add("user", user_id, username)
+
     # Short: unix socket paths are capped at 108 bytes.
     root = Path(tempfile.mkdtemp(prefix="cc-e2e-", dir="/tmp"))
     config_dir, state_root, run_dir = root / "etc", root / "lib", root / "run"
@@ -448,17 +474,20 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
     )
     assert team.status_code == 201, team.text
     team_id = str(team.json()["id"])
+    record.add("team", team_id, f"crew-e2e{run}")
 
     accounts: dict[str, dict[str, Any]] = {}
     for key, crew in names.items():
-        broker_id, broker_token = broker_account(mattermost, f"crewbroker-{crew}-{SID}")
-        partner_id, partner_token = login_user(mattermost, f"partner-{crew}")
+        broker_id, broker_token = broker_account(
+            mattermost, f"crewbroker-{crew}-{SID}", on_create=add_user
+        )
+        partner_id, partner_token = login_user(mattermost, f"partner-{crew}", on_create=add_user)
         accounts[key] = {
             "broker": (broker_id, broker_token),
             "partner": (partner_id, partner_token),
         }
-    outsider_id, outsider_token = login_user(mattermost, f"outsider-e2e{run}")
-    spoof_id, spoof_token = _outsider_bot(mattermost, f"x.{names['oaw']}")
+    outsider_id, outsider_token = login_user(mattermost, f"outsider-e2e{run}", on_create=add_user)
+    spoof_id, spoof_token = _outsider_bot(mattermost, f"x.{names['oaw']}", record)
 
     running: dict[str, RunningBroker] = {}
     hung: HungBroker | None = None
@@ -482,6 +511,7 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
                 run_dir=run_dir,
                 clock=clock,
                 counter=counter,
+                record=record,
             )
         hung = HungBroker(broker_cfg.socket_path(f"{hung_crew}-{SID}", run_dir))
         servers_toml = config_dir / "servers.toml"
@@ -521,6 +551,7 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
             spoof_id=spoof_id,
             spoof_token=spoof_token,
             servers_toml=servers_toml,
+            record=record,
         )
         for user_id in [*(c.partner_id for c in crews.values()), outsider_id, spoof_id]:
             world.seat(user_id)

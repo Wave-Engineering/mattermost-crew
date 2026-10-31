@@ -11,7 +11,7 @@
 # Usage:
 #
 #   MM_URL=https://chat.apps.oakai.waveeng.com MM_ADMIN_TOKEN=<a dev-space admin access token> \
-#   SMOKE_TARGET=oaw-devspace scripts/smoke-devspace.sh
+#   SMOKE_TARGET=oaw-devspace scripts/smoke-devspace.sh [--cleanup <run> [--yes]]
 #
 # It prints a markdown report on stdout, ready to post to Plan #3 as a comment, and writes the
 # same report to reports/smoke-devspace.md (with the JUnit XML beside it). Progress and pytest's
@@ -21,8 +21,16 @@
 # What it does to the server: the tests/e2e world creates two crews' partners, an outsider, two
 # broker accounts and the bot accounts, each with a per-run suffix, and gives the broker
 # accounts the patched system_user_access_token role (scripts/ci/broker-role-patch.sh). The
-# OaW dev space needs no yes-prod for that (CP-06). It never cleans up after itself: wiping the
-# dev space needs BJ. On any partner organization's production server the role patch is the
+# OaW dev space needs no yes-prod for that (CP-06). The report names the run's 4-hex suffix and
+# its creation record, reports/smoke-<run>-created.json: every account and team the run made.
+#
+# `--cleanup <run>` deactivates that run's own accounts and archives its team, from its creation
+# record: it disables the bots, deactivates the users and archives the team, with Mattermost's
+# soft deletes, so each is reversible. It acts on an entry only when its id is in the record,
+# its name carries the run's suffix, and the server still has that id under that name, active.
+# Nothing outside the record is listed or touched. Without `--yes` it is a dry run that writes
+# nothing. That is not a dev-space wipe, which still needs BJ; the same target guard below keeps
+# it off any partner's server. On any partner organization's production server the role patch is the
 # human partner's yes-prod (CP-03, S-25), so this script runs only with
 # SMOKE_TARGET=oaw-devspace and MM_URL exactly the OaW dev space ($DEVSPACE_URL below), or
 # with SMOKE_TARGET=local against a localhost throwaway from scripts/ci/mattermost-up.sh.
@@ -36,6 +44,21 @@ FLOWS=(tests/e2e/test_cross_crew.py tests/e2e/test_outsider_switch.py tests/e2e/
 
 log() { echo "smoke-devspace: $*" >&2; }
 die() { log "ERROR: $*"; exit 2; }
+
+cleanup_run=""
+yes=0
+while (($#)); do
+  case "$1" in
+    --cleanup)
+      (($# >= 2)) || die "--cleanup needs the run suffix the smoke report names"
+      cleanup_run="$2"
+      shift 2
+      ;;
+    --yes) yes=1; shift ;;
+    *) die "unknown argument: $1 (usage: $0 [--cleanup <run> [--yes]])" ;;
+  esac
+done
+[[ "$yes" == 0 || -n "$cleanup_run" ]] || die "--yes goes only with --cleanup <run>"
 
 : "${MM_URL:?set MM_URL to the OaW dev space URL}"
 : "${MM_ADMIN_TOKEN:?set MM_ADMIN_TOKEN to a dev-space admin access token}"
@@ -63,6 +86,89 @@ for tool in curl jq uv; do
   command -v "$tool" >/dev/null || die "$tool is not installed"
 done
 
+# One request as the admin: the body goes to $api_body, the HTTP status to stdout ("000" when
+# the server could not be reached). Not -f: a 404 is an answer here ("gone"), not a failure.
+api_body=""
+api() {
+  curl -sS -o "$api_body" -w '%{http_code}' -X "$1" \
+    -H "Authorization: Bearer ${MM_ADMIN_TOKEN}" "${MM_URL}/api/v4$2" || true
+}
+
+# `--cleanup <run> [--yes]`: deactivate what run <run> recorded creating, and nothing else.
+cleanup() {
+  local run="$1" yes="$2"
+  [[ "$run" =~ ^[0-9a-f]{4}$ ]] || die "--cleanup needs a run suffix of 4 lowercase hex digits, not '$run'"
+  local record="${REPORTS}/smoke-${run}-created.json"
+  [[ -f "$record" ]] || die "no creation record ${record}: with no record, there is nothing --cleanup may touch"
+  jq -e --arg run "$run" '.run == $run and (.created | type == "array")' "$record" >/dev/null 2>&1 \
+    || die "${record} is not run ${run}'s creation record"
+  local user_re="^(partner-(oaw|synth)${run}|outsider-e2e${run}|x\\.oaw${run}|crewbroker-(oaw|synth)${run}-e2e|[a-z0-9_-]+\\.(oaw|synth)${run})$"
+  local team_re="^crew-e2e${run}$"
+  api_body="$(mktemp)"
+  trap 'rm -f "$api_body"' RETURN
+  local acted=0 skipped=0 failed=0 kind id name status path reason verb method
+  while IFS=$'\t' read -r kind id name; do
+    reason=""
+    case "$kind" in
+      user | bot) [[ "$name" =~ $user_re ]] || reason="not this run's name"; path="/users/${id}" ;;
+      team) [[ "$name" =~ $team_re ]] || reason="not this run's name"; path="/teams/${id}" ;;
+      *) reason="unknown kind '$kind'" ;;
+    esac
+    [[ -n "$reason" || "$id" =~ ^[a-z0-9]{26}$ ]] || reason="not a Mattermost id"
+    if [[ -z "$reason" ]]; then
+      status="$(api GET "$path")"
+      if [[ "$status" == 404 ]]; then
+        reason="gone"
+      elif [[ "$status" != 200 ]]; then
+        echo "FAILED  ${kind} ${name} (${id}): lookup answered HTTP ${status}"
+        failed=$((failed + 1))
+        continue
+      elif [[ "$(jq -r 'if has("name") and (has("username") | not) then .name else .username end' "$api_body")" != "$name" ]]; then
+        reason="renamed"
+      elif [[ "$(jq -r '.delete_at // 0' "$api_body")" != 0 ]]; then
+        reason="already deactivated"
+      elif [[ "$kind" != team && "$(jq -r '.is_bot // false' "$api_body")" != "$([[ "$kind" == bot ]] && echo true || echo false)" ]]; then
+        reason="kind mismatch"
+      fi
+    fi
+    if [[ -n "$reason" ]]; then
+      echo "skip    ${kind} ${name} (${id}): ${reason}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    case "$kind" in
+      bot) verb="disable"; method=POST; path="/bots/${id}/disable" ;;
+      user) verb="deactivate"; method=DELETE; path="/users/${id}" ;;
+      team) verb="archive"; method=DELETE; path="/teams/${id}" ;;
+    esac
+    if [[ "$yes" != 1 ]]; then
+      echo "would   ${verb} ${kind} ${name} (${id})"
+      acted=$((acted + 1))
+      continue
+    fi
+    status="$(api "$method" "$path")"
+    if [[ "$status" == 200 ]]; then
+      echo "done    ${verb} ${kind} ${name} (${id})"
+      acted=$((acted + 1))
+    else
+      echo "FAILED  ${verb} ${kind} ${name} (${id}): HTTP ${status}"
+      failed=$((failed + 1))
+    fi
+  done < <(jq -r '.created[] | [.kind, .id, .username] | @tsv' "$record")
+  if [[ "$yes" == 1 ]]; then
+    echo "cleanup ${run}: ${acted} acted on, ${skipped} skipped, ${failed} failed"
+  else
+    echo "cleanup ${run} (dry run, nothing written; add --yes): ${acted} to act on, ${skipped} skipped, ${failed} failed"
+  fi
+  ((failed == 0))
+}
+
+if [[ -n "$cleanup_run" ]]; then
+  rc=0
+  cleanup "$cleanup_run" "$yes" || rc=$?
+  exit "$rc"
+fi
+
 version="$(curl -fsS "${MM_URL}/api/v4/config/client?format=old" | jq -r '.Version // "unknown"')" \
   || die "no answer from ${MM_URL}/api/v4/config/client"
 curl -fsS -o /dev/null -H "Authorization: Bearer ${MM_ADMIN_TOKEN}" "${MM_URL}/api/v4/users/me" \
@@ -75,7 +181,14 @@ report="${REPORTS}/smoke-devspace.md"
 started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 head_sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-log "running ${#FLOWS[@]} flows against ${MM_URL} (Mattermost ${version})"
+# The run suffix is chosen here and printed, so `--cleanup <run>` can find what the run made.
+run="$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+created="${REPORTS}/smoke-${run}-created.json"
+[[ ! -e "$created" ]] || die "${created} already exists: a creation record is never overwritten"
+export E2E_RUN="$run" E2E_CREATED="$created"
+
+log "running ${#FLOWS[@]} flows against ${MM_URL} (Mattermost ${version}), run suffix ${run}"
+log "creation record: ${created} (scripts/smoke-devspace.sh --cleanup ${run} deactivates its accounts)"
 uv sync --frozen >&2
 export MM_URL MM_ADMIN_TOKEN
 # The e2e world's broker accounts get the patched role through broker-role-patch.sh, which
@@ -92,11 +205,12 @@ set -e
 finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 uv run python - "$junit" "$report" "$MM_URL" "$version" "$head_sha" "$started" "$finished" \
-  "$pytest_rc" <<'PY'
+  "$pytest_rc" "$run" "$created" <<'PY'
+import os
 import sys
 import xml.etree.ElementTree as ET
 
-junit, report, url, version, sha, started, finished, rc = sys.argv[1:]
+junit, report, url, version, sha, started, finished, rc, run, created = sys.argv[1:]
 flows = {
     "test_e2e01_cross_crew_under_trusted": "E2E-01 cross-crew exchange under trusted crews",
     "test_e2e02_outsider_and_switch": "E2E-02 kiosk Q&A, social flip and its review, lapse",
@@ -116,6 +230,8 @@ lines = [
     f"- **Server:** {url} (Mattermost {version})",
     f"- **Commit:** `{sha}`",
     f"- **Run:** {started} to {finished}, by `scripts/smoke-devspace.sh`",
+    f"- **Run suffix:** `{run}` (`scripts/smoke-devspace.sh --cleanup {run}` deactivates its accounts)",
+    f"- **Creation record:** `reports/{os.path.basename(created)}` (what `--cleanup {run}` acts on)",
     "",
     "| Flow | Result | Time |",
     "|------|--------|------|",
