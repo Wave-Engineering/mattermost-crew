@@ -10,7 +10,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
-from crewbroker.mattermost import MattermostAPI, MattermostError, NotFound
+from crewbroker.mattermost import (
+    MattermostAPI,
+    MattermostError,
+    NotFound,
+    call_deadline,
+    uncapped,
+)
 from crewbroker.state import AccountStore, TokenRecord, TokenStore
 
 log = logging.getLogger(__name__)
@@ -112,11 +118,15 @@ def native_expiry_supported(client: MattermostAPI, server_key: str, broker_user_
         if cached is not None:
             return cached
         wanted = int(time.time() * 1000) + PROBE_TTL_MS
-        token = client.create_token(broker_user_id, PROBE_DESCRIPTION, expires_at_ms=wanted)
+        with uncapped():  # its reply names the token to revoke (#158)
+            token = client.create_token(broker_user_id, PROBE_DESCRIPTION, expires_at_ms=wanted)
         try:
             supported = token.get("expires_at") == wanted
         finally:
-            client.revoke_token(str(token["id"]))
+            # Always sent, deadline or not: a probe token left live on the broker's own
+            # account is recorded nowhere, and never expires on a server without expiry.
+            with call_deadline(None):
+                client.revoke_token(str(token["id"]))
         _expiry_capability[server_key] = supported
         return supported
 
@@ -151,7 +161,10 @@ def mint_token(
     expiry (R-07).
     """
     expires_at = int(time.time() * 1000) + ttl_hours * 3_600_000 if expiry_supported else None
-    created = client.create_token(bot_user_id, "crewbroker", expires_at_ms=expires_at)
+    # Once sent, its reply is waited for in full, past a caller's deadline if need be, so the
+    # token is recorded and a late one is the next call's supersede (#41, #158).
+    with uncapped():
+        created = client.create_token(bot_user_id, "crewbroker", expires_at_ms=expires_at)
     token = Token(
         token=str(created["token"]),
         token_id=str(created["id"]),

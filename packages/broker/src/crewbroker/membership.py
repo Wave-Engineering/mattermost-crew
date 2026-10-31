@@ -19,8 +19,9 @@ the next mint.
 The adds run after the token is minted and before the daemon has it, inside the daemon's
 deadline for the call. A reply past that deadline is a token the daemon never receives, so
 `ensure` stops adding once less than `DEADLINE_RESERVE_S` is left, and reports what it did not
-reach as deferred. The next register repeats it. A single call that sits in `_call`'s 429
-retries can still overrun; bounding that would need a deadline-aware `_call`.
+reach as deferred. The next register repeats it. Each single call is bounded too: `mint` runs
+under `call_deadline` (#158), so `_call` stops rather than wait out a 429 or a slow request
+past the deadline less `DEADLINE_RESERVE_S`, and the add fails as `DeadlineExceeded`.
 
 Tagged channels (#167). A channel joins the crew by carrying its tag (`crew-<crew>` by default)
 in its header or purpose, as a whole token, ignoring case. `reconcile` runs on the broker's loop:
