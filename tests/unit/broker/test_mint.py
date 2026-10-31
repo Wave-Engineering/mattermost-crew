@@ -205,6 +205,20 @@ def test_mint_sets_avatar_once(broker: Broker, fake: Any) -> None:
     assert fake.count("set_user_image") == 1
 
 
+def test_recreated_bot_gets_its_avatar(broker: Broker, fake: Any) -> None:
+    """#151 review: a bot gone from the server (a dev-space wipe) is created again under the
+    same name, and the new bot gets the avatar too: the flag belongs to the old bot id."""
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    acct = broker.accounts.get("babel.oaw")
+    assert acct is not None
+    del fake.users[acct.bot_user_id], fake.bots[acct.bot_user_id]
+    broker.mint({"dev_name": "babel", "crew": "oaw"})
+    again = broker.accounts.get("babel.oaw")
+    assert again is not None and again.bot_user_id != acct.bot_user_id
+    assert fake.count("set_user_image") == 2
+    assert fake.images[again.bot_user_id] == identicon_png("babel.oaw")
+
+
 def test_avatar_failure_does_not_fail_mint(broker: Broker, fake: Any) -> None:
     """#151: `set_user_image` failing: the mint still returns its token, the flag stays unset,
     and the next mint tries again."""

@@ -86,7 +86,10 @@ class AccountStore:
         data = self._load()
         if bot_user_id not in data["minted_bot_ids"]:
             data["minted_bot_ids"].append(bot_user_id)
-        data["accounts"].setdefault(name, {})["bot_user_id"] = bot_user_id
+        entry = data["accounts"].setdefault(name, {})
+        if entry.get("bot_user_id") != bot_user_id:
+            entry.pop("avatar_set", None)  # a new bot under the name: its avatar is unset
+        entry["bot_user_id"] = bot_user_id
         data["pending_create"].pop(name, None)
         write_private_json(self.path, data)
 
