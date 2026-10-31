@@ -160,7 +160,7 @@ def server(fake: Any) -> Any:
 
 def joiner(fake: Any, crew_config: CrewConfig, path: Path, clock: Any, *channels: str) -> Broker:
     config = replace(crew_config, team=TEAM, default_channels=list(channels or (PUBLIC, PRIVATE)))
-    return Broker(config, fake, path, clock=clock)
+    return Broker(config, fake, path, clock=clock, epoch=lambda: clock.now.timestamp())
 
 
 @pytest.fixture
@@ -607,6 +607,26 @@ def test_late_request_past_its_deadline_is_refused(
         broker.remint({**_args(held["token_id"]), "deadline": sent + 2})
     assert fake.count("create_token") == tokens_before
     assert fake.token_works(newer["token"])
+
+
+def test_deadline_reads_the_epoch_clock_not_the_business_clock(
+    server: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any
+) -> None:
+    """#189: the daemon stamps `deadline` with `time.time()`. A business clock a day ahead
+    (E2E-02 moves the E2E world's) neither expires a live call, defers its joins or skips
+    its avatar, and one a day behind does not revive a dead call."""
+    epoch = clock.now.timestamp()
+    config = replace(crew_config, team=TEAM, default_channels=[PUBLIC, PRIVATE])
+    built = Broker(config, server, tmp_path / "s", clock=clock, epoch=lambda: epoch)
+    clock.now += timedelta(days=1)
+
+    minted = built.mint({**BABEL, "deadline": epoch + 2})
+    assert server.token_works(minted["token"])
+    assert minted["membership"]["failed"] == []
+    assert built.accounts.avatar_set("babel.oaw")
+    clock.now -= timedelta(days=2)
+    with pytest.raises(OpError, match="expired"):
+        built.mint({**BABEL, "deadline": epoch - 1})
 
 
 def test_mint_rate_limited_past_deadline_is_expired(

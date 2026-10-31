@@ -29,6 +29,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -132,6 +133,7 @@ class Broker:
         *,
         server_key: str | None = None,
         clock: Clock = utc_now,
+        epoch: Callable[[], float] = time.time,
     ) -> None:
         if not config.broker_user_id:
             raise ValueError("config.broker_user_id is unset; load the config with a client")
@@ -143,6 +145,9 @@ class Broker:
         self.dm_cursor = DMCursorStore(state_dir)
         self.server_key = server_key or config.server_url
         self.clock = clock
+        # A caller's `deadline` is the daemon's epoch seconds, so it is read against this,
+        # as `mattermost._call` reads it, never against `clock` (#189).
+        self.epoch = epoch
         self._lock = threading.Lock()
         # Membership on mint (#132): the configured names resolve now, at startup. One that
         # doesn't is logged and reported on each mint, and never stops the broker.
@@ -198,7 +203,7 @@ class Broker:
         Minting for it anyway would leave an orphan, and its supersede could revoke the token
         a newer call has since swapped in (#41).
         """
-        if deadline is not None and self.clock().timestamp() > deadline:
+        if deadline is not None and self.epoch() > deadline:
             raise OpError("expired", "the caller's deadline passed before the broker got to it")
 
     def _supersede(self, bot_id: str, held: str | EllipsisType | None, new_id: str) -> None:
@@ -254,9 +259,7 @@ class Broker:
             # Ensure the bot's team and default channels (#132, D-109); never raises. Only a
             # bot this broker owns gets here: `ensure_bot` created it, or read its `owner_id`
             # as this broker, earlier in this mint.
-            answer["membership"] = self.membership.ensure(
-                name, bot_id, deadline, lambda: self.clock().timestamp()
-            )
+            answer["membership"] = self.membership.ensure(name, bot_id, deadline, self.epoch)
         self._ensure_avatar(name, bot_id, deadline)
         return answer
 
@@ -266,7 +269,7 @@ class Broker:
         fails the mint. Either way the flag stays unset, so the next `mint` tries again."""
         if self.accounts.avatar_set(name):
             return
-        if deadline is not None and deadline - self.clock().timestamp() < DEADLINE_RESERVE_S:
+        if deadline is not None and deadline - self.epoch() < DEADLINE_RESERVE_S:
             return
         try:
             self.client.set_user_image(bot_id, identicon_png(name))
