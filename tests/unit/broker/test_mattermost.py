@@ -218,14 +218,17 @@ def test_uncapped_still_refuses_past_the_deadline() -> None:
 
 def test_expiry_probe_revokes_past_the_deadline() -> None:
     """#158 review: the probe's revoke is sent even when its `create_token` used up the
-    deadline, so no probe token is left live on the broker's own account."""
+    deadline, so no probe token is left live on the broker's own account. Its create is
+    uncapped: a capped one cut off late would leave a token whose id the revoke never learns."""
     now = [1000.0]
     revoked: list[str] = []
+    create_timeouts: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/users/tokens/revoke"):
             revoked.append(json.loads(request.content)["token_id"])
             return httpx.Response(200, json={"status": "OK"})
+        create_timeouts.append(request.extensions["timeout"]["read"])
         now[0] += 3
         return httpx.Response(200, json={"id": "probe", "token": "s"})
 
@@ -238,6 +241,7 @@ def test_expiry_probe_revokes_past_the_deadline() -> None:
             assert native_expiry_supported(client, "http://mm.invalid", "broker") is False
     finally:
         clear_expiry_cache()
+    assert create_timeouts == [10.0]  # the client's own timeout, not the 1 s left
     assert revoked == ["probe"]
 
 
