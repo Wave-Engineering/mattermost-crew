@@ -9,14 +9,20 @@ socket.
 
 For each Mattermost server the crew has a broker for, and whose allowlist admits the agent's
 `project_key` or Dev-Name (`crewchat.allowlist`, #117), `register` asks that broker to `mint`.
-It is the **only** caller of `BrokerClient.mint` (R-30). For an agent that already holds a
-token there (the shim's daily re-register), the new token goes through the rotation sequence:
-swap, `on_token_rotated`, then `revoke` the previous token, so none is left live. After each
-`mint`, that broker's `crew_info` and `switch_state` are refreshed, so the new bot account is
-in `minted_bot_ids` before its first post (§5.9).
+It is the **only** caller of `BrokerClient.mint` (R-30), through `_mint_on`, with
+`retry_unavailable` finishing a register's failed servers (#186). For an agent that already
+holds a token there (the shim's daily re-register), the new token goes through the rotation
+sequence: swap, `on_token_rotated`, then `revoke` the previous token, so none is left live.
+After each `mint`, that broker's `crew_info` and `switch_state` are refreshed, so the new bot
+account is in `minted_bot_ids` before its first post (§5.9).
 
 The agent's `repo` (its full forge path, #139) is recorded beside its tokens, and every
 `register` refreshes the kiosk's corpus pool manifests (`crewchat.corpus_pool`, D-112).
+
+A server whose broker didn't mint is in the registration's `unavailable`, and `register`
+still succeeds on the others, so the shim won't register again for a day. `retry_unavailable`
+mints on just those servers again (#186), never on a squatted one, and `crewchat.retry` calls
+it in the background.
 """
 
 from __future__ import annotations
@@ -99,16 +105,30 @@ class Registration:
     needs_list: str
     registered_at: datetime
     unavailable: list[str] = field(default_factory=list)
+    # The servers in `unavailable` whose broker refused the name itself (#186).
+    squatted: list[str] = field(default_factory=list)
     # The agent's Dev-Team (BJ's direction scope, S-11), for `@<dev-team>` addressing (R-17).
     # `register` carries it, self-declared from the shim's identity file (D-103).
     dev_team: str = ""
     # The agent's avatar: display only, for its Discord signature (D-103). Never read by
     # addressing, membership or any trust decision.
     dev_avatar: str = ""
+    # The agent's full forge path (#139), for a retry's `install_minted` (#186).
+    repo: str = ""
+
+    @property
+    def retryable(self) -> list[str]:
+        """The servers worth another mint (#186): every `unavailable` one not `squatted`."""
+        return [s for s in self.unavailable if s not in self.squatted]
 
     def result(self) -> dict[str, Any]:
         """What `register` answers. Never a token (R-08)."""
-        return {"account": self.account, "backends": self.backends, "needs_list": self.needs_list}
+        # A copy: a retry adds to `backends` later (#186), and an answer never changes.
+        return {
+            "account": self.account,
+            "backends": list(self.backends),
+            "needs_list": self.needs_list,
+        }
 
 
 class Registry:
@@ -182,37 +202,13 @@ class Registry:
                     # Revokes a token still held there, or retries one whose revoke failed.
                     await self.store.retire_server(dev_name, crew, server.id)
                     continue
-                client = self.brokers[(crew, server.id)]
-                try:
-                    held = self.store.held_token_id(dev_name, crew, server.id)
-                    minted = await client.mint(dev_name, crew, held)
-                except (BrokerError, BrokerUnavailable) as exc:
-                    log.error("register %s on %s: %s", account, server.id, exc)
-                    unavailable.append(server.id)
-                    if isinstance(exc, BrokerError) and exc.code == "squatted":
-                        squatted.append(server.id)
+                why = await self._mint_on(dev_name, crew, account, server.id, now, repo)
+                if why is None:
+                    backends.append(mattermost_backend(server.id))
                     continue
-                if minted.get("account") != account:
-                    log.error(
-                        "register %s on %s: the broker named the account %r",
-                        account,
-                        server.id,
-                        minted.get("account"),
-                    )
-                    unavailable.append(server.id)
-                    continue
-                membership = minted.get("membership")
-                if isinstance(membership, dict) and membership.get("failed"):
-                    # The broker logged each at ERROR; the token is good, so register goes on.
-                    log.warning(
-                        "register %s on %s: membership adds failed: %s",
-                        account,
-                        server.id,
-                        membership["failed"],
-                    )
-                await self.store.install_minted(dev_name, crew, server.id, minted, now, repo)
-                await self.cache.refresh(crew, server.id)
-                backends.append(mattermost_backend(server.id))
+                unavailable.append(server.id)
+                if why == "squatted":
+                    squatted.append(server.id)
 
         if self.pool is not None:
             # After the lock: a mint or a retire may have changed a server's pool.
@@ -237,8 +233,10 @@ class Registry:
             needs_list=entry.needs_list,
             registered_at=now,
             unavailable=unavailable,
+            squatted=squatted,
             dev_team=dev_team,
             dev_avatar=dev_avatar,
+            repo=repo,
         )
         self._registrations[dev_name] = reg
         if self.config.discord_enabled and self.identity_sink is not None:
@@ -246,3 +244,68 @@ class Registry:
             self.identity_sink.set_identity(dev_name, avatar=dev_avatar, team=dev_team)
         log.info("registered %s (session %s): %s", account, session_id, ", ".join(backends))
         return reg
+
+    async def retry_unavailable(self, reg: Registration) -> list[str]:
+        """Mint again on each server in `reg.retryable` (#186), and never on one that already
+        worked: a mint there would rotate a good token. Each server that mints moves from
+        `reg.unavailable` to `reg.backends`. The backends gained; none once a newer `register`
+        has replaced `reg`."""
+        gained: list[str] = []
+        async with self.store.lock(reg.dev_name):
+            for server_id in reg.retryable:
+                if self._registrations.get(reg.dev_name) is not reg:
+                    break
+                why = await self._mint_on(
+                    reg.dev_name, reg.crew, reg.account, server_id, self.clock(), reg.repo
+                )
+                if why == "squatted":
+                    reg.squatted.append(server_id)
+                if why is not None:
+                    continue
+                reg.unavailable.remove(server_id)
+                backend = mattermost_backend(server_id)
+                # Before `discord`, in the order `register` lists them.
+                at = reg.backends.index("discord") if "discord" in reg.backends else None
+                reg.backends.insert(len(reg.backends) if at is None else at, backend)
+                gained.append(backend)
+        if gained:
+            if self.pool is not None:
+                self.pool.refresh()
+            log.info("registered %s on %s, on a retry", reg.account, ", ".join(gained))
+        return gained
+
+    async def _mint_on(
+        self, dev_name: str, crew: str, account: str, server_id: str, now: datetime, repo: str
+    ) -> str | None:
+        """Mint `dev_name`'s token on `server_id` and install it. None, or why it failed:
+        `"squatted"` (a retry won't help) or `"unavailable"`. The caller holds
+        `store.lock(dev_name)`."""
+        client = self.brokers[(crew, server_id)]
+        try:
+            held = self.store.held_token_id(dev_name, crew, server_id)
+            minted = await client.mint(dev_name, crew, held)
+        except (BrokerError, BrokerUnavailable) as exc:
+            log.error("register %s on %s: %s", account, server_id, exc)
+            if isinstance(exc, BrokerError) and exc.code == "squatted":
+                return "squatted"
+            return "unavailable"
+        if minted.get("account") != account:
+            log.error(
+                "register %s on %s: the broker named the account %r",
+                account,
+                server_id,
+                minted.get("account"),
+            )
+            return "unavailable"
+        membership = minted.get("membership")
+        if isinstance(membership, dict) and membership.get("failed"):
+            # The broker logged each at ERROR; the token is good, so register goes on.
+            log.warning(
+                "register %s on %s: membership adds failed: %s",
+                account,
+                server_id,
+                membership["failed"],
+            )
+        await self.store.install_minted(dev_name, crew, server_id, minted, now, repo)
+        await self.cache.refresh(crew, server_id)
+        return None

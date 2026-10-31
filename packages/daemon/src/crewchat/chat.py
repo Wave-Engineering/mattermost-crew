@@ -24,6 +24,9 @@ backend other than the agent's default) is logged as `off-default: <dev> <backen
 - The guild ops are Discord's (`GuildBackend`); a Mattermost backend answers `unsupported`,
   except `resolve` of a channel (`ChannelResolver`, #145). On Mattermost, `send`, `read` and
   `read_one` take a channel's URL name or display name, with or without `#`, as well as its ID.
+  `dm` takes a username or a user ID, and a bare Dev-Name that is no username reaches the
+  crewmate `<dev-name>.<crew>`: `<dev-name>` and `<dev-name>.<crew>` both name an agent, as
+  inbound addressing reads them (#186). A bare username that exists wins.
 
 The daemon never reads a file on the agent's side (§5.3). What it knows about the agent's seed
 brief and its squawks is what the shim pushed: `AgentContext` keeps it for the doorbell and the
@@ -247,14 +250,39 @@ def build_chat_handlers(
         root = threads.record(dev_name, msg)
         return {"backend": backend_name, "post_id": msg.post_id, "thread": root}
 
+    async def dm_to(
+        dev_name: str,
+        reg: Registration,
+        backend_name: str,
+        backend: ChatBackend,
+        to: str,
+        text: str,
+        kw: dict[str, Any],
+    ) -> InboundMessage:
+        """`to` as given. On Mattermost, a bare name that is no username is tried once more
+        as the crewmate `<to>.<crew>`, as inbound addressing reads it (#186)."""
+        try:
+            return await backend.dm(dev_name, to, text, **kw)
+        except NotFound:
+            bare = to.removeprefix("@")
+            if not backend_name.startswith(MATTERMOST_PREFIX) or "." in bare:
+                raise
+        crewmate = f"{bare}.{reg.crew}"
+        try:
+            return await backend.dm(dev_name, crewmate, text, **kw)
+        except NotFound as exc:
+            raise NotFound(f"no user {bare!r} or {crewmate!r}") from exc
+
     async def dm(args: dict[str, Any]) -> dict[str, Any]:
-        dev_name, _reg, backend_name, backend = agent(args)
+        dev_name, reg, backend_name, backend = agent(args)
         to, text = _str(args, "to"), _text(args)
         assert to is not None
         embed = _embed(args)
         attachments = take_attachments(dev_name, args)
         try:
-            msg = await backend.dm(dev_name, to, text, **rich(attachments, embed))
+            msg = await dm_to(
+                dev_name, reg, backend_name, backend, to, text, rich(attachments, embed)
+            )
         except Exception as exc:
             raise backend_error(backend_name, "dm", exc) from exc
         finally:

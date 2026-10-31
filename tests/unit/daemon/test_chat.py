@@ -32,6 +32,7 @@ class FakeBackend:
         self.calls: list[tuple[Any, ...]] = []
         self.n = 0
         self.fail: Exception | None = None
+        self.users: set[str] | None = None  # usernames `dm` finds; None: every one
 
     def _msg(self, channel: str, text: str, root: str = "") -> InboundMessage:
         self.n += 1
@@ -70,6 +71,8 @@ class FakeBackend:
 
     async def dm(self, dev_name: str, to: str, text: str) -> InboundMessage:
         self.calls.append(("dm", dev_name, to, text))
+        if self.users is not None and to.removeprefix("@") not in self.users:
+            raise NotFound(f"user {to!r}")
         return self._msg("dm-chan", text)
 
     async def react(self, dev_name: str, post_id: str, emoji: str) -> None:
@@ -153,6 +156,36 @@ def test_every_op_forwards(h: Harness) -> None:
     assert h.call("react", **base, post_id="p1", emoji="+1")["result"] == {}
     assert [c[0] for c in h.mm.calls] == ["dm", "read", "thread", "react"]
     assert h.mm.calls[1] == ("read", "babel", "c", 1.5, 3)
+
+
+def test_dm_to_a_bare_dev_name_reaches_the_crewmate(h: Harness) -> None:
+    """#186: `<dev>` names the agent `<dev>.<crew>`, as inbound addressing reads it."""
+    h.mm.users = {"kessel.oaw", "bj"}
+    base = {"dev_name": "babel", "backend": "mattermost:dev", "text": "psst"}
+    assert h.call("dm", **base, to="@kessel")["ok"] is True
+    assert [c[2] for c in h.mm.calls] == ["@kessel", "kessel.oaw"]
+    h.mm.calls.clear()
+    assert h.call("dm", **base, to="bj")["ok"] is True  # a bare username that exists wins
+    assert [c[2] for c in h.mm.calls] == ["bj"]
+
+
+def test_dm_names_both_usernames_it_tried(h: Harness) -> None:
+    h.mm.users = set()
+    base = {"dev_name": "babel", "backend": "mattermost:dev", "text": "psst"}
+    got = h.call("dm", **base, to="nobody")
+    assert got["ok"] is False and got["error"].startswith("not_found")
+    assert "'nobody' or 'nobody.oaw'" in got["error"]
+    h.mm.calls.clear()
+    # A dotted name is a username as given: no second guess.
+    assert h.call("dm", **base, to="nobody.oaw")["error"].startswith("not_found")
+    assert [c[2] for c in h.mm.calls] == ["nobody.oaw"]
+
+
+def test_dm_on_discord_has_no_crewmate_fallback(h: Harness) -> None:
+    h.discord.users = set()
+    got = h.call("dm", dev_name="babel", backend="discord", to="kessel", text="psst")
+    assert got["ok"] is False and got["error"].startswith("not_found")
+    assert [c[2] for c in h.discord.calls] == ["kessel"]
 
 
 @pytest.mark.parametrize(

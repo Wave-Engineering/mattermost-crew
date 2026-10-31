@@ -66,7 +66,8 @@ from typing import Any, Protocol
 from crewchat import filters
 from crewchat.adapters.base import InboundMessage, StatusSink, StreamCursor
 from crewchat.adapters.squawkie import SquawkEvent
-from crewchat.registry import Registry
+from crewchat.registry import Registration, Registry
+from crewchat.retry import RegisterRetry
 from crewchat.server import Handler, OpError, Reply
 from crewchat.threads import SAFE_NAME_RE, STATE_DIR
 from crewchat.tokens import DIR_MODE, write_private_json
@@ -522,23 +523,35 @@ def build_doorbell_handlers(
     *,
     extra_backends: Iterable[str] = (),
     on_registered: Callable[[Any], object] | None = None,
+    retry: RegisterRetry | None = None,
 ) -> dict[str, Handler]:
     """`subscribe`, and `register` wrapped so a registration attaches the agent's backends
     (its registration's, plus `extra_backends`: squawkie) and then calls `on_registered(reg)`:
-    `crewchat serve` runs the kiosk review there when social is already on (R-33, #99)."""
+    `crewchat serve` runs the kiosk review there when social is already on (R-33, #99).
+
+    With `retry`, a registration with servers left `unavailable` gets a background retry
+    there (#186), and each backend it gains takes the same attach and `on_registered` step.
+    A newer `register` for the agent cancels a pending retry first."""
     extra = list(extra_backends)
 
+    def after_register(reg: Registration) -> None:
+        doorbell.attach(reg.dev_name, [*reg.backends, *extra])
+        if on_registered is not None:
+            try:
+                on_registered(reg)
+            except Exception:
+                log.exception("after registering %s", reg.dev_name)
+
     async def registered(args: dict[str, Any]) -> dict[str, Any] | Reply:
-        result = await register(args)
         dev_name = args.get("dev_name")
+        if retry is not None and isinstance(dev_name, str):
+            retry.cancel(dev_name)
+        result = await register(args)
         reg = registry.get(dev_name) if isinstance(dev_name, str) else None
         if reg is not None:
-            doorbell.attach(reg.dev_name, [*reg.backends, *extra])
-            if on_registered is not None:
-                try:
-                    on_registered(reg)
-                except Exception:
-                    log.exception("after registering %s", reg.dev_name)
+            after_register(reg)
+            if retry is not None:
+                retry.schedule(reg, after_register)
         return result
 
     async def subscribe(args: dict[str, Any]) -> Reply:
