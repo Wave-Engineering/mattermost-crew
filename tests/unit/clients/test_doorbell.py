@@ -19,6 +19,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -70,6 +71,8 @@ class FakeDaemon:
                     if not chunk:
                         break
                     buf += chunk
+                if not buf:  # a client that connected and then failed to send
+                    continue
                 frame = json.loads(buf)
                 self.frames.append(frame)
                 reply = self.respond(frame)
@@ -486,6 +489,54 @@ def test_a_timeout_inside_an_outage_reports_the_outage(
             fake.close()
     assert (code, out) == ((EXIT_NOT_REGISTERED if replies else EXIT_UNREACHABLE), "")
     assert time.monotonic() - start < 2
+
+
+def broken_pipe_on_send(monkeypatch: pytest.MonkeyPatch, times: int | None) -> None:
+    """The one-shot's sockets fail `sendall` with `BrokenPipeError`, as against a daemon that
+    closed between our connect and our send: the first `times` sends (every one when None).
+    Only the one-shot's `socket` is replaced, so the fake daemon's own sockets are untouched."""
+    sends = 0
+
+    class Flaky(socket.socket):
+        def sendall(self, data: Any, flags: int = 0) -> None:
+            nonlocal sends
+            sends += 1
+            if times is None or sends <= times:
+                raise BrokenPipeError(32, "Broken pipe")
+            super().sendall(data, flags)
+
+    fake_socket = SimpleNamespace(
+        socket=Flaky, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM
+    )
+    monkeypatch.setattr(doorbell, "socket", fake_socket)
+
+
+def test_broken_pipe_on_send_is_a_restart(short_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#152: a `BrokenPipeError` on send is the daemon's shutdown window, retried in the grace,
+    not unreachable at once."""
+    broken_pipe_on_send(monkeypatch, times=1)
+    fake = FakeDaemon(short_dir / "d.sock", ok(with_id("mattermost:p1")))
+    try:
+        event, event_id = doorbell.wait_for_new(fake.path, DEV, 5, None, grace_s=5)
+    finally:
+        fake.close()
+    assert (event, event_id) == (with_id("mattermost:p1"), "mattermost:p1")
+
+
+def test_broken_pipe_past_the_grace_exits_4(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#152: a send that keeps breaking is a daemon down: exit 4, but only after the grace."""
+    broken_pipe_on_send(monkeypatch, times=None)
+    fake = FakeDaemon(short_dir / "d.sock", ok(EVENT))
+    start = time.monotonic()
+    try:
+        with pytest.raises(doorbell.Down) as raised:
+            doorbell.wait_for_new(fake.path, DEV, None, None, grace_s=GRACE_S)
+    finally:
+        fake.close()
+    assert raised.value.code == EXIT_UNREACHABLE
+    assert GRACE_S <= time.monotonic() - start < GRACE_S + 2
 
 
 def test_no_permission_is_unreachable_at_once(repo: Path, short_dir: Path) -> None:
