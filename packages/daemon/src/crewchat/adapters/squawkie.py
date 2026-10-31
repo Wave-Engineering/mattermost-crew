@@ -9,11 +9,14 @@ the doorbell, and squawkie events are exempt from the filters (§5.9).
   `:` line (squawkie's `: connected` and its ~25 s `: ping`) is not.
 - **The predicate** (`rings`) is `sqtk-doorbell.sh`'s, verbatim in effect: a `squawk.updated`
   event for one of the agent's squawk IDs, where the squawk is no longer `open` or has an
-  answer after its last `→`. The IDs are the ones the shim pushed with `squawk_ids`
-  (`ids_for(dev_name)`, read at every event, so a new push applies at once); the daemon never
-  reads the agent's squawk records itself (§5.3). As in the script, a squawk ID only matches
-  when the event carries it as a number. A shared fixture
-  (`tests/fixtures/sqtk_doorbell_predicate.json`) holds this predicate to the script's jq.
+  answer. The answer is the kit's `sqtk-answer.jq` (cc#1363, #170, `squawk_answer`): none while
+  the squawk is pristine; with its original text O known, what follows O's own arrows; with O
+  unknown, what follows the last arrow. The IDs and each one's O are the ones the shim pushed
+  with `squawk_ids` (`ids_for`/`texts_for(dev_name)`, read at every event, so a new push
+  applies at once); the daemon never reads the agent's squawk records itself (§5.3). As in
+  the script, a squawk ID only matches when the event carries it as a number. A shared
+  fixture (`tests/fixtures/sqtk_doorbell_predicate.json`, with the kit's `sqtk-answer.jq`
+  vendored beside it) holds this predicate to the script's jq.
 - **Catch-up on connect** mirrors `sqtk-drain.sh --pending`. Once the stream is open (squawkie
   sends its headers with `: connected`), the adapter reads the lists (`GET /api/lists`, only
   those with activity since the agent's position when it has one) and their squawks
@@ -61,6 +64,7 @@ RECENT_KEYS = 1000
 log = logging.getLogger("crewchat.adapters.squawkie")
 
 IdsFor = Callable[[str], Collection[str]]
+TextsFor = Callable[[str], Mapping[str, str]]
 
 
 class SquawkieError(Exception):
@@ -81,13 +85,78 @@ class SquawkEvent:
         return self.keys[0]
 
 
-def squawk_answer(text: Any) -> str:
-    """The text after the squawk's last `→`, trimmed; `""` when it has no arrow."""
-    if not isinstance(text, str):
-        return ""
+# A squawk's answer, by the kit's `hooks/workflow/sqtk-answer.jq` (cc#1363; #170). squawkie has
+# no answer field: an answer is typed after the squawk's `→` slot, so an arrow in the author's
+# own text ("campaign→main") must not start one. O is the author's original text, which the
+# shim pushes with the ids (`texts`). jq's `gsub("^\\s+|\\s+$"; "")` is `str.strip`: its `\s`
+# is Unicode whitespace.
+
+
+def prose_arrows(original: str) -> int:
+    """O's arrows, less a closing `→` (the answer slot)."""
+    closing = 1 if original.rstrip().endswith(ARROW) else 0
+    return max(0, len(original.split(ARROW)) - 1 - closing)
+
+
+def pristine(squawk: Mapping[str, Any]) -> bool:
+    """Never edited, so it holds no answer: both timestamps present and equal."""
+    created, updated = squawk.get("created_at"), squawk.get("updated_at")
+    return created is not None and updated is not None and created == updated
+
+
+def legacy_answer(text: str) -> str:
+    """Everything after the last arrow (rule 3)."""
     parts = text.split(ARROW)
-    # jq's `gsub("^\\s+|\\s+$"; "")`: its `\s` is Unicode whitespace, like `str.strip`.
     return parts[-1].strip() if len(parts) > 1 else ""
+
+
+def answer_after(text: str, p: int) -> str:
+    """Everything after the (p+1)-th arrow, less leading whitespace and arrows (rule 2)."""
+    parts = text.split(ARROW)
+    if len(parts) <= p + 1:
+        return ""
+    rest = ARROW.join(parts[p + 1 :]).rstrip()
+    i = 0
+    while i < len(rest) and (rest[i].isspace() or rest[i] == ARROW):
+        i += 1
+    return rest[i:]
+
+
+def kept_arrows(text: str, original: str | None) -> int | None:
+    """O's prose arrows when `text` keeps O's segments left of them, else None."""
+    if not isinstance(original, str):
+        return None
+    p = prose_arrows(original)
+
+    def head(s: str) -> list[str]:
+        return [seg.strip() for seg in s.split(ARROW)[:p]]
+
+    kept = head(text)
+    return p if len(kept) == p and kept == head(original) else None
+
+
+def squawk_answer(squawk: Mapping[str, Any], original: str | None = None) -> str:
+    """`sq_answer($o)`: the squawk's answer, or `""`. Pristine has none; with O known, it
+    follows O's prose arrows; with O unknown, or a segment changed, it follows the last arrow.
+
+    A text that is neither a string nor null raises ValueError, where jq would error.
+    """
+    text = squawk.get("text")
+    if text is None or text is False:
+        text = ""  # jq's `.text // ""`
+    if pristine(squawk):
+        return ""
+    if not isinstance(text, str):
+        raise ValueError("text is not a string")
+    p = kept_arrows(text, original)
+    return answer_after(text, p) if p is not None else legacy_answer(text)
+
+
+def _answer_or_empty(squawk: Mapping[str, Any], original: str | None) -> str:
+    try:
+        return squawk_answer(squawk, original)
+    except ValueError:
+        return ""
 
 
 def _squawk_id(squawk: Mapping[str, Any]) -> str | None:
@@ -99,19 +168,25 @@ def _squawk_id(squawk: Mapping[str, Any]) -> str | None:
     return str(int(value)) if float(value).is_integer() else str(value)
 
 
-def _settled(squawk: Mapping[str, Any]) -> bool:
-    """No longer open, or answered: `.state != "open" or (.text | answer) != ""`."""
+def _settled(squawk: Mapping[str, Any], original: str | None = None) -> bool:
+    """No longer open, or answered: `.state != "open" or sq_answer($o) != ""`. Raises
+    ValueError where jq errors (no ring)."""
     if squawk.get("state") != "open":
         return True
-    text = squawk.get("text")
-    if not isinstance(text, str):
-        raise ValueError("text is not a string")  # jq errors: no ring
-    return squawk_answer(text) != ""
+    return squawk_answer(squawk, original) != ""
 
 
-def rings(event: Any, ids: Collection[str]) -> bool:
+def _original(squawk: Mapping[str, Any], texts: Mapping[str, str] | None) -> str | None:
+    """O for this squawk, from the shim's `texts`, keyed by the id as a string."""
+    if not texts:
+        return None
+    value = texts.get(str(squawk.get("id")))
+    return value if isinstance(value, str) else None
+
+
+def rings(event: Any, ids: Collection[str], texts: Mapping[str, str] | None = None) -> bool:
     """`sqtk-doorbell.sh`'s predicate: a `squawk.updated` event on one of `ids` whose squawk
-    is no longer open or has an answer after its last arrow."""
+    is no longer open or has an answer (`sq_answer`, with O from `texts`)."""
     if not isinstance(event, dict) or event.get("type") != "squawk.updated":
         return False
     squawk = event.get("squawk")
@@ -121,14 +196,15 @@ def rings(event: Any, ids: Collection[str]) -> bool:
     if sid is None or sid not in ids:
         return False
     try:
-        return _settled(squawk)
+        return _settled(squawk, _original(squawk, texts))
     except ValueError:
         return False
 
 
-def squawk_key(squawk: Mapping[str, Any]) -> str:
+def squawk_key(squawk: Mapping[str, Any], texts: Mapping[str, str] | None = None) -> str:
     """`<id>:<state>|<answer>`: a squawk rings once per key (`sqtk-rung.json`'s value)."""
-    return f"{_squawk_id(squawk)}:{squawk.get('state')}|{squawk_answer(squawk.get('text'))}"
+    answer = _answer_or_empty(squawk, _original(squawk, texts))
+    return f"{_squawk_id(squawk)}:{squawk.get('state')}|{answer}"
 
 
 def iso_ts(value: Any) -> float:
@@ -176,6 +252,7 @@ class SquawkieBackend:
         token: str | None = None,
         *,
         ids_for: IdsFor | None = None,
+        texts_for: TextsFor | None = None,
         http_client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         read_timeout_s: float = READ_TIMEOUT_S,
@@ -183,6 +260,7 @@ class SquawkieBackend:
         self.url = url.rstrip("/")
         self.token = token or None
         self._ids_for: IdsFor = ids_for if ids_for is not None else (lambda _dev: ())
+        self._texts_for: TextsFor = texts_for if texts_for is not None else (lambda _dev: {})
         self._http = http_client
         self._owns_http = http_client is None
         self._sleep = sleep
@@ -205,6 +283,10 @@ class SquawkieBackend:
     def ids(self, dev_name: str) -> set[str]:
         return {str(i) for i in self._ids_for(dev_name)}
 
+    def texts(self, dev_name: str) -> Mapping[str, str]:
+        """Each squawk's original text, by id, as the shim pushed it (#170)."""
+        return self._texts_for(dev_name)
+
     async def _get_json(self, path: str) -> Any:
         resp = await self._client().get(f"{self.url}{path}", headers=self._headers())
         if resp.status_code == 401:
@@ -223,6 +305,7 @@ class SquawkieBackend:
         ids = self.ids(dev_name)
         if not ids:
             return None
+        texts = self.texts(dev_name)
         lists = await self._get_json("/api/lists")
         if not isinstance(lists, list):
             raise SquawkieError("GET /api/lists: not a list")
@@ -248,12 +331,13 @@ class SquawkieBackend:
                 sid = _squawk_id(squawk)
                 if sid is None or sid not in ids:
                     continue
+                original = _original(squawk, texts)
                 try:
-                    if not _settled(squawk):
+                    if not _settled(squawk, original):
                         continue
                 except ValueError:
                     continue
-                key = squawk_key(squawk)
+                key = squawk_key(squawk, texts)
                 if key in agent.rung or key in keys:
                     continue
                 keys.append(key)
@@ -264,7 +348,7 @@ class SquawkieBackend:
                         "list": entry.get("name"),
                         "seq": squawk.get("seq"),
                         "state": squawk.get("state"),
-                        "answer": squawk_answer(squawk.get("text")),
+                        "answer": _answer_or_empty(squawk, original),
                         "text": squawk.get("text"),
                     }
                 )
@@ -280,9 +364,10 @@ class SquawkieBackend:
             event = json.loads(line[len("data:") :])
         except ValueError:
             return None
-        if not rings(event, self.ids(dev_name)):
+        texts = self.texts(dev_name)
+        if not rings(event, self.ids(dev_name), texts):
             return None
-        key = squawk_key(event["squawk"])
+        key = squawk_key(event["squawk"], texts)
         if key in agent.rung:
             return None  # this state and answer already rang (R-28)
         return SquawkEvent(event, (key,), iso_ts(event["squawk"].get("updated_at")))

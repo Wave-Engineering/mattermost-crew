@@ -29,7 +29,10 @@ from crewchat.adapters.squawkie import (
 
 from tests.fakes.squawkie import URL, FakeSquawkie
 
-FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "sqtk_doorbell_predicate.json"
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
+FIXTURE = FIXTURES / "sqtk_doorbell_predicate.json"
+# The kit's `hooks/workflow/sqtk-answer.jq` (cc#1363), vendored so the jq runs without the kit.
+ANSWER_JQ = FIXTURES / "sqtk-answer.jq"
 CASES = json.loads(FIXTURE.read_text(encoding="utf-8"))
 DEV = "babel"
 
@@ -38,17 +41,36 @@ def case_ids(case: dict[str, Any]) -> list[str]:
     return [str(i) for i in case["ids"]]
 
 
+def case_texts(case: dict[str, Any]) -> dict[str, Any]:
+    """The script's `$bl`: the squawk's original text by id, when the case knows it."""
+    squawk = case["event"].get("squawk") or {}
+    return {str(squawk.get("id")): case["original"]} if "original" in case else {}
+
+
 @pytest.mark.parametrize("case", CASES["cases"], ids=lambda c: c["name"])
 def test_predicate_matches_the_fixture(case: dict[str, Any]) -> None:
-    assert rings(case["event"], case_ids(case)) is case["rings"]
+    assert rings(case["event"], case_ids(case), case_texts(case)) is case["rings"]
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
 @pytest.mark.parametrize("case", CASES["cases"], ids=lambda c: c["name"])
 def test_fixture_is_sqtk_doorbells_own_verdict(case: dict[str, Any]) -> None:
-    """The fixture's verdicts are the script's: its jq, run as the script runs it."""
+    """The fixture's verdicts are the script's: its jq, run as the script runs it, with
+    `--slurpfile`'s one-element arrays for `$ids` and `$bl`."""
     proc = subprocess.run(
-        ["jq", "-e", "--argjson", "ids", json.dumps(case["ids"]), CASES["jq"]],
+        [
+            "jq",
+            "-e",
+            "-L",
+            str(FIXTURES),
+            "--argjson",
+            "ids",
+            json.dumps([case["ids"]]),
+            "--argjson",
+            "bl",
+            json.dumps([case_texts(case)], ensure_ascii=False),
+            CASES["jq"],
+        ],
         input=json.dumps(case["event"], ensure_ascii=False),
         capture_output=True,
         text=True,
@@ -58,7 +80,8 @@ def test_fixture_is_sqtk_doorbells_own_verdict(case: dict[str, Any]) -> None:
 
 
 def test_fixture_jq_is_the_installed_scripts() -> None:
-    """When the kit's `sqtk-doorbell.sh` is on this host, the fixture's jq is its jq."""
+    """When the kit's `sqtk-doorbell.sh` is on this host, the fixture's jq is its jq, and the
+    vendored `sqtk-answer.jq` is the one installed beside it."""
     candidates = [os.environ.get("SQTK_DOORBELL", ""), "~/.claude/scripts/sqtk-doorbell.sh"]
     paths = [Path(c).expanduser() for c in candidates if c]
     script = next((p for p in paths if p.is_file()), None)
@@ -67,12 +90,22 @@ def test_fixture_jq_is_the_installed_scripts() -> None:
     text = script.read_text(encoding="utf-8")
     for line in CASES["jq"].splitlines():
         assert line in text, line
+    installed = script.resolve().parent / "hooks" / "workflow" / "sqtk-answer.jq"
+    assert installed.read_text(encoding="utf-8") == ANSWER_JQ.read_text(encoding="utf-8")
 
 
 def test_answer_and_key() -> None:
-    assert squawk_answer("a → b → c ") == "c"
-    assert squawk_answer("no arrow") == ""
+    edited = {"created_at": "t0", "updated_at": "t1"}
+    assert squawk_answer({**edited, "text": "a → b → c "}) == "c"
+    assert squawk_answer({**edited, "text": "no arrow"}) == ""
+    assert squawk_answer({"created_at": "t0", "updated_at": "t0", "text": "q → yes"}) == ""
+    assert squawk_answer({**edited, "text": "campaign→main fix, and more"}) == "main fix, and more"
+    original = "campaign→main fix"
+    assert squawk_answer({**edited, "text": "campaign→main fix, and more"}, original) == ""
+    assert squawk_answer({**edited, "text": "q → a → b"}, "q →") == "a → b"
     assert squawk_key({"id": 5, "state": "open", "text": "q → yes"}) == "5:open|yes"
+    key = squawk_key({"id": 5, "state": "open", "text": "x→y z"}, {"5": "x→y"})
+    assert key == "5:open|"  # O's arrow: no answer, so the key carries none
 
 
 async def take(gen: AsyncIterator[SquawkEvent], n: int) -> list[SquawkEvent]:
@@ -91,10 +124,48 @@ async def no_sleep(_seconds: float) -> None:
     await asyncio.sleep(0)
 
 
-def make(sq: FakeSquawkie, ids: dict[str, list[str]], token: str | None = None) -> SquawkieBackend:
+def make(
+    sq: FakeSquawkie,
+    ids: dict[str, list[str]],
+    token: str | None = None,
+    texts: dict[str, dict[str, str]] | None = None,
+) -> SquawkieBackend:
     return SquawkieBackend(
-        URL, token, ids_for=lambda d: ids.get(d, []), http_client=sq.http_client(), sleep=no_sleep
+        URL,
+        token,
+        ids_for=lambda d: ids.get(d, []),
+        texts_for=lambda d: (texts or {}).get(d, {}),
+        http_client=sq.http_client(),
+        sleep=no_sleep,
     )
+
+
+def test_a_prose_arrow_never_rings(run: Any) -> None:
+    """#170: with O known, an edit to a squawk whose own text holds an arrow is no answer,
+    live or in the catch-up; an answer in its slot rings, keyed by that answer."""
+    sq = FakeSquawkie()
+    needs = sq.add_list("bj:needs")
+    prose = sq.add_squawk(needs, "merge campaign→main?")
+    sid = str(prose["id"])
+    # Edited, still unanswered. By the last-arrow rule this reads "main now?" and would ring.
+    sq.update(prose["id"], text="merge campaign→main now?")
+    b = make(sq, {DEV: [sid]}, texts={DEV: {sid: "merge campaign→main?"}})
+
+    async def scenario() -> SquawkEvent:
+        gen = b.stream(DEV)
+        nxt = asyncio.ensure_future(take(gen, 1))
+        while sq.open_streams() == 0:
+            await asyncio.sleep(0)
+        sq.update(prose["id"], text="merge campaign→main today?")  # still no answer
+        sq.update(prose["id"], text="merge campaign→main today? → yes")
+        got = (await nxt)[0]
+        await b.aclose()
+        await gen.aclose()
+        return got
+
+    got = run(scenario())
+    assert got.payload["type"] == "squawk.updated"  # no catch-up rang first
+    assert got.keys == (f"{sid}:open|yes",)
 
 
 def test_squawkie_filter_and_catchup(run: Any) -> None:
@@ -103,7 +174,8 @@ def test_squawkie_filter_and_catchup(run: Any) -> None:
     sq = FakeSquawkie(token="sq-token")
     needs = sq.add_list("bj:needs")
     other = sq.add_list("other:triage")
-    early = sq.add_squawk(needs, "which server? → dev")  # answered before we connect
+    early = sq.add_squawk(needs, "which server? →")
+    sq.update(early["id"], text="which server? → dev")  # answered before we connect
     mine = sq.add_squawk(needs, "deploy now?")
     theirs = sq.add_squawk(needs, "not mine")
     settled = sq.add_squawk(other, "old one", state="retired")
@@ -151,8 +223,11 @@ def test_catch_up_skips_what_the_cursor_says_rang(run: Any) -> None:
     """A restart's catch-up leaves out the keys in `cursor.seen` (R-28)."""
     sq = FakeSquawkie()
     needs = sq.add_list("bj:needs")
-    a = sq.add_squawk(needs, "a → yes")
-    b_sq = sq.add_squawk(needs, "b → no")
+    a = sq.add_squawk(needs, "a →")
+    b_sq = sq.add_squawk(needs, "b →")
+    sq.update(a["id"], text="a → yes")  # answers are edits: a pristine squawk has none
+    sq.update(b_sq["id"], text="b → no")
+    a = sq.squawks[a["id"]]
     ids = {DEV: [str(a["id"]), str(b_sq["id"])]}
     b = make(sq, ids)
 

@@ -166,6 +166,7 @@ async def serve(
             config.squawkie_url,
             token,
             ids_for=lambda dev: context.squawk_ids.get(dev, ()),
+            texts_for=lambda dev: context.squawk_texts.get(dev, {}),
         )
     # The doorbell (Story 3.2): one task per (agent, backend), one queue per agent. It goes
     # first among the store's adapters, so an agent leaving rotation has its doorbell tasks

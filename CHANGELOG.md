@@ -70,6 +70,13 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **An arrow in a squawk's own text no longer rings the doorbell** (#170). The daemon read a
+  squawk's answer as everything after its last `→`, so "campaign→main" rang as answered. It now
+  reads it as the kit's `sqtk-answer.jq` does (cc#1363): a squawk never edited has no answer,
+  and with its original text known, the answer is what follows that text's own arrows. The
+  shim pushes each squawk's original text with its id (`squawk_ids`'s new `texts`), from its
+  record or the drain's `sqtk-baseline.json`. With an older shim, the last-arrow rule still
+  applies to an edited squawk.
 - **The corpus builder can reach its forge credentials** (#142). `crewkiosk-corpus` runs as
   `crewcorpus` and reads `/etc/crewkiosk/corpus-<server>@<host>.credential`. But
   `/etc/crewkiosk` is 0750 `root:crewkiosk`, so it couldn't traverse to them, and no repo could

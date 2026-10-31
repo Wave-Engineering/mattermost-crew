@@ -587,13 +587,49 @@ def test_pushes_squawk_ids(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         await shim.start()
-        assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": ["113"]}]
+        assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": ["113"], "texts": {}}]
         await shim.tick()
         assert len(daemon.of("squawk_ids")) == 1
         mine.write_text(json.dumps([{"id": 113}, {"id": 117}]))
         bump_mtime(mine, 5)
         await shim.tick()
-        assert daemon.of("squawk_ids")[-1] == {"dev_name": DEV, "ids": ["113", "117"]}
+        assert daemon.of("squawk_ids")[-1] == {
+            "dev_name": DEV,
+            "ids": ["113", "117"],
+            "texts": {},
+        }
+
+    asyncio.run(scenario())
+    assert len(daemon.of("squawk_ids")) == 2
+
+
+def test_pushes_squawk_texts(tmp_path: Path) -> None:
+    """#170: each squawk's original text O, for its answer, as `sqtk-doorbell.sh` reads it:
+    the drain's baseline file, overlaid by the record's own `.text`, kept to the ids."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon)
+    claude = shim.repo_root / ".claude"
+    mine = claude / "sqtk-mine.json"
+    baseline = claude / "sqtk-baseline.json"
+    mine.write_text(json.dumps([{"id": 113, "text": "campaign→main fix"}, {"id": 117}]))
+    baseline.write_text(
+        json.dumps({"113": "older", "117": "q → ", "999": "not mine", "118": 5})
+    )
+
+    async def scenario() -> None:
+        await shim.start()
+        assert daemon.of("squawk_ids")[-1]["texts"] == {
+            "113": "campaign→main fix",
+            "117": "q → ",
+        }
+        # The drain writes a baseline: a change to that file alone is pushed too.
+        baseline.write_text(json.dumps({"117": "q2 → ", "120": "x" * 5000}))
+        bump_mtime(baseline, 5)
+        await shim.tick()
+        assert daemon.of("squawk_ids")[-1]["texts"] == {
+            "113": "campaign→main fix",
+            "117": "q2 → ",
+        }
 
     asyncio.run(scenario())
     assert len(daemon.of("squawk_ids")) == 2
@@ -603,7 +639,7 @@ def test_missing_files_push_empty_at_start(tmp_path: Path) -> None:
     daemon = FakeDaemon()
     asyncio.run(make_shim(tmp_path, daemon).start())
     assert daemon.of("kiosk_brief") == [{"dev_name": DEV, "text": ""}]
-    assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": []}]
+    assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": [], "texts": {}}]
 
 
 # -- default resolution (R-11) ----------------------------------------------------------------
