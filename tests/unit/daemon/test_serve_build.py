@@ -54,6 +54,7 @@ def test_build_wires_the_doorbell_first(tmp_path: Path, short_dir: Path) -> None
     assert parts.store.adapters[0] is parts.doorbell
     assert parts.store.adapters[1:] == parts.backends
     assert parts.discord is None and parts.squawkie is None
+    assert parts.register_retry.registry is parts.registry  # #186's retry, built here
 
 
 def test_build_takes_the_injected_clock_and_runner(tmp_path: Path, short_dir: Path) -> None:
@@ -85,6 +86,14 @@ def test_run_stops_with_a_hung_switch_refresh(tmp_path: Path, short_dir: Path) -
         await asyncio.Event().wait()  # a `switch_state` call that never returns
 
     parts.cache.run = hung  # type: ignore[method-assign]
+    closed: list[bool] = []
+    retry_aclose = parts.register_retry.aclose
+
+    async def aclose() -> None:
+        closed.append(True)
+        await retry_aclose()
+
+    parts.register_retry.aclose = aclose  # type: ignore[method-assign]
 
     async def scenario() -> int:
         stop = asyncio.Event()
@@ -101,3 +110,4 @@ def test_run_stops_with_a_hung_switch_refresh(tmp_path: Path, short_dir: Path) -
 
     assert asyncio.run(scenario()) == 0
     assert not sock.exists()
+    assert closed == [True]  # the register retries stop with the daemon
