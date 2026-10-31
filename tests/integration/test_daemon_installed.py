@@ -304,10 +304,11 @@ def test_deactivated_canary_stops_reconnecting(installed: dict[str, Any]) -> Non
     # The log's clock is this host's: wait until it has written past the window.
     while datetime.now() <= window_end + timedelta(seconds=1):
         time.sleep(1)
-    # Every line a still-looping stream would write: a connect with no token left (the retire
-    # popped it), a 401 at the upgrade, a dropped or refused connection, a backend flip.
+    # Every line a still-looping stream would write: a connect or who-am-I with no token left
+    # (the retire popped it), a 401 at the upgrade, a dropped or refused connection, a backend
+    # flip. Not the stream's own last `who am I: ... deactivated` line, which ends it.
     retries = (
-        "stream verify-canary: ",
+        f"verify-canary holds no token on {sid}",
         f"websocket verify-canary on {sid}",
         f"websocket 401 for verify-canary on {sid}",
         f"backend mattermost:{sid} down for verify-canary",
