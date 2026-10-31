@@ -262,8 +262,9 @@ Before you set the keys, add the broker account to every channel in the list (se
 prerequisites). A private channel it isn't in can't be found by either name.
 
 **Give the crew a channel** (#167, D-116). Put the crew's tag, `crew-<crew>` (for example `crew-oaw`),
-anywhere in the channel's header or purpose, as a word of its own: `crew-oawx` or
-`old-crew-oaw` don't count, and case doesn't matter. Within `membership_reconcile_s` (5 minutes
+anywhere in the channel's header or purpose, as a word of its own: `crew-oawx`,
+`old-crew-oaw` and `crew-oaw.dev` don't count, a closing full stop (`crew-oaw.`) does, and case
+doesn't matter. Within `membership_reconcile_s` (5 minutes
 by default) every agent bot of that crew is a member, and every bot it mints later joins at
 once. No restart and no config change is needed.
 
@@ -271,6 +272,11 @@ once. No restart and no config change is needed.
   bots, and the channel shows it joining.
 - **A private channel:** add the broker account to it first. A private
   channel it isn't in is invisible to it.
+
+**Who can tag decides who gets the bots.** Anyone who may edit a public channel's header or
+purpose can tag it, and so pull the crew's agents into it. Header-edit rights are the trust
+boundary. On a partner's server, who holds them is the human partner's call (CP-03); restrict
+them, or set `membership_reconcile_s = 0` and use `default_channels` alone.
 
 The broker only adds. Removing the tag, or removing a bot from the channel, takes no one out
 and is not undone while the broker runs; the next broker restart adds the crew's bots again

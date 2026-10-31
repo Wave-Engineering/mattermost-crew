@@ -74,11 +74,29 @@ def test_reconcile_is_idempotent(server: Any) -> None:
         ("crew-oaw-old", False),
         ("crew_oaw", False),
         ("", False),
+        # Crew names may hold dots: a dot joining name characters is part of the token.
+        ("crew-oaw.dev", False),
+        ("crew-x.crew-oaw", False),
+        ("ask in here: crew-oaw.", True),  # a sentence's closing dot is not
+        ("crew-oaw. next sentence", True),
+        ("v1.crew-oaw", False),
     ],
 )
 def test_tag_matches_whole_token_only(text: str, hit: bool) -> None:
     channel = {"id": "c", "type": "O", "delete_at": 0, "header": text}
     assert tagged(channel, tag_pattern(TAG)) is hit
+
+
+def test_tag_of_one_crew_is_not_another_dotted_crews() -> None:
+    """Crew `bj` (a username) must not claim crew `bj.baker`'s channels, nor the reverse."""
+    for header, crew, hit in [
+        ("crew-bj.baker", "bj", False),
+        ("crew-bj.baker", "bj.baker", True),
+        ("crew-bj", "bj.baker", False),
+        ("crew-bj, crew-bj.baker", "bj", True),
+    ]:
+        channel = {"id": "c", "type": "O", "delete_at": 0, "header": header}
+        assert tagged(channel, tag_pattern(f"crew-{crew}")) is hit, (header, crew)
 
 
 def test_tag_in_purpose_or_header(server: Any) -> None:
@@ -167,6 +185,35 @@ def test_broker_joins_a_tagged_public_channel_first(server: Any) -> None:
     joins = [a for a in adds(server) if a == (OPS_ID, BROKER_ID)]
     built.reconcile(list(owned), owned)
     assert [a for a in adds(server) if a == (OPS_ID, BROKER_ID)] == joins
+
+
+def test_unjoined_channel_is_never_offered_to_a_mint(server: Any) -> None:
+    """A tagged public channel the broker isn't in is published only once it has joined, so
+    a mint never adds its bot where the add would be refused; with no bots, it doesn't join."""
+    server.channel_needs_broker = True
+    server.my_ids.discard(OPS_ID)
+    built = membership(server)
+    built.scan()
+    assert OPS not in [t.name for t in built.channel_targets()]
+    assert built.reconcile([], {}) == {"added": [], "failed": []}
+    assert OPS_ID not in server.members  # no bots: the broker joins nothing
+    owned = bots(server, "babel.oaw")
+    built.reconcile(list(owned), owned)
+    assert OPS in [t.name for t in built.channel_targets()]
+
+
+def test_a_channel_the_broker_cant_join_is_warned_and_left_out(
+    server: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.my_ids.discard(OPS_ID)
+    server.add_fails.add(OPS_ID)
+    owned = bots(server, "babel.oaw")
+    with caplog.at_level(logging.WARNING, logger="crewbroker.membership"):
+        result = membership(server).reconcile(list(owned), owned)
+    assert result["failed"] == []  # not a target: no bot add was tried
+    assert [t for t, _ in adds(server)].count(OPS_ID) == 1  # the broker's own join
+    [warning] = [r.getMessage() for r in caplog.records]
+    assert f"tagged channel {OPS} ({OPS_ID}) refused the broker" in warning
 
 
 def test_unresolved_team_adds_nothing(fake: Any) -> None:

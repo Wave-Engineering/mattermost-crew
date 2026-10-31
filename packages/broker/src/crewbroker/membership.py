@@ -27,8 +27,9 @@ in its header or purpose, as a whole token, ignoring case. `reconcile` runs on t
 each pass lists the team's channels once, then adds every bot the broker owns to the team, each
 default channel and each tagged channel. The broker account joins a tagged public channel it is
 not in first, because a `team_user` can add its bots only to a channel it is in (#132's probe);
-a private one is visible only once a person has added the broker account. A mint adds its bot
-to the tagged channels the last pass found, as well as the default channels.
+a private one is visible only once a person has added the broker account. It joins only in a
+pass with bots to add. A mint adds its bot to the tagged channels the last pass published, as
+well as the default channels; a channel is published only once the broker is in it.
 
 The server answers 201 for an existing member as for a new one, so a pass can't tell them
 apart. Each (bot, target) pair an add has succeeded for is remembered in memory and not sent
@@ -66,7 +67,12 @@ def keep_channel(item: dict[str, Any]) -> bool:
 def tag_pattern(tag: str) -> re.Pattern[str]:
     """`tag` as a whole token, ignoring case: `crew-oaw` matches, `crew-oawx` and `xcrew-oaw`
     do not (#167)."""
-    return re.compile(rf"(?<![\w-]){re.escape(tag)}(?![\w-])", re.IGNORECASE)
+    # A dot that joins name characters is part of the token, as crew names may hold dots
+    # (`crew-bj.baker` is not `crew-bj`'s; `crew-x.crew-oaw` is not `crew-oaw`'s), but a
+    # sentence's closing dot is not (`… crew-oaw.` is). Two lookbehinds: `re` needs each fixed.
+    return re.compile(
+        rf"(?<![\w-])(?<!\w\.){re.escape(tag)}(?![\w-]|\.\w)", re.IGNORECASE
+    )
 
 
 def tagged(item: dict[str, Any], pattern: re.Pattern[str]) -> bool:
@@ -147,7 +153,7 @@ class Membership:
         # The tagged channels the last scan found (#167), and of those, the public ones the
         # broker account is not in, which it joins before adding its bots.
         self.tagged: list[Target] = []
-        self._join_first: set[str] = set()
+        self._join_first: dict[str, Target] = {}
         # (bot id, target id) pairs an add has succeeded for since the broker started.
         self._joined: set[tuple[str, str]] = set()
 
@@ -322,12 +328,18 @@ class Membership:
             (item for item in found.values() if tagged(item, pattern)),
             key=lambda item: (str(item.get("name")), str(item["id"])),
         )
+        # Only channels the broker is in are published: a mint never adds its bot to one it
+        # would be refused. A public one it isn't in waits for `join_tagged`.
+        targets = {
+            str(i["id"]): Target("channel", str(i.get("name") or i["id"]), str(i["id"]))
+            for i in hits
+        }
         with self._lock:
-            self.tagged = [
-                Target("channel", str(i.get("name") or i["id"]), str(i["id"])) for i in hits
-            ]
+            self.tagged = [t for cid, t in targets.items() if cid in mine]
             self._join_first = {
-                str(i["id"]) for i in hits if i.get("type") == "O" and str(i["id"]) not in mine
+                cid: t
+                for cid, t in targets.items()
+                if cid not in mine and found[cid].get("type") == "O"
             }
         return True
 
@@ -336,6 +348,37 @@ class Membership:
         if self._pending():
             self.resolve()
         self.scan()
+
+    def join_tagged(self) -> int:
+        """Join each tagged public channel the broker account is not in, then publish it.
+
+        A `team_user` adds its bots only to a channel it is in (#132's probe). A channel it
+        can't join is logged at WARNING, once per pass, and stays unpublished. Returns how many
+        it published.
+        """
+        with self._lock:
+            pending = list(self._join_first.values())
+        published = 0
+        for channel in pending:
+            assert channel.id is not None
+            try:
+                self.client.add_channel_member(channel.id, self.broker_user_id)
+            except MattermostError as exc:
+                if not _already_member(exc):
+                    log.warning(
+                        "membership: reconcile: tagged channel %s (%s) refused the broker: "
+                        "the broker account can't join it: %s",
+                        channel.name,
+                        channel.id,
+                        exc,
+                    )
+                    continue
+            with self._lock:
+                self._join_first.pop(channel.id, None)
+                self.tagged = sorted([*self.tagged, channel], key=lambda t: (t.name, str(t.id)))
+            published += 1
+            log.info("membership: reconcile: the broker joined %s", channel.name)
+        return published
 
     def reconcile(
         self,
@@ -346,34 +389,24 @@ class Membership:
     ) -> dict[str, list[Any]]:
         """Add each bot in `bot_ids` to the team, then to every channel target.
 
-        `names` gives each bot's account name for the logs; `refresh=False` skips the scan,
-        for a caller that has just run `refresh`. Never removes anyone. A failed add is
-        reported and never raised: at ERROR, or at WARNING once per pass for a tagged channel
-        that refuses the broker (403), where the rest of the pass's adds to it are skipped.
-        No deadline applies: no mint is waiting.
+        `names` gives each bot's account name for the logs. With `refresh` (the default), it
+        first scans and, when there are bots to add, joins the tagged public channels; a caller
+        that has done both passes False. Never removes anyone. A failed add is reported and
+        never raised: at ERROR, or at WARNING once per pass for a tagged channel that refuses
+        the broker (403), where the rest of the pass's adds to it are skipped. No deadline
+        applies: no mint is waiting.
         """
         if refresh:
             self.refresh()
+            if bot_ids:  # the broker never joins a channel for no bot
+                self.join_tagged()
         names = names or {}
         channels = self.channel_targets()
         with self._lock:
             tagged_ids = {t.id for t in self.tagged}
-            join_first = set(self._join_first)
         refused: dict[str, str] = {}  # tagged channel id -> why, warned once below
         added: list[Any] = []
         failed: list[Any] = []
-
-        for channel in channels:
-            if channel.id in join_first and self.broker_user_id:
-                try:
-                    self.client.add_channel_member(channel.id, self.broker_user_id)
-                except MattermostError as exc:
-                    if not _already_member(exc):
-                        refused[channel.id] = f"the broker account can't join it: {exc}"
-                        continue
-                with self._lock:
-                    self._join_first.discard(channel.id)
-                log.info("membership: reconcile: the broker joined %s", channel.name)
 
         def add(target: Target, call: Callable[[str, str], None], bot_id: str) -> bool:
             account = names.get(bot_id, bot_id)

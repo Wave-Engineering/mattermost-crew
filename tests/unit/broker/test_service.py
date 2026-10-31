@@ -473,6 +473,39 @@ def test_reconcile_covers_only_bots_this_broker_owns(joining: Broker, fake: Any)
     assert kessel.bot_user_id not in fake.members.get(TAGGED_ID, [])
 
 
+def test_bot_minted_while_the_broker_joins_still_joins(joining: Broker, fake: Any) -> None:
+    """The race the pass closes: a bot minted while the broker joins a tagged public channel
+    is either in the pass's second read of its bots or minted after the channel was published."""
+    fake.channel_needs_broker = True
+    fake.add_channel(TAGGED_ID, TEAM_ID, TAGGED, "Precheck", mine=False, header="crew-oaw")
+    joining.mint(BABEL)
+    late: dict[str, Any] = {}
+
+    def mint_during_the_join(target: str) -> None:
+        if target == TAGGED_ID and not late:
+            late["reply"] = joining.mint({"dev_name": "kessel", "crew": "oaw"})
+
+    fake.on_add = mint_during_the_join
+    joining.reconcile_membership()
+    # Minted before the channel was published: its own mint couldn't add it there.
+    assert TAGGED not in late["reply"]["membership"]["joined"]
+    for name in ("babel.oaw", "kessel.oaw"):
+        acct = joining.accounts.get(name)
+        assert acct is not None and acct.bot_user_id in fake.members[TAGGED_ID], name
+
+
+def test_reconcile_joins_nothing_without_bots(joining: Broker, fake: Any) -> None:
+    fake.channel_needs_broker = True
+    fake.add_channel(TAGGED_ID, TEAM_ID, TAGGED, "Precheck", mine=False, header="crew-oaw")
+    assert joining.reconcile_membership() == {"added": [], "failed": []}
+    assert TAGGED_ID not in fake.members
+    fake.list_bots_fails = True
+    joining.mint(BABEL)
+    with pytest.raises(Exception, match="boom"):
+        joining.reconcile_membership()  # the loop logs it; nothing is joined
+    assert TAGGED_ID not in fake.members
+
+
 def test_reconcile_loop_runs_at_start_and_interval(
     joining: Broker, broker: Broker, caplog: pytest.LogCaptureFixture
 ) -> None:

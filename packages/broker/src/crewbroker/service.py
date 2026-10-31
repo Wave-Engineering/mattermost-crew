@@ -329,14 +329,22 @@ class Broker:
     def reconcile_membership(self) -> dict[str, list[Any]] | None:
         """One reconcile pass over the bots this broker owns (#167); None with no `team`.
 
-        The scan runs before the bots are read, so a bot minted while it runs is either in the
-        list or was minted after it, and its own mint adds it to the channels found.
+        Every channel a mint can see was published before the bots are read: the scan
+        publishes only tagged channels the broker is in, and a public one it joins is
+        published before the bots are read again. So a bot minted during the pass is in the
+        list, or was minted after it and its own mint adds it to every channel published. The
+        broker joins nothing when it owns no bots, or when reading them fails (the pass then
+        raises).
         """
         if self.membership is None:
             return None
         self.membership.refresh()
         with self._lock:
             bot_ids = self._owned_minted()
+        if bot_ids and self.membership.join_tagged():
+            with self._lock:
+                bot_ids = self._owned_minted()
+        with self._lock:
             names = {a.bot_user_id: a.name for a in self.accounts.all()}
         return self.membership.reconcile(bot_ids, names, refresh=False)
 
