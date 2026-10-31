@@ -199,6 +199,19 @@ def test_pushes_are_kept(h: Harness) -> None:
     assert h.call("squawk_ids", dev_name="babel", ids="113")["ok"] is False
 
 
+def test_squawk_texts_are_kept_and_checked(h: Harness) -> None:
+    """#170: each squawk's original text, for its answer; an older shim sends none."""
+    texts = {"113": "campaign→main fix"}
+    assert h.call("squawk_ids", dev_name="babel", ids=[113, 117], texts=texts)["ok"] is True
+    assert h.context.squawk_texts == {"babel": texts}
+    assert h.call("squawk_ids", dev_name="babel", ids=[113])["ok"] is True
+    assert h.context.squawk_texts == {"babel": {}}  # no texts: the pristine and last-arrow rules
+    for bad in ({"999": "not in ids"}, {"113": 5}, {"113": "x" * 4097}, ["113"]):
+        reply = h.call("squawk_ids", dev_name="babel", ids=[113], texts=bad)
+        assert reply["ok"] is False and "bad_request" in reply["error"], bad
+    assert h.context.squawk_ids == {"babel": ["113"]}  # a refused push changes nothing
+
+
 def test_daemon_reads_no_agent_files() -> None:
     """R-11, R-32, §5.3: the daemon package never names a file on the agent's side."""
     root = Path(crewchat.__file__).parent

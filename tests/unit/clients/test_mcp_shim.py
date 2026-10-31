@@ -56,6 +56,7 @@ class FakeDaemon:
         self.uploads: dict[tuple[str, str], bytes] = {}  # in flight, by (dev, name)
         self.finished: dict[str, bytes] = {}  # upload id -> content
         self.secret = SECRET  # what the daemon holds; it never goes to the shim
+        self.refuse_texts = False  # refuse a `squawk_ids` that carries any texts
 
     def ops(self) -> list[str]:
         return [op for op, _ in self.frames]
@@ -64,6 +65,11 @@ class FakeDaemon:
         return [args for o, args in self.frames if o == op]
 
     async def __call__(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        frame = {"proto": 1, "id": "x" * 36, "op": op, "args": args}
+        if len(json.dumps(frame).encode()) + 1 > 64 * 1024:  # the daemon's MAX_FRAME_BYTES
+            raise DaemonError(op, "bad_request: frame too large")
+        if op == "squawk_ids" and args.get("texts") and self.refuse_texts:
+            raise DaemonError(op, "bad_request: texts refused")
         self.frames.append((op, json.loads(json.dumps(args))))
         if op == "register":
             # The one backend-name form (§5.4): as calls name them.
@@ -587,23 +593,102 @@ def test_pushes_squawk_ids(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         await shim.start()
-        assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": ["113"]}]
+        assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": ["113"], "texts": {}}]
         await shim.tick()
         assert len(daemon.of("squawk_ids")) == 1
         mine.write_text(json.dumps([{"id": 113}, {"id": 117}]))
         bump_mtime(mine, 5)
         await shim.tick()
-        assert daemon.of("squawk_ids")[-1] == {"dev_name": DEV, "ids": ["113", "117"]}
+        assert daemon.of("squawk_ids")[-1] == {
+            "dev_name": DEV,
+            "ids": ["113", "117"],
+            "texts": {},
+        }
 
     asyncio.run(scenario())
     assert len(daemon.of("squawk_ids")) == 2
+
+
+def test_pushes_squawk_texts(tmp_path: Path) -> None:
+    """#170: each squawk's original text O, for its answer, as `sqtk-doorbell.sh` reads it:
+    the drain's baseline file, overlaid by the record's own `.text`, kept to the ids."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon)
+    claude = shim.repo_root / ".claude"
+    mine = claude / "sqtk-mine.json"
+    baseline = claude / "sqtk-baseline.json"
+    mine.write_text(json.dumps([{"id": 113, "text": "campaign→main fix"}, {"id": 117}]))
+    baseline.write_text(
+        json.dumps({"113": "older", "117": "q → ", "999": "not mine", "118": 5})
+    )
+
+    async def scenario() -> None:
+        await shim.start()
+        assert daemon.of("squawk_ids")[-1]["texts"] == {
+            "113": "campaign→main fix",
+            "117": "q → ",
+        }
+        # The drain writes a baseline: a change to that file alone is pushed too.
+        baseline.write_text(json.dumps({"117": "q2 → ", "120": "x" * 5000}))
+        bump_mtime(baseline, 5)
+        await shim.tick()
+        assert daemon.of("squawk_ids")[-1]["texts"] == {
+            "113": "campaign→main fix",
+            "117": "q2 → ",
+        }
+
+    asyncio.run(scenario())
+    assert len(daemon.of("squawk_ids")) == 2
+
+
+def test_squawk_texts_fit_the_frame(tmp_path: Path) -> None:
+    """Texts that would overflow the daemon's 64 KiB frame are cut, longest first, so the ids
+    still land: an oversized frame is refused whole, and the doorbell would go silent."""
+    daemon = FakeDaemon()
+    shim = make_shim(tmp_path, daemon)
+    # Each `→` is 6 bytes once encoded: 40 near-cap texts are about 960 KiB on the wire.
+    records = [{"id": n, "text": "→" * 4000} for n in range(1, 41)]
+    records += [{"id": 100, "text": "short → "}, {"id": 101}]
+    mine = shim.repo_root / ".claude" / "sqtk-mine.json"
+    mine.write_text(json.dumps(records))
+
+    asyncio.run(shim.start())
+    (pushed,) = daemon.of("squawk_ids")
+    assert pushed["ids"] == [str(n) for n in range(1, 41)] + ["100", "101"]
+    assert len(json.dumps(pushed).encode()) <= mcp_shim.SQUAWK_ARGS_BUDGET
+    assert pushed["texts"]["100"] == "short → "
+    assert 1 <= len(pushed["texts"]) < 41
+    assert all(pushed["texts"][i] == "→" * 4000 for i in pushed["texts"] if i != "100")
+
+
+def test_fit_squawk_texts_drops_the_longest_first() -> None:
+    texts = {"1": "a" * 300, "2": "b" * 100, "3": "c" * 200}
+    whole = len(json.dumps({"dev_name": DEV, "ids": ["1", "2", "3"], "texts": texts}).encode())
+    assert mcp_shim.fit_squawk_texts(DEV, ["1", "2", "3"], texts, whole) == texts
+    assert mcp_shim.fit_squawk_texts(DEV, ["1", "2", "3"], texts, whole - 1) == {
+        "2": "b" * 100,
+        "3": "c" * 200,
+    }
+    assert mcp_shim.fit_squawk_texts(DEV, ["1", "2", "3"], texts, 10) == {}
+
+
+def test_squawk_ids_go_alone_when_texts_are_refused(tmp_path: Path) -> None:
+    """Should the daemon refuse the push with texts, the ids go again without them."""
+    daemon = FakeDaemon()
+    daemon.refuse_texts = True
+    shim = make_shim(tmp_path, daemon)
+    mine = shim.repo_root / ".claude" / "sqtk-mine.json"
+    mine.write_text(json.dumps([{"id": 113, "text": "q → "}]))
+
+    asyncio.run(shim.start())
+    assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": ["113"], "texts": {}}]
 
 
 def test_missing_files_push_empty_at_start(tmp_path: Path) -> None:
     daemon = FakeDaemon()
     asyncio.run(make_shim(tmp_path, daemon).start())
     assert daemon.of("kiosk_brief") == [{"dev_name": DEV, "text": ""}]
-    assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": []}]
+    assert daemon.of("squawk_ids") == [{"dev_name": DEV, "ids": [], "texts": {}}]
 
 
 # -- default resolution (R-11) ----------------------------------------------------------------
@@ -1073,6 +1158,10 @@ def test_socket_transport(tmp_path: Path) -> None:
         frame = json.loads(await reader.readline())
         if frame["op"] == "health":
             reply = {"proto": 1, "id": frame["id"], "ok": True, "result": {"backends": {}}}
+        elif frame["op"] == "big":  # the daemon's reply to a frame it couldn't read
+            reply = {"proto": 1, "id": None, "ok": False, "error": "bad_request: frame too large"}
+        elif frame["op"] == "stray":
+            reply = {"proto": 1, "id": "someone-else", "ok": False, "error": "unsupported"}
         else:
             reply = {"proto": 1, "id": frame["id"], "ok": False, "error": "unsupported"}
         writer.write(json.dumps(reply).encode() + b"\n")
@@ -1087,6 +1176,12 @@ def test_socket_transport(tmp_path: Path) -> None:
             with pytest.raises(DaemonError) as exc:
                 await t("nope", {})
             assert exc.value.code == "unsupported"
+            # An error with no id is the one frame's: a frame too large is a DaemonError.
+            with pytest.raises(DaemonError) as exc:
+                await t("big", {})
+            assert exc.value.code == "bad_request"
+            with pytest.raises(DaemonUnreachable, match="mismatched"):
+                await t("stray", {})
         finally:
             server.close()
             await server.wait_closed()

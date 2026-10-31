@@ -66,6 +66,7 @@ from crewchat.uploads import UploadError, UploadStore
 
 MAX_BRIEF_CHARS = 32 * 1024
 MAX_SQUAWK_IDS = 1000
+MAX_SQUAWK_TEXT = 4096
 MATTERMOST_PREFIX = "mattermost:"
 DISCORD = "discord"
 BACKEND_NAME_RE = re.compile(r"^(discord|mattermost:[a-z0-9._-]+)$")
@@ -77,10 +78,12 @@ log = logging.getLogger("crewchat.chat")
 
 @dataclass
 class AgentContext:
-    """What the shims pushed, by Dev-Name: the `## Kiosk` brief and the squawk ids."""
+    """What the shims pushed, by Dev-Name: the `## Kiosk` brief, the squawk ids and each
+    squawk's original text (#170)."""
 
     briefs: BriefStore = field(default_factory=BriefStore)
     squawk_ids: dict[str, list[str]] = field(default_factory=dict)
+    squawk_texts: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def check_backend_name(name: str) -> str:
@@ -427,7 +430,20 @@ def build_chat_handlers(
             if isinstance(item, bool) or not isinstance(item, int | str) or item == "":
                 raise OpError("bad_request", "each id is an integer or a non-empty string")
             out.append(str(item))
+        # Each squawk's original text, for its answer (#170). Absent from an older shim: then
+        # the answer is the pristine and last-arrow rules only.
+        texts = args.get("texts", {})
+        if not isinstance(texts, dict):
+            raise OpError("bad_request", "texts is an object of id -> original text")
+        for key, value in texts.items():
+            if key not in out:
+                raise OpError("bad_request", f"texts names {key!r}, which is not in ids")
+            if not isinstance(value, str) or len(value) > MAX_SQUAWK_TEXT:
+                raise OpError(
+                    "bad_request", f"each text is a string of at most {MAX_SQUAWK_TEXT} characters"
+                )
         context.squawk_ids[dev_name] = out
+        context.squawk_texts[dev_name] = dict(texts)
         return {}
 
     return {

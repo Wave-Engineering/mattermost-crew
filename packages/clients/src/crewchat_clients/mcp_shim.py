@@ -51,8 +51,9 @@ and the daemon acts on the agent's behalf with what it holds itself.
   or path logs one WARNING and the shim starts anyway, on stderr.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
   needs: `kiosk_brief{dev_name, text}` with only the seed's `## Kiosk` section (R-32), at start
-  and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids}` from the agent's
-  squawk records, at start and whenever they change.
+  and whenever the seed's mtime changes, and `squawk_ids{dev_name, ids, texts}` from the
+  agent's squawk records, at start and whenever they change. `texts` is each squawk's original
+  text, from its record's `.text` or the drain's `sqtk-baseline.json`, for its answer (#170).
 - **Discord's guild ops (D-108).** `chat_list_channels`, `chat_create_channel` and
   `chat_create_thread` take today's `disc_*` argument shapes and always send
   `backend="discord"`. `chat_resolve` does too when given a `guild_id`; without one it goes to
@@ -122,6 +123,11 @@ IDENTITY_FILE = Path(".claude/agent-identity.json")
 LEGACY_IDENTITY_DIR = Path("/tmp")
 SEED_FILE = Path(".claude/reseed-revive.md")
 SQUAWKS_FILE = Path(".claude/sqtk-mine.json")
+BASELINE_FILE = Path(".claude/sqtk-baseline.json")  # the drain hook's original texts
+MAX_SQUAWK_TEXT = 4096  # the daemon's limit; a longer original is left out (unknown)
+# The encoded `squawk_ids` args stay under this, well inside the daemon's 64 KiB frame: past
+# it the frame is refused whole and no id lands, so texts are dropped (longest first) to fit.
+SQUAWK_ARGS_BUDGET = 48 * 1024
 # CLAUDE_CODE_ENTRYPOINT values of a session with a human at the keyboard.
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli", "claude-vscode", "claude-desktop", "claude-jetbrains"})
 OUTSIDER_PREFIX = "[from outside the crew]"
@@ -242,7 +248,12 @@ class SocketTransport:
             reply = json.loads(line)
         except ValueError as exc:
             raise DaemonUnreachable(f"crewchat daemon sent a malformed reply to {op}") from exc
-        if not isinstance(reply, dict) or reply.get("id") != req_id:
+        if not isinstance(reply, dict):
+            raise DaemonUnreachable(f"crewchat daemon sent a mismatched reply to {op}")
+        # An error with no id is one the daemon gave before it could read the frame (a frame
+        # too large). The connection carries one frame, so it is this frame's error.
+        unread = reply.get("id") is None and not reply.get("ok")
+        if reply.get("id") != req_id and not unread:
             raise DaemonUnreachable(f"crewchat daemon sent a mismatched reply to {op}")
         if not reply.get("ok"):
             raise DaemonError(op, str(reply.get("error", "error")))
@@ -294,7 +305,7 @@ async def run_sqtk(argv: Sequence[str], cwd: Path) -> int:
 class _FileState:
     """What the shim last pushed for one of the agent's files."""
 
-    mtime_ns: int | None = None
+    mtime_ns: Any = None  # one file's mtime, or a tuple of them
     value: Any = None
     pushed: bool = False
 
@@ -321,6 +332,54 @@ def read_squawk_ids(path: Path) -> list[str]:
         if valid and str(value) not in ids:
             ids.append(str(value))
     return ids
+
+
+def _json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def read_squawk_texts(mine: Path, baseline: Path, ids: list[str]) -> dict[str, str]:
+    """Each squawk's original text O, by id, as `sqtk-doorbell.sh`'s `load_baselines` reads it
+    (#170): the drain's baseline file, overlaid by each record's own `.text`, kept to `ids`.
+    Only strings count (anything else is unknown), and only up to `MAX_SQUAWK_TEXT`."""
+    texts: dict[str, str] = {}
+    base = _json_file(baseline)
+    if isinstance(base, dict):
+        texts.update({str(k): v for k, v in base.items() if isinstance(v, str)})
+    records = _json_file(mine)
+    for item in records if isinstance(records, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            sid = item.get("id")
+            if isinstance(sid, int | str) and not isinstance(sid, bool):
+                texts[str(sid)] = item["text"]
+    return {i: texts[i] for i in ids if i in texts and len(texts[i]) <= MAX_SQUAWK_TEXT}
+
+
+def fit_squawk_texts(
+    dev_name: str, ids: list[str], texts: dict[str, str], budget: int = SQUAWK_ARGS_BUDGET
+) -> dict[str, str]:
+    """`texts` cut until the encoded `squawk_ids` args fit `budget`, longest dropped first. A
+    dropped text is unknown to the daemon, so that squawk's answer falls back to the last
+    arrow: worse, but the ids, and every other squawk's doorbell, still land."""
+
+    def size(kept: dict[str, str]) -> int:
+        args = {"dev_name": dev_name, "ids": ids, "texts": kept}
+        return len(json.dumps(args).encode())
+
+    # Each entry costs its `"id": "text"` plus a `, ` separator, as `json.dumps` writes it.
+    cost = {i: len(json.dumps({i: t}).encode()) for i, t in texts.items()}
+    kept, total = dict(texts), size(texts)
+    for i in sorted(kept, key=lambda i: (-cost[i], i)):
+        if total <= budget:
+            break
+        del kept[i]
+        total -= cost[i]
+    while kept and size(kept) > budget:  # the estimate's last few bytes, never more than once
+        del kept[max(kept, key=lambda i: (cost[i], i))]
+    return kept
 
 
 class Shim:
@@ -481,12 +540,30 @@ class Shim:
             self._brief = _FileState(mtime_ns=mtime, value=text, pushed=True)
 
         squawks = self.repo_root / SQUAWKS_FILE
-        mtime = file_mtime(squawks)
-        if force or not self._squawks.pushed or mtime != self._squawks.mtime_ns:
+        baseline = self.repo_root / BASELINE_FILE
+        mtimes = (file_mtime(squawks), file_mtime(baseline))
+        if force or not self._squawks.pushed or mtimes != self._squawks.mtime_ns:
             ids = read_squawk_ids(squawks)
-            if force or not self._squawks.pushed or ids != self._squawks.value:
-                await self.transport("squawk_ids", {"dev_name": self.dev_name, "ids": ids})
-            self._squawks = _FileState(mtime_ns=mtime, value=ids, pushed=True)
+            texts = read_squawk_texts(squawks, baseline, ids)
+            if force or not self._squawks.pushed or (ids, texts) != self._squawks.value:
+                await self.push_squawks(ids, texts)
+            self._squawks = _FileState(mtime_ns=mtimes, value=(ids, texts), pushed=True)
+
+    async def push_squawks(self, ids: list[str], texts: dict[str, str]) -> None:
+        """`squawk_ids`, with the texts fitted to the frame. Should the daemon still refuse it,
+        the ids go again without texts: the doorbell needs the ids, the texts only refine it."""
+        fitted = fit_squawk_texts(self.dev_name, ids, texts)
+        if len(fitted) < len(texts):
+            left_out = len(texts) - len(fitted)
+            log.warning("squawk_ids: %d of %d texts left out to fit", left_out, len(texts))
+        args: dict[str, Any] = {"dev_name": self.dev_name, "ids": ids, "texts": fitted}
+        try:
+            await self.transport("squawk_ids", args)
+        except DaemonError as exc:
+            if exc.code != "bad_request" or not fitted:
+                raise
+            log.warning("squawk_ids: refused with texts (%s); pushing the ids alone", exc.error)
+            await self.transport("squawk_ids", {**args, "texts": {}})
 
     async def start(self) -> None:
         """Register and push; a daemon that isn't up yet is retried before the first call."""
