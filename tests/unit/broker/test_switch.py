@@ -519,14 +519,17 @@ def test_backfill_first_start_no_replay(broker: Broker, fake: Any, clock: Any) -
     assert broker.dm_cursor.load() == ms(clock.now)
 
 
-def test_backfill_unreadable_cursor_is_a_first_start(broker: Broker, fake: Any, clock: Any) -> None:
-    """A corrupt cursor never replays history: that would answer every old DM."""
+def test_backfill_unreadable_cursor_is_a_first_start(
+    broker: Broker, fake: Any, clock: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A corrupt cursor never replays history: that would answer every old DM. It says so."""
     broker.dm_cursor.path.parent.mkdir(parents=True, exist_ok=True)
     broker.dm_cursor.path.write_text("{", encoding="utf-8")
     fake.history[DM_CHANNEL] = [dm_post("p1", "crew", clock.now - timedelta(days=30))]
     DMListener(broker, "http://mm", "tok").handle(HELLO)
     assert fake.posts == []
     assert broker.dm_cursor.load() == ms(clock.now)
+    assert "DM cursor unreadable" in caplog.text
 
 
 def test_backfill_skips_edited_deleted_and_failed_reads(
@@ -633,8 +636,9 @@ def test_failed_read_keeps_the_backfill_owed(
 def test_refused_partner_does_not_hold_the_backfill(
     two_partners: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A partner the server refuses (a deleted or mistyped ID) never reads on a retry either:
-    they are skipped, and the other partner's missed DMs apply. A 5xx still holds."""
+    """A partner the server says doesn't exist (a deleted or mistyped ID) never reads on a
+    retry either: they are skipped, and the other partner's missed DMs apply. A 5xx or a 403
+    (DMs the broker may not read) still holds."""
     cursor = ms(clock.now - timedelta(minutes=5))
     two_partners.dm_cursor.save(cursor)
     missed = dm_post("a1", "crew", clock.now - timedelta(seconds=30))
@@ -656,7 +660,15 @@ def test_refused_partner_does_not_hold_the_backfill(
     listener.handle(HELLO)
     assert fake.posts == [] and two_partners.dm_cursor.load() == cursor  # 503: held
 
+    refusal["exc"] = MattermostError("POST", "/channels/direct", 403, "forbidden")
+    listener.handle(HELLO)
+    assert fake.posts == [] and two_partners.dm_cursor.load() == cursor  # 403: held
+
     refusal["exc"] = NotFound("POST", "/channels/direct", 404, "user not found")
     listener.handle(HELLO)
     assert two_partners.switch.load().mode == "crew"
     assert two_partners.dm_cursor.load() == missed["create_at"]
+
+    live = dm_post("a2", "trusted", clock.now)
+    listener.handle(posted_event(live, seq=1))  # no backfill owed: the cursor follows it
+    assert two_partners.dm_cursor.load() == live["create_at"]

@@ -84,9 +84,10 @@ WS_BACKOFF_MAX_S = 60.0
 # refused rather than applied, unless it only narrows who gets through.
 BACKFILL_MAX_AGE_S = 600
 NARROWING_COMMANDS = {("crew",), ("kiosk", "off")}
-# A partner whose DM channel the server refuses with one of these will not be read on a retry
-# either: the backfill skips them rather than holding every partner's DMs (#159).
-BACKFILL_SKIP_STATUSES = {400, 403, 404}
+# A partner whose DM channel read the server answers with one of these doesn't exist, so has no
+# DMs to lose: the backfill skips them rather than holding every partner's DMs (#159). A 403 is
+# not here: DMs may exist that the broker may not read, often for every partner at once.
+BACKFILL_SKIP_STATUSES = {400, 404}
 HANDLED_DMS_MAX = 500
 
 log = logging.getLogger("crewbroker")
@@ -732,7 +733,7 @@ class DMListener:
         (`NARROWING_COMMANDS`): applied late, a `social 2h` would open the crew when the
         partner believes it closed. If any read fails, nothing is applied, the cursor stays,
         and the backfill stays owed: it is tried again before the next DM and at the next
-        `hello`. A partner the server refuses outright (`BACKFILL_SKIP_STATUSES`, such as a
+        `hello`. A partner the server says doesn't exist (`BACKFILL_SKIP_STATUSES`, such as a
         deleted user) is logged and skipped instead, so one bad ID cannot hold the cursor and
         every other partner's backfill forever. With no usable cursor, as on a fresh install,
         it starts the cursor now and replays nothing. Never raises.
@@ -740,6 +741,8 @@ class DMListener:
         cursor = self.broker.dm_cursor.load()
         now = self.broker.clock()
         if cursor <= 0:
+            if self.broker.dm_cursor.path.exists():
+                log.warning("DM cursor unreadable; starting it now, with no backfill")
             self._owed = False
             self._save_cursor(int(now.timestamp() * 1000))
             return
