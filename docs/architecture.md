@@ -83,9 +83,10 @@ switch on that server (R-24).
 
 A sender's crew is resolved by Mattermost user id, never by name.
 
-- **A bot account is in crew X if and only if** its `owner_id` is X's broker account **and** its
-  user id is in X's broker's `minted_bot_ids`, the bot accounts that broker created. Both are
-  needed: a bot's owner can reassign it to another user.
+- **A bot account is in crew X if and only if** its user id is in X's broker's `minted_bot_ids`:
+  the bot accounts that broker created **and still owns**. A bot's owner can reassign it to
+  another user, so the broker checks ownership itself and drops a reassigned bot from the list.
+  The daemon never reads `owner_id`: the server doesn't report it to other users (D-100).
 - **A human is in crew X if and only if** their user id is in X's `human_user_ids`.
 - **Username suffixes are never used.** Anyone can register `x.oaw`.
 - **Trusted crews** are named, by name only, in our broker's `trusted` list. The daemon builds
@@ -95,10 +96,11 @@ A sender's crew is resolved by Mattermost user id, never by name.
   humans are whoever that crew's own broker reports: its operator decides, not ours (D-087). A
   trusted crew with no broker on this host is skipped, and its senders are outsiders.
 - A sender that can't be resolved is dropped (R-22). With no cached `crew_info` or switch state
-  for a server, nothing from that Mattermost server is delivered. A bot account whose `owner_id`
-  is a local broker but isn't in its cached `minted_bot_ids` triggers one re-fetch of that
-  broker's `crew_info` before any verdict, so a newly minted crewmate is never treated as an
-  outsider.
+  for a server, nothing from that Mattermost server is delivered. A bot account in no cached
+  `minted_bot_ids` triggers one re-fetch of every local broker's `crew_info` before any
+  verdict, so a newly minted crewmate is never treated as an outsider. While a trusted crew's
+  broker has no cached `crew_info`, an unrecognised bot account is dropped (it may be that
+  crew's); an untrusted crew's broker never causes a drop (D-115).
 
 ## Data paths
 

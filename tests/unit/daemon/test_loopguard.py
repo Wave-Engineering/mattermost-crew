@@ -85,6 +85,27 @@ def test_loop_guard_window(guard: tuple[LoopGuard, Mono]) -> None:
     assert g.admit(msg("@babel later", root=MINE), REG) is True
 
 
+def test_loop_guard_counts_dropped_messages(guard: tuple[LoopGuard, Mono]) -> None:
+    """#154: the window is 1 h, sliding, and the messages it drops count too, so a running
+    loop stays dropped until the rate falls, not just until its first 20 age out."""
+    g, mono = guard
+    sent = []  # when each of the 25 was sent: one every 72 s, so 30 min in all
+    verdicts = []
+    for _ in range(25):
+        mono.t += 72
+        sent.append(mono.t)
+        verdicts.append(g.admit(msg("@babel your turn", root=MINE), REG))
+    assert verdicts == [True] * 20 + [False] * 5  # the 21st to the 25th are dropped
+    # Just over an hour after the 5th: the 6th to the 25th (20, the 5 dropped among them) are
+    # still in the window, so this one is the 21st and is dropped too. Were dropped messages
+    # not counted, the 6th to the 20th (15) would leave room for it.
+    mono.t = sent[4] + 3601
+    assert g.admit(msg("@babel still looping", root=MINE), REG) is False
+    # Once the 6th and 7th age out, 18 remain plus that refused one: this is the 20th.
+    mono.t = sent[6] + 3601
+    assert g.admit(msg("@babel calmer now", root=MINE), REG) is True
+
+
 def test_loop_guard_window_configurable() -> None:
     threads = MyThreads()
     threads.add("babel", MINE, MM)

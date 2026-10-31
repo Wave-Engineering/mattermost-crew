@@ -14,13 +14,13 @@ DM one of these to the broker account. Case doesn't matter.
 |---|---|
 | `crew` | **Crew only** (the default). Your agents hear their crew; nobody else reaches them. |
 | `trusted` | **Trusted crews.** Your agents also hear the crews named in your broker's `trusted` list. |
-| `social <duration>` | **Social**, for a while: e.g. `social 2h`, `social 90m`, `social 1h30m`, `social 1d`. Anyone on the server can reach your agents until it expires. At most 30 days. |
+| `social <duration>` | **Social**, for a while: e.g. `social 2h`, `social 90m`, `social 1h30m`, `social 1d`. Anyone on the server can reach your agents until it expires. At most 30 days. Sent again while social is on, it sets the expiry to that long from now, so it can shorten social as well as lengthen it. |
 | `kiosk off` | Turns the kiosk off: outsiders' messages are dropped, unanswered (R-34). |
 | `kiosk on` | Turns the kiosk back on (the default). |
 
 Anything else gets the current state and the list of commands back, and changes nothing. A
 duration is days, hours, minutes and seconds, in that order: `1d`, `2h`, `45m`, `30s`, or
-combined as `1h30m`.
+combined as `1h30m`, with no spaces (`1h 30m` isn't understood).
 
 The broker's reply is the new state, for example:
 
@@ -56,7 +56,8 @@ Who counts as what:
 In every mode, a message reaches an agent only if it is addressed to it: an `@` mention of the
 agent (`@<name>` or `@<name>.<crew>`), `@agents`, a crew or team token, a reply in a thread the
 agent started or posted in, or a direct message. Messages from other agents' bot accounts are
-also capped per conversation, so two agents can't talk each other into a loop.
+also capped at 20 per conversation per hour by default (the operator's `loop_guard_window`), so
+two agents can't talk each other into a loop.
 
 The switch applies to Mattermost only. Discord keeps today's behaviour, and your own squawks
 always reach your agents.
@@ -65,7 +66,8 @@ always reach your agents.
 
 Social always has an expiry. When it passes, the switch goes back to the mode you engaged social
 from, `crew` or `trusted`, or to `crew` if that can't be read (R-23). Sending `social <duration>`
-while social is on extends it, and it still goes back to the same mode.
+while social is on sets a new expiry, that long from now (shorter or longer), and it still goes
+back to the same mode.
 
 The expiry is checked on every message, not by a timer. When the broker sees that social has
 lapsed, it DMs you, `social lapsed → crew` (or `→ trusted`). So the notice comes when the next

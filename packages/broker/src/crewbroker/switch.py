@@ -124,8 +124,9 @@ def apply_command(
         if dur is None or dur > MAX_SOCIAL:
             return state, f"not a duration (up to {MAX_SOCIAL.days}d): {words[1]!r}. {USAGE}"
         mode, _ = effective_mode(state, now)
-        # Already social: extend, keeping where it reverts to. Otherwise remember the mode
-        # social was engaged from, which by the invariant is crew or trusted.
+        # Already social: a new expiry, `dur` from now (shorter or longer, #154), keeping where
+        # it reverts to. Otherwise remember the mode social was engaged from, which by the
+        # invariant is crew or trusted.
         revert_to = safe_revert(state.revert_to) if mode == "social" else safe_revert(mode)
         state = replace(state, mode="social", expires_at=now + dur, revert_to=revert_to)
     else:

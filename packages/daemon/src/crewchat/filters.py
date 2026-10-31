@@ -33,8 +33,9 @@ concurrently, so one that doesn't answer costs at most one timeout and never sta
   `minted_bot_ids` (X's broker lists only the bots it minted and still owns, D-100); a human
   is in X if and only if it is in X's `human_user_ids`. Username suffixes are never read. With
   no switch state or `crew_info` cached for the agent's crew, or an author the server can't
-  resolve, the verdict is `DROP`. While any local broker on the server has no cached
-  `crew_info`, an unrecognised bot account is `DROP`, never `KIOSK`.
+  resolve, the verdict is `DROP`. While a trusted crew's local broker on the server has no
+  cached `crew_info`, an unrecognised bot account is `DROP`, never `KIOSK`. An untrusted
+  crew's uncached broker changes nothing: its bots are outsiders either way (D-115).
 - **Push order:** membership, addressing (`addressed_to`, with membership's crew as
   `author_crew`, D-103), the loop guard, then the switch. **Pull order:** membership, then the
   switch, only.
@@ -66,7 +67,7 @@ import json
 import logging
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -361,10 +362,18 @@ class SwitchCache:
             self._round = asyncio.create_task(self._crew_info_round(), name="crew_info round")
         return await asyncio.wait_for(asyncio.shield(self._round), self.round_wait_s)
 
-    async def miss(self, bot_id: str, server_id: str) -> MissResult:
+    async def miss(
+        self,
+        bot_id: str,
+        server_id: str,
+        crews: Callable[[], Collection[str] | None] | None = None,
+    ) -> MissResult:
         """A bot account in no cached `minted_bot_ids`: re-fetch, at most once per bot per
         `refetch_per_bot_s`. `failed` when the round timed out or a broker on `server_id`
-        didn't answer; `capped` when this bot was re-fetched for too recently."""
+        didn't answer, counting only the brokers of the crews `crews()` names when it names
+        any (D-115: an untrusted crew's broker being down changes nothing). `crews` is called
+        after the round, which may have changed who is trusted. `capped` when this bot was
+        re-fetched for too recently."""
         now = self._mono()
         while self._bot_refetch:
             oldest, at = next(iter(self._bot_refetch.items()))
@@ -379,7 +388,9 @@ class SwitchCache:
         except TimeoutError:
             log.warning("crew_info re-fetch for bot %s timed out", bot_id)
             return "failed"
-        return "failed" if any(k[1] == server_id for k in failed) else "ok"
+        scope = crews() if crews is not None else None
+        mine = [k for k in failed if k[1] == server_id and (scope is None or k[0] in scope)]
+        return "failed" if mine else "ok"
 
 
 # -- the loop guard -------------------------------------------------------------------------
@@ -568,6 +579,13 @@ def _ids(info: Mapping[str, Any], key: str) -> set[str]:
     return {str(v) for v in value} if isinstance(value, list) else set()
 
 
+def _trusted(own: Mapping[str, Any], crew: str) -> list[str]:
+    """The crews our `crew_info` trusts, in its order, never our own crew."""
+    value = own.get("trusted")
+    names = [str(v) for v in value] if isinstance(value, list) else []
+    return [n for n in names if n != crew]
+
+
 class Filters:
     def __init__(
         self,
@@ -621,11 +639,7 @@ class Filters:
         if own is None:
             return []
         crews: list[tuple[str, Class, dict[str, Any]]] = [(reg.crew, "crew", own)]
-        trusted = own.get("trusted")
-        for name in trusted if isinstance(trusted, list) else []:
-            name = str(name)
-            if name == reg.crew:
-                continue
+        for name in _trusted(own, reg.crew):
             if not self.cache.has_broker(name, server_id):
                 if (name, server_id) not in self._skipped:
                     self._skipped.add((name, server_id))
@@ -660,15 +674,34 @@ class Filters:
             return found
         if not msg.is_bot:
             return "outsider", None
-        # A bot in no cached `minted_bot_ids`: re-fetch, then re-check (R-22).
-        if await self.cache.miss(msg.author_id, server_id) == "failed":
+        # A bot in no cached `minted_bot_ids`: re-fetch, then re-check (R-22). Only our own and
+        # our trusted crews' brokers failing can matter (D-115); with our own crew uncached,
+        # which crews we trust is unknown, so every broker counts. The round can change who
+        # we trust, so the crews trusted before it and after it both count (fail closed).
+        before = self.cache.crew_info(reg.crew, server_id)
+
+        def crews() -> set[str] | None:
+            after = self.cache.crew_info(reg.crew, server_id)
+            if before is None or after is None:
+                return None
+            return {reg.crew, *_trusted(before, reg.crew), *_trusted(after, reg.crew)}
+
+        if await self.cache.miss(msg.author_id, server_id, crews) == "failed":
             return DROP("refetch_failed")
-        if self.cache.crew_info(reg.crew, server_id) is None:
+        own = self.cache.crew_info(reg.crew, server_id)
+        if own is None:
             return DROP("no_cache")
         found = self._lookup(msg, reg, server_id)
         if found is not None:
             return found
-        uncached = [k for k in self.cache.keys(server_id) if self.cache.crew_info(*k) is None]
+        # Only a trusted crew's bot can be misclassified by a cache miss (D-115): an untrusted
+        # crew's bots are outsiders whether its broker is cached or not.
+        trusted = set(_trusted(own, reg.crew))
+        uncached = [
+            k
+            for k in self.cache.keys(server_id)
+            if k[0] in trusted and self.cache.crew_info(*k) is None
+        ]
         if uncached:
             return DROP("uncached_crew")  # it may be theirs: never the kiosk
         return "outsider", None
