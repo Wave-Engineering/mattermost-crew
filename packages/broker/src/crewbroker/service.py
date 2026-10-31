@@ -682,6 +682,10 @@ class DMListener:
         # Post ids already handled, newest last: a DM the backfill applied and the websocket
         # then replays (or the reverse) is handled once (#159).
         self._handled: OrderedDict[str, None] = OrderedDict()
+        # A backfill not yet completed: the cursor stays where it is until one is (#159).
+        self._owed = False
+        self._newest_dm = 0  # ms: the newest DM handled, from anyone
+        self._newest_partner_dm = 0  # ms: the newest from a human partner
 
     def uri(self) -> str:
         if not self.connection_id:
@@ -705,55 +709,66 @@ class DMListener:
             conn_id = data.get("connection_id")
             if isinstance(conn_id, str):
                 self.connection_id = conn_id
+            self._owed = True
             self.backfill()
             return
         dm = dm_from_event(event, self.broker.config.broker_user_id)
         if dm is not None:
+            if self._owed:
+                self.backfill()  # what was missed goes first, once the server answers
             self._apply(dm)
 
     def backfill(self) -> None:
-        """Apply the human partners' DMs sent since the cursor, at every `hello` (#159).
+        """Apply the human partners' DMs sent since the cursor, owed at every `hello` (#159).
 
         The websocket resumes only while the server still holds its `connection_id`, which a
-        broker restart always loses. A DM older than `BACKFILL_MAX_AGE_S` is answered "not
-        applied" unless it only narrows (`NARROWING_COMMANDS`): applied late, a `social 2h`
-        would open the crew when the partner believes it closed. With no usable cursor, as on
-        a fresh install, it starts the cursor now and replays nothing. Never raises.
+        broker restart always loses. Every partner's channel is read first, and the posts are
+        applied in `create_at` order: the partners share one switch, so the latest instruction
+        must land last. A DM older than `BACKFILL_MAX_AGE_S`, or older than a partner DM
+        already handled, is answered "not applied" unless it only narrows
+        (`NARROWING_COMMANDS`): applied late, a `social 2h` would open the crew when the
+        partner believes it closed. If any read fails, nothing is applied, the cursor stays,
+        and the backfill stays owed: it is tried again before the next DM and at the next
+        `hello`. With no usable cursor, as on a fresh install, it starts the cursor now and
+        replays nothing. Never raises.
         """
         cursor = self.broker.dm_cursor.load()
         now = self.broker.clock()
         if cursor <= 0:
-            try:
-                self.broker.dm_cursor.save(int(now.timestamp() * 1000))
-            except OSError:
-                log.exception("DM cursor not saved")
+            self._owed = False
+            self._save_cursor(int(now.timestamp() * 1000))
             return
         broker_id = self.broker.config.broker_user_id
+        missed: list[DirectMessage] = []
         for human in self.broker.config.human_user_ids:
             try:
                 channel = self.broker.client.direct_channel(broker_id, human)
                 posts = self.broker.client.posts_since(channel, cursor)
             except Exception:
-                log.exception("DM backfill from %s failed", human)
-                continue
+                log.exception("DM backfill from %s failed; retried before the next DM", human)
+                return
             for post in posts:
                 dm = dm_from_post(post, broker_id)
                 # `since` also returns older posts edited since: only new ones count.
                 if dm is None or dm.sender_user_id != human or dm.create_at <= cursor:
                     continue
-                if post.get("delete_at"):
-                    continue
-                age = now.timestamp() - dm.create_at / 1000
-                words = tuple(dm.message.strip().lower().split())
-                if age > BACKFILL_MAX_AGE_S and words not in NARROWING_COMMANDS:
-                    sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
-                    self._apply(dm, refuse=f"sent {sent.isoformat(timespec='seconds')}")
-                else:
-                    self._apply(dm)
+                if not post.get("delete_at"):
+                    missed.append(dm)
+        for dm in sorted(missed, key=lambda m: (m.create_at, m.post_id)):
+            stale = now.timestamp() - dm.create_at / 1000 > BACKFILL_MAX_AGE_S
+            superseded = dm.create_at < self._newest_partner_dm
+            words = tuple(dm.message.strip().lower().split())
+            if (stale or superseded) and words not in NARROWING_COMMANDS:
+                sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
+                self._apply(dm, refuse=f"sent {sent.isoformat(timespec='seconds')}")
+            else:
+                self._apply(dm)
+        self._owed = False
+        self._save_cursor(self._newest_dm)
 
     def _apply(self, dm: DirectMessage, *, refuse: str = "") -> None:
         """Handle one DM once: apply it and reply, or with `refuse`, reply that it was not
-        applied. Then advance the cursor past it."""
+        applied. Then advance the cursor past it, unless a backfill is still owed."""
         if dm.post_id:
             if dm.post_id in self._handled:
                 return
@@ -768,9 +783,17 @@ class DMListener:
             self.broker.client.create_post(dm.channel_id, reply, props={BROKER_PROP: 1})
         except Exception:
             log.exception("switch DM from %s failed", dm.sender_user_id)
+        self._newest_dm = max(self._newest_dm, dm.create_at)
+        if dm.sender_user_id in self.broker.config.human_user_ids:
+            self._newest_partner_dm = max(self._newest_partner_dm, dm.create_at)
+        if not self._owed:
+            self._save_cursor(dm.create_at)
+
+    def _save_cursor(self, ms: int) -> None:
+        """Move the cursor forward to `ms`; never back."""
         try:
-            if dm.create_at > self.broker.dm_cursor.load():
-                self.broker.dm_cursor.save(dm.create_at)
+            if ms > self.broker.dm_cursor.load():
+                self.broker.dm_cursor.save(ms)
         except OSError:
             log.exception("DM cursor not saved")
 

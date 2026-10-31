@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import stat
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -554,3 +555,75 @@ def test_live_dm_advances_the_cursor(broker: Broker, fake: Any, clock: Any) -> N
     DMListener(broker, "http://mm", "tok").handle(posted_event(dm_post("p1", "trusted", clock.now)))
     assert broker.switch.load().mode == "trusted"
     assert broker.dm_cursor.load() == ms(clock.now)
+
+
+PARTNER_B = "partner-b-user-id"
+B_CHANNEL = "__".join(sorted([BROKER_ID, PARTNER_B]))
+
+
+@pytest.fixture
+def two_partners(fake: Any, crew_config: CrewConfig, tmp_path: Path, clock: Any) -> Broker:
+    config = replace(crew_config, human_user_ids=[HUMAN_ID, PARTNER_B])
+    return Broker(config, fake, tmp_path / "state2", clock=clock)
+
+
+def test_backfill_applies_all_partners_in_create_at_order(
+    two_partners: Broker, fake: Any, clock: Any
+) -> None:
+    """The partners share one switch: B's earlier `social 1h` must not land after A's later
+    `crew`, though A's channel is read first."""
+    two_partners.dm_cursor.save(ms(clock.now - timedelta(minutes=5)))
+    fake.history[B_CHANNEL] = [
+        dm_post(
+            "b1",
+            "social 1h",
+            clock.now - timedelta(seconds=60),
+            user_id=PARTNER_B,
+            channel_id=B_CHANNEL,
+        )
+    ]
+    fake.history[DM_CHANNEL] = [dm_post("a1", "crew", clock.now - timedelta(seconds=30))]
+    DMListener(two_partners, "http://mm", "tok").handle(HELLO)
+    assert two_partners.switch.load().mode == "crew"
+    assert [p["channel_id"] for p in fake.posts] == [B_CHANNEL, DM_CHANNEL]
+
+
+def test_failed_read_keeps_the_backfill_owed(
+    two_partners: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed read applies nothing and moves no cursor, not even for a live DM in the
+    meantime. The retry still applies what was missed, and an older widening command that
+    a newer live one has overtaken is refused."""
+    cursor = ms(clock.now - timedelta(minutes=5))
+    two_partners.dm_cursor.save(cursor)
+    fake.history[DM_CHANNEL] = [
+        dm_post("a1", "kiosk off", clock.now - timedelta(seconds=90)),
+        dm_post("a2", "social 1h", clock.now - timedelta(seconds=60)),
+    ]
+    reads = fake.posts_since
+    down = {"on": True}
+
+    def flaky(channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        if down["on"] and channel_id == B_CHANNEL:
+            raise OSError("connection refused")
+        posts: list[dict[str, Any]] = reads(channel_id, since_ms)
+        return posts
+
+    monkeypatch.setattr(fake, "posts_since", flaky)
+    listener = DMListener(two_partners, "http://mm", "tok")
+    listener.handle(HELLO)
+    assert fake.posts == [] and two_partners.dm_cursor.load() == cursor  # A's not applied alone
+
+    live = dm_post("a3", "crew", clock.now - timedelta(seconds=10))
+    listener.handle(posted_event(live, seq=1))  # the retry fails again; the live DM applies
+    assert two_partners.switch.load().mode == "crew"
+    assert two_partners.dm_cursor.load() == cursor  # still owed: the cursor holds
+
+    down["on"] = False
+    listener.handle(HELLO)
+    state = two_partners.switch.load()
+    assert (state.mode, state.kiosk_on) == ("crew", False)  # narrowing applied, social refused
+    assert [m for m in replies(fake) if m.startswith("not applied")] == [
+        "not applied: sent 2026-10-01T11:59:00+00:00 while the broker was offline; send it again"
+    ]
+    assert two_partners.dm_cursor.load() == live["create_at"]
