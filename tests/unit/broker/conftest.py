@@ -39,6 +39,8 @@ class FakeMattermost:
         self.tokens: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, Any]] = []
         self.posts: list[dict[str, Any]] = []
+        # DM history per channel for the backfill (#159): each post as the REST API gives it.
+        self.history: dict[str, list[dict[str, Any]]] = {}
         self.post_fails = False
         # Membership (#132): target (team or channel) id -> member user ids.
         self.members: dict[str, list[str]] = {}
@@ -209,6 +211,16 @@ class FakeMattermost:
     def direct_channel(self, user_id: str, other_id: str) -> str:
         self.calls.append(("direct_channel", (user_id, other_id)))
         return "__".join(sorted([user_id, other_id]))
+
+    def posts_since(self, channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        """As the server's `since`: posts created or changed after it, edits included."""
+        self.calls.append(("posts_since", (channel_id, since_ms)))
+        found = [
+            p
+            for p in self.history.get(channel_id, [])
+            if max(p.get("create_at", 0), p.get("update_at", 0)) > since_ms
+        ]
+        return sorted(found, key=lambda p: p.get("create_at", 0))
 
     def create_post(
         self, channel_id: str, message: str, props: dict[str, Any] | None = None

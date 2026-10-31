@@ -30,6 +30,7 @@ import struct
 import sys
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ from crewbroker.mint import (
     revoke_superseded,
 )
 from crewbroker.prune import prune_idle
-from crewbroker.state import AccountStore, TokenStore
+from crewbroker.state import AccountStore, DMCursorStore, TokenStore
 from crewbroker.switch import (
     Mode,
     SwitchState,
@@ -72,6 +73,7 @@ from crewbroker.switch import (
     apply_command,
     effective_mode,
     settle,
+    widens,
 )
 
 PROTO = 1
@@ -86,6 +88,14 @@ WS_PING_S = 30.0
 WS_RECV_POLL_S = 1.0
 WS_BACKOFF_FIRST_S = 1.0
 WS_BACKOFF_MAX_S = 60.0
+# The DM backfill (#159): a command older than this, sent while the broker was offline, is
+# refused rather than applied, unless it widens nothing (`Broker.handle_late_dm`).
+BACKFILL_MAX_AGE_S = 600
+# A partner whose DM channel read the server answers with one of these doesn't exist, so has no
+# DMs to lose: the backfill skips them rather than holding every partner's DMs (#159). A 403 is
+# not here: DMs may exist that the broker may not read, often for every partner at once.
+BACKFILL_SKIP_STATUSES = {400, 404}
+HANDLED_DMS_MAX = 500
 
 log = logging.getLogger("crewbroker")
 
@@ -130,6 +140,7 @@ class Broker:
         self.accounts = AccountStore(state_dir)
         self.tokens = TokenStore(state_dir)
         self.switch = SwitchStore(state_dir)
+        self.dm_cursor = DMCursorStore(state_dir)
         self.server_key = server_key or config.server_url
         self.clock = clock
         self._lock = threading.Lock()
@@ -444,6 +455,24 @@ class Broker:
         Only the crew's human partners change anything (R-24); anyone else is refused and
         the stored state is not touched.
         """
+        reply = self._handle_dm(sender_user_id, text, late=False)
+        assert reply is not None  # only a late command is ever held back
+        return reply
+
+    def handle_late_dm(
+        self, sender_user_id: str, text: str, *, overtaken: bool = False
+    ) -> str | None:
+        """`handle_dm` for a command the backfill found stale or overtaken (#159): applied only
+        if it widens nothing (`widens`) on the switch as it stands, else None and nothing
+        changes. Applied late, a widening command opens the crew when the partner believes
+        it closed; a narrowing one is what they asked for, whatever its words. An `overtaken`
+        one must not widen where the switch ends up either: the newer command, and its reply,
+        told the partner that."""
+        return self._handle_dm(sender_user_id, text, late=True, overtaken=overtaken)
+
+    def _handle_dm(
+        self, sender_user_id: str, text: str, *, late: bool, overtaken: bool = False
+    ) -> str | None:
         now = self.clock()
         lapsed_to: Mode | None = None
         with self._lock:
@@ -452,10 +481,16 @@ class Broker:
             else:
                 state = self.switch.load()
             new, reply = apply_command(state, sender_user_id, text, self.config, now)
-            if new != state:
+            held = late and widens(state, new, now, later=overtaken)
+            if held:
+                new = state
+            elif new != state:
                 self.switch.save(new)
         if lapsed_to is not None:
             self._notify_lapse(lapsed_to)
+        if held:
+            log.info("switch: late %r from %s not applied: it widens", text, sender_user_id)
+            return None
         if new != state:
             log.info("switch: %s by %s", reply, sender_user_id)
         elif sender_user_id not in self.config.human_user_ids:
@@ -606,6 +641,8 @@ class DirectMessage:
     channel_id: str
     sender_user_id: str
     message: str
+    post_id: str = ""
+    create_at: int = 0  # ms; 0 when the post didn't carry one
 
 
 def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
@@ -623,6 +660,15 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
         post = json.loads(str(data.get("post", "")))
     except ValueError:
         return None
+    members = str(data.get("channel_name", "")).split("__")
+    if broker_user_id not in members:
+        return None
+    return dm_from_post(post, broker_user_id)
+
+
+def dm_from_post(post: Any, broker_user_id: str) -> DirectMessage | None:
+    """A post, as a DM it should answer, or None: the checks `dm_from_event` makes on the post
+    itself, which the backfill makes on each post it reads (#159)."""
     if not isinstance(post, dict):
         return None
     sender = post.get("user_id")
@@ -635,10 +681,17 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
     props = post.get("props")
     if isinstance(props, dict) and props.get(BROKER_PROP):
         return None
-    members = str(data.get("channel_name", "")).split("__")
-    if broker_user_id not in members:
-        return None
-    return DirectMessage(channel_id=channel, sender_user_id=sender, message=message)
+    post_id = post.get("id")
+    create_at = post.get("create_at")
+    if isinstance(create_at, bool) or not isinstance(create_at, int):
+        create_at = 0
+    return DirectMessage(
+        channel_id=channel,
+        sender_user_id=sender,
+        message=message,
+        post_id=post_id if isinstance(post_id, str) else "",
+        create_at=create_at,
+    )
 
 
 class WebSocketLike(Protocol):
@@ -684,6 +737,15 @@ class DMListener:
         self._sleep = sleep
         self.connection_id = ""
         self.next_seq = 0
+        # Post ids already handled, newest last: a DM the backfill applied and the websocket
+        # then replays (or the reverse) is handled once (#159). Both it and the newest partner
+        # DM persist beside the cursor, which a restart can find held behind them.
+        newest_partner, handled = broker.dm_cursor.load_seen()
+        self._handled: OrderedDict[str, None] = OrderedDict.fromkeys(handled[-HANDLED_DMS_MAX:])
+        # A backfill not yet completed: the cursor stays where it is until one is (#159).
+        self._owed = False
+        self._newest_dm = 0  # ms: the newest DM handled, from anyone
+        self._newest_partner_dm = newest_partner  # ms: the newest from a human partner
 
     def uri(self) -> str:
         if not self.connection_id:
@@ -707,15 +769,130 @@ class DMListener:
             conn_id = data.get("connection_id")
             if isinstance(conn_id, str):
                 self.connection_id = conn_id
+            self._owed = True
+            self.backfill()
             return
         dm = dm_from_event(event, self.broker.config.broker_user_id)
-        if dm is None:
+        if dm is not None:
+            if self._owed:
+                self.backfill()  # what was missed goes first, once the server answers
+            self._apply(dm)
+
+    def backfill(self) -> None:
+        """Apply the human partners' DMs sent since the cursor, owed at every `hello` (#159).
+
+        The websocket resumes only while the server still holds its `connection_id`, which a
+        broker restart always loses. Every partner's channel is read first, and the posts are
+        applied in `create_at` order: the partners share one switch, so the latest instruction
+        must land last. A DM older than `BACKFILL_MAX_AGE_S`, or older than a partner DM
+        already handled, is late: it is applied only if it widens nothing on the switch as it
+        stands (`Broker.handle_late_dm`), and is otherwise answered "not applied". Applied
+        late, a `social 2h` would open the crew when the partner believes it closed; a late
+        `trusted` under social, or a shorter `social`, closes what the partner asked closed.
+        An overtaken one must also not widen where the switch ends up (`switch.landing`): a
+        newer command, and its reply, told the partner that. A command that fails stops the
+        backfill there, still owed: it is retried before the next DM and at the next `hello`.
+        If that retry fails too, the next DM still applies, and the failed one, overtaken by
+        it if it is a partner's, is judged late. What the backfill has seen persists beside
+        the cursor (`DMCursorStore.load_seen`), which can be held behind DMs already applied,
+        so a restart's replay still judges overtaken commands so and applies none twice.
+        If any read fails, nothing is applied, the cursor stays, and the backfill stays owed:
+        it is tried again before the next DM and at the next `hello`. A partner the server
+        says doesn't exist (`BACKFILL_SKIP_STATUSES`, such as a deleted user) is logged and
+        skipped instead, so one bad ID cannot hold the cursor and every other partner's
+        backfill forever. With no usable cursor, as on a fresh install, it starts the cursor
+        now and replays nothing. Never raises.
+        """
+        cursor = self.broker.dm_cursor.load()
+        now = self.broker.clock()
+        if cursor <= 0:
+            if self.broker.dm_cursor.path.exists():
+                log.warning("DM cursor unreadable; starting it now, with no backfill")
+            self._owed = False
+            self._save_cursor(int(now.timestamp() * 1000))
             return
+        broker_id = self.broker.config.broker_user_id
+        missed: list[DirectMessage] = []
+        for human in self.broker.config.human_user_ids:
+            try:
+                channel = self.broker.client.direct_channel(broker_id, human)
+                posts = self.broker.client.posts_since(channel, cursor)
+            except Exception as exc:
+                if isinstance(exc, MattermostError) and exc.status in BACKFILL_SKIP_STATUSES:
+                    log.error("DM backfill skips %s, whom the server refuses: %s", human, exc)
+                    continue
+                log.exception("DM backfill from %s failed; retried before the next DM", human)
+                return
+            for post in posts:
+                dm = dm_from_post(post, broker_id)
+                # `since` also returns older posts edited since: only new ones count.
+                if dm is None or dm.sender_user_id != human or dm.create_at <= cursor:
+                    continue
+                if not post.get("delete_at"):
+                    missed.append(dm)
+        for dm in sorted(missed, key=lambda m: (m.create_at, m.post_id)):
+            late = ""
+            stale = now.timestamp() - dm.create_at / 1000 > BACKFILL_MAX_AGE_S
+            overtaken = dm.create_at < self._newest_partner_dm
+            if stale or overtaken:
+                sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
+                late = f"sent {sent.isoformat(timespec='seconds')}"
+            if not self._apply(dm, late=late, overtaken=overtaken):
+                return  # still owed: retried before the next DM, and at the next `hello`
+        self._owed = False
+        self._save_cursor(self._newest_dm)
+
+    def _apply(self, dm: DirectMessage, *, late: str = "", overtaken: bool = False) -> bool:
+        """Handle one DM once: apply it and reply. With `late` (when it was sent, for a DM the
+        backfill found stale or overtaken), it is applied only if it widens nothing, and is
+        otherwise answered that it was not; `overtaken` also judges where the switch ends up.
+        Then advance the cursor past it, unless a backfill is still owed. A command that fails
+        is not handled: the backfill is owed again, so it is retried before the next DM, and
+        False is returned."""
+        if dm.post_id:
+            if dm.post_id in self._handled:
+                # Handled before a restart, perhaps: the cursor may move past it now.
+                self._newest_dm = max(self._newest_dm, dm.create_at)
+                return True
+            self._handled[dm.post_id] = None
+            if len(self._handled) > HANDLED_DMS_MAX:
+                self._handled.popitem(last=False)
         try:
-            reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
+            if late:
+                reply = self.broker.handle_late_dm(
+                    dm.sender_user_id, dm.message, overtaken=overtaken
+                )
+                if reply is None:
+                    reply = f"not applied: {late} while the broker was offline; send it again"
+            else:
+                reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
+        except Exception:
+            log.exception("switch DM from %s failed; retried before the next DM", dm.sender_user_id)
+            self._handled.pop(dm.post_id, None)
+            self._owed = True
+            return False
+        try:
             self.broker.client.create_post(dm.channel_id, reply, props={BROKER_PROP: 1})
         except Exception:
-            log.exception("switch DM from %s failed", dm.sender_user_id)
+            log.exception("reply to the switch DM from %s failed", dm.sender_user_id)
+        self._newest_dm = max(self._newest_dm, dm.create_at)
+        if dm.sender_user_id in self.broker.config.human_user_ids:
+            self._newest_partner_dm = max(self._newest_partner_dm, dm.create_at)
+        try:
+            self.broker.dm_cursor.save_seen(self._newest_partner_dm, list(self._handled))
+        except OSError:
+            log.exception("DM backfill state not saved")
+        if not self._owed:
+            self._save_cursor(dm.create_at)
+        return True
+
+    def _save_cursor(self, ms: int) -> None:
+        """Move the cursor forward to `ms`; never back."""
+        try:
+            if ms > self.broker.dm_cursor.load():
+                self.broker.dm_cursor.save(ms)
+        except OSError:
+            log.exception("DM cursor not saved")
 
     def run(self, stop: threading.Event) -> None:
         sleep = self._sleep or stop.wait

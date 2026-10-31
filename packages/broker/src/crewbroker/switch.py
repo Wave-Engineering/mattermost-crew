@@ -63,6 +63,43 @@ def effective_mode(state: SwitchState, now: datetime) -> tuple[Mode, bool]:
     return DEFAULT_MODE, False
 
 
+_RANK: dict[str, int] = {"crew": 0, "trusted": 1, "social": 2}
+
+
+def landing(state: SwitchState, now: datetime) -> Mode:
+    """The mode `state` settles on for good: where a social reverts to, else the mode now."""
+    mode, _ = effective_mode(state, now)
+    return safe_revert(state.revert_to) if mode == "social" else mode
+
+
+def widens(before: SwitchState, after: SwitchState, now: datetime, *, later: bool = False) -> bool:
+    """Whether `after` lets through anyone `before` keeps out (#159).
+
+    It widens when the effective mode rises now (crew < trusted < social), when the kiosk
+    goes from off to on, or, while social, when the expiry moves later or the mode it reverts
+    to rises. Whether a command widens depends on the state it lands on: `trusted` narrows a
+    social switch and widens a crew one. With `later`, it also widens when the mode `after`
+    lands on for good (`landing`) rises: `trusted` ends a social that reverts to crew, so it
+    narrows now and widens later. A command a newer one has overtaken is judged with `later`,
+    since the newer one told the partner where the switch ends up.
+    """
+    was, _ = effective_mode(before, now)
+    mode, _ = effective_mode(after, now)
+    if _RANK[mode] > _RANK[was] or (after.kiosk_on and not before.kiosk_on):
+        return True
+    if later and _RANK[landing(after, now)] > _RANK[landing(before, now)]:
+        return True
+    if mode != "social":
+        return False
+    # Both are social here, so both carry an expiry; a missing one counts as widening.
+    if before.expires_at is None or after.expires_at is None:
+        return True
+    # `apply_command` keeps `revert_to` while social, so the revert check is defensive.
+    return after.expires_at > before.expires_at or (
+        _RANK[safe_revert(after.revert_to)] > _RANK[safe_revert(before.revert_to)]
+    )
+
+
 def settle(state: SwitchState, now: datetime) -> SwitchState:
     """`state` with any lapse applied: `mode = revert_to` and no expiry.
 

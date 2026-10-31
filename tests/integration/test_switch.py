@@ -75,7 +75,28 @@ def world(mattermost: Any, tmp_path: Path) -> Iterator[dict[str, Any]]:
         broker_user_id=broker_id,
     )
     broker = Broker(config, client, tmp_path / "state", clock=clock)
-    listener = DMListener(broker, mattermost.url, broker_token)
+    stop, thread = start_listener(broker, mattermost.url, broker_token)
+    try:
+        yield {
+            "broker": broker,
+            "broker_id": broker_id,
+            "broker_token": broker_token,
+            "clock": clock,
+            "partner": (partner_id, partner_token),
+            "outsider": (outsider_id, outsider_token),
+            "listener": (stop, thread),
+        }
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+        client.close()
+
+
+def start_listener(
+    broker: Broker, url: str, token: str
+) -> tuple[threading.Event, threading.Thread]:
+    """A `DMListener` running on its own thread, once the server's `hello` has arrived."""
+    listener = DMListener(broker, url, token)
     stop = threading.Event()
     thread = threading.Thread(target=listener.run, args=(stop,), daemon=True)
     thread.start()
@@ -83,18 +104,14 @@ def world(mattermost: Any, tmp_path: Path) -> Iterator[dict[str, Any]]:
     while not listener.connection_id:  # the server's `hello`: the listener is subscribed
         assert time.monotonic() < deadline, "the broker's websocket never said hello"
         time.sleep(0.1)
-    try:
-        yield {
-            "broker": broker,
-            "broker_id": broker_id,
-            "clock": clock,
-            "partner": (partner_id, partner_token),
-            "outsider": (outsider_id, outsider_token),
-        }
-    finally:
-        stop.set()
-        thread.join(timeout=10)
-        client.close()
+    return stop, thread
+
+
+def stop_listener(listener: tuple[threading.Event, threading.Thread]) -> None:
+    stop, thread = listener
+    stop.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the broker's listener did not stop"
 
 
 def dm_channel(mattermost: Any, user: tuple[str, str], broker_id: str) -> str:
@@ -198,3 +215,51 @@ def test_it18_outsider_dm_is_refused_and_changes_nothing(
         assert reply["message"] == REFUSAL
     assert broker.switch_state({}) == before
     assert not broker.switch.path.exists()  # nothing was ever written (R-24)
+
+
+def test_it33_dm_backfill_after_outage(mattermost: Any, world: dict[str, Any]) -> None:
+    """IT-33 (#159, R-24): DMs sent while the broker's websocket was down are backfilled on
+    the next `hello`; a stale command that would widen access is refused, not applied."""
+    broker: Broker = world["broker"]
+    broker_id: str = world["broker_id"]
+    clock: Clock = world["clock"]
+    partner = world["partner"]
+    channel = dm_channel(mattermost, partner, broker_id)
+    assert broker.dm_cursor.load() > 0  # the first `hello` started the cursor
+
+    # The broker is offline while the partner sends two commands.
+    stop_listener(world["listener"])
+    say(mattermost, partner, channel, "kiosk off")
+    say(mattermost, partner, channel, "social 1h")
+    assert broker_posts(mattermost, partner[1], channel, broker_id) == []
+
+    # Restarted on the same state directory: both are backfilled, in order, and answered.
+    restarted = start_listener(broker, mattermost.url, world["broker_token"])
+    try:
+        assert (
+            "kiosk off"
+            in wait_for_broker_post(mattermost, partner[1], channel, broker_id, 1)["message"]
+        )
+        assert (
+            "social until"
+            in wait_for_broker_post(mattermost, partner[1], channel, broker_id, 2)["message"]
+        )
+        state = broker.switch_state({})
+        assert (state["kiosk_on"], state["mode"]) == (False, "social")
+    finally:
+        stop_listener(restarted)
+
+    # Offline again; this time the command is 20 minutes old when the broker comes back.
+    expires_at = broker.switch_state({})["expires_at"]
+    say(mattermost, partner, channel, "social 1h")
+    clock.now = datetime.now(UTC) + timedelta(minutes=20)
+    restarted = start_listener(broker, mattermost.url, world["broker_token"])
+    try:
+        reply = wait_for_broker_post(mattermost, partner[1], channel, broker_id, 3)
+        assert reply["message"].startswith("not applied: sent ")
+        assert reply["props"].get(BROKER_PROP) in (1, "1", True)
+        assert broker.switch_state({})["expires_at"] == expires_at  # nothing was applied
+        time.sleep(1)  # no replay of the first two on this new connection
+        assert len(broker_posts(mattermost, partner[1], channel, broker_id)) == 3
+    finally:
+        stop_listener(restarted)
