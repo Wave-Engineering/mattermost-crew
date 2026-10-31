@@ -309,7 +309,7 @@ def posted(
     seq: int = 1,
 ) -> dict[str, Any]:
     post = {
-        "id": "p1",
+        "id": f"p{seq}",  # one id per post: the listener handles each id once (#159)
         "user_id": sender,
         "channel_id": "dm-channel",
         "message": message,
@@ -412,3 +412,145 @@ def test_switch_file_lives_in_the_instance_state_dir(
     b = Broker(crew_config, fake, tmp_path / "oaw-dev")
     b.handle_dm(HUMAN_ID, "kiosk off")
     assert (tmp_path / "oaw-dev" / "switch.json").exists()
+
+
+# -- the DM backfill (#159) -----------------------------------------------------------------
+DM_CHANNEL = "__".join(sorted([BROKER_ID, HUMAN_ID]))  # the fake's direct_channel id
+HELLO = json.dumps({"event": "hello", "seq": 0, "data": {"connection_id": "c1"}})
+
+
+def ms(at: datetime) -> int:
+    return int(at.timestamp() * 1000)
+
+
+def dm_post(post_id: str, message: str, at: datetime, **extra: Any) -> dict[str, Any]:
+    """A DM to the broker, as `GET /channels/{id}/posts` gives it."""
+    return {
+        "id": post_id,
+        "user_id": HUMAN_ID,
+        "channel_id": DM_CHANNEL,
+        "message": message,
+        "type": "",
+        "props": {},
+        "create_at": ms(at),
+        "update_at": ms(at),
+        "delete_at": 0,
+        **extra,
+    }
+
+
+def posted_event(post: dict[str, Any], seq: int = 1) -> str:
+    """The websocket's `posted` frame for `post`, a DM to the broker."""
+    data = {"channel_type": "D", "channel_name": DM_CHANNEL, "post": json.dumps(post)}
+    return json.dumps({"event": "posted", "seq": seq, "data": data})
+
+
+def replies(fake: Any) -> list[str]:
+    assert all(p["props"] == {BROKER_PROP: 1} for p in fake.posts)
+    return [p["message"] for p in fake.posts]
+
+
+def test_backfill_applies_recent_dm(broker: Broker, fake: Any, clock: Any) -> None:
+    broker.dm_cursor.save(ms(clock.now - timedelta(minutes=5)))
+    sent = clock.now - timedelta(seconds=60)
+    fake.history[DM_CHANNEL] = [
+        dm_post("p1", "social 2h", sent),
+        dm_post("r1", "an earlier reply", sent, user_id=BROKER_ID, props={BROKER_PROP: 1}),
+    ]
+    DMListener(broker, "http://mm", "tok").handle(HELLO)
+    assert broker.switch.load().mode == "social"
+    assert [p["channel_id"] for p in fake.posts] == [DM_CHANNEL]
+    assert "social until" in replies(fake)[0]
+    assert broker.dm_cursor.load() == ms(sent)
+
+
+def test_backfill_refuses_stale_widening(broker: Broker, fake: Any, clock: Any) -> None:
+    broker.dm_cursor.save(ms(clock.now - timedelta(hours=1)))
+    sent = clock.now - timedelta(minutes=20)
+    fake.history[DM_CHANNEL] = [dm_post("p1", "social 2h", sent)]
+    DMListener(broker, "http://mm", "tok").handle(HELLO)
+    assert broker.switch.load().mode == "crew"
+    assert replies(fake) == [
+        "not applied: sent 2026-10-01T11:40:00+00:00 while the broker was offline; send it again"
+    ]
+    assert broker.dm_cursor.load() == ms(sent)  # answered: never refused twice
+
+
+def test_backfill_applies_stale_narrowing(broker: Broker, fake: Any, clock: Any) -> None:
+    broker.handle_dm(HUMAN_ID, "social 1d")
+    broker.dm_cursor.save(ms(clock.now - timedelta(hours=3)))
+    fake.history[DM_CHANNEL] = [
+        dm_post("p1", " Kiosk  OFF ", clock.now - timedelta(hours=2, minutes=1)),
+        dm_post("p2", "crew", clock.now - timedelta(hours=2)),
+    ]
+    DMListener(broker, "http://mm", "tok").handle(HELLO)
+    state = broker.switch.load()
+    assert (state.mode, state.kiosk_on) == ("crew", False)
+    assert not any(r.startswith("not applied") for r in replies(fake))
+    assert len(fake.posts) == 2
+
+
+def test_backfill_dedupes_with_websocket(broker: Broker, fake: Any, clock: Any) -> None:
+    broker.dm_cursor.save(ms(clock.now - timedelta(minutes=5)))
+    post = dm_post("p1", "kiosk off", clock.now - timedelta(seconds=30))
+    fake.history[DM_CHANNEL] = [post]
+    listener = DMListener(broker, "http://mm", "tok")
+    listener.handle(HELLO)  # the backfill applies it
+    listener.handle(posted_event(post, seq=1))  # the resumed websocket replays it
+    assert len(fake.posts) == 1
+
+    # The other order: the websocket first, then a reconnect's backfill.
+    fake.posts.clear()
+    post2 = dm_post("p2", "kiosk on", clock.now - timedelta(seconds=10))
+    fake.history[DM_CHANNEL].append(post2)
+    listener.handle(posted_event(post2, seq=2))
+    listener.handle(HELLO)
+    assert len(fake.posts) == 1
+    assert broker.switch.load().kiosk_on is True
+
+
+def test_backfill_first_start_no_replay(broker: Broker, fake: Any, clock: Any) -> None:
+    fake.history[DM_CHANNEL] = [dm_post("p1", "kiosk off", clock.now - timedelta(seconds=30))]
+    DMListener(broker, "http://mm", "tok").handle(HELLO)
+    assert broker.switch.load().kiosk_on is True
+    assert fake.posts == [] and not any(c[0] == "posts_since" for c in fake.calls)
+    assert broker.dm_cursor.load() == ms(clock.now)
+
+
+def test_backfill_unreadable_cursor_is_a_first_start(broker: Broker, fake: Any, clock: Any) -> None:
+    """A corrupt cursor never replays history: that would answer every old DM."""
+    broker.dm_cursor.path.parent.mkdir(parents=True, exist_ok=True)
+    broker.dm_cursor.path.write_text("{", encoding="utf-8")
+    fake.history[DM_CHANNEL] = [dm_post("p1", "crew", clock.now - timedelta(days=30))]
+    DMListener(broker, "http://mm", "tok").handle(HELLO)
+    assert fake.posts == []
+    assert broker.dm_cursor.load() == ms(clock.now)
+
+
+def test_backfill_skips_edited_deleted_and_failed_reads(
+    broker: Broker, fake: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server's `since` returns old posts edited since: those are not new DMs."""
+    cursor = clock.now - timedelta(minutes=5)
+    broker.dm_cursor.save(ms(cursor))
+    fake.history[DM_CHANNEL] = [
+        dm_post("old", "social 2h", cursor - timedelta(minutes=1), update_at=ms(clock.now)),
+        dm_post("gone", "social 2h", clock.now - timedelta(seconds=5), delete_at=ms(clock.now)),
+    ]
+    listener = DMListener(broker, "http://mm", "tok")
+    listener.handle(HELLO)
+    assert fake.posts == [] and broker.switch.load().mode == "crew"
+
+    def down(channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(fake, "posts_since", down)
+    listener.handle(HELLO)  # logged, never raised
+    assert broker.dm_cursor.load() == ms(cursor)
+
+
+def test_live_dm_advances_the_cursor(broker: Broker, fake: Any, clock: Any) -> None:
+    broker.dm_cursor.save(ms(clock.now - timedelta(minutes=5)))
+    DMListener(broker, "http://mm", "tok").handle(posted_event(dm_post("p1", "trusted", clock.now)))
+    assert broker.switch.load().mode == "trusted"
+    assert broker.dm_cursor.load() == ms(clock.now)

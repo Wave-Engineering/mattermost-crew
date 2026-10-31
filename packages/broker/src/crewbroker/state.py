@@ -7,6 +7,8 @@
   the nonce the bot's description carries, and the bot is adopted rather than squatted
   (#151).
 - `tokens.json`: the token-id ledger. Token ids, owners and times only; never a token.
+- `dm_cursor.json`: `last_create_at`, the `create_at` in ms of the newest DM to the broker it
+  has handled. On every websocket `hello` it backfills the DMs after it (#159).
 
 Every file is written whole, through a mode-`0600` temporary file and an atomic rename, so a
 crash never leaves a half-written file and no other user can ever read one (R-08).
@@ -198,3 +200,23 @@ class TokenStore:
         data = self._load()
         if data["tokens"].pop(token_id, None) is not None:
             write_private_json(self.path, data)
+
+
+class DMCursorStore:
+    """`dm_cursor.json`: where the DM backfill resumes (#159)."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "dm_cursor.json"
+
+    def load(self) -> int:
+        """The cursor in ms; 0 when the file is missing or unreadable."""
+        try:
+            value = read_json(self.path, {}).get("last_create_at")
+        except (OSError, ValueError):
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    def save(self, ms: int) -> None:
+        write_private_json(self.path, {"last_create_at": ms})

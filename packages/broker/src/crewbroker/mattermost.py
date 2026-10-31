@@ -67,6 +67,8 @@ class MattermostAPI(Protocol):
 
     def direct_channel(self, user_id: str, other_id: str) -> str: ...
 
+    def posts_since(self, channel_id: str, since_ms: int) -> list[dict[str, Any]]: ...
+
     def create_post(
         self, channel_id: str, message: str, props: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
@@ -209,6 +211,19 @@ class MattermostClient:
         """The DM channel between two users, created if missing; its ID."""
         result: dict[str, Any] = self._call("POST", "/channels/direct", json=[user_id, other_id])
         return str(result["id"])
+
+    def posts_since(self, channel_id: str, since_ms: int) -> list[dict[str, Any]]:
+        """A channel's posts created or changed since `since_ms`, oldest `create_at` first.
+
+        The server's `since` also returns older posts edited or deleted since then, so a caller
+        that wants only new posts filters on `create_at` itself.
+        """
+        result: dict[str, Any] = self._call(
+            "GET", f"/channels/{channel_id}/posts", params={"since": since_ms}
+        )
+        posts = result.get("posts") or {}
+        found = [posts[pid] for pid in result.get("order") or [] if pid in posts]
+        return sorted(found, key=lambda post: int(post.get("create_at") or 0))
 
     def create_post(
         self, channel_id: str, message: str, props: dict[str, Any] | None = None

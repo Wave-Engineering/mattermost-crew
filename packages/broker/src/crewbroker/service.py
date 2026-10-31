@@ -30,6 +30,7 @@ import struct
 import sys
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -57,7 +58,7 @@ from crewbroker.mint import (
     revoke_superseded,
 )
 from crewbroker.prune import prune_idle
-from crewbroker.state import AccountStore, TokenStore
+from crewbroker.state import AccountStore, DMCursorStore, TokenStore
 from crewbroker.switch import (
     Mode,
     SwitchState,
@@ -79,6 +80,11 @@ WS_PING_S = 30.0
 WS_RECV_POLL_S = 1.0
 WS_BACKOFF_FIRST_S = 1.0
 WS_BACKOFF_MAX_S = 60.0
+# The DM backfill (#159): a command older than this, sent while the broker was offline, is
+# refused rather than applied, unless it only narrows who gets through.
+BACKFILL_MAX_AGE_S = 600
+NARROWING_COMMANDS = {("crew",), ("kiosk", "off")}
+HANDLED_DMS_MAX = 500
 
 log = logging.getLogger("crewbroker")
 
@@ -117,6 +123,7 @@ class Broker:
         self.accounts = AccountStore(state_dir)
         self.tokens = TokenStore(state_dir)
         self.switch = SwitchStore(state_dir)
+        self.dm_cursor = DMCursorStore(state_dir)
         self.server_key = server_key or config.server_url
         self.clock = clock
         self._lock = threading.Lock()
@@ -576,6 +583,8 @@ class DirectMessage:
     channel_id: str
     sender_user_id: str
     message: str
+    post_id: str = ""
+    create_at: int = 0  # ms; 0 when the post didn't carry one
 
 
 def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
@@ -593,6 +602,15 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
         post = json.loads(str(data.get("post", "")))
     except ValueError:
         return None
+    members = str(data.get("channel_name", "")).split("__")
+    if broker_user_id not in members:
+        return None
+    return dm_from_post(post, broker_user_id)
+
+
+def dm_from_post(post: Any, broker_user_id: str) -> DirectMessage | None:
+    """A post, as a DM it should answer, or None: the checks `dm_from_event` makes on the post
+    itself, which the backfill makes on each post it reads (#159)."""
     if not isinstance(post, dict):
         return None
     sender = post.get("user_id")
@@ -605,10 +623,17 @@ def dm_from_event(event: Any, broker_user_id: str) -> DirectMessage | None:
     props = post.get("props")
     if isinstance(props, dict) and props.get(BROKER_PROP):
         return None
-    members = str(data.get("channel_name", "")).split("__")
-    if broker_user_id not in members:
-        return None
-    return DirectMessage(channel_id=channel, sender_user_id=sender, message=message)
+    post_id = post.get("id")
+    create_at = post.get("create_at")
+    if isinstance(create_at, bool) or not isinstance(create_at, int):
+        create_at = 0
+    return DirectMessage(
+        channel_id=channel,
+        sender_user_id=sender,
+        message=message,
+        post_id=post_id if isinstance(post_id, str) else "",
+        create_at=create_at,
+    )
 
 
 class WebSocketLike(Protocol):
@@ -654,6 +679,9 @@ class DMListener:
         self._sleep = sleep
         self.connection_id = ""
         self.next_seq = 0
+        # Post ids already handled, newest last: a DM the backfill applied and the websocket
+        # then replays (or the reverse) is handled once (#159).
+        self._handled: OrderedDict[str, None] = OrderedDict()
 
     def uri(self) -> str:
         if not self.connection_id:
@@ -677,15 +705,74 @@ class DMListener:
             conn_id = data.get("connection_id")
             if isinstance(conn_id, str):
                 self.connection_id = conn_id
+            self.backfill()
             return
         dm = dm_from_event(event, self.broker.config.broker_user_id)
-        if dm is None:
+        if dm is not None:
+            self._apply(dm)
+
+    def backfill(self) -> None:
+        """Apply the human partners' DMs sent since the cursor, at every `hello` (#159).
+
+        The websocket resumes only while the server still holds its `connection_id`, which a
+        broker restart always loses. A DM older than `BACKFILL_MAX_AGE_S` is answered "not
+        applied" unless it only narrows (`NARROWING_COMMANDS`): applied late, a `social 2h`
+        would open the crew when the partner believes it closed. With no usable cursor, as on
+        a fresh install, it starts the cursor now and replays nothing. Never raises.
+        """
+        cursor = self.broker.dm_cursor.load()
+        now = self.broker.clock()
+        if cursor <= 0:
+            try:
+                self.broker.dm_cursor.save(int(now.timestamp() * 1000))
+            except OSError:
+                log.exception("DM cursor not saved")
             return
+        broker_id = self.broker.config.broker_user_id
+        for human in self.broker.config.human_user_ids:
+            try:
+                channel = self.broker.client.direct_channel(broker_id, human)
+                posts = self.broker.client.posts_since(channel, cursor)
+            except Exception:
+                log.exception("DM backfill from %s failed", human)
+                continue
+            for post in posts:
+                dm = dm_from_post(post, broker_id)
+                # `since` also returns older posts edited since: only new ones count.
+                if dm is None or dm.sender_user_id != human or dm.create_at <= cursor:
+                    continue
+                if post.get("delete_at"):
+                    continue
+                age = now.timestamp() - dm.create_at / 1000
+                words = tuple(dm.message.strip().lower().split())
+                if age > BACKFILL_MAX_AGE_S and words not in NARROWING_COMMANDS:
+                    sent = datetime.fromtimestamp(dm.create_at / 1000, UTC)
+                    self._apply(dm, refuse=f"sent {sent.isoformat(timespec='seconds')}")
+                else:
+                    self._apply(dm)
+
+    def _apply(self, dm: DirectMessage, *, refuse: str = "") -> None:
+        """Handle one DM once: apply it and reply, or with `refuse`, reply that it was not
+        applied. Then advance the cursor past it."""
+        if dm.post_id:
+            if dm.post_id in self._handled:
+                return
+            self._handled[dm.post_id] = None
+            if len(self._handled) > HANDLED_DMS_MAX:
+                self._handled.popitem(last=False)
         try:
-            reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
+            if refuse:
+                reply = f"not applied: {refuse} while the broker was offline; send it again"
+            else:
+                reply = self.broker.handle_dm(dm.sender_user_id, dm.message)
             self.broker.client.create_post(dm.channel_id, reply, props={BROKER_PROP: 1})
         except Exception:
             log.exception("switch DM from %s failed", dm.sender_user_id)
+        try:
+            if dm.create_at > self.broker.dm_cursor.load():
+                self.broker.dm_cursor.save(dm.create_at)
+        except OSError:
+            log.exception("DM cursor not saved")
 
     def run(self, stop: threading.Event) -> None:
         sleep = self._sleep or stop.wait

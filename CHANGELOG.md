@@ -94,6 +94,12 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A switch command sent while the broker is offline is no longer lost** (#159). On every
+  websocket `hello` the broker reads the partner's DMs since its cursor, `dm_cursor.json`. One
+  under 10 minutes old is applied; `crew` and `kiosk off` are applied at any age, since they
+  only narrow; any other older one is answered `not applied: … send it again`. A fresh install
+  starts the cursor and replays nothing.
+
 - **A container's bind mount of `/run/crewchat` survives a daemon restart** (#173).
   `crewchat.service` now sets `RuntimeDirectoryPreserve=yes`, so a restart no longer deletes
   the directory under a container that mounts it. Because the directory now outlives the
