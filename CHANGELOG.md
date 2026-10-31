@@ -64,6 +64,10 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **The broker sets each bot's avatar** (#151, D-098): an identicon drawn from the account
+  name, set once per bot. **On the first mint after the upgrade, every existing bot gets it,
+  replacing any avatar set on a bot by hand.** That is a one-time, visible change on a live
+  server. Set a hand-picked avatar again after that mint, and the broker leaves it alone.
 - **`crewkiosk-broker` admits answers, and bounds every call to its key** (#142).
   - It serves only an answer a hello admitted, one live or recorded in its server's day. Any
     other answer id is a 403 that spends nothing and makes no record. So the turns and counts
