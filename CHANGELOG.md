@@ -75,6 +75,17 @@ All notable changes to this project are recorded here. The format follows
     the answer is admitted before the kiosk starts.
   - Each server's two sockets get that server's own group, `crewkiosk-r-<server>`, not
     `crewkiosk`.
+- **An untrusted crew's broker no longer switches the kiosk off for unknown bots** (#154,
+  D-115). Before, while **any** local broker on a server had no cached `crew_info`, or didn't
+  answer a cache-miss re-fetch, every unrecognised bot account there was dropped, never sent to
+  the kiosk. Now only our own crew's and our trusted crews' brokers count: an untrusted crew's
+  bots are outsiders whether its broker is up or not. An uncached trusted crew's broker still
+  drops them, because they may be its bots.
+- **The Dev Spec and the partner guide now say what the switch and the loop guard do** (#154).
+  `social <duration>` sets the expiry to that long from now, so sending it again can shorten
+  social as well as lengthen it (the docs said it extends). Durations take no spaces, and 30
+  days is allowed. The loop guard's window is a fixed hour, and the messages it drops count
+  toward it.
 
 ### Fixed
 

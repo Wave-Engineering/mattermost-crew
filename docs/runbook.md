@@ -119,7 +119,8 @@ default_crew = "oaw"
 broker_timeout_s = 2
 # Kiosk routings per outsider, per expert, per server, per hour. Optional, default 10.
 kiosk_rate_per_hour = 10
-# Messages from bot accounts per conversation in the loop guard's window. Optional, default 20.
+# Messages from bot accounts per conversation in the loop guard's one-hour window. Optional,
+# default 20.
 loop_guard_window = 20
 # How long a thread the agent posted in stays "mine", in days. Optional, default 90 (D-104).
 my_threads_retention_days = 90

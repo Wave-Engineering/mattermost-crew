@@ -107,6 +107,44 @@ def test_social_extend_keeps_revert(cfg: CrewConfig) -> None:
     assert effective_mode(state, later + timedelta(hours=2)) == ("trusted", True)
 
 
+def test_social_reengage_can_shorten(cfg: CrewConfig) -> None:
+    """#154: `social <dur>` sets the expiry to `dur` from now, so a shorter one shortens it."""
+    state = run(SwitchState(), cfg, "trusted", "social 2h")
+    later = NOW + timedelta(minutes=10)
+    state, reply = apply_command(state, HUMAN_ID, "social 30m", cfg, later)
+    assert state.mode == "social" and state.revert_to == "trusted"
+    assert state.expires_at == later + timedelta(minutes=30) < NOW + timedelta(hours=2)
+    assert "social until" in reply
+
+
+def test_social_cap_is_inclusive(cfg: CrewConfig) -> None:
+    """#154: 30 days is accepted; anything past it is refused, and changes nothing."""
+    state = run(SwitchState(), cfg, "social 30d")
+    assert state.mode == "social" and state.expires_at == NOW + timedelta(days=30)
+    start = SwitchState(mode="trusted", revert_to="trusted")
+    for text in ("social 30d1s", "social 31d"):
+        new, reply = apply_command(start, HUMAN_ID, text, cfg, NOW)
+        assert new == start, text
+        assert reply.startswith("not a duration (up to 30d)"), reply
+
+
+def test_social_multiword_duration_is_usage(cfg: CrewConfig) -> None:
+    """#154: durations take no spaces. `social 1h 30m` is three words: the usage, no change."""
+    start = SwitchState(mode="trusted", revert_to="trusted")
+    new, reply = apply_command(start, HUMAN_ID, "social 1h 30m", cfg, NOW)
+    assert new == start
+    assert "commands:" in reply
+
+
+def test_social_without_expiry_lapses() -> None:
+    """#154: social with no expiry, or a naive (offset-less) one, lapses: it fails closed."""
+    stored = from_json({"mode": "social", "expires_at": None, "revert_to": "trusted"})
+    assert effective_mode(stored, NOW) == ("trusted", True)
+    naive = (NOW + timedelta(hours=1)).replace(tzinfo=None).isoformat()
+    stored = from_json({"mode": "social", "expires_at": naive, "revert_to": "trusted"})
+    assert effective_mode(stored, NOW) == ("trusted", True)
+
+
 def test_reengage_after_lapse(cfg: CrewConfig) -> None:
     state = run(SwitchState(), cfg, "trusted", "social 1h")
     after = NOW + timedelta(hours=2)  # lapsed, but not yet settled

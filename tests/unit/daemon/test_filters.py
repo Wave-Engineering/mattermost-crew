@@ -402,6 +402,45 @@ def test_stale_crew_info_expires_to_uncached() -> None:
     run(scenario())
 
 
+def test_untrusted_uncached_broker_leaves_kiosk() -> None:
+    """D-115: rival, which oaw doesn't trust, never fetched. Its bots are outsiders whether it
+    is cached or not, so an unknown bot addressing the agent still reaches the kiosk: both when
+    the miss's re-fetch finds rival down, and when the re-fetch is capped and the uncached rule
+    decides."""
+
+    async def scenario() -> list[Verdict]:
+        rig = Rig()
+        rig.broker("rival").hang = True
+        await rig.prime()
+        assert rig.cache.crew_info("rival", SID) is None
+        refetched = await rig.admit(mm("bot-unknown"))
+        rig.mono.t += 5  # within refetch_per_bot_s: no second re-fetch
+        capped = await rig.admit(mm("bot-unknown"))
+        return [refetched, capped]
+
+    assert run(scenario()) == [KIOSK, KIOSK]
+
+
+def test_trusted_uncached_broker_still_drops() -> None:
+    """D-115: ally, which oaw trusts, never fetched. An unknown bot may be one of ally's, which
+    `trusted` would deliver, so it is dropped rather than sent to the kiosk: by the miss's
+    re-fetch finding ally down, then, with the re-fetch capped, by the uncached rule."""
+
+    async def scenario() -> list[Verdict]:
+        rig = Rig()
+        rig.broker("ally").hang = True
+        await rig.prime()
+        assert rig.cache.crew_info("ally", SID) is None
+        refetched = await rig.admit(mm("bot-unknown"))
+        rig.mono.t += 5  # within refetch_per_bot_s: no second re-fetch
+        capped = await rig.admit(mm("bot-unknown"))
+        return [refetched, capped]
+
+    refetched, capped = run(scenario())
+    assert refetched.kind == Kind.DROP and refetched.reason == "refetch_failed"
+    assert capped.kind == Kind.DROP and capped.reason == "uncached_crew"
+
+
 # -- cache misses ---------------------------------------------------------------------------
 def test_new_crewmate_cache_miss_never_kiosk(rig: Rig) -> None:
     async def scenario() -> tuple[Verdict, dict[BrokerKey, int]]:
