@@ -311,13 +311,11 @@ def test_it03_prune_counts_register_not_remint(
     assert token_works(mattermost, busy["token"])
 
 
-def mkchannel(mattermost: Any, team_id: str, name: str, kind: str, display: str = "") -> str:
-    resp = mm_request(
-        mattermost,
-        "POST",
-        "/channels",
-        json={"team_id": team_id, "name": name, "display_name": display or name, "type": kind},
-    )
+def mkchannel(
+    mattermost: Any, team_id: str, name: str, kind: str, display: str = "", header: str = ""
+) -> str:
+    body = {"team_id": team_id, "name": name, "display_name": display or name, "type": kind}
+    resp = mm_request(mattermost, "POST", "/channels", json={**body, "header": header})
     assert resp.status_code == 201, resp.text
     return str(resp.json()["id"])
 
@@ -393,6 +391,57 @@ def test_mint_joins_the_team_and_default_channels(
     assert unknown["id"] is None and "no channel has" in unknown["error"]
     assert not is_member(mattermost, "channel", outside, user_by_name(mattermost, third["account"]))
     assert token_works(mattermost, third["token"])
+
+
+def test_reconcile_keeps_bots_in_tagged_channels(
+    mattermost: Any, broker: Broker, setup: dict[str, str], tmp_path: Path
+) -> None:
+    """#167: a channel tagged `crew-<crew>` after a bot was minted gets that bot on the next
+    reconcile pass, and the bot can post there. The broker joins a tagged public channel it is
+    not in; a tagged private one it is not in is invisible to it, and stays untouched."""
+    run = secrets.token_hex(3)
+    resp = mm_request(
+        mattermost,
+        "POST",
+        "/teams",
+        json={"name": f"tag{run}", "display_name": f"Tag Crew {run}", "type": "I"},
+    )
+    assert resp.status_code == 201, resp.text
+    team_id = str(resp.json()["id"])
+    broker_id = setup["broker_id"]
+    resp = mm_request(
+        mattermost,
+        "POST",
+        f"/teams/{team_id}/members",
+        json={"team_id": team_id, "user_id": broker_id},
+    )
+    assert resp.status_code == 201, resp.text
+    config = replace(broker.config, team=f"tag{run}", default_channels=[])
+    built = Broker(config, broker.client, tmp_path / "tag", clock=broker.clock)
+    minted = built.mint(args(built, "tagger"))
+    bot_id = user_by_name(mattermost, minted["account"])
+
+    # Tagged after the mint: the bot is in neither yet.
+    tag = f"crew-{setup['crew']}"
+    public = mkchannel(mattermost, team_id, f"tpub{run}", "O", header=f"crew room · {tag}")
+    secret = mkchannel(mattermost, team_id, f"tsec{run}", "P", header=tag)
+    assert not is_member(mattermost, "channel", public, broker_id)
+    assert not is_member(mattermost, "channel", public, bot_id)
+
+    result = built.reconcile_membership()
+    assert result is not None and result["failed"] == []
+    assert {"account": minted["account"], "target": f"tpub{run}"} in result["added"]
+    assert is_member(mattermost, "channel", public, broker_id)
+    assert is_member(mattermost, "channel", public, bot_id)
+    assert not is_member(mattermost, "channel", secret, bot_id)
+    resp = mm_request(
+        mattermost,
+        "POST",
+        "/posts",
+        token=minted["token"],
+        json={"channel_id": public, "message": f"reconciled {run}"},
+    )
+    assert resp.status_code == 201, resp.text
 
 
 def user_by_name(mattermost: Any, username: str) -> str:

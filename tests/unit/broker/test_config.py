@@ -112,3 +112,28 @@ def test_config_errors(tmp_path: Path) -> None:
         load_config("oaw-dev", config_dir=tmp_path)
     write(tmp_path, BASE)
     assert read_server_url("oaw-dev", config_dir=tmp_path) == "http://mm.invalid"
+
+
+def test_config_reconcile_and_tag_keys(tmp_path: Path) -> None:
+    """#167: the reconcile interval defaults to 300 s (0 is off), the tag to `crew-<crew>`."""
+    write(tmp_path, 'crew = "oaw"\n' + BASE)
+    config = load_config("oaw-dev", config_dir=tmp_path)
+    assert config.membership_reconcile_s == 300
+    assert config.channel_tag == "crew-oaw"
+    write(tmp_path, 'crew = "oaw"\nmembership_reconcile_s = 0\nchannel_tag = "oaw_ops"\n' + BASE)
+    config = load_config("oaw-dev", config_dir=tmp_path)
+    assert (config.membership_reconcile_s, config.channel_tag) == (0, "oaw_ops")
+
+    bad = {
+        "membership_reconcile_s = -1\n": "membership_reconcile_s",
+        "membership_reconcile_s = 1.5\n": "membership_reconcile_s",
+        "membership_reconcile_s = true\n": "membership_reconcile_s",
+        'membership_reconcile_s = "300"\n': "membership_reconcile_s",
+        'channel_tag = "Crew OaW"\n': "channel_tag",
+        'channel_tag = ""\n': "channel_tag",
+        "channel_tag = 7\n": "channel_tag",
+    }
+    for body, named in bad.items():
+        write(tmp_path, 'crew = "oaw"\n' + body + BASE)
+        with pytest.raises(ConfigError, match=named):
+            load_config("oaw-dev", config_dir=tmp_path)
