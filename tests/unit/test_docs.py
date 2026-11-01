@@ -284,3 +284,5 @@ def test_architecture_states_the_trust_boundaries() -> None:
         assert needed in membership, needed
     for needed in ("Push (the doorbell)", "Pull (`read`, `thread`)", "Kiosk"):
         assert f"### {needed}" in parts["Data paths"], needed
+
+_RED_FORMAT = 'single quotes are not ruff format style'
