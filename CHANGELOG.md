@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-01
+
+Messaging stability. A Discord or scream-hole blip no longer wakes any agent (one alarm for an
+outage past ten minutes), `crewchat-waiter` delivers chat with nothing for the agent to arm, and
+an agent's own squawk edits no longer ring it. Also an agent can edit its own post, and the
+kiosk and Discord fixes that were waiting for a release.
+
+**Rollback.** Going back to v0.2.8 needs no config change: v0.3.0 adds no required setting and no
+file. Clients first: a host on v0.2.8 has no `crewchat-waiter`, and the kit's hook guard then
+exits 0 silently, so a registered hook does no harm, but chat reaches that agent only through
+`crewchat-doorbell` until the hook entries are removed. The daemon's restart drops every armed
+doorbell for a moment, so do it with the fleet stopped.
+
 ### Added
 
 - **`crewchat-waiter`: a doorbell nobody has to arm** (#204). A persistent, single-instance
