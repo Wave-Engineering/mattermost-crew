@@ -22,6 +22,7 @@ from crewchat.adapters.base import StreamCursor
 from crewchat.adapters.squawkie import (
     SquawkEvent,
     SquawkieBackend,
+    own_initials,
     rings,
     squawk_answer,
     squawk_key,
@@ -222,6 +223,88 @@ def test_squawkie_filter_and_catchup(run: Any) -> None:
     assert live.payload["squawk"]["id"] == mine["id"]
     assert live.keys == (f"{mine['id']}:open|yes",)
     assert status.seen[0] == (True, "")
+
+
+def test_own_initials_follow_sqtks_rule() -> None:
+    """`norm_initials`: uppercase, ASCII alphanumerics only, at most 3; none when none are left."""
+    assert own_initials("babel") == "BAB"
+    assert own_initials("dixie-flatline") == "DIX"
+    assert own_initials("k2") == "K2"
+    assert own_initials("") is None
+    assert own_initials("---") is None
+
+
+def test_the_answer_that_is_only_the_editors_own_tag_is_no_answer() -> None:
+    """#206 / claudecode-workflow#93: `(CER)` by CER is a signature; `(ok)` by someone else, or
+    text with the tag, is an answer. Matched to the kit's jq by the shared fixture."""
+    edited = {"created_at": "t0", "updated_at": "t1"}
+    mine = {**edited, "initials": "CER"}
+    assert squawk_answer({**mine, "text": "q →  (CER)"}) == ""
+    assert squawk_answer({**mine, "text": "q →  (CER)  (CER)"}) == ""
+    assert squawk_answer({**mine, "text": "q → yes (CER)"}) == "yes (CER)"
+    assert squawk_answer({**edited, "initials": "BJ", "text": "q → (ok)"}) == "(ok)"
+    assert squawk_answer({**edited, "initials": "BJ", "text": "q → (CER)"}) == "(CER)"
+    assert squawk_answer({**edited, "text": "q → (CER)"}) == "(CER)"  # no editor recorded
+    assert (
+        squawk_answer({**mine, "initials": "a.b", "text": "q → (a.b)"}) == "(a.b)"
+    )  # not initials
+
+
+def test_own_changes_do_not_ring_but_a_later_answer_does() -> None:
+    """#206: the last change was the agent's own: nothing rings. Someone else's change after it
+    rings as before, so an answer is never lost behind the agent's own edit."""
+
+    def event(initials: str, state: str, text: str) -> dict[str, Any]:
+        squawk = {
+            "id": 5,
+            "state": state,
+            "text": text,
+            "initials": initials,
+            "created_at": "t0",
+            "updated_at": "t1",
+        }
+        return {"type": "squawk.updated", "squawk": squawk}
+
+    retired = event("BAB", "retired", "mine →")
+    assert rings(retired, ["5"], None) is True  # without `own`: as before
+    assert rings(retired, ["5"], None, "BAB") is False
+    assert rings(event("BAB", "open", "mine → yes"), ["5"], None, "BAB") is False
+    assert rings(event("BJ", "open", "mine → yes"), ["5"], None, "BAB") is True
+    assert rings(event("BJ", "retired", "mine →"), ["5"], None, "BAB") is True
+    assert rings(retired, ["5"], None, None) is True
+
+
+def test_own_changes_neither_ring_live_nor_in_catch_up(run: Any) -> None:
+    """#206 through the stream: a squawk the agent itself last changed is left out of the
+    catch-up and rings nothing live, and an answer from someone else after it still rings."""
+    sq = FakeSquawkie()
+    needs = sq.add_list("bj:needs")
+    theirs = sq.add_squawk(needs, "which server? →")
+    sq.update(theirs["id"], text="which server? → dev", initials="BJ")  # settled by someone else
+    own_early = sq.add_squawk(needs, "recorded →")
+    sq.update(own_early["id"], state="retired", initials="BAB")  # settled by the agent
+    live = sq.add_squawk(needs, "deploy now?")
+    ids = {DEV: [str(theirs["id"]), str(own_early["id"]), str(live["id"])]}
+    b = make(sq, ids)
+
+    async def scenario() -> list[SquawkEvent]:
+        gen = b.stream(DEV)
+        first = await take(gen, 1)
+        nxt = asyncio.ensure_future(take(gen, 1))
+        while sq.open_streams() == 0:
+            await asyncio.sleep(0)
+        sq.update(live["id"], state="retired", initials="BAB")  # the agent retires it: silent
+        sq.update(live["id"], text="deploy now? → yes", initials="BJ")  # then BJ answers
+        got = first + await nxt
+        await b.aclose()
+        await gen.aclose()
+        return got
+
+    catch_up, ring = run(scenario())
+    assert [c["id"] for c in catch_up.payload["changes"]] == [theirs["id"]]
+    assert ring.payload["squawk"]["id"] == live["id"]
+    assert ring.payload["squawk"]["initials"] == "BJ"
+    assert ring.keys == (f"{live['id']}:retired|yes",)
 
 
 def test_catch_up_skips_what_the_cursor_says_rang(run: Any) -> None:

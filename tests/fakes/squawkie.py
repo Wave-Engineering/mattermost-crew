@@ -100,14 +100,22 @@ class FakeSquawkie:
         return squawk
 
     def update(
-        self, squawk_id: int, *, text: str | None = None, state: str | None = None
+        self,
+        squawk_id: int,
+        *,
+        text: str | None = None,
+        state: str | None = None,
+        initials: str | None = None,
     ) -> dict[str, Any]:
-        """Change a squawk and broadcast `squawk.updated`."""
+        """Change a squawk and broadcast `squawk.updated`. As squawkie does, `initials` records
+        who made the change (the web UI and `sqtk` always send them)."""
         squawk = self.squawks[squawk_id]
         if text is not None:
             squawk["text"] = text
         if state is not None:
             squawk["state"] = state
+        if initials is not None:
+            squawk["initials"] = initials
         squawk["updated_at"] = self.now()
         self.broadcast({"type": "squawk.updated", "squawk": dict(squawk)})
         return squawk
