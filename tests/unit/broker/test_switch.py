@@ -346,8 +346,8 @@ def test_dm_from_event_filters() -> None:
 
 
 def test_dm_from_event_ignores_kiosk_answers(broker: Broker, fake: Any) -> None:
-    """#52: a kiosk answer, from a human's account or a bot's, is never a command: no reply,
-    no change to the switch."""
+    """mm:triage #52: a kiosk answer, from a human's account or a bot's, is never a command:
+    no reply, no change to the switch."""
     assert dm_from_event(posted(HUMAN_ID, "x", props={"crew_kiosk": 1}), BROKER_ID) is None
     assert dm_from_event(posted("bot-id", "x", props={"crew_kiosk": 1}), BROKER_ID) is None
     before = broker.switch.load()

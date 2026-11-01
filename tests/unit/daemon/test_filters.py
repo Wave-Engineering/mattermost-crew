@@ -1024,10 +1024,10 @@ def test_team_token_needs_own_crew_author(rig: Rig) -> None:
     assert ally.reason == "unaddressed"
 
 
-# -- broker accounts (#25) ------------------------------------------------------------------
+# -- broker accounts (mm:triage #25) --------------------------------------------------------
 def test_broker_post_dropped_on_push_and_pull(run: Any) -> None:
-    """#25: a configured broker account's post, ours or a trusted crew's, is never delivered
-    or sent to the kiosk, even as a human's DM to the agent."""
+    """mm:triage #25: a configured broker account's post, ours or a trusted crew's, is never
+    delivered or sent to the kiosk, even as a human's DM to the agent."""
     rig = Rig(broker_user_ids={SID: ["b-oaw", "b-ally"]})
     rig.set_mode("crew")
 
@@ -1044,7 +1044,7 @@ def test_broker_post_dropped_on_push_and_pull(run: Any) -> None:
 
 
 def test_broker_post_dropped_under_social_too(run: Any) -> None:
-    """#25: under `social` a broker's post is dropped, not delivered as an outsider's."""
+    """mm:triage #25: under `social` a broker's post is dropped, not delivered as an outsider's."""
     rig = Rig(broker_user_ids={SID: ["b-oaw"]})
     rig.set_mode("social", expires=NOW + timedelta(hours=1))
 
@@ -1061,7 +1061,7 @@ def test_broker_post_dropped_under_social_too(run: Any) -> None:
 
 
 def test_broker_ids_are_per_server(run: Any) -> None:
-    """#25: a broker account is matched on its own server only."""
+    """mm:triage #25: a broker account is matched on its own server only."""
     rig = Rig(broker_user_ids={SID2: ["b-oaw2"]})
     rig.set_mode("crew")
 
@@ -1078,7 +1078,7 @@ def test_broker_ids_are_per_server(run: Any) -> None:
 
 
 def test_from_config_passes_broker_ids() -> None:
-    """#25: `from_config` collects every crew's broker on each server."""
+    """mm:triage #25: `from_config` collects every crew's broker on each server."""
     config = parse_config(
         {
             "default_crew": "oaw",

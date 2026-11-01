@@ -432,7 +432,7 @@ def test_doorbell_one_shot_prints_rendered_outsider_text(
 ) -> None:
     import crewchat_clients.doorbell as client
 
-    monkeypatch.setattr(client, "subscribe", lambda *_a: json.loads(json.dumps(payload)))
+    monkeypatch.setattr(client, "subscribe", lambda *_a, **_kw: json.loads(json.dumps(payload)))
     repo = tmp_path / "repo"
     (repo / ".claude").mkdir(parents=True)
     (repo / ".claude" / "agent-identity.json").write_text(json.dumps({"dev_name": DEV}))

@@ -11,6 +11,12 @@ unset MM_URL MM_ADMIN_TOKEN CREWCHAT_SOCKET CREWCHAT_BIN CREWKIOSK_SOCKET CREWBR
 
 uv sync --frozen
 make lint
+# The tools the unit tests check against (#156): shellcheck comes with the dev group, and the
+# kit's sqtk-doorbell.sh at the pinned ref. With them set up, a test missing one fails, not skips.
+# Captured first: `eval "$(...)"` takes eval's status, so a failed fetch would pass unseen.
+kit_env="$(./scripts/ci/fetch-kit.sh)"
+eval "$kit_env"
+export CREWCHAT_REQUIRE_TEST_TOOLS=1
 mkdir -p reports
 uv run pytest tests/unit -q --junitxml=reports/junit-unit.xml \
   --cov=packages --cov-report=xml:reports/coverage-unit.xml

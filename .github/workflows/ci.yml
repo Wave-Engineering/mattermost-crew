@@ -78,19 +78,25 @@ jobs:
           - leg: team-11.11.3
             mm_image: mattermost/mattermost-team-edition:11.11.3
             native_token_expiry: present
+            # The one leg whose installed daemon has Discord enabled, so its credential's
+            # permissions are checked too (#156).
+            discord: enabled
           - leg: enterprise-11.11.3
             # Unlicensed: the stand-in for Enterprise Entry (CT-01, Dev Spec 5.N-5).
             mm_image: mattermost/mattermost-enterprise-edition:11.11.3
             native_token_expiry: present
+            discord: disabled
           - leg: team-11.8.5
             # The oldest supported server, at the newest 11.8 patch (CT-11). Bump the patch
             # here, and only here, when a newer 11.8 patch ships.
             mm_image: mattermost/mattermost-team-edition:11.8.5
             # Tests that need native token expiry assert it is detected as absent (R-07).
             native_token_expiry: absent
+            discord: disabled
     env:
       MM_IMAGE: ${{ matrix.mm_image }}
       MM_NATIVE_TOKEN_EXPIRY: ${{ matrix.native_token_expiry }}
+      CREWCHAT_CI_DISCORD: ${{ matrix.discord }}
       UV_FROZEN: "1"
     steps:
       - uses: actions/checkout@v4

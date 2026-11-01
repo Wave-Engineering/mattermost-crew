@@ -55,7 +55,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -90,9 +90,17 @@ REPEAT_BACKOFF_S = (0.0, 0.05, 0.2, 1.0)
 # and coming back, then the shim's ping (every 15 s) registering the agent again.
 RESTART_GRACE_S = 60.0
 RESTART_BACKOFF_S = (0.25, 0.5, 1.0, 2.0)
+# The daemon answers a subscribe for an agent it doesn't hold at once (`not_registered`). So a
+# socket timeout on a subscribe given this long or more means it held the agent: the outage was
+# over. One given less could not tell, and a timeout there still ends inside the outage (#156).
+REPLY_S = 1.0
 # A connect that fails like this is a daemon that is stopped or starting, not a broken host, or
 # a daemon that closed between our connect and our send (its shutdown window).
 DOWN_ERRORS = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)
+# The clock and the pause `run` waits with: tests swap them, so no assertion races real time
+# (#156).
+_clock: Callable[[], float] = time.monotonic
+_sleep: Callable[[float], None] = time.sleep
 
 
 class DoorbellExit(Exception):
@@ -214,9 +222,15 @@ class SeenSet:
             self._warn("not written, so this event may come again", exc)
 
 
-def subscribe(sock_path: Path, dev_name: str, timeout_s: float | None) -> dict[str, Any]:
+def subscribe(
+    sock_path: Path,
+    dev_name: str,
+    timeout_s: float | None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
     """One `subscribe{dev_name}` frame and its reply: the event, or a `DoorbellExit`."""
-    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    deadline = None if timeout_s is None else clock() + timeout_s
     req_id = str(uuid.uuid4())
     frame = {"proto": PROTO, "id": req_id, "op": "subscribe", "args": {"dev_name": dev_name}}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -233,7 +247,7 @@ def subscribe(sock_path: Path, dev_name: str, timeout_s: float | None) -> dict[s
             if deadline is None:
                 sock.settimeout(None)
             else:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - clock()
                 if remaining <= 0:
                     raise TimedOut(f"no event within {timeout_s:g} s")
                 sock.settimeout(remaining)
@@ -280,7 +294,9 @@ def run(
         timeout_s = parse_timeout(environ)
         dev_name = read_dev_name(repo_root)
         seen = SeenSet.for_dev(environ, dev_name, err)
-        event, event_id = wait_for_new(sock_path, dev_name, timeout_s, seen)
+        event, event_id = wait_for_new(
+            sock_path, dev_name, timeout_s, seen, clock=_clock, sleep=_sleep
+        )
     except DoorbellExit as exc:
         print(f"crewchat-doorbell: {exc}", file=err)
         return exc.code
@@ -299,6 +315,8 @@ def wait_for_new(
     seen: SeenSet | None,
     *,
     grace_s: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[dict[str, Any], str | None]:
     """The first event whose `event_id` isn't in `seen`, and that ID (None for an event from
     a daemon that gives none). A repeat's reply was written, so the daemon has acked it, and
@@ -311,33 +329,40 @@ def wait_for_new(
     inside an outage raises the outage, not `TimedOut`: the agent should hear that the daemon
     is down."""
     grace_s = RESTART_GRACE_S if grace_s is None else grace_s
-    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    deadline = None if timeout_s is None else clock() + timeout_s
     last, again = None, 0
     outage: float | None = None  # when the current run of `Restarting` failures began
     failure: Restarting | None = None  # its latest
     tries = 0
     while True:
-        remaining = None if deadline is None else deadline - time.monotonic()
+        remaining = None if deadline is None else deadline - clock()
         if remaining is not None and remaining <= 0:
             if failure is not None:
                 raise failure
             raise TimedOut(f"no new event within {timeout_s:g} s")
         try:
-            event = subscribe(sock_path, dev_name, remaining)
+            event = subscribe(sock_path, dev_name, remaining, clock=clock)
         except TimedOut as exc:
+            # The socket's own timeout. Inside an outage only when the budget was too short for
+            # the daemon's answer; with time for it, the daemon held the agent again (#156).
+            if failure is not None and remaining is not None and remaining < REPLY_S:
+                raise failure from exc
             raise TimedOut(f"no new event within {timeout_s:g} s") from exc
         except Restarting as exc:
-            now = time.monotonic()
+            now = clock()
             outage = now if outage is None else outage
             failure = exc
-            if now - outage >= grace_s:
+            # One subtraction decides both the exit and the last pause, so they agree to the
+            # last bit: computed two ways, they can disagree, and a pause of 0 never ends.
+            left = grace_s - (now - outage)
+            if left <= 0:
                 raise type(exc)(f"{exc}, for {now - outage:.0f} s") from exc
             pause = RESTART_BACKOFF_S[min(tries, len(RESTART_BACKOFF_S) - 1)]
-            pause = min(pause, outage + grace_s - now)
+            pause = min(pause, left)
             if deadline is not None:
                 pause = min(pause, deadline - now)
             tries += 1
-            time.sleep(max(pause, 0.0))
+            sleep(max(pause, 0.0))
             continue
         outage, failure, tries = None, None, 0
         event_id = event.get("event_id")
@@ -349,7 +374,7 @@ def wait_for_new(
         last = event_id
         pause = REPEAT_BACKOFF_S[min(again, len(REPEAT_BACKOFF_S) - 1)]
         if pause:
-            time.sleep(pause if remaining is None else min(pause, remaining))
+            sleep(pause if remaining is None else min(pause, remaining))
 
 
 def main(argv: list[str] | None = None) -> int:

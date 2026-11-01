@@ -14,11 +14,11 @@ import subprocess
 import tomllib
 from datetime import UTC, datetime
 
-import pytest
 from crewbroker import config as broker_config
 from crewbroker.switch import USAGE, SwitchState, apply_command
 from crewchat import config as daemon_config
 
+from tests.required import missing
 from tests.runbook_md import DOCS, RUNBOOK, VERIFY_HEADING, fenced_blocks, runbook_blocks, sections
 
 PARTNER_GUIDE = DOCS / "partner-guide.md"
@@ -70,8 +70,9 @@ def test_runbook_install_blocks_are_valid_bash() -> None:
         assert proc.returncode == 0, f"'{heading}': {proc.stderr}"
 
 
-@pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck is not installed")
 def test_runbook_install_blocks_pass_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        missing("shellcheck")
     for heading, script in runbook_blocks(RUNBOOK.read_text(encoding="utf-8")):
         proc = subprocess.run(
             ["shellcheck", "--shell=bash", "-"],

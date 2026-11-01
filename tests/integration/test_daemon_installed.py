@@ -128,6 +128,17 @@ def credential_files(installed: dict[str, Any], registered: dict[str, Any]) -> l
     return files
 
 
+def test_ci_discord_leg_enables_discord(
+    installed: dict[str, Any], registered: dict[str, Any]
+) -> None:
+    """#156: the leg CI runs with Discord enabled really has it enabled, so the credential
+    checks below cover the Discord credential, and can't silently check nothing again."""
+    if os.environ.get("CREWCHAT_CI_DISCORD") != "enabled":
+        pytest.skip("not the Discord leg (CREWCHAT_CI_DISCORD is not 'enabled')")
+    assert installed["servers"]["discord"]["enabled"] is True
+    assert "/etc/crewchat/discord.credential" in credential_files(installed, registered)
+
+
 def test_credential_files_not_readable_by_agent(
     installed: dict[str, Any], registered: dict[str, Any]
 ) -> None:

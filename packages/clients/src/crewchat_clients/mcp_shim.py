@@ -533,8 +533,8 @@ class Shim:
     # -- pushes ---------------------------------------------------------------------------------
     async def sync_files(self, *, force: bool = False) -> None:
         """Push the brief when the seed's mtime changed, and the squawk ids when they changed.
-        `force` pushes both, and a forced push that fails stays owed until it lands (#47); one
-        failing never skips the other."""
+        `force` pushes both, and a forced push that fails stays owed until it lands
+        (mm:triage #47); one failing never skips the other."""
         if force:
             self._brief = _FileState()
             self._squawks = _FileState()

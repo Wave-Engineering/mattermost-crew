@@ -28,6 +28,7 @@ from crewchat.adapters.squawkie import (
 )
 
 from tests.fakes.squawkie import URL, FakeSquawkie
+from tests.required import REQUIRE_ENV, missing
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 FIXTURE = FIXTURES / "sqtk_doorbell_predicate.json"
@@ -52,11 +53,12 @@ def test_predicate_matches_the_fixture(case: dict[str, Any]) -> None:
     assert rings(case["event"], case_ids(case), case_texts(case)) is case["rings"]
 
 
-@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
 @pytest.mark.parametrize("case", CASES["cases"], ids=lambda c: c["name"])
 def test_fixture_is_sqtk_doorbells_own_verdict(case: dict[str, Any]) -> None:
     """The fixture's verdicts are the script's: its jq, run as the script runs it, with
     `--slurpfile`'s one-element arrays for `$ids` and `$bl`."""
+    if shutil.which("jq") is None:
+        missing("jq")
     proc = subprocess.run(
         [
             "jq",
@@ -81,12 +83,15 @@ def test_fixture_is_sqtk_doorbells_own_verdict(case: dict[str, Any]) -> None:
 
 def test_fixture_jq_is_the_installed_scripts() -> None:
     """When the kit's `sqtk-doorbell.sh` is on this host, the fixture's jq is its jq, and the
-    vendored `sqtk-answer.jq` is the one installed beside it."""
-    candidates = [os.environ.get("SQTK_DOORBELL", ""), "~/.claude/scripts/sqtk-doorbell.sh"]
+    vendored `sqtk-answer.jq` is the one installed beside it. Under `CREWCHAT_REQUIRE_TEST_TOOLS=1`
+    only the job's pinned `SQTK_DOORBELL` counts, never a kit in the runner's home (#156)."""
+    candidates = [os.environ.get("SQTK_DOORBELL", "")]
+    if os.environ.get(REQUIRE_ENV) != "1":
+        candidates.append("~/.claude/scripts/sqtk-doorbell.sh")
     paths = [Path(c).expanduser() for c in candidates if c]
     script = next((p for p in paths if p.is_file()), None)
     if script is None:
-        pytest.skip("sqtk-doorbell.sh is not installed here")
+        missing("sqtk-doorbell.sh")
     text = script.read_text(encoding="utf-8")
     for line in CASES["jq"].splitlines():
         assert line in text, line
