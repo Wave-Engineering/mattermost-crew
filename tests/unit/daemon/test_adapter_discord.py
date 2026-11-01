@@ -489,6 +489,22 @@ def test_failures_far_apart_are_not_a_streak(credential: Path, run: Any) -> None
     assert run(b.check_health(force=True)) is False  # 10 s of failing since the new streak
 
 
+def test_sparse_polling_still_flips_health(credential: Path, run: Any) -> None:
+    """#202: polled only every 15 s (slower than the 10 s window, faster than the 60 s healthy
+    recheck), a scream-hole that stays down must still be called unhealthy on the second probe."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(
+        discord, credential, now=clock, health_fail_threshold=100, health_fail_window_s=10.0
+    )
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # failure 1: the window opens
+    clock.t += 15.0
+    assert run(b.check_health(force=True)) is False  # failure 2, 15 s on: an outage
+
+
 def test_the_first_probe_waits_longer(credential: Path, run: Any) -> None:
     clock = Clock()
     discord = FakeDiscord(now=clock)

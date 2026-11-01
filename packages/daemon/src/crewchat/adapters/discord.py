@@ -458,11 +458,11 @@ class DiscordBackend:
             self._probe_fail_since = None
         elif self._healthy is True:
             now = self._now()
-            if (
-                self._probe_fail_since is None
-                or now - self._probe_fail_last > self.health_fail_window_s
+            if self._probe_fail_since is None or now - self._probe_fail_last > max(
+                self.health_fail_window_s, self.healthy_recheck_s
             ):
-                # A failure long after the last one is a new streak, not a continuation.
+                # A failure long after the last one (beyond the healthy recheck, so sparse
+                # polling still builds a streak) is a new streak, not a continuation.
                 self._probe_fail_since = now
                 self._probe_fails = 0
             self._probe_fail_last = now
