@@ -214,11 +214,11 @@ def waiter_running(environ: Mapping[str, str], dev_name: str) -> bool:
     """Whether a `crewchat-waiter` holds `dev_name`'s lock right now (#204). Only a lock that
     is held counts: a host where `flock` fails some other way has no waiter that could be."""
     path = waiter_lock_path(environ, dev_name)
-    if path is None or not path.exists():
+    if path is None:
         return False
     try:
-        fd = os.open(path, os.O_RDWR)
-    except OSError:
+        fd = os.open(path, os.O_RDWR)  # no O_CREAT: a missing file is no waiter
+    except OSError:  # missing, or a state directory this user can't read: no waiter to yield to
         return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -261,6 +261,22 @@ def test_a_flock_error_is_not_a_held_lock(repo: Path, monkeypatch: pytest.Monkey
         try_waiter_lock(env_for(repo), DEV)
 
 
+def test_an_unreadable_state_dir_is_no_waiter_not_a_crash(repo: Path) -> None:
+    """`waiter_running` is called by the doorbell before anything else: a state directory the
+    user can't traverse (EACCES) must read as "no waiter", never raise out of the doorbell."""
+    path = waiter_lock_path(env_for(repo), DEV)
+    assert path is not None
+    path.parent.mkdir(parents=True)
+    path.touch()
+    path.parent.chmod(0)
+    try:
+        if os.access(path, os.R_OK):  # running as root: the mode proves nothing
+            pytest.skip("permission bits are not enforced for this user")
+        assert not waiter_running(env_for(repo), DEV)
+    finally:
+        path.parent.chmod(0o700)
+
+
 def test_no_lock_means_no_waiter(tmp_path: Path, short_dir: Path) -> None:
     """A waiter that cannot take a lock does not run unguarded (every Stop hook would start
     another): it exits 0, delivers nothing, and writes nothing the model could read."""
