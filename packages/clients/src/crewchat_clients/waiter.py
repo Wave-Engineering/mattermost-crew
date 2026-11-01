@@ -15,10 +15,11 @@ anything:
                                    "asyncRewake": true, "timeout": 1814400}]}]}}
 
 It is in effect only where the hook is registered AND this command is installed: a
-registration with no waiter behind it does nothing, silently, and installing the package
-changes no settings by itself. The harness kills a waiting hook silently at its `timeout` and
-nothing restarts it until the next `Stop`, so the timeout (21 days here, under 2^31 ms) is how
-long an idle agent stays reachable.
+registration with no waiter behind it does nothing, silently (the kit's guard exits 0 where
+this command is absent), and installing the package changes no settings by itself. The
+harness kills a waiting hook silently at its `timeout` and nothing restarts it until the next
+`Stop`, so the timeout (21 days here, under 2^31 ms) is how long an idle agent stays
+reachable.
 
 Measured on Claude Code 2.1.316 (spike S0, 2026-11-01): an idle session woke about 1 s after
 the hook exited 2; fired mid-turn it rode into the same turn; `Stop` re-armed it after each

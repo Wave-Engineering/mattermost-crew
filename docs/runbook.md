@@ -768,8 +768,9 @@ changes nothing by itself. In the agent user's `~/.claude/settings.json`:
   reaches a host's settings only when the kit's install runs there.
 - **The timeout is how long an idle agent stays reachable.** The harness kills a waiting hook
   silently at its `timeout`, and nothing restarts it until the next `Stop`, so an agent idle
-  past it is deaf until its next turn. 1814400 s is 21 days, kept under 2^31 ms in case the
-  harness arms the hook with one 32-bit timer (measured, claudecode-workflow#1420).
+  past it is deaf until its next turn (measured, claudecode-workflow#1420). 1814400 s is 21
+  days, kept under 2^31 ms as a precaution in case the harness arms the hook with one 32-bit
+  timer; that part is not measured.
 
 - **One per Dev-Name.** The waiter holds a `flock` on
   `${XDG_STATE_HOME:-~/.local/state}/crewchat/waiter/<dev_name>.lock` for its life. The `Stop`
