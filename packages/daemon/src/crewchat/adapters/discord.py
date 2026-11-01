@@ -100,6 +100,11 @@ RESOLVE_TYPES = ("channel", "user", "role")
 # scream-hole's health (D-106): re-checked on a backoff while it is down, and now and then
 # while it is up.
 HEALTH_TIMEOUT_S = 2.0  # today's HEALTH_CHECK_TIMEOUT_MS
+# One failed probe is not an outage (#202): unhealthy only after this many in a row, or this long
+# of failing; and the first probe, with no earlier answer to fall back on, waits longer.
+HEALTH_FIRST_TIMEOUT_S = 5.0
+HEALTH_FAIL_THRESHOLD = 3
+HEALTH_FAIL_WINDOW_S = 10.0
 HEALTH_BACKOFF_FIRST_S = 1.0
 HEALTH_BACKOFF_MAX_S = 60.0
 HEALTHY_RECHECK_S = 60.0
@@ -322,12 +327,19 @@ class DiscordBackend:
         max_retries: int = 3,
         healthy_recheck_s: float = HEALTHY_RECHECK_S,
         health_backoff_max_s: float = HEALTH_BACKOFF_MAX_S,
+        health_fail_threshold: int = HEALTH_FAIL_THRESHOLD,
+        health_fail_window_s: float = HEALTH_FAIL_WINDOW_S,
     ) -> None:
         self.screamhole = ensure_api_v10(screamhole_url)
         self.health_url = f"{screamhole_root(screamhole_url)}/health"
         self.healthy_recheck_s = healthy_recheck_s
         self.health_backoff_max_s = health_backoff_max_s
+        self.health_fail_threshold = health_fail_threshold
+        self.health_fail_window_s = health_fail_window_s
         self._healthy: bool | None = None  # None: never checked
+        self._probe_fails = 0  # consecutive failed /health probes while healthy (#202)
+        self._probe_fail_since: float | None = None
+        self._probe_fail_last = 0.0
         self._health_since = 0.0
         self._health_next = 0.0
         self._health_delay = HEALTH_BACKOFF_FIRST_S
@@ -425,15 +437,43 @@ class DiscordBackend:
         self._health_next = now + min(self._health_delay, self.health_backoff_max_s)
 
     async def check_health(self, *, force: bool = False) -> bool:
-        """scream-hole's health, re-checked when stale (or `force`)."""
+        """scream-hole's health, re-checked when stale (or `force`).
+
+        One failed probe while healthy is not an outage (#202): scream-hole's `/health` is
+        trivial, so a slow answer means the host or network stalled for a moment. The probe
+        is repeated after `HEALTH_BACKOFF_FIRST_S`, and health flips only after
+        `health_fail_threshold` failures in a row or `health_fail_window_s` of failing. The
+        very first probe gets the longer `HEALTH_FIRST_TIMEOUT_S`."""
         if not force and self._healthy is not None and self._now() < self._health_next:
             return self._healthy
+        timeout = HEALTH_FIRST_TIMEOUT_S if self._healthy is None else HEALTH_TIMEOUT_S
         try:
-            resp = await self._client().get(self.health_url, timeout=HEALTH_TIMEOUT_S)
+            resp = await self._client().get(self.health_url, timeout=timeout)
             ok = resp.status_code == 200
         except (httpx.HTTPError, OSError) as exc:
             log.debug("scream-hole health: %s", exc)
             ok = False
+        if ok:
+            self._probe_fails = 0
+            self._probe_fail_since = None
+        elif self._healthy is True:
+            now = self._now()
+            if self._probe_fail_since is None or now - self._probe_fail_last > max(
+                self.health_fail_window_s, self.healthy_recheck_s
+            ):
+                # A failure long after the last one (beyond the healthy recheck, so sparse
+                # polling still builds a streak) is a new streak, not a continuation.
+                self._probe_fail_since = now
+                self._probe_fails = 0
+            self._probe_fail_last = now
+            self._probe_fails += 1
+            if (
+                self._probe_fails < self.health_fail_threshold
+                and now - self._probe_fail_since < self.health_fail_window_s
+            ):
+                log.debug("scream-hole health probe failed (%d); still healthy", self._probe_fails)
+                self._health_next = now + HEALTH_BACKOFF_FIRST_S
+                return True
         self._set_health(ok)
         return ok
 

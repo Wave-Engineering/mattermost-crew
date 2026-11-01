@@ -125,7 +125,9 @@ class World:
             "discord": self.disc,
             "squawkie": self.squawkie,
         }
-        self.doorbell = Doorbell(sources, CursorStore(self.root / "state"), sleep=fast_sleep)
+        self.doorbell = Doorbell(
+            sources, CursorStore(self.root / "state"), sleep=fast_sleep, deaf_alarm_s=0
+        )
 
     async def connected(self) -> None:
         async with asyncio.timeout(3):
@@ -835,7 +837,7 @@ def test_cursor_replay_dedups_an_overlap(tmp_path: Path, run: Any) -> None:
     """A replay that overlaps what was queued delivers each event once; the restarted
     stream is handed a cursor that covers every ID already queued."""
     src = Scripted(["p1", "p2", "p3", "raise"], ["up", "p2", "p3", "p4"])
-    bell = Doorbell({"x": src}, CursorStore(tmp_path), sleep=fast_sleep)
+    bell = Doorbell({"x": src}, CursorStore(tmp_path), sleep=fast_sleep, deaf_alarm_s=0)
 
     async def scenario() -> list[str]:
         bell.attach(DEV, ["x"])
@@ -902,7 +904,8 @@ def test_backend_down_once_others_flow(world: World, run: Any) -> None:
 
 
 def test_status_is_once_per_outage(tmp_path: Path, run: Any) -> None:
-    bell = Doorbell({}, CursorStore(None))
+    """`deaf_alarm_s=0` raises the alarm at once: the pre-#202 timing, one event per outage."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=0, clock=lambda: 100.0)
 
     async def scenario() -> list[dict[str, Any]]:
         bell.status(DEV, "x", True)  # up while never down: nothing
@@ -916,10 +919,108 @@ def test_status_is_once_per_outage(tmp_path: Path, run: Any) -> None:
         return [q.get_nowait().payload for _ in range(q.qsize())]
 
     assert run(scenario()) == [
-        {"type": "backend.down", "backend": "x", "reason": "a"},
-        {"type": "backend.down", "backend": "y", "reason": "other"},
+        {"type": "backend.down", "backend": "x", "reason": "a", "since": 100.0},
+        {"type": "backend.down", "backend": "y", "reason": "other", "since": 100.0},
         {"type": "backend.up", "backend": "x"},
     ]
+
+
+ALARM = 0.05  # the alarm delay the #202 tests use, real time
+
+
+def drained(bell: Doorbell) -> list[dict[str, Any]]:
+    q = bell.queue(DEV)
+    return [q.get_nowait().payload for _ in range(q.qsize())]
+
+
+def test_a_blip_wakes_nobody(run: Any) -> None:
+    """#202: an outage that ends inside the alarm window queues nothing, however often it flips."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM)
+
+    async def scenario() -> list[dict[str, Any]]:
+        for _ in range(5):
+            bell.status(DEV, "discord", False, "scream-hole unhealthy")
+            bell.status(DEV, "discord", True)
+        await asyncio.sleep(ALARM * 3)  # past every alarm that was cancelled
+        return drained(bell)
+
+    assert run(scenario()) == []
+
+
+def test_a_long_outage_raises_one_alarm_and_one_up(run: Any) -> None:
+    """#202: still down after the window: ONE backend.down (the first reason, the start time),
+    however many reports follow; its end is ONE backend.up; a second up adds nothing."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM, clock=lambda: 7.0)
+
+    async def scenario() -> list[dict[str, Any]]:
+        bell.status(DEV, "discord", False, "first")
+        for reason in ("second", "third"):
+            bell.status(DEV, "discord", False, reason)
+        assert drained(bell) == []  # not yet
+        await asyncio.sleep(ALARM * 3)
+        bell.status(DEV, "discord", False, "fourth")  # a late report adds nothing
+        bell.status(DEV, "discord", True)
+        bell.status(DEV, "discord", True)
+        return drained(bell)
+
+    assert run(scenario()) == [
+        {"type": "backend.down", "backend": "discord", "reason": "first", "since": 7.0},
+        {"type": "backend.up", "backend": "discord"},
+    ]
+
+
+def test_an_outage_after_an_alarm_is_a_new_outage(run: Any) -> None:
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM)
+
+    async def scenario() -> list[str]:
+        bell.status(DEV, "x", False, "a")
+        await asyncio.sleep(ALARM * 3)
+        bell.status(DEV, "x", True)
+        bell.status(DEV, "x", False, "b")  # a blip after recovery: silent
+        bell.status(DEV, "x", True)
+        await asyncio.sleep(ALARM * 3)
+        return [str(e["type"]) for e in drained(bell)]
+
+    assert run(scenario()) == ["backend.down", "backend.up"]
+
+
+def test_detach_and_aclose_cancel_pending_alarms(run: Any) -> None:
+    """#202: an agent that left is never alarmed, and no timer outlives the doorbell."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM)
+
+    async def scenario() -> list[dict[str, Any]]:
+        bell.status(DEV, "x", False, "a")
+        bell.status("other", "x", False, "b")
+        await bell.detach(DEV)
+        assert not bell.is_down(DEV, "x")  # a later attach starts a fresh outage
+        await bell.aclose()
+        assert bell._alarms == {}
+        await asyncio.sleep(ALARM * 3)
+        return drained(bell) + [e.payload for e in _drain_all(bell, "other")]
+
+    assert run(scenario()) == []
+
+
+def _drain_all(bell: Doorbell, dev: str) -> list[DoorbellEvent]:
+    q = bell.queue(dev)
+    return [q.get_nowait() for _ in range(q.qsize())]
+
+
+def test_close_server_drops_its_pending_alarm(run: Any) -> None:
+    """#202: a Mattermost server the agent no longer has (#155) is never alarmed, and the
+    agent's other backends keep their own outages."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM)
+
+    async def scenario() -> list[dict[str, Any]]:
+        bell.status(DEV, "mattermost:dev", False, "gone")
+        bell.status(DEV, "discord", False, "still down")
+        await bell.close_server(DEV, "dev")
+        assert not bell.is_down(DEV, "mattermost:dev")
+        assert bell.is_down(DEV, "discord")
+        await asyncio.sleep(ALARM * 3)
+        return drained(bell)
+
+    assert [(e["backend"], e["type"]) for e in run(scenario())] == [("discord", "backend.down")]
 
 
 def test_filter_hook_and_full_queue(tmp_path: Path, run: Any) -> None:

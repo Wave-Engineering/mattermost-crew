@@ -14,7 +14,10 @@ from typing import Any
 import pytest
 from crewchat.adapters.base import Attachment, BackendUnavailable, Embed, NotFound
 from crewchat.adapters.discord import (
+    HEALTH_BACKOFF_FIRST_S,
     HEALTH_BACKOFF_MAX_S,
+    HEALTH_FIRST_TIMEOUT_S,
+    HEALTH_TIMEOUT_S,
     SCREAMHOLE_UNHEALTHY,
     WHERE_MAX,
     DiscordBackend,
@@ -51,7 +54,10 @@ def backend(discord: FakeDiscord, credential: Path, **kw: Any) -> DiscordBackend
         discord_api=DISCORD_API,
         http_client=discord.http_client(),
         guild_id=GUILD_ID,
-        **kw,
+        **{
+            "health_fail_threshold": 1,
+            **kw,
+        },  # one failed probe is an outage, unless a test says not
     )
     b.set_identity(ME, avatar="📡", team="oaw")
     return b
@@ -401,3 +407,117 @@ def test_where_is_bounded_lru(credential: Path) -> None:
     assert len(b._where) == WHERE_MAX
     assert "1000000" not in b._where  # the least recent, evicted
     assert str(1_000_000 + WHERE_MAX) in b._where
+
+
+# -- hysteresis (#202) -----------------------------------------------------------------------
+def test_one_failed_probe_is_not_an_outage(credential: Path, run: Any) -> None:
+    """#202: scream-hole's /health is trivial, so one failed probe means a stalled host or
+    network. Health flips only after `health_fail_threshold` failures in a row, and a probe
+    that passes in between starts the count again."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(discord, credential, now=clock, health_fail_threshold=3)
+    assert run(b.check_health()) is True
+
+    discord.screamhole_healthy = False
+    for want in (True, True, False):  # fails 1 and 2 are absorbed; the 3rd is an outage
+        clock.t = b._health_next
+        assert run(b.check_health()) is want
+    assert run(b.health())["state"] == "degraded"
+
+    discord.screamhole_healthy = True  # recovery, then a fresh run of failures
+    clock.t = b._health_next
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    for _ in range(2):
+        clock.t = b._health_next
+        assert run(b.check_health()) is True
+    discord.screamhole_healthy = True
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # a pass resets the count ...
+    discord.screamhole_healthy = False
+    for _ in range(2):
+        clock.t = b._health_next
+        assert run(b.check_health()) is True  # ... so two more failures are still absorbed
+
+
+def test_a_blip_is_reprobed_soon_not_a_minute_later(credential: Path, run: Any) -> None:
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(discord, credential, now=clock, health_fail_threshold=3)
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next  # the healthy recheck (60 s) comes due
+    assert run(b.check_health()) is True
+    assert b._health_next - clock.t == HEALTH_BACKOFF_FIRST_S  # then 1 s, not 60
+
+
+def test_failing_for_the_window_is_an_outage(credential: Path, run: Any) -> None:
+    """#202: the threshold or the window, whichever comes first."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(
+        discord, credential, now=clock, health_fail_threshold=100, health_fail_window_s=10.0
+    )
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # the window opens here
+    clock.t += 9.0
+    assert run(b.check_health(force=True)) is True
+    clock.t += 1.0
+    assert run(b.check_health(force=True)) is False
+
+
+def test_failures_far_apart_are_not_a_streak(credential: Path, run: Any) -> None:
+    """#202: a failure long after the last one starts a new streak: two failures minutes
+    apart must not read as an outage on the second."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(
+        discord, credential, now=clock, health_fail_threshold=100, health_fail_window_s=10.0
+    )
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # failure 1
+    clock.t += 300.0  # nobody asked for minutes
+    assert run(b.check_health(force=True)) is True  # a new streak, not the window expiring
+    clock.t += 9.0
+    assert run(b.check_health(force=True)) is True
+    clock.t += 1.0
+    assert run(b.check_health(force=True)) is False  # 10 s of failing since the new streak
+
+
+def test_sparse_polling_still_flips_health(credential: Path, run: Any) -> None:
+    """#202: polled only every 15 s (slower than the 10 s window, faster than the 60 s healthy
+    recheck), a scream-hole that stays down must still be called unhealthy on the second probe."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(
+        discord, credential, now=clock, health_fail_threshold=100, health_fail_window_s=10.0
+    )
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # failure 1: the window opens
+    clock.t += 15.0
+    assert run(b.check_health(force=True)) is False  # failure 2, 15 s on: an outage
+
+
+def test_the_first_probe_waits_longer(credential: Path, run: Any) -> None:
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(discord, credential, now=clock)
+    client = b._client()
+    real_get = client.get
+    seen: list[Any] = []
+
+    async def spy(url: str, **kw: Any) -> Any:
+        seen.append(kw.get("timeout"))
+        return await real_get(url, **kw)
+
+    client.get = spy  # type: ignore[method-assign]
+    run(b.check_health())
+    run(b.check_health(force=True))
+    assert seen == [HEALTH_FIRST_TIMEOUT_S, HEALTH_TIMEOUT_S]

@@ -155,8 +155,10 @@ the kiosk; under social it is returned marked. Pull never gives a `KIOSK` verdic
 | Discord | **Crew-equivalent**: our guild is membership-controlled, and its own kill switch still applies. The switch and the kiosk do not apply (R-15). |
 | squawkie | **Exempt**: the adapter delivers only the agent's own squawks (R-26). |
 
-A backend that goes down is reported as `backend.down` and the others keep flowing (R-27); on
-reconnect each replays from its saved cursor, queuing each missed event exactly once (R-28). A
+A backend that goes down does not wake the agent: the others keep flowing, and `chat_health`
+answers on demand. An outage that outlasts `DEAF_ALARM_S` (10 minutes) raises ONE `backend.down`
+(R-27's reason: an agent waiting on a dead backend must learn it is deaf), and its end one
+`backend.up`; a blip queues nothing (#202). On reconnect each replays from its saved cursor, queuing each missed event exactly once (R-28). A
 replay that fails is an outage too, and loses nothing. Handing an event to the agent is at least
 once: the cursor moves only after `subscribe`'s reply is written, and each reply carries an
 `event_id` to drop a repeat by (#99).
