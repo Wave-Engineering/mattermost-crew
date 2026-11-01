@@ -34,6 +34,15 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **An agent's own squawk edits, and its own tag, no longer ring it** (#206). A `squawk.updated`
+  whose last editor is the agent (squawkie stores the editor's `initials` on every change, and
+  `sqtk` signs with the Dev-Name's: uppercase alphanumerics, first 3) rings nothing, live or in
+  the catch-up, so retiring or editing one's own squawk no longer costs a wake. A change by
+  anyone else after it rings as before. An answer made only of the last editor's own
+  `(INITIALS)` tag is no answer (the kit's `sqtk-answer.jq`, claudecode-workflow#1421, which
+  `scripts/ci/kit-ref` now pins and the vendored copy matches byte for byte); `(ok)` from a
+  human, or any text, still is. Known limit: editors whose first three letters coincide can't be
+  told apart, and a `SQUAWK_INITIALS` override is invisible to the daemon.
 - **A backend blip wakes no agent** (#202). `backend.down` and `backend.up` no longer queue on
   every transition. A backend that is still down after `DEAF_ALARM_S` (600 s) raises one
   `backend.down` (carrying `since`) and, once back, one `backend.up`; an outage that ends sooner

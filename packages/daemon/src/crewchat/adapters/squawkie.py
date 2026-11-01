@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -150,7 +151,18 @@ def squawk_answer(squawk: Mapping[str, Any], original: str | None = None) -> str
     if not isinstance(text, str):
         raise ValueError("text is not a string")
     p = kept_arrows(text, original)
-    return answer_after(text, p) if p is not None else legacy_answer(text)
+    answer = answer_after(text, p) if p is not None else legacy_answer(text)
+    return "" if only_editor_tags(answer, squawk.get("initials")) else answer
+
+
+def only_editor_tags(answer: str, initials: Any) -> bool:
+    """An answer that is nothing but the last editor's own tag, `(CER)` or `(CER) (CER)`, is a
+    signature and not an answer (#206, claudecode-workflow#93): it appears when `sqtk show`'s
+    display suffix is copied back into `--text`. A different tag (`(ok)`) or any other text
+    is an answer. `initials` is the squawk's last editor, so a human's `(ok)` is safe."""
+    if not isinstance(initials, str) or not re.fullmatch(r"[A-Za-z0-9]{1,3}", initials):
+        return False
+    return re.fullmatch(rf"(?:\({initials}\)\s*)+", answer) is not None
 
 
 def _answer_or_empty(squawk: Mapping[str, Any], original: str | None) -> str:
@@ -186,9 +198,26 @@ def _original(squawk: Mapping[str, Any], texts: Mapping[str, str] | None) -> str
     return value if isinstance(value, str) else None
 
 
-def rings(event: Any, ids: Collection[str], texts: Mapping[str, str] | None = None) -> bool:
+def own_initials(dev_name: str) -> str | None:
+    """The initials `sqtk` signs `dev_name`'s changes with: uppercase alphanumerics, at most 3
+    (`norm_initials`). squawkie stores the last editor's initials on every change, so a
+    squawk whose `initials` are these was last changed by the agent itself. None when the name
+    leaves none. `SQUAWK_INITIALS` (an env override the daemon can't see) is not covered, and
+    two editors whose initials coincide can't be told apart (#206)."""
+    initials = "".join(c for c in dev_name.upper() if c.isascii() and c.isalnum())[:3]
+    return initials or None
+
+
+def rings(
+    event: Any,
+    ids: Collection[str],
+    texts: Mapping[str, str] | None = None,
+    own: str | None = None,
+) -> bool:
     """`sqtk-doorbell.sh`'s predicate: a `squawk.updated` event on one of `ids` whose squawk
-    is no longer open or has an answer (`sq_answer`, with O from `texts`)."""
+    is no longer open or has an answer (`sq_answer`, with O from `texts`). With `own` (the
+    agent's initials), a change the agent itself made last rings nothing (#206): it just made
+    it, and a woken turn would only tell it what it knows."""
     if not isinstance(event, dict) or event.get("type") != "squawk.updated":
         return False
     squawk = event.get("squawk")
@@ -196,6 +225,8 @@ def rings(event: Any, ids: Collection[str], texts: Mapping[str, str] | None = No
         return False
     sid = _squawk_id(squawk)
     if sid is None or sid not in ids:
+        return False
+    if own is not None and squawk.get("initials") == own:
         return False
     try:
         return _settled(squawk, _original(squawk, texts))
@@ -308,6 +339,7 @@ class SquawkieBackend:
         if not ids:
             return None
         texts = self.texts(dev_name)
+        own = own_initials(dev_name)
         lists = await self._get_json("/api/lists")
         if not isinstance(lists, list):
             raise SquawkieError("GET /api/lists: not a list")
@@ -333,6 +365,8 @@ class SquawkieBackend:
                 sid = _squawk_id(squawk)
                 if sid is None or sid not in ids:
                     continue
+                if own is not None and squawk.get("initials") == own:
+                    continue  # the agent's own last change: it knows (#206)
                 original = _original(squawk, texts)
                 try:
                     if not _settled(squawk, original):
@@ -367,7 +401,7 @@ class SquawkieBackend:
         except ValueError:
             return None
         texts = self.texts(dev_name)
-        if not rings(event, self.ids(dev_name), texts):
+        if not rings(event, self.ids(dev_name), texts, own_initials(dev_name)):
             return None
         key = squawk_key(event["squawk"], texts)
         if key in agent.rung:
