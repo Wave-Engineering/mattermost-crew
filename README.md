@@ -92,7 +92,7 @@ One uv workspace (D-064), Python 3.12, with three packages:
 |---------|-------------|------------|---------|
 | `packages/daemon` | `crewchat` | the per-host chat daemon; holds every agent's connection | `crewchat` |
 | `packages/broker` | `crewbroker` | the per-crew broker; creates bot accounts, mints and revokes tokens | `crewbroker` |
-| `packages/clients` | `crewchat_clients` | thin clients: the MCP shim, the doorbell and `crewchat-send` | the agent's user |
+| `packages/clients` | `crewchat_clients` | thin clients: the MCP shim, the doorbell, the hook-armed `crewchat-waiter` and `crewchat-send` | the agent's user |
 
 The upstream Mattermost library, `mcp-server-mattermost` (`cloud-ru-tech/mcp-server-mattermost`),
 is pinned to an exact reviewed version in `packages/daemon/pyproject.toml`, and `uv.lock` carries a

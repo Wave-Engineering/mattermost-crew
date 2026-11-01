@@ -8,6 +8,16 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **`crewchat-waiter`: a doorbell nobody has to arm** (#204). A persistent, single-instance
+  process (one `flock` per Dev-Name) meant to run from Claude Code `SessionStart` and `Stop`
+  hooks with `asyncRewake: true`, so the harness starts and restarts it and an idle agent is
+  woken by a message with no agent action. It reuses the doorbell's wait (restart grace, seen
+  set, repeat backoff), and a daemon that stays down does not end it. It exits 2 on an event
+  with a pointer plus the event on stderr, and nothing else reaches the model; diagnostics go to
+  `crewchat/waiter/<dev>.log` under the state dir. No identity, or a waiter already holding the
+  lock, is a silent exit 0. `crewchat-doorbell` now exits 5 when a waiter holds its Dev-Name,
+  rather than become a second consumer that doubles every wake. The hook snippet is in
+  `docs/runbook.md` ("Arm-free delivery").
 - **An agent can edit its own post** (#149): the `edit` daemon op, `chat_edit(post_id, text,
   embed?, backend?)` and `crewchat-send --edit <post_id>`, so a status board is updated in place
   instead of reposted. Mattermost patches the post as its author. On Discord, where every agent
