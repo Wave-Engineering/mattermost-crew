@@ -46,7 +46,8 @@ and the daemon acts on the agent's behalf with what it holds itself.
   stderr after it connects, so a field check needs a file: `CREWCHAT_SHIM_LOG` sets the level
   of the shim's own lines (`debug`, `info` or `warning`, any case; the MCP library stays at
   INFO, as its DEBUG carries message text), and `CREWCHAT_SHIM_LOG_FILE`, an absolute path,
-  appends the same lines to that file, created 0600 and never rotated. `debug` shows the
+  appends the same lines to that file, created 0600 and never rotated; a symlink at that path
+  is refused, and an existing file is set to 0600. `debug` shows the
   timer's `tick` and `ping:` lines. Turn both on for a session, then remove them. A bad level
   or path logs one WARNING and the shim starts anyway, on stderr.
 - **Pushes (§5.3).** The daemon never reads the agent's files, so the shim pushes what it
@@ -1079,8 +1080,16 @@ def configure_logging(environ: Mapping[str, str]) -> None:
     if not os.path.isabs(path):
         log.warning("CREWCHAT_SHIM_LOG_FILE=%r is not an absolute path: stderr only", path)
         return
+    # O_NOFOLLOW refuses a symlink planted at the path (ELOOP), and fchmod tightens a file
+    # that already existed: the mode in `os.open` applies only to a file it creates.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
     except OSError as exc:
         log.warning("CREWCHAT_SHIM_LOG_FILE=%r can't be opened (%s): stderr only", path, exc)
         return

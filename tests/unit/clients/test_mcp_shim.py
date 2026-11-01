@@ -1395,6 +1395,39 @@ def test_shim_log_file(
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_shim_log_file_tightens_an_existing_file(
+    tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file already at 0644 is set to 0600: the open's mode applies only to a new file."""
+    path = tmp_path / "shim.log"
+    path.write_text("")
+    path.chmod(0o644)
+    before = list(root_logger.handlers)
+    mcp_shim.configure_logging({"CREWCHAT_SHIM_LOG_FILE": str(path)})
+    assert len(added(root_logger, before)) == 2 and not shim_warnings(caplog)
+    assert path.stat().st_mode & 0o777 == 0o600
+    logging.getLogger("crewchat_clients.mcp_shim").info("a line for the file")
+    assert "a line for the file" in path.read_text()
+
+
+def test_shim_log_file_refuses_a_symlink(
+    tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A symlink at the path is refused: one WARNING, stderr only, the target untouched."""
+    target = tmp_path / "elsewhere"
+    target.write_text("kept\n")
+    target.chmod(0o644)
+    link = tmp_path / "shim.log"
+    link.symlink_to(target)
+    before = list(root_logger.handlers)
+    mcp_shim.configure_logging({"CREWCHAT_SHIM_LOG_FILE": str(link)})
+    (stderr,) = added(root_logger, before)
+    assert isinstance(stderr, logging.StreamHandler) and stderr.stream is mcp_shim.sys.stderr
+    assert len(shim_warnings(caplog)) == 1
+    logging.getLogger("crewchat_clients.mcp_shim").info("must not reach the target")
+    assert target.read_text() == "kept\n" and target.stat().st_mode & 0o777 == 0o644
+
+
 @pytest.mark.parametrize("where", ["relative", "unopenable"])
 def test_shim_log_file_bad_path_falls_back(
     tmp_path: Path, root_logger: logging.Logger, caplog: pytest.LogCaptureFixture, where: str

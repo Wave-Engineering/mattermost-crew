@@ -25,13 +25,15 @@ without them every E2E test skips, as the integration tests do.
 - Two agents per crew (`AGENTS`). Bot accounts are the brokers' and outlive a daemon, so each
   test's `Daemon` registers the agents it uses through its socket, as the shim does.
 
-**The daemon** (`Daemon`, one per test) is wired as `crewchat serve` wires it, from that
-`servers.toml`: `broker_clients` over the real broker sockets, the token store, the
-Mattermost adapter, the switch cache (its 30 s refresh loop running), the registry, the
-persisted my-threads, the filters, the doorbell with its cursors on disk, the kiosk (on a stub
-model runner, since CI has no Claude Code), the social-engaged kiosk review, and every op on a
-real `DaemonServer` socket. Agents register, send and push their kiosk brief over that socket,
-and wake on the real `crewchat-doorbell` one-shot. It does not run the daily token rotation.
+**The daemon** (`Daemon`, one per test) is `crewchat.__main__.build` and `run`, the same code
+`crewchat serve` runs, from that `servers.toml`, with the world's clock, a stub kiosk runner
+(CI has no Claude Code) and a pool directory under the world's root. So it has every part
+`serve` has: the real broker sockets, the token store, the Mattermost adapter, the switch cache
+and its 30 s refresh, the registry, the persisted my-threads, the filters, the doorbell with
+its cursors on disk, the kiosk and its social-engaged review, the daily token rotation (with
+no agent registered at its first pass, and its next a day away), and every op on a real
+`DaemonServer` socket. Agents register, send and push their kiosk brief over that socket, and
+wake on the real `crewchat-doorbell` one-shot.
 
 Every HTTP response the daemon and the brokers see goes through a `RateLimitCounter`, so a
 test can assert how many `429`s the server sent (E2E-03).
@@ -43,6 +45,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -68,18 +71,19 @@ from crewbroker.service import (
     DMListener,
     start_dm_listener,
 )
-from crewchat.__main__ import call
+from crewchat.__main__ import build, call, run
 from crewchat.adapters.mattermost import MattermostBackend
-from crewchat.chat import AgentContext, build_chat_handlers
-from crewchat.config import load_config
-from crewchat.doorbell import CursorStore, Doorbell, DoorbellEvent, build_doorbell_handlers
+from crewchat.chat import AgentContext
+from crewchat.config import ServersConfig, load_config
+from crewchat.doorbell import Doorbell, DoorbellEvent
 from crewchat.filters import Filters, KioskQueue, SwitchCache
-from crewchat.kiosk import Kiosk
+from crewchat.kiosk import Kiosk, ResearchFrame
 from crewchat.registry import Registry
-from crewchat.server import DaemonServer, build_handlers
+from crewchat.server import DaemonServer
 from crewchat.threads import MyThreads
-from crewchat.tokens import TokenStore, broker_clients
+from crewchat.tokens import TokenStore
 
+from tests.e2e.creation_record import CreationRecord
 from tests.integration.conftest import MattermostServer, mattermost_from_env
 from tests.integration.mmhttp import mm_request
 from tests.integration.test_filters import broker_account, login_user
@@ -192,11 +196,22 @@ class RunningBroker:
         run_dir: Path,
         clock: Clock,
         counter: RateLimitCounter,
+        record: CreationRecord,
     ) -> None:
         self.instance = instance
         credential = broker_cfg.credential_path(instance, config_dir).read_text().strip()
         self.client = BrokerMattermost(broker_cfg.read_server_url(instance, config_dir), credential)
         self.client._http.event_hooks["response"].append(counter.sync_hook(f"broker {instance}"))
+        # Every bot this broker mints goes in the run's creation record (#157), on the
+        # client itself, so each `ensure_bot` create is caught and crewbroker is unchanged.
+        create_bot = self.client.create_bot
+
+        def recorded_create_bot(username: str, display_name: str, description: str) -> Any:
+            result = create_bot(username, display_name, description)
+            record.add("bot", str(result["user_id"]), username)
+            return result
+
+        self.client.create_bot = recorded_create_bot  # type: ignore[method-assign]
         config = broker_cfg.load_config(instance, config_dir=config_dir, client=self.client)
         state = broker_cfg.state_dir(instance, state_root)
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -234,7 +249,7 @@ class Crew:
     instance: str
     broker_id: str
     partner_id: str
-    partner_token: str
+    partner_token: str = field(repr=False)  # a failing test's repr goes in reports/
     agents: tuple[str, ...]
     running: RunningBroker
 
@@ -259,10 +274,11 @@ class World:
     hung_crew: str
     hung: HungBroker
     outsider_id: str
-    outsider_token: str
+    outsider_token: str = field(repr=False)
     spoof_id: str
-    spoof_token: str
+    spoof_token: str = field(repr=False)
     servers_toml: Path
+    record: CreationRecord  # every account and team the run creates goes in it (#157)
     channels: list[str] = field(default_factory=list)
     _daemons: int = 0
 
@@ -413,13 +429,16 @@ def _write_servers_toml(path: Path, world_crews: list[tuple[str, Path, str]], ur
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _outsider_bot(mattermost: MattermostServer, username: str) -> tuple[str, str]:
+def _outsider_bot(
+    mattermost: MattermostServer, username: str, record: CreationRecord
+) -> tuple[str, str]:
     """A bot account the admin owns (not any broker), with a token: (user id, token)."""
     resp = mm_request(
         mattermost, "POST", "/bots", json={"username": username, "display_name": username}
     )
     assert resp.status_code == 201, resp.text
     bot_id = str(resp.json()["user_id"])
+    record.add("bot", bot_id, username)
     tok = mm_request(mattermost, "POST", f"/users/{bot_id}/tokens", json={"description": "e2e"})
     assert tok.status_code == 200, tok.text
     return bot_id, str(tok.json()["token"])
@@ -427,7 +446,16 @@ def _outsider_bot(mattermost: MattermostServer, username: str) -> tuple[str, str
 
 @pytest.fixture(scope="session")
 def e2e(mattermost: MattermostServer) -> Iterator[World]:
-    run = secrets.token_hex(2)
+    # `smoke-devspace.sh` chooses the suffix and prints it, so `--cleanup <run>` can find it.
+    run = os.environ.get("E2E_RUN") or secrets.token_hex(2)
+    if not re.fullmatch(r"[0-9a-f]{4}", run):
+        pytest.fail(f"E2E_RUN must be 4 lowercase hex digits, not {run!r}")
+    created = os.environ.get("E2E_CREATED")
+    record = CreationRecord(Path(created) if created else None, run)
+
+    def add_user(user_id: str, username: str) -> None:
+        record.add("user", user_id, username)
+
     # Short: unix socket paths are capped at 108 bytes.
     root = Path(tempfile.mkdtemp(prefix="cc-e2e-", dir="/tmp"))
     config_dir, state_root, run_dir = root / "etc", root / "lib", root / "run"
@@ -446,17 +474,20 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
     )
     assert team.status_code == 201, team.text
     team_id = str(team.json()["id"])
+    record.add("team", team_id, f"crew-e2e{run}")
 
     accounts: dict[str, dict[str, Any]] = {}
     for key, crew in names.items():
-        broker_id, broker_token = broker_account(mattermost, f"crewbroker-{crew}-{SID}")
-        partner_id, partner_token = login_user(mattermost, f"partner-{crew}")
+        broker_id, broker_token = broker_account(
+            mattermost, f"crewbroker-{crew}-{SID}", on_create=add_user
+        )
+        partner_id, partner_token = login_user(mattermost, f"partner-{crew}", on_create=add_user)
         accounts[key] = {
             "broker": (broker_id, broker_token),
             "partner": (partner_id, partner_token),
         }
-    outsider_id, outsider_token = login_user(mattermost, f"outsider-e2e{run}")
-    spoof_id, spoof_token = _outsider_bot(mattermost, f"x.{names['oaw']}")
+    outsider_id, outsider_token = login_user(mattermost, f"outsider-e2e{run}", on_create=add_user)
+    spoof_id, spoof_token = _outsider_bot(mattermost, f"x.{names['oaw']}", record)
 
     running: dict[str, RunningBroker] = {}
     hung: HungBroker | None = None
@@ -480,6 +511,7 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
                 run_dir=run_dir,
                 clock=clock,
                 counter=counter,
+                record=record,
             )
         hung = HungBroker(broker_cfg.socket_path(f"{hung_crew}-{SID}", run_dir))
         servers_toml = config_dir / "servers.toml"
@@ -519,6 +551,7 @@ def e2e(mattermost: MattermostServer) -> Iterator[World]:
             spoof_id=spoof_id,
             spoof_token=spoof_token,
             servers_toml=servers_toml,
+            record=record,
         )
         for user_id in [*(c.partner_id for c in crews.values()), outsider_id, spoof_id]:
             world.seat(user_id)
@@ -546,13 +579,13 @@ class StubRunner:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    async def answer(self, prompt: str) -> str:
+    async def answer(self, prompt: str, *, frame: ResearchFrame | None = None) -> str:
         self.prompts.append(prompt)
         return f"We build a chat daemon (answer {len(self.prompts)})."
 
 
 class Daemon:
-    """The daemon, wired from `servers.toml` as `crewchat serve` wires it, for one test."""
+    """The daemon `crewchat serve` runs (`build` and `run`), from `servers.toml`, for one test."""
 
     def __init__(self, world: World) -> None:
         world._daemons += 1
@@ -567,74 +600,84 @@ class Daemon:
         self.runner = StubRunner()
 
         mint.clear_expiry_cache()
-        config = load_config(world.servers_toml)
-        self.config = config
-        self.brokers = broker_clients(config)
-        self.store = TokenStore(tokens, self.brokers)
-        self.store.load()
-        (server,) = config.mattermost
-        self.backend = MattermostBackend(
-            server.id, server.url, self.store.token_for, refresher=self.store
+        self.parts = build(
+            load_config(world.servers_toml),
+            self.sock,
+            tokens,
+            self.state_dir,
+            clock=world.clock,
+            kiosk_runner=self.runner,
+            pool_dir=self.root / "pool",
         )
         self.backend._shared_http().event_hooks["response"].append(
             world.counter.async_hook("daemon")
         )
-        self.store.adapters.append(self.backend)
-        backends = {self.backend.name: self.backend}
-        self.cache = SwitchCache.from_config(self.brokers, config, clock=world.clock)
-        self.registry = Registry(config, self.brokers, self.store, self.cache)
-        self.threads = MyThreads.load(self.state_dir, config.my_threads_retention_days)
-        self.filters = Filters.from_config(
-            self.registry, self.cache, self.threads, config, clock=world.clock
-        )
-        self.kiosk_queue = KioskQueue()
-        self.doorbell = Doorbell(
-            dict(backends),
-            CursorStore(self.state_dir),
-            admit=self.filters.admit_event,
-            kiosk=self.kiosk_queue,
-        )
-        self.store.adapters.insert(0, self.doorbell)
-        self.context = AgentContext()
-        self.kiosk = Kiosk(
-            self.kiosk_queue,
-            self.context.briefs,
-            backends,
-            self.runner,
-            state_dir=self.state_dir,
-            deliver=self.doorbell.deliver,
-        )
-        self.cache.social_listeners.append(
-            lambda crew, server_id: self.kiosk.on_social(
-                server_id, self.registry.agents_on(crew, server_id)
-            )
-        )
-        handlers = build_handlers(config, self.registry, {})
-        handlers.update(
-            build_chat_handlers(
-                self.registry, backends, self.threads, self.context, filters=self.filters
-            )
-        )
-        handlers.update(build_doorbell_handlers(self.registry, self.doorbell, handlers["register"]))
-        self.server = DaemonServer(handlers, hangup_cancels=frozenset({"subscribe"}))
+
+    # What the flows read, over the parts `build` wired.
+    @property
+    def config(self) -> ServersConfig:
+        return self.parts.config
+
+    @property
+    def store(self) -> TokenStore:
+        return self.parts.store
+
+    @property
+    def backend(self) -> MattermostBackend:
+        (backend,) = self.parts.backends
+        return backend
+
+    @property
+    def registry(self) -> Registry:
+        return self.parts.registry
+
+    @property
+    def cache(self) -> SwitchCache:
+        return self.parts.cache
+
+    @property
+    def threads(self) -> MyThreads:
+        return self.parts.threads
+
+    @property
+    def filters(self) -> Filters:
+        return self.parts.filters
+
+    @property
+    def kiosk_queue(self) -> KioskQueue:
+        return self.parts.kiosk_queue
+
+    @property
+    def doorbell(self) -> Doorbell:
+        return self.parts.doorbell
+
+    @property
+    def context(self) -> AgentContext:
+        return self.parts.context
+
+    @property
+    def kiosk(self) -> Kiosk:
+        return self.parts.kiosk
+
+    @property
+    def server(self) -> DaemonServer:
+        return self.parts.server
 
     async def __aenter__(self) -> Daemon:
-        await self.server.start(self.sock, group=None)
         self.stop = asyncio.Event()
-        self.kiosk.start()
-        # `switch_state` and `crew_info` from every broker, now and every 30 s (§5.9).
-        self.refresher = asyncio.create_task(self.cache.run(self.stop))
+        self.task = asyncio.create_task(run(self.parts, self.sock, None, self.stop))
+        for _ in range(100):
+            if self.sock.exists() or self.task.done():
+                break
+            await asyncio.sleep(0.1)
+        if self.task.done():
+            await self.task  # it failed to start: raise why
+        assert self.sock.exists(), f"the daemon's socket {self.sock} never appeared"
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         self.stop.set()
-        self.refresher.cancel()  # it may be waiting on the hung broker
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.refresher
-        await self.server.aclose()
-        await self.doorbell.aclose()
-        await self.kiosk.aclose()
-        await self.backend.aclose()
+        await self.task
         self.sock.unlink(missing_ok=True)
         await asyncio.to_thread(self.world.reset_switches)
 

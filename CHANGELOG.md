@@ -15,6 +15,19 @@ All notable changes to this project are recorded here. The format follows
   once. Another agent's post is `forbidden`, and `crewchat-send` exits 6 for a post that is
   gone or not the agent's: the caller posts a new one.
 
+- **`scripts/smoke-devspace.sh --cleanup <run> [--yes]`** (#157). The smoke picks its run suffix,
+  prints it, and the E2E world writes a creation record of every user, bot and team it makes.
+  `--cleanup` dry-runs by default, and with `--yes` disables that run's bots, deactivates its
+  users and archives its team: only ids in the record, still on the server under the recorded
+  name, active, and carrying the suffix.
+
+### Changed
+
+- **`crewchat serve` is `build()` plus `run()`** (#157). The E2E world runs the same code
+  instead of a hand copy, so it now has the pool manifest, the upload store and the daily
+  rotation too. On stop, the daemon cancels a switch refresh blocked on a hung broker instead of
+  waiting on it.
+
 ### Fixed
 
 - **An agent's DM to its broker no longer loops through the kiosk** (#153). The daemon took
@@ -48,6 +61,12 @@ All notable changes to this project are recorded here. The format follows
 - **`chat_read` and `chat_thread` set `dm` on Mattermost** (#155). They always reported
   `dm: false`, so an agent reading a DM back could not tell it was one. A post in a DM channel
   with the reading agent, its own posts included, is now `dm: true`.
+
+### Security
+
+- **The MCP shim's log file is opened `O_NOFOLLOW` and set to 0600** (#157). A symlink at
+  `CREWCHAT_SHIM_LOG_FILE` is refused, and an existing file is tightened: the open's mode had
+  applied only to a file it created.
 
 ## [0.2.8] — 2026-10-31
 

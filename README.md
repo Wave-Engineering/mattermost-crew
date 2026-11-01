@@ -159,3 +159,10 @@ It creates users, broker accounts and bot accounts with a per-run suffix and pat
 accounts' role, which the dev space allows (CP-06). It refuses to run without
 `SMOKE_TARGET=oaw-devspace`, and is never pointed at a partner organization's production server
 (CP-03).
+
+The report names the run's suffix and its creation record, `reports/smoke-<run>-created.json`.
+`scripts/smoke-devspace.sh --cleanup <run>` then shows what it would deactivate, and with
+`--yes` disables that run's bots, deactivates its users and archives its team. It acts only on
+what the record lists, still active on the server under the recorded name, so no other run's
+accounts are touched. Each step is Mattermost's soft delete, so it can be undone. It is not a
+dev-space wipe, which still needs BJ.

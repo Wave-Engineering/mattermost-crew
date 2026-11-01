@@ -19,7 +19,7 @@ import os
 import secrets
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -68,8 +68,11 @@ class Switchable(InProcessBroker):
         return await super().call(op, args)
 
 
-def login_user(mattermost: Any, username: str) -> tuple[str, str]:
-    """A new user, logged in: (user id, session token)."""
+def login_user(
+    mattermost: Any, username: str, *, on_create: Callable[[str, str], None] | None = None
+) -> tuple[str, str]:
+    """A new user, logged in: (user id, session token). `on_create` gets (user id, username)
+    as soon as the server creates it, so an account whose login then fails is still known."""
     password = f"It-{secrets.token_hex(8)}-Aa1!"
     resp = mm_request(
         mattermost,
@@ -78,6 +81,8 @@ def login_user(mattermost: Any, username: str) -> tuple[str, str]:
         json={"username": username, "email": f"{username}@example.com", "password": password},
     )
     assert resp.status_code == 201, resp.text
+    if on_create is not None:
+        on_create(str(resp.json()["id"]), username)
     login = mm_request(
         mattermost, "POST", "/users/login", json={"login_id": username, "password": password}
     )
@@ -99,8 +104,11 @@ def seat(mattermost: Any, team_id: str, channel_id: str, user_id: str) -> None:
     assert resp.status_code == 201, resp.text
 
 
-def broker_account(mattermost: Any, username: str) -> tuple[str, str]:
-    """A broker account with the patched role and a personal access token."""
+def broker_account(
+    mattermost: Any, username: str, *, on_create: Callable[[str, str], None] | None = None
+) -> tuple[str, str]:
+    """A broker account with the patched role and a personal access token. `on_create` gets
+    (user id, username) as soon as the server creates it, before the role patch."""
     resp = mm_request(
         mattermost,
         "POST",
@@ -113,6 +121,8 @@ def broker_account(mattermost: Any, username: str) -> tuple[str, str]:
     )
     assert resp.status_code == 201, resp.text
     user_id = str(resp.json()["id"])
+    if on_create is not None:
+        on_create(user_id, username)
     env = {**os.environ, "MM_URL": mattermost.url, "MM_ADMIN_TOKEN": mattermost.admin_token}
     subprocess.run([str(ROLE_PATCH), user_id], env=env, check=True)
     tok = mm_request(mattermost, "POST", f"/users/{user_id}/tokens", json={"description": "it"})
