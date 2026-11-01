@@ -90,6 +90,10 @@ REPEAT_BACKOFF_S = (0.0, 0.05, 0.2, 1.0)
 # and coming back, then the shim's ping (every 15 s) registering the agent again.
 RESTART_GRACE_S = 60.0
 RESTART_BACKOFF_S = (0.25, 0.5, 1.0, 2.0)
+# The daemon answers a subscribe for an agent it doesn't hold at once (`not_registered`). So a
+# socket timeout on a subscribe given this long or more means it held the agent: the outage was
+# over. One given less could not tell, and a timeout there still ends inside the outage (#156).
+REPLY_S = 1.0
 # A connect that fails like this is a daemon that is stopped or starting, not a broken host, or
 # a daemon that closed between our connect and our send (its shutdown window).
 DOWN_ERRORS = (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)
@@ -339,7 +343,9 @@ def wait_for_new(
         try:
             event = subscribe(sock_path, dev_name, remaining, clock=clock)
         except TimedOut as exc:
-            if failure is not None:  # the socket's own timeout, inside an outage (#156)
+            # The socket's own timeout. Inside an outage only when the budget was too short for
+            # the daemon's answer; with time for it, the daemon held the agent again (#156).
+            if failure is not None and remaining is not None and remaining < REPLY_S:
                 raise failure from exc
             raise TimedOut(f"no new event within {timeout_s:g} s") from exc
         except Restarting as exc:

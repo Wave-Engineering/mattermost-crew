@@ -28,7 +28,7 @@ from crewchat.adapters.squawkie import (
 )
 
 from tests.fakes.squawkie import URL, FakeSquawkie
-from tests.required import missing
+from tests.required import REQUIRE_ENV, missing
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 FIXTURE = FIXTURES / "sqtk_doorbell_predicate.json"
@@ -83,8 +83,11 @@ def test_fixture_is_sqtk_doorbells_own_verdict(case: dict[str, Any]) -> None:
 
 def test_fixture_jq_is_the_installed_scripts() -> None:
     """When the kit's `sqtk-doorbell.sh` is on this host, the fixture's jq is its jq, and the
-    vendored `sqtk-answer.jq` is the one installed beside it."""
-    candidates = [os.environ.get("SQTK_DOORBELL", ""), "~/.claude/scripts/sqtk-doorbell.sh"]
+    vendored `sqtk-answer.jq` is the one installed beside it. Under `CREWCHAT_REQUIRE_TEST_TOOLS=1`
+    only the job's pinned `SQTK_DOORBELL` counts, never a kit in the runner's home (#156)."""
+    candidates = [os.environ.get("SQTK_DOORBELL", "")]
+    if os.environ.get(REQUIRE_ENV) != "1":
+        candidates.append("~/.claude/scripts/sqtk-doorbell.sh")
     paths = [Path(c).expanduser() for c in candidates if c]
     script = next((p for p in paths if p.is_file()), None)
     if script is None:

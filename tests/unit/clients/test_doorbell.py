@@ -518,14 +518,27 @@ def test_a_timeout_inside_an_outage_reports_the_outage(
     assert time.monotonic() - real_start < 5
 
 
+@pytest.mark.parametrize(
+    ("timeout_s", "want"),
+    [
+        # 0.25 s left after the first pause: too short for the daemon's answer, so the
+        # timeout ends inside the outage (#51).
+        (0.5, doorbell.NotRegistered),
+        # 9.75 s left: the daemon answered nothing, so it held the agent again. The outage
+        # was over, and this is a plain timeout, exit 3.
+        (10.0, doorbell.TimedOut),
+    ],
+    ids=["inside-the-outage", "after-it-ended"],
+)
 def test_a_socket_timeout_mid_outage_reports_the_outage(
-    monkeypatch: pytest.MonkeyPatch, short_dir: Path
+    monkeypatch: pytest.MonkeyPatch, short_dir: Path, timeout_s: float, want: type[Exception]
 ) -> None:
     """#156: a `subscribe` whose socket times out while an outage is recorded raises that
-    outage, not `TimedOut`, as the docstring promises."""
+    outage, as the docstring promises, but only when its budget was too short for the daemon
+    to answer `not_registered`. With time for that answer, the outage had ended."""
     replies: list[Exception] = [
         doorbell.NotRegistered("bell is not registered"),
-        doorbell.TimedOut("no event within 1 s"),
+        doorbell.TimedOut("no event"),
     ]
 
     def subscribe(*_args: Any, **_kw: Any) -> dict[str, Any]:
@@ -533,9 +546,9 @@ def test_a_socket_timeout_mid_outage_reports_the_outage(
 
     monkeypatch.setattr(doorbell, "subscribe", subscribe)
     clock = FakeClock()
-    with pytest.raises(doorbell.NotRegistered):
+    with pytest.raises(want):
         doorbell.wait_for_new(
-            short_dir / "d.sock", DEV, 10.0, None, grace_s=30.0, clock=clock, sleep=clock.sleep
+            short_dir / "d.sock", DEV, timeout_s, None, grace_s=30.0, clock=clock, sleep=clock.sleep
         )
     assert replies == []
 
