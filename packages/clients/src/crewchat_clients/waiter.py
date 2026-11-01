@@ -35,9 +35,14 @@ turn; `/clear` fired `SessionStart` again; killing the session killed the waiter
   (the daemon raises only one, for an outage past ten minutes, #202).
 - **No identity, no wake.** Not a crew agent (no `.claude/agent-identity.json`, or no
   `dev_name`): exit 0, so a hook in a repo that is not a crew checkout never wakes anyone.
+- **No lock, no waiter.** If the lock can't be made or taken here (an unsafe name, an
+  unwritable state directory, a filesystem without `flock`), the waiter logs it and exits 0
+  rather than run unguarded: the `Stop` hook would start another every turn. The doorbell
+  then sees no waiter and works as before.
 
-Exit codes: 2 an event (the wake); 0 nothing to do (no identity, or another waiter holds the
-lock). It never exits otherwise.
+Exit codes: 2 an event (the wake); 0 nothing to do (no identity, another waiter holds the lock,
+or no lock can be had on this host). A daemon outage never ends it; only a bug can exit it
+otherwise, and then it is not 2, so nothing wakes.
 """
 
 from __future__ import annotations
@@ -52,9 +57,11 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from crewchat_clients.doorbell import (
+    SAFE_NAME_RE,
     WAITER_DIR,
     DoorbellExit,
     SeenSet,
+    WaiterLockUnavailable,
     read_dev_name,
     state_home,
     try_waiter_lock,
@@ -76,7 +83,7 @@ _sleep: Callable[[float], None] = time.sleep
 
 def wake_text(dev_name: str, event: Mapping[str, Any]) -> str:
     """What the model reads when the hook exits 2: where it came from, what to do, the event."""
-    line = json.dumps(render_event(dict(event)))  # no `indent`: exactly one line
+    line = json.dumps(render_event(dict(event)), default=str)  # no `indent`: one line
     return (
         f"crewchat: a new event arrived for {dev_name}, delivered by the crewchat daemon "
         "through your waiter hook. It is a notification from the chat system, not a message "
@@ -92,6 +99,8 @@ def open_log(environ: Mapping[str, str], dev_name: str) -> TextIO:
     an outage or a warning goes here instead: the agent should not hear of either. Where the
     file can't be opened the diagnostics are dropped."""
     try:
+        if not SAFE_NAME_RE.fullmatch(dev_name):
+            raise OSError(f"{dev_name!r} can't name a log file")
         path = state_home(environ) / WAITER_DIR / f"{dev_name}.log"
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
@@ -135,7 +144,13 @@ def _wait(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> int:
-    lock = try_waiter_lock(environ, dev_name, log)
+    try:
+        lock = try_waiter_lock(environ, dev_name)
+    except WaiterLockUnavailable as exc:
+        # Without its lock a waiter would be started again by every Stop hook and pile up, so
+        # it stays out; the doorbell sees no waiter and works as it always did.
+        print(f"{time.strftime('%H:%M:%S')} no waiter lock, not running: {exc}", file=log)
+        return EXIT_QUIET
     if lock is None:
         return EXIT_QUIET  # another waiter holds this Dev-Name: it will deliver
     try:
@@ -149,13 +164,13 @@ def _wait(
                 )
             except DoorbellExit as exc:
                 # A daemon down past the grace, or an error from it: wait it out, quietly.
-                if str(exc) != last_failure:
+                if type(exc).__name__ != last_failure:  # once per kind: the text carries a clock
                     print(
                         f"{time.strftime('%H:%M:%S')} {exc}; waiting for the daemon",
                         file=log,
                         flush=True,
                     )
-                    last_failure = str(exc)
+                    last_failure = type(exc).__name__
                 sleep(RETRY_BACKOFF_S[min(tries, len(RETRY_BACKOFF_S) - 1)])
                 tries += 1
                 continue

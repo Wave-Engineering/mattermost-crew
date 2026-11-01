@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -181,32 +182,37 @@ def waiter_lock_path(environ: Mapping[str, str], dev_name: str) -> Path | None:
     return state_home(environ) / WAITER_DIR / f"{dev_name}.lock"
 
 
-def try_waiter_lock(environ: Mapping[str, str], dev_name: str, err: TextIO) -> int | None:
+class WaiterLockUnavailable(Exception):
+    """The Dev-Name's waiter lock can't be made or taken on this host (a name that can't be a
+    file, an unwritable state directory, a filesystem without `flock`). Not "another waiter
+    holds it": the waiter then stays out of it and the doorbell, which sees no waiter, works."""
+
+
+def try_waiter_lock(environ: Mapping[str, str], dev_name: str) -> int | None:
     """Take `dev_name`'s waiter lock for the life of the file descriptor returned: None when
-    another waiter holds it. Where the lock can't be made at all (a name that can't be a file,
-    an unwritable state directory) it is a warning and the lock is skipped: a waiter that
-    can't take its lock still delivers, and the seen set drops the repeats a twin would add."""
+    another waiter holds it; `WaiterLockUnavailable` when no lock can be had here. A waiter
+    with no lock would be started again by every `Stop` hook and pile up, so it doesn't run."""
     path = waiter_lock_path(environ, dev_name)
+    if path is None:
+        raise WaiterLockUnavailable(f"{dev_name!r} can't name a lock file")
     try:
-        if path is None:
-            raise OSError(f"{dev_name!r} can't name a lock file")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as exc:
-        print(
-            f"crewchat-waiter: no lock for {dev_name}, so no single-instance guard: {exc}", file=err
-        )
-        return os.open(os.devnull, os.O_RDONLY)
+        raise WaiterLockUnavailable(f"{path}: {exc}") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as exc:
         os.close(fd)
-        return None
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None  # held
+        raise WaiterLockUnavailable(f"flock {path}: {exc}") from exc
     return fd
 
 
 def waiter_running(environ: Mapping[str, str], dev_name: str) -> bool:
-    """Whether a `crewchat-waiter` holds `dev_name`'s lock right now (#204)."""
+    """Whether a `crewchat-waiter` holds `dev_name`'s lock right now (#204). Only a lock that
+    is held counts: a host where `flock` fails some other way has no waiter that could be."""
     path = waiter_lock_path(environ, dev_name)
     if path is None or not path.exists():
         return False
@@ -216,8 +222,8 @@ def waiter_running(environ: Mapping[str, str], dev_name: str) -> bool:
         return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True
+    except OSError as exc:
+        return exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
     finally:
         os.close(fd)  # taking it and closing releases it at once
     return False

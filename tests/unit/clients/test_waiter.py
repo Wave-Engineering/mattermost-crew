@@ -7,6 +7,7 @@ own retry pause is a hook that either skips the wait or brings the daemon back.
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -23,6 +24,7 @@ from crewchat_clients import doorbell, waiter
 from crewchat_clients.doorbell import (
     EXIT_WAITER,
     SeenSet,
+    WaiterLockUnavailable,
     try_waiter_lock,
     waiter_lock_path,
     waiter_running,
@@ -97,7 +99,7 @@ def test_an_outsider_event_keeps_its_marking(repo: Path, short_dir: Path) -> Non
 def test_a_second_waiter_is_silent_and_consumes_nothing(repo: Path, short_dir: Path) -> None:
     """One waiter per Dev-Name: a copy that finds the lock held exits 0 with no output and
     never subscribes, so it can neither wake the agent nor eat the event."""
-    held = try_waiter_lock(env_for(repo), DEV, io.StringIO())
+    held = try_waiter_lock(env_for(repo), DEV)
     assert held is not None
     fake = FakeDaemon(short_dir / "d.sock", ok(with_id("e1")))
     try:
@@ -140,7 +142,7 @@ def test_a_killed_waiter_frees_the_lock(repo: Path) -> None:
         holder.kill()
         holder.wait(timeout=10)
     assert not waiter_running(env_for(repo), DEV)
-    again = try_waiter_lock(env_for(repo), DEV, io.StringIO())
+    again = try_waiter_lock(env_for(repo), DEV)
     assert again is not None
     os.close(again)
 
@@ -241,11 +243,59 @@ def test_no_identity_means_no_wake(tmp_path: Path, short_dir: Path) -> None:
     assert not (tmp_path / "state").exists()
 
 
+def test_a_flock_error_is_not_a_held_lock(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only EWOULDBLOCK/EAGAIN mean another waiter holds the lock. A filesystem without flock
+    (ENOLCK, EOPNOTSUPP) means no waiter can be running: the doorbell must not yield to a ghost
+    and the waiter must not read it as someone else delivering."""
+    path = waiter_lock_path(env_for(repo), DEV)
+    assert path is not None
+    path.parent.mkdir(parents=True)
+    path.touch()
+
+    def broken(fd: int, op: int) -> None:
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(doorbell.fcntl, "flock", broken)
+    assert not waiter_running(env_for(repo), DEV)
+    with pytest.raises(WaiterLockUnavailable):
+        try_waiter_lock(env_for(repo), DEV)
+
+
+def test_no_lock_means_no_waiter(tmp_path: Path, short_dir: Path) -> None:
+    """A waiter that cannot take a lock does not run unguarded (every Stop hook would start
+    another): it exits 0, delivers nothing, and writes nothing the model could read."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "agent-identity.json").write_text(json.dumps({"dev_name": DEV}))
+    blocked = tmp_path / "state-is-a-file"
+    blocked.write_text("not a directory")
+    fake = FakeDaemon(short_dir / "d.sock", ok(with_id("e1")))
+    err = io.StringIO()
+    try:
+        code = run(tmp_path, fake.path, {"XDG_STATE_HOME": str(blocked)}, err)
+    finally:
+        fake.close()
+    assert (code, err.getvalue()) == (EXIT_QUIET, "")
+    assert fake.frames == []
+
+
+def test_an_unsafe_dev_name_touches_nothing_outside_the_state_dir(
+    tmp_path: Path, short_dir: Path
+) -> None:
+    """The lock, seen and log paths all refuse a Dev-Name that is not a plain file name."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "agent-identity.json").write_text(json.dumps({"dev_name": "../x"}))
+    state = tmp_path / "state"
+    code, err = wait(tmp_path, short_dir / "d.sock")
+    assert (code, err) == (EXIT_QUIET, "")
+    assert not state.exists() and not (tmp_path / "x.log").exists()
+    assert not (tmp_path / "state" / "crewchat" / "x.log").exists()
+
+
 def test_the_doorbell_yields_to_a_live_waiter(repo: Path, short_dir: Path) -> None:
     """While a waiter holds the Dev-Name's lock the one-shot exits 5 at once and never
     subscribes (a second consumer would double every wake); with none, it is unchanged."""
     fake = FakeDaemon(short_dir / "d.sock", ok(with_id("e1")))
-    held = try_waiter_lock(env_for(repo), DEV, io.StringIO())
+    held = try_waiter_lock(env_for(repo), DEV)
     assert held is not None
     out, err = io.StringIO(), io.StringIO()
     try:
