@@ -40,12 +40,19 @@ Exit codes (§5.8). It **never** exits 0 without printing an event:
 | 3 | timeout |
 | 4 | daemon unreachable: down past the restart grace; or at once for no permission, a connect |
 |   | timeout, or a reply that is oversized, malformed or mismatched |
+| 5 | a `crewchat-waiter` is already delivering this Dev-Name's events (#204): nothing to arm |
+
+**Nobody has to arm this.** `crewchat-waiter` (#204) is the same wait, started and restarted by
+the harness through an `asyncRewake` hook, one per Dev-Name. While one holds its lock this
+one-shot would be a second consumer of the same queue and double every wake, so it exits 5
+at once instead, with a line saying why. Agents whose skills still say to arm it lose nothing.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -73,6 +80,7 @@ EXIT_ERROR = 1
 EXIT_NOT_REGISTERED = 2
 EXIT_TIMEOUT = 3
 EXIT_UNREACHABLE = 4
+EXIT_WAITER = 5
 
 TIMEOUT_ENV = "CREWCHAT_DOORBELL_TIMEOUT"
 CONNECT_TIMEOUT_S = 10.0
@@ -80,6 +88,7 @@ RECV_CHUNK = 65536
 
 SEEN_MAX = 512  # the `event_id`s kept per Dev-Name (#109)
 SEEN_DIR = Path("crewchat") / "doorbell-seen"
+WAITER_DIR = Path("crewchat") / "waiter"  # one lock file per Dev-Name (#204)
 # A Dev-Name safe as a file name, and an `event_id` safe as one line of the seen file.
 SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EVENT_ID_RE = re.compile(r"[^\s]{1,512}")
@@ -157,6 +166,69 @@ def parse_timeout(environ: Mapping[str, str]) -> float | None:
     return value or None
 
 
+def state_home(environ: Mapping[str, str]) -> Path:
+    """`$XDG_STATE_HOME`, or `~/.local/state` when it is unset, empty or relative."""
+    state = environ.get("XDG_STATE_HOME", "")
+    if not os.path.isabs(state):
+        home = environ.get("HOME") or str(Path.home())
+        state = os.path.join(home, ".local", "state")
+    return Path(state)
+
+
+def waiter_lock_path(environ: Mapping[str, str], dev_name: str) -> Path | None:
+    """`dev_name`'s waiter lock file (#204), or None when the name can't be a file name."""
+    if not SAFE_NAME_RE.fullmatch(dev_name):
+        return None
+    return state_home(environ) / WAITER_DIR / f"{dev_name}.lock"
+
+
+class WaiterLockUnavailable(Exception):
+    """The Dev-Name's waiter lock can't be made or taken on this host (a name that can't be a
+    file, an unwritable state directory, a filesystem without `flock`). Not "another waiter
+    holds it": the waiter then stays out of it and the doorbell, which sees no waiter, works."""
+
+
+def try_waiter_lock(environ: Mapping[str, str], dev_name: str) -> int | None:
+    """Take `dev_name`'s waiter lock for the life of the file descriptor returned: None when
+    another waiter holds it; `WaiterLockUnavailable` when no lock can be had here. A waiter
+    with no lock would be started again by every `Stop` hook and pile up, so it doesn't run."""
+    path = waiter_lock_path(environ, dev_name)
+    if path is None:
+        raise WaiterLockUnavailable(f"{dev_name!r} can't name a lock file")
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise WaiterLockUnavailable(f"{path}: {exc}") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None  # held
+        raise WaiterLockUnavailable(f"flock {path}: {exc}") from exc
+    return fd
+
+
+def waiter_running(environ: Mapping[str, str], dev_name: str) -> bool:
+    """Whether a `crewchat-waiter` holds `dev_name`'s lock right now (#204). Only a lock that
+    is held counts: a host where `flock` fails some other way has no waiter that could be."""
+    path = waiter_lock_path(environ, dev_name)
+    if path is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)  # no O_CREAT: a missing file is no waiter
+    except OSError:  # missing, or a state directory this user can't read: no waiter to yield to
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        return exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+    finally:
+        os.close(fd)  # taking it and closing releases it at once
+    return False
+
+
 class SeenSet:
     """The `event_id`s this Dev-Name's one-shots have printed, newest last, at most `SEEN_MAX`
     (#109). Shared by every one-shot with that Dev-Name, in any checkout, as the daemon's
@@ -172,11 +244,7 @@ class SeenSet:
         if not SAFE_NAME_RE.fullmatch(dev_name):
             print(f"crewchat-doorbell: {dev_name!r} can't name a seen file; repeats pass", file=err)
             return None
-        state = environ.get("XDG_STATE_HOME", "")
-        if not os.path.isabs(state):  # unset, empty or relative: the XDG default
-            home = environ.get("HOME") or str(Path.home())
-            state = os.path.join(home, ".local", "state")
-        return cls(Path(state) / SEEN_DIR / dev_name, err)
+        return cls(state_home(environ) / SEEN_DIR / dev_name, err)
 
     def _warn(self, what: str, exc: BaseException) -> None:
         print(f"crewchat-doorbell: seen file {self.path} {what}: {exc}", file=self.err)
@@ -293,6 +361,13 @@ def run(
     try:
         timeout_s = parse_timeout(environ)
         dev_name = read_dev_name(repo_root)
+        if waiter_running(environ, dev_name):
+            print(
+                f"crewchat-doorbell: crewchat-waiter already delivers events for {dev_name}; "
+                "nothing to arm",
+                file=err,
+            )
+            return EXIT_WAITER
         seen = SeenSet.for_dev(environ, dev_name, err)
         event, event_id = wait_for_new(
             sock_path, dev_name, timeout_s, seen, clock=_clock, sleep=_sleep

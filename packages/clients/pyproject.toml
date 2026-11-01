@@ -11,6 +11,7 @@ dependencies = [
 [project.scripts]
 crewchat-mcp = "crewchat_clients.mcp_shim:main"
 crewchat-doorbell = "crewchat_clients.doorbell:main"
+crewchat-waiter = "crewchat_clients.waiter:main"
 crewchat-send = "crewchat_clients.send:main"
 
 [build-system]

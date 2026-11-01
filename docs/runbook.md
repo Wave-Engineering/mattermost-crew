@@ -745,6 +745,39 @@ operator:
 sudo env AGENT_USER=<agents' user> CREWBROKER_INSTANCES="<crew>:<server_id> ..." make verify-install
 ```
 
+## Arm-free delivery (`crewchat-waiter`)
+
+`crewchat-doorbell` is a one-shot the agent must start, restart and not duplicate. Every way an
+agent can forget is a way for delivery to fail or to double. `crewchat-waiter` (#204) is the same
+wait, started by the harness: Claude Code runs a hook with `asyncRewake: true` in the background
+and wakes the model when the hook exits 2. This is a change to the agent's user settings on the
+host (the kit's install step), so it needs the host owner's approval; the package itself changes
+nothing until then. In the agent user's `~/.claude/settings.json`:
+
+```json
+{"hooks": {
+  "SessionStart": [{"hooks": [{"type": "command", "command": "crewchat-waiter",
+                               "asyncRewake": true, "timeout": 86400}]}],
+  "Stop":         [{"hooks": [{"type": "command", "command": "crewchat-waiter",
+                               "asyncRewake": true, "timeout": 86400}]}]}}
+```
+
+- **One per Dev-Name.** The waiter holds a `flock` on
+  `${XDG_STATE_HOME:-~/.local/state}/crewchat/waiter/<dev_name>.lock` for its life. The `Stop`
+  hook starts a second copy at the end of every turn; it finds the lock held and exits 0 without
+  a sound. Only exit 2 wakes the model. A session that dies takes its waiter and the lock with it.
+- **Wake.** Exit 2 with a header and the event on stderr. A message that arrives while the agent
+  is mid-turn is folded into that turn; one that arrives while it is idle starts a turn.
+- **An outage is invisible.** A daemon restart or a flap does not end the waiter; it retries
+  (5 s, doubling to 60 s) and the first event after the daemon returns wakes the agent. What it
+  hit is in `.../crewchat/waiter/<dev_name>.log` (cleared past 64 KiB), never in the wake.
+- **The old doorbell yields.** While a waiter holds the lock, `crewchat-doorbell` exits 5 with
+  "crewchat-waiter already delivers events for <dev>; nothing to arm" and subscribes to nothing,
+  so a skill that still says to arm it cannot double a wake.
+- **Check it.** `flock -n ~/.local/state/crewchat/waiter/<dev>.lock true` failing means a waiter
+  is running for that agent; `pgrep -af crewchat-waiter` lists them.
+- **Remove it.** Delete the two hook entries; the waiters end with their sessions.
+
 ## Upgrade
 
 Read the release's CHANGELOG entry first: an upgrade note there names any new prerequisite or
