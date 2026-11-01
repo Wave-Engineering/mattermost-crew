@@ -45,8 +45,8 @@ from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` i
 # -- Mattermost --------------------------------------------------------------------------------
 def test_it06_mattermost_send_writes_crew_proto(
     mattermost: Any,
-    setup: dict[str, str],
-    tmp_path: Path,  # noqa: F811
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     """IT-06, Mattermost written (R-14): `send` marks the post `props.crew_proto = PROTO`."""
     channel = setup["channel_id"]
@@ -68,8 +68,8 @@ def test_it06_mattermost_send_writes_crew_proto(
 
 def test_it06_mattermost_unmarked_post_reads_as_proto_0(
     mattermost: Any,
-    setup: dict[str, str],
-    tmp_path: Path,  # noqa: F811
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     """IT-06, Mattermost proto 0 (R-14): a post with no `crew_proto` reads back as 0."""
     channel = setup["channel_id"]

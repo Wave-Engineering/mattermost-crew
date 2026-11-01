@@ -258,9 +258,9 @@ def post(mattermost: Any, post_id: str) -> dict[str, Any]:
 # -- IT-04 -------------------------------------------------------------------------------------
 def test_it04_default_resolution_and_headless_squawk(
     mattermost: Any,
-    setup: dict[str, str],
+    setup: dict[str, str],  # noqa: F811
     tmp_path: Path,
-    sock_dir: Path,  # noqa: F811
+    sock_dir: Path,
 ) -> None:
     """IT-04 (R-11)."""
     channel = setup["channel_id"]
@@ -663,9 +663,9 @@ def test_it25_screamhole_unhealthy_refuses_reads(tmp_path: Path, sock_dir: Path)
 # -- IT-16 -------------------------------------------------------------------------------------
 def test_it16_one_contract_across_two_mattermost_servers_and_discord(
     mattermost: Any,
-    setup: dict[str, str],
+    setup: dict[str, str],  # noqa: F811
     tmp_path: Path,
-    sock_dir: Path,  # noqa: F811
+    sock_dir: Path,
 ) -> None:
     """IT-16 (R-09, R-10)."""
     channel = setup["channel_id"]
