@@ -1006,6 +1006,23 @@ def _drain_all(bell: Doorbell, dev: str) -> list[DoorbellEvent]:
     return [q.get_nowait() for _ in range(q.qsize())]
 
 
+def test_close_server_drops_its_pending_alarm(run: Any) -> None:
+    """#202: a Mattermost server the agent no longer has (#155) is never alarmed, and the
+    agent's other backends keep their own outages."""
+    bell = Doorbell({}, CursorStore(None), deaf_alarm_s=ALARM)
+
+    async def scenario() -> list[dict[str, Any]]:
+        bell.status(DEV, "mattermost:dev", False, "gone")
+        bell.status(DEV, "discord", False, "still down")
+        await bell.close_server(DEV, "dev")
+        assert not bell.is_down(DEV, "mattermost:dev")
+        assert bell.is_down(DEV, "discord")
+        await asyncio.sleep(ALARM * 3)
+        return drained(bell)
+
+    assert [(e["backend"], e["type"]) for e in run(scenario())] == [("discord", "backend.down")]
+
+
 def test_filter_hook_and_full_queue(tmp_path: Path, run: Any) -> None:
     refused: list[str] = []
 

@@ -81,7 +81,8 @@ class Rig:
             "discord": self.discord,
             "squawkie": self.squawkie,
         }
-        self.doorbell = Doorbell(sources, CursorStore(self.root / "state"))
+        # deaf_alarm_s=0: IT-12 asserts the down/up pair at once, not the 10-minute alarm (#202).
+        self.doorbell = Doorbell(sources, CursorStore(self.root / "state"), deaf_alarm_s=0)
         self.d.store.adapters.insert(0, self.doorbell)
 
         async def no_register(args: dict[str, Any]) -> dict[str, Any]:

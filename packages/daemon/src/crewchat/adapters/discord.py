@@ -339,6 +339,7 @@ class DiscordBackend:
         self._healthy: bool | None = None  # None: never checked
         self._probe_fails = 0  # consecutive failed /health probes while healthy (#202)
         self._probe_fail_since: float | None = None
+        self._probe_fail_last = 0.0
         self._health_since = 0.0
         self._health_next = 0.0
         self._health_delay = HEALTH_BACKOFF_FIRST_S
@@ -457,8 +458,14 @@ class DiscordBackend:
             self._probe_fail_since = None
         elif self._healthy is True:
             now = self._now()
-            if self._probe_fail_since is None:
+            if (
+                self._probe_fail_since is None
+                or now - self._probe_fail_last > self.health_fail_window_s
+            ):
+                # A failure long after the last one is a new streak, not a continuation.
                 self._probe_fail_since = now
+                self._probe_fails = 0
+            self._probe_fail_last = now
             self._probe_fails += 1
             if (
                 self._probe_fails < self.health_fail_threshold

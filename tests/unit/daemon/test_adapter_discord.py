@@ -469,6 +469,26 @@ def test_failing_for_the_window_is_an_outage(credential: Path, run: Any) -> None
     assert run(b.check_health(force=True)) is False
 
 
+def test_failures_far_apart_are_not_a_streak(credential: Path, run: Any) -> None:
+    """#202: a failure long after the last one starts a new streak: two failures minutes
+    apart must not read as an outage on the second."""
+    clock = Clock()
+    discord = FakeDiscord(now=clock)
+    b = backend(
+        discord, credential, now=clock, health_fail_threshold=100, health_fail_window_s=10.0
+    )
+    assert run(b.check_health()) is True
+    discord.screamhole_healthy = False
+    clock.t = b._health_next
+    assert run(b.check_health()) is True  # failure 1
+    clock.t += 300.0  # nobody asked for minutes
+    assert run(b.check_health(force=True)) is True  # a new streak, not the window expiring
+    clock.t += 9.0
+    assert run(b.check_health(force=True)) is True
+    clock.t += 1.0
+    assert run(b.check_health(force=True)) is False  # 10 s of failing since the new streak
+
+
 def test_the_first_probe_waits_longer(credential: Path, run: Any) -> None:
     clock = Clock()
     discord = FakeDiscord(now=clock)

@@ -414,10 +414,10 @@ class Doorbell:
         if handle is not None:
             handle.cancel()
 
-    def _forget_health(self, dev_name: str) -> None:
-        """`dev_name` left: drop its pending alarms and outage state, so a later attach to a
-        backend that is still down starts a fresh outage."""
-        for key in [k for k in self._down if k[0] == dev_name]:
+    def _forget_health(self, dev_name: str, backend: str | None = None) -> None:
+        """`dev_name` left (or just `backend` did): drop its pending alarms and outage state, so
+        a later attach to a backend that is still down starts a fresh outage."""
+        for key in [k for k in self._down if k[0] == dev_name and backend in (None, k[1])]:
             self._cancel_alarm(key)
             self._down.pop(key, None)
             self._down_since.pop(key, None)
@@ -586,7 +586,9 @@ class Doorbell:
         """`dev_name`'s token on `server_id` was retired (#155): stop that one task, before the
         Mattermost adapter closes its stream. Called from inside that task (a remint on its
         stream's refresh), it is only popped: `owned()` then ends it once the stream ends."""
-        task = self._tasks.pop((dev_name, f"mattermost:{server_id}"), None)
+        backend = f"mattermost:{server_id}"
+        task = self._tasks.pop((dev_name, backend), None)
+        self._forget_health(dev_name, backend)  # no alarm for a server the agent no longer has
         if task is None or task is asyncio.current_task():
             return
         await self._stop_task(task)
