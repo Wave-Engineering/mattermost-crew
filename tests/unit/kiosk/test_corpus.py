@@ -381,9 +381,7 @@ def test_a_repo_cannot_exempt_itself(
     # gitleaks runs inside the flat copy and scans `.`: every path it sees is an f<n> name,
     # never one under the server's directory (a server named node_modules is allowlisted).
     assert seen["env"] == [] and seen["args"][-1] == "."
-    assert Path(seen["cwd"]).name == "scan" and sorted(seen["cwd_entries"]) == sorted(
-        seen["files"]
-    )
+    assert Path(seen["cwd"]).name == "scan" and sorted(seen["cwd_entries"]) == sorted(seen["files"])
     assert (current(builder) / repo / "a.py").read_text() == "tok = 'x'  # gitleaks:allow\n"
 
 

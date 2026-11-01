@@ -159,9 +159,7 @@ def test_broker_role_is_patched_and_not_admin(mattermost: Any, setup: dict[str, 
     assert set(role["permissions"]) >= PATCHED
 
 
-def test_ensure_bot_creates_once(
-    mattermost: Any, broker: Broker, setup: dict[str, str]
-) -> None:
+def test_ensure_bot_creates_once(mattermost: Any, broker: Broker, setup: dict[str, str]) -> None:
     """R-01, R-03: `<dev>.<crew>` is created on the first call only."""
     first = broker.mint(args(broker, "once"))
     second = broker.mint(args(broker, "once"))
@@ -450,9 +448,7 @@ def user_by_name(mattermost: Any, username: str) -> str:
     return str(resp.json()["id"])
 
 
-def test_it32_supersede_revokes_unheld_token(
-    mattermost: Any, broker: Broker, clock: Clock
-) -> None:
+def test_it32_supersede_revokes_unheld_token(mattermost: Any, broker: Broker, clock: Clock) -> None:
     """IT-32 (R-05, R-07; #41, #151): a `mint` whose daemon holds no token (`current_token_id:
     null`) revokes the account's earlier token on a real server, so a token whose reply the
     daemon never received stops working. A token already revoked out of band is cleared from

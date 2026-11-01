@@ -591,9 +591,7 @@ def test_current_token_id_must_be_an_id_or_null(broker: Broker) -> None:
             broker.remint(_args(bad))  # type: ignore[arg-type]
 
 
-def test_late_request_past_its_deadline_is_refused(
-    broker: Broker, fake: Any, clock: Any
-) -> None:
+def test_late_request_past_its_deadline_is_refused(broker: Broker, fake: Any, clock: Any) -> None:
     """#41: a call the daemon gave up on, served after a newer one, mints and revokes nothing."""
     held = broker.mint(_args(None))
     sent = clock.now.timestamp()

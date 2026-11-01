@@ -597,9 +597,7 @@ class DiscordBackend:
             raise ValueError(f"type {type!r} is not text, voice or category")
         found = [c for c in await self.guild_channels(fresh=True) if c.get("type") == kind]
         found.sort(key=lambda c: (c.get("position", 0), str(c.get("id"))))
-        return [
-            {"id": str(c["id"]), "name": str(c.get("name", "")), "type": type} for c in found
-        ]
+        return [{"id": str(c["id"]), "name": str(c.get("name", "")), "type": type} for c in found]
 
     async def resolve(
         self, dev_name: str, name: str, type: str = "channel", guild_id: str | None = None

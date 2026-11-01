@@ -28,8 +28,7 @@ def identicon_png(name: str, size: int = 128) -> bytes:
     bits = int.from_bytes(h[3:5], "big")
     # Cell (r, c) mirrors column c onto GRID - 1 - c, so only the left three columns are drawn.
     on = [
-        [bool(bits >> (r * 3 + min(c, GRID - 1 - c)) & 1) for c in range(GRID)]
-        for r in range(GRID)
+        [bool(bits >> (r * 3 + min(c, GRID - 1 - c)) & 1) for c in range(GRID)] for r in range(GRID)
     ]
     rows = []
     for y in range(size):

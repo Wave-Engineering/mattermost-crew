@@ -31,8 +31,20 @@ BLOCK_TIMEOUT_S = 900
 
 def _journal() -> str:
     proc = subprocess.run(
-        ["sudo", "-n", "journalctl", "-u", "crewchat", "-u", "crewbroker@*", "-u", "crewkiosk*",
-         "-n", "80", "--no-pager"],
+        [
+            "sudo",
+            "-n",
+            "journalctl",
+            "-u",
+            "crewchat",
+            "-u",
+            "crewbroker@*",
+            "-u",
+            "crewkiosk*",
+            "-n",
+            "80",
+            "--no-pager",
+        ],
         capture_output=True,
         text=True,
         timeout=60,

@@ -56,9 +56,7 @@ def test_embed_mattermost_attachment(mm: Any, run: Any, daemon: Any) -> None:
     assert len(mm.posts) == before
 
 
-def test_attachments_upload_with_the_agents_own_token(
-    mm: Any, run: Any, tmp_path: Path
-) -> None:
+def test_attachments_upload_with_the_agents_own_token(mm: Any, run: Any, tmp_path: Path) -> None:
     """CT-01: `POST /api/v4/files` with the agent's token, then the post with `file_ids`."""
     tokens = Tokens(mm)
     me = tokens.add(DEV)

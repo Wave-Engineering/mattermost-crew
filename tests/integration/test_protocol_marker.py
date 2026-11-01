@@ -44,7 +44,9 @@ from tests.integration.test_mattermost_adapter import (  # noqa: F401 (`setup` i
 
 # -- Mattermost --------------------------------------------------------------------------------
 def test_it06_mattermost_send_writes_crew_proto(
-    mattermost: Any, setup: dict[str, str], tmp_path: Path  # noqa: F811
+    mattermost: Any,
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     """IT-06, Mattermost written (R-14): `send` marks the post `props.crew_proto = PROTO`."""
     channel = setup["channel_id"]
@@ -65,7 +67,9 @@ def test_it06_mattermost_send_writes_crew_proto(
 
 
 def test_it06_mattermost_unmarked_post_reads_as_proto_0(
-    mattermost: Any, setup: dict[str, str], tmp_path: Path  # noqa: F811
+    mattermost: Any,
+    setup: dict[str, str],  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     """IT-06, Mattermost proto 0 (R-14): a post with no `crew_proto` reads back as 0."""
     channel = setup["channel_id"]
@@ -115,7 +119,8 @@ def test_it06_discord_send_writes_proto_suffix(tmp_path: Path, sock_dir: Path) -
 
 
 def test_it06_discord_unmarked_messages_read_as_proto_0(
-    tmp_path: Path, sock_dir: Path  # noqa: F811
+    tmp_path: Path,
+    sock_dir: Path,  # noqa: F811
 ) -> None:
     """IT-06, Discord proto 0 (R-14): no ` ·p<N>` suffix means `proto` 0, and no error,
     whether the message has today's signature or none at all."""

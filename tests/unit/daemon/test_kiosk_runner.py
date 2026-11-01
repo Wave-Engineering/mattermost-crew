@@ -876,8 +876,7 @@ def test_ci_stub_claude_parses(tmp_path: Path) -> None:
     # Exactly the probe and the prompt: a stray pair of apostrophes that leaves a prefix which
     # still compiles also leaves unquoted whitespace, which splits into extra words.
     check = (
-        "import sys; assert len(sys.argv) == 3, sys.argv[2:]; "
-        'compile(sys.argv[1], "probe", "exec")'
+        'import sys; assert len(sys.argv) == 3, sys.argv[2:]; compile(sys.argv[1], "probe", "exec")'
     )
     compiled.write_text(
         match.group(1).replace(

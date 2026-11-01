@@ -327,9 +327,7 @@ def test_trusted_membership_by_minted_ids(rig: Rig) -> None:
     assert wrong_list == KIOSK  # humans only by `human_user_ids`
 
 
-def test_trusted_crew_without_table_is_outsider(
-    rig: Rig, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_trusted_crew_without_table_is_outsider(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     rig.set_mode("trusted")
 
     async def scenario() -> list[Verdict]:
@@ -765,8 +763,9 @@ def test_kiosk_daily_cap_zero_means_none() -> None:
 def test_kiosk_daily_cap_survives_restart(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """The count is reloaded from `kiosk-daily.json`: a restart never resets the day."""
     (tmp_path / "kiosk-daily.json").write_text(
-        json.dumps({SID: {"date": "2026-10-24", "count": 3}, SID2: {"date": "2026-10-23",
-                                                                      "count": 3}})
+        json.dumps(
+            {SID: {"date": "2026-10-24", "count": 3}, SID2: {"date": "2026-10-23", "count": 3}}
+        )
     )
     caplog.set_level(logging.WARNING, logger="crewchat.filters")
 
@@ -986,10 +985,18 @@ def test_discord_crew_equivalent_squawkie_exempt(rig: Rig) -> None:
         # No broker cache at all: Discord and squawkie never need it.
         return [
             await rig.admit(mm("u", "@babel hi", is_bot=False, backend="discord")),
-            await rig.admit(mm("u", "@agents in my thread", root="700000000000000001",
-                               is_bot=True, backend="discord")),
-            await rig.admit(mm("u", "no mention", root="700000000000000001", is_bot=True,
-                               backend="discord")),
+            await rig.admit(
+                mm(
+                    "u",
+                    "@agents in my thread",
+                    root="700000000000000001",
+                    is_bot=True,
+                    backend="discord",
+                )
+            ),
+            await rig.admit(
+                mm("u", "no mention", root="700000000000000001", is_bot=True, backend="discord")
+            ),
             await rig.admit(mm("u", "no mention", is_bot=True, backend="discord"), "pull"),
             await rig.admit(mm("u", "x", backend="squawkie")),
         ]

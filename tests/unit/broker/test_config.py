@@ -31,7 +31,7 @@ def test_trusted_config_parses(tmp_path: Path) -> None:
     bad = [
         # a table form
         '[trusted.otter]\nbroker_user_id = "x"\n',
-        '[trusted]\notter = true\n',
+        "[trusted]\notter = true\n",
         # membership keys inline
         'trusted = [{name = "otter", broker_user_id = "x"}]\n',
         'trusted = [{name = "otter", human_user_ids = ["h"]}]\n',
