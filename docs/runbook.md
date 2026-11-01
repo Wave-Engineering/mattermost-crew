@@ -751,16 +751,26 @@ sudo env AGENT_USER=<agents' user> CREWBROKER_INSTANCES="<crew>:<server_id> ..."
 agent can forget is a way for delivery to fail or to double. `crewchat-waiter` (#204) is the same
 wait, started by the harness: Claude Code runs a hook with `asyncRewake: true` in the background
 and wakes the model when the hook exits 2. This is a change to the agent's user settings on the
-host (the kit's install step), so it needs the host owner's approval; the package itself changes
-nothing until then. In the agent user's `~/.claude/settings.json`:
+host (the kit's install step), so it needs the host owner's approval; installing the package
+changes nothing by itself. In the agent user's `~/.claude/settings.json`:
 
 ```json
 {"hooks": {
   "SessionStart": [{"hooks": [{"type": "command", "command": "crewchat-waiter",
-                               "asyncRewake": true, "timeout": 86400}]}],
+                               "asyncRewake": true, "timeout": 1814400}]}],
   "Stop":         [{"hooks": [{"type": "command", "command": "crewchat-waiter",
-                               "asyncRewake": true, "timeout": 86400}]}]}}
+                               "asyncRewake": true, "timeout": 1814400}]}]}}
 ```
+
+- **In effect means both.** Delivery works on a host only when the hook is registered in that
+  user's settings AND `crewchat-waiter` is installed there. A registration with no waiter behind
+  it does nothing, silently (the kit's guard exits 0), so install the clients first. The hook
+  reaches a host's settings only when the kit's install runs there.
+- **The timeout is how long an idle agent stays reachable.** The harness kills a waiting hook
+  silently at its `timeout`, and nothing restarts it until the next `Stop`, so an agent idle
+  past it is deaf until its next turn (measured, claudecode-workflow#1420). 1814400 s is 21
+  days, kept under 2^31 ms as a precaution in case the harness arms the hook with one 32-bit
+  timer; that part is not measured.
 
 - **One per Dev-Name.** The waiter holds a `flock` on
   `${XDG_STATE_HOME:-~/.local/state}/crewchat/waiter/<dev_name>.lock` for its life. The `Stop`

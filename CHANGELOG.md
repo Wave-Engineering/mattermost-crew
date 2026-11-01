@@ -34,6 +34,12 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **Docs: the `crewchat-waiter` hook timeout is 1814400 s, and "in effect" is stated** (#208).
+  The runbook ("Arm-free delivery") and the `waiter.py` docstring showed `"timeout": 86400`. The
+  harness kills a waiting hook silently at its timeout and only the next `Stop` restarts it, so
+  the timeout is how long an idle agent stays reachable; both now show 21 days and say why.
+  Both also say delivery is in effect only where the hook is registered AND the waiter is
+  installed, and that installing the package changes no settings. No behaviour change.
 - **An agent's own squawk edits, and its own tag, no longer ring it** (#206). A `squawk.updated`
   whose last editor is the agent (squawkie stores the editor's `initials` on every change, and
   `sqtk` signs with the Dev-Name's: uppercase alphanumerics, first 3) rings nothing, live or in
