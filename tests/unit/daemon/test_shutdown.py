@@ -142,9 +142,7 @@ def test_aclose_returns_while_ops_wait(short_dir: Path) -> None:
 
 
 @pytest.mark.parametrize("extra", [b"\n", b"x" * 80 + b"\n"], ids=["blank", "unknown"])
-def test_a_frame_sent_while_an_op_waits_keeps_it_cancellable(
-    short_dir: Path, extra: bytes
-) -> None:
+def test_a_frame_sent_while_an_op_waits_keeps_it_cancellable(short_dir: Path, extra: bytes) -> None:
     """A second frame arriving while a `subscribe` waits doesn't take the op out of
     shutdown's reach: `aclose` still cancels it, and nothing is written (#107)."""
     sock = short_dir / "s.sock"

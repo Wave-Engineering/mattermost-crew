@@ -689,9 +689,7 @@ def test_pushes_squawk_texts(tmp_path: Path) -> None:
     mine = claude / "sqtk-mine.json"
     baseline = claude / "sqtk-baseline.json"
     mine.write_text(json.dumps([{"id": 113, "text": "campaign→main fix"}, {"id": 117}]))
-    baseline.write_text(
-        json.dumps({"113": "older", "117": "q → ", "999": "not mine", "118": 5})
-    )
+    baseline.write_text(json.dumps({"113": "older", "117": "q → ", "999": "not mine", "118": 5}))
 
     async def scenario() -> None:
         await shim.start()
@@ -1132,8 +1130,9 @@ def test_chat_send_to_discord_carries_attach_and_embed(tmp_path: Path) -> None:
 
     async def scenario() -> dict[str, Any]:
         await shim.start()
-        return await shim.chat_send("agent-ops", "see attached", attach_path=str(report),
-                                    embed="Build:green")
+        return await shim.chat_send(
+            "agent-ops", "see attached", attach_path=str(report), embed="Build:green"
+        )
 
     asyncio.run(scenario())
     ups = daemon.of("upload")

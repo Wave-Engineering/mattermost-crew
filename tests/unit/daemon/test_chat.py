@@ -130,9 +130,7 @@ def test_send_goes_to_the_named_backend_and_records_the_thread(h: Harness) -> No
         "thread": "mattermost:dev-1",
     }
     assert h.mm.calls == [("send", "babel", "town", "hi", None)] and h.discord.calls == []
-    reply = h.call(
-        "send", dev_name="babel", backend="discord", to="c", text="re", thread="root9"
-    )
+    reply = h.call("send", dev_name="babel", backend="discord", to="c", text="re", thread="root9")
     assert reply["result"]["thread"] == "root9"
     assert h.threads.roots("babel") == {"mattermost:dev-1", "root9"}
 
@@ -382,9 +380,10 @@ def test_upload_store_mode_and_expiry(tmp_path: Path) -> None:
         except UploadError as err:
             assert err.code == "bad_request", args
         else:
-            assert args[0].endswith("passwd") and store.take("babel", [got["upload_id"]])[
-                0
-            ].name == "passwd"
+            assert (
+                args[0].endswith("passwd")
+                and store.take("babel", [got["upload_id"]])[0].name == "passwd"
+            )
 
 
 def test_clear_stale_removes_leftovers(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -529,9 +528,7 @@ def test_send_and_dm_carry_uploads_and_embeds(daemon: Any, tmp_path: Path) -> No
     # A used, unknown or other agent's upload is refused loudly; nothing is sent.
     calls = len(h.backends["discord"].calls)
     for ids in ([upload_id], ["0" * 32], "nope"):
-        got = h.call(
-            "send", dev_name="babel", backend="discord", to="c", text="x", attachments=ids
-        )
+        got = h.call("send", dev_name="babel", backend="discord", to="c", text="x", attachments=ids)
         assert got["ok"] is False and got["error"].split(":")[0] in ("not_found", "bad_request")
     assert len(h.backends["discord"].calls) == calls
 

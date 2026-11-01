@@ -650,9 +650,7 @@ class Rotator:
         return left
 
 
-def retry_delays(
-    first_s: float = RETRY_FIRST_S, cap_s: float = RETRY_MAX_S
-) -> Iterator[float]:
+def retry_delays(first_s: float = RETRY_FIRST_S, cap_s: float = RETRY_MAX_S) -> Iterator[float]:
     """A failed rotation's retry waits: 5 min, doubling, capped at 1 h."""
     delay = first_s
     while True:

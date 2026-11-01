@@ -181,9 +181,7 @@ class Host:
         self.threads = MyThreads()
         handlers = build_handlers(config, self.registry, {self.dc.name: self.dc})
         handlers.update(
-            build_chat_handlers(
-                self.registry, backends, self.threads, AgentContext(), self.uploads
-            )
+            build_chat_handlers(self.registry, backends, self.threads, AgentContext(), self.uploads)
         )
         self.server = DaemonServer(handlers)
 
@@ -259,7 +257,10 @@ def post(mattermost: Any, post_id: str) -> dict[str, Any]:
 
 # -- IT-04 -------------------------------------------------------------------------------------
 def test_it04_default_resolution_and_headless_squawk(
-    mattermost: Any, setup: dict[str, str], tmp_path: Path, sock_dir: Path  # noqa: F811
+    mattermost: Any,
+    setup: dict[str, str],
+    tmp_path: Path,
+    sock_dir: Path,  # noqa: F811
 ) -> None:
     """IT-04 (R-11)."""
     channel = setup["channel_id"]
@@ -620,8 +621,9 @@ def test_it25_screamhole_unhealthy_refuses_reads(tmp_path: Path, sock_dir: Path)
 
     async def scenario() -> None:
         async with host.serving(sock):
-            shim, _ = make_shim(make_repo(tmp_path, "shim-it25", home_backend="discord"), sock,
-                                tmp_path)
+            shim, _ = make_shim(
+                make_repo(tmp_path, "shim-it25", home_backend="discord"), sock, tmp_path
+            )
             await shim.start()
             assert (await shim.chat_health())["backends"]["discord"]["state"] == "ok"
 
@@ -660,7 +662,10 @@ def test_it25_screamhole_unhealthy_refuses_reads(tmp_path: Path, sock_dir: Path)
 
 # -- IT-16 -------------------------------------------------------------------------------------
 def test_it16_one_contract_across_two_mattermost_servers_and_discord(
-    mattermost: Any, setup: dict[str, str], tmp_path: Path, sock_dir: Path  # noqa: F811
+    mattermost: Any,
+    setup: dict[str, str],
+    tmp_path: Path,
+    sock_dir: Path,  # noqa: F811
 ) -> None:
     """IT-16 (R-09, R-10)."""
     channel = setup["channel_id"]

@@ -141,9 +141,7 @@ def test_send_replaces_an_existing_own_signature(
 ) -> None:
     b = backend(discord, credential)
     run(b.send(ME, C1, "hello\n\n— **hailing-frequencies** 📡 (oaw)"))
-    assert (
-        discord.messages[C1][-1]["content"] == "hello\n\n— **hailing-frequencies** 📡 (oaw) ·p1"
-    )
+    assert discord.messages[C1][-1]["content"] == "hello\n\n— **hailing-frequencies** 📡 (oaw) ·p1"
 
 
 SIG = "— **hailing-frequencies** 📡 (oaw) ·p1"

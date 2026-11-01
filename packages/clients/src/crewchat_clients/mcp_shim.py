@@ -833,9 +833,7 @@ class Shim:
         backend: str | None = None,
         post_id: str | None = None,
     ) -> dict[str, Any]:
-        return await self._read(
-            channel, since=since, limit=limit, backend=backend, post_id=post_id
-        )
+        return await self._read(channel, since=since, limit=limit, backend=backend, post_id=post_id)
 
     async def _read(
         self,
@@ -1004,8 +1002,7 @@ TOOLS: dict[str, str] = {
     "chat_set_default": "Record the human partner's answer: `key` (the repo's forge org, or its "
     "path) uses `backend` (mattermost:<server-id> or discord) by default. Local only.",
     # Discord only (D-108).
-    "chat_list_channels": "Discord only: the guild's channels of `type` (text, voice or "
-    "category).",
+    "chat_list_channels": "Discord only: the guild's channels of `type` (text, voice or category).",
     "chat_resolve": "The ID of `name`. On Discord, give `guild_id`: a channel, user or role "
     "(`type`). On Mattermost (the default, or `backend`), no `guild_id`: a channel, by URL "
     "name or display name, in the agent's team.",

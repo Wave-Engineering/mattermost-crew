@@ -154,9 +154,7 @@ def test_reconnect_after_forced_close(mm: Any, recording_sleep: Any, run: Any) -
     assert recording_sleep.waits == [1]
 
 
-def test_token_rotation_reconnects_with_new_token(
-    mm: Any, recording_sleep: Any, run: Any
-) -> None:
+def test_token_rotation_reconnects_with_new_token(mm: Any, recording_sleep: Any, run: Any) -> None:
     """§4.8: a new token closes the open websocket, which reopens at once on the new token."""
     tokens = Tokens(mm)
     me = tokens.add(DEV)

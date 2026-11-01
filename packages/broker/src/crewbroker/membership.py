@@ -71,9 +71,7 @@ def tag_pattern(tag: str) -> re.Pattern[str]:
     # A dot that joins name characters is part of the token, as crew names may hold dots
     # (`crew-bj.baker` is not `crew-bj`'s; `crew-x.crew-oaw` is not `crew-oaw`'s), but a
     # sentence's closing dot is not (`… crew-oaw.` is). Two lookbehinds: `re` needs each fixed.
-    return re.compile(
-        rf"(?<![\w-])(?<!\w\.){re.escape(tag)}(?![\w-]|\.\w)", re.IGNORECASE
-    )
+    return re.compile(rf"(?<![\w-])(?<!\w\.){re.escape(tag)}(?![\w-]|\.\w)", re.IGNORECASE)
 
 
 def tagged(item: dict[str, Any], pattern: re.Pattern[str]) -> bool:

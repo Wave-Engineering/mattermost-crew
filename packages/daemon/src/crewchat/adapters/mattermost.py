@@ -181,6 +181,7 @@ def require_mm_username(value: str) -> str:
         raise ValueError(f"{value!r} is not a Mattermost username")
     return value.lower()
 
+
 log = logging.getLogger("crewchat.adapters.mattermost")
 
 T = TypeVar("T")
@@ -427,9 +428,7 @@ class MattermostBackend:
         self._clients[dev_name] = _Client(token, client, stack)
         return client
 
-    async def _call(
-        self, dev_name: str, request: Callable[[MattermostClient], Awaitable[T]]
-    ) -> T:
+    async def _call(self, dev_name: str, request: Callable[[MattermostClient], Awaitable[T]]) -> T:
         """Run `request` as `dev_name`; a 401 goes through the store's refresh (R-30)."""
 
         async def with_token(token: str) -> T:

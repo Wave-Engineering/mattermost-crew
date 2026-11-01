@@ -218,9 +218,7 @@ def test_a_register_during_a_retrys_mint_waits_for_it(daemon: Any) -> None:
         block["next_mint"] = True  # the retry's mint blocks, holding the store lock
         first = retry._tasks["babel"]
         await asyncio.wait_for(entered.wait(), 2)
-        newer = asyncio.create_task(
-            handlers["register"]({"dev_name": "babel", "session_id": "s2"})
-        )
+        newer = asyncio.create_task(handlers["register"]({"dev_name": "babel", "session_id": "s2"}))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert first.cancelled()  # the outer task, not the shielded mint

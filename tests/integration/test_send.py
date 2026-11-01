@@ -46,7 +46,8 @@ async def crewchat_send(repo: Path, sock: Path, text: str, *args: str) -> tuple[
 
 
 def test_it27_crewchat_send_posts_as_the_registered_agent(
-    tmp_path: Path, sock_dir: Path  # noqa: F811 (the imported fixture)
+    tmp_path: Path,
+    sock_dir: Path,  # noqa: F811 (the imported fixture)
 ) -> None:
     """IT-27 (#146)."""
     discord = FakeDiscord()

@@ -94,7 +94,7 @@ def test_runbook_broker_is_one_instance_per_crew_and_server() -> None:
     body = runbook_sections()["Install the broker"]
     assert "crewbroker@<crew>-<server_id>" in body
     (script,) = fenced_blocks(body, "bash")
-    assert 'crewbroker@${instance}' in script
+    assert "crewbroker@${instance}" in script
     assert "for entry in $CREWBROKER_INSTANCES" in script
 
 
@@ -255,16 +255,31 @@ def test_partner_guide_covers_per_server_expiry_kiosk_and_review() -> None:
 def test_architecture_states_the_trust_boundaries() -> None:
     text = ARCHITECTURE.read_text(encoding="utf-8")
     parts = dict(sections(text))
-    for needed in ("System context", "Components", "Trust boundaries", "Membership",
-                   "Data paths", "Per backend"):
+    for needed in (
+        "System context",
+        "Components",
+        "Trust boundaries",
+        "Membership",
+        "Data paths",
+        "Per backend",
+    ):
         assert needed in parts, needed
     boundaries = parts["Trust boundaries"]
-    for needed in ("/run/crewchat/crewchat.sock", "`crewchat` user", "`crewbroker` user",
-                   "`crewkiosk` user"):
+    for needed in (
+        "/run/crewchat/crewchat.sock",
+        "`crewchat` user",
+        "`crewbroker` user",
+        "`crewkiosk` user",
+    ):
         assert needed in boundaries, needed
     membership = " ".join(parts["Membership"].split())
-    for needed in ("owner_id", "minted_bot_ids", "Username suffixes are never used",
-                   "No broker ever calls another broker", "that crew's own broker reports"):
+    for needed in (
+        "owner_id",
+        "minted_bot_ids",
+        "Username suffixes are never used",
+        "No broker ever calls another broker",
+        "that crew's own broker reports",
+    ):
         assert needed in membership, needed
     for needed in ("Push (the doorbell)", "Pull (`read`, `thread`)", "Kiosk"):
         assert f"### {needed}" in parts["Data paths"], needed
