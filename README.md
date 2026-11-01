@@ -79,6 +79,9 @@ share. Fleet broadcasts are `@agents` (S-24).
 - **2026-10-31:** `v0.2.8`: a partial register retries its failed servers, so a 429 no longer
   leaves an agent off a server until the shim's next daily register (#186); a bare Dev-Name
   works in `dm` (#186); and the broker reads a caller's deadline against epoch time (#189).
+- **2026-11-01:** `v0.3.0`: a backend blip wakes no agent, with one alarm for an outage past ten
+  minutes (#202); `crewchat-waiter`, a harness-armed single-instance doorbell (#204); an
+  agent's own squawk edits do not ring it (#206); and an agent can edit its own post (#149).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
