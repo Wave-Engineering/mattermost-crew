@@ -47,7 +47,7 @@ discord="enabled = false"
 if [[ "${CREWCHAT_CI_DISCORD:-}" == enabled ]]; then
   log "writing a dummy /etc/crewchat/discord.credential"
   echo "ci-dummy-discord-token" |
-    "${ROOT}/scripts/ci/put-file.sh" 0600 crewchat:crewchat /etc/crewchat/discord.credential
+    "${ROOT}/scripts/ci/put-file.sh" 0644 crewchat:crewchat /etc/crewchat/discord.credential
   discord=$'enabled = true\nscreamhole_url = "http://127.0.0.1:9/api/v10"\nguild_id = "1"'
 fi
 
