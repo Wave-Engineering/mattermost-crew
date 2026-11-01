@@ -23,6 +23,13 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **A backend blip wakes no agent** (#202). `backend.down` and `backend.up` no longer queue on
+  every transition. A backend that is still down after `DEAF_ALARM_S` (600 s) raises one
+  `backend.down` (carrying `since`) and, once back, one `backend.up`; an outage that ends sooner
+  queues nothing. `Doorbell(deaf_alarm_s=0)` raises it at once, as before. The Discord adapter
+  no longer marks scream-hole unhealthy on one failed 2 s `/health` probe: it re-probes after
+  1 s and flips after 3 failures in a row or 10 s of failing, and the first probe waits 5 s.
+
 - **`crewchat serve` is `build()` plus `run()`** (#157). The E2E world runs the same code
   instead of a hand copy, so it now has the pool manifest, the upload store and the daily
   rotation too. On stop, the daemon cancels a switch refresh blocked on a hung broker instead of

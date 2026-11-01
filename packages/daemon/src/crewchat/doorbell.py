@@ -32,10 +32,12 @@ the registration, and squawkie when it is configured (§4.2 step 3).
   queues each event exactly once. Handing it to the agent is at least once (above).
 - **Backend health** (R-27). A stream reports its state through `on_status`; a stream that
   raises or ends counts as down too, and is restarted after a backoff (1 s, doubling, capped at
-  60 s). The first report of an outage enqueues
-  `{"type":"backend.down","backend":b,"reason":...}`, once; the outage's later reports add
-  nothing. The next report that the stream is up enqueues `{"type":"backend.up","backend":b}`.
-  Every other task keeps running throughout.
+  60 s). A blip wakes nobody (#202): the first report of an outage only starts a timer, and an
+  outage that ends before `deaf_alarm_s` (600 s) queues nothing. One that outlasts it enqueues
+  `{"type":"backend.down","backend":b,"reason":...,"since":...}`, once; the outage's later
+  reports add nothing. The report that the stream is up again enqueues
+  `{"type":"backend.up","backend":b}`, but only when that alarm was raised. `deaf_alarm_s=0`
+  raises the alarm at once. Every other task keeps running throughout.
 - The queue holds at most `QUEUE_MAX` events. Past that an event is dropped, loudly in the log;
   a dropped message is not handed over, so its cursor does not move past it.
 - **Stopping** (#152). `detach` cancels each of the agent's tasks, all at once, cancels again
@@ -55,6 +57,7 @@ import io
 import json
 import logging
 import os
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
@@ -75,6 +78,7 @@ from crewchat.tokens import DIR_MODE, write_private_json
 CURSORS_SUBDIR = "cursors"
 RECENT_IDS = 1000  # the IDs a cursor remembers handing over, and the doorbell having queued
 QUEUE_MAX = 1000
+DEAF_ALARM_S = 600.0  # how long a backend stays down before the agent is told it is deaf (#202)
 RESTART_FIRST_S = 1.0
 RESTART_MAX_S = 60.0
 DETACH_RECANCEL_S = 1.0  # how often `detach` cancels again a task that is still running
@@ -133,8 +137,11 @@ def to_event(backend: str, item: StreamItem) -> DoorbellEvent:
     return DoorbellEvent(backend, {**item.payload, "backend": backend}, item.keys, item.ts)
 
 
-def backend_down(backend: str, reason: str) -> DoorbellEvent:
-    return DoorbellEvent(backend, {"type": "backend.down", "backend": backend, "reason": reason})
+def backend_down(backend: str, reason: str, since: float | None = None) -> DoorbellEvent:
+    payload: dict[str, Any] = {"type": "backend.down", "backend": backend, "reason": reason}
+    if since is not None:
+        payload["since"] = since
+    return DoorbellEvent(backend, payload)
 
 
 def backend_up(backend: str) -> DoorbellEvent:
@@ -272,8 +279,12 @@ class Doorbell:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         detach_timeout_s: float = DETACH_TIMEOUT_S,
         detach_recancel_s: float = DETACH_RECANCEL_S,
+        deaf_alarm_s: float = DEAF_ALARM_S,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.sources = dict(sources)
+        self.deaf_alarm_s = deaf_alarm_s
+        self._clock = clock
         self.detach_timeout_s = detach_timeout_s
         self.detach_recancel_s = detach_recancel_s
         self.cursors = cursors
@@ -285,6 +296,10 @@ class Doorbell:
         self._queues: dict[str, asyncio.Queue[DoorbellEvent]] = {}
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._down: dict[tuple[str, str], bool] = {}
+        # An outage's start and first reason, its pending alarm, and the outages that raised one.
+        self._down_since: dict[tuple[str, str], tuple[float, str]] = {}
+        self._alarms: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        self._alarmed: set[tuple[str, str]] = set()
         # IDs queued or handed over in this process, per (agent, backend): never twice (R-28).
         self._handled: dict[tuple[str, str], _Recent] = {}
         # Each agent's event taken but not yet acknowledged, and the lock that makes two
@@ -352,17 +367,61 @@ class Doorbell:
 
     # -- health (R-27) ----------------------------------------------------------------------
     def status(self, dev_name: str, backend: str, up: bool, reason: str = "") -> None:
-        """A stream's state: one `backend.down` per outage, one `backend.up` at its end."""
+        """A stream's state. A blip wakes nobody (#202): an agent cannot repair a backend, and
+        `chat_health` answers on demand. An outage that outlasts `deaf_alarm_s` raises ONE
+        `backend.down` (the original R-27 reason: an agent waiting on a dead backend must
+        learn it is deaf), and its end then one `backend.up`. An outage that ends sooner
+        queues nothing."""
         key = (dev_name, backend)
         down = self._down.get(key, False)
         if not up and not down:
             self._down[key] = True
+            self._down_since[key] = (self._clock(), reason or "unavailable")
             log.warning("backend %s down for %s: %s", backend, dev_name, reason)
-            self._enqueue(dev_name, backend_down(backend, reason or "unavailable"))
+            self._arm_alarm(key)
         elif up and down:
             self._down[key] = False
+            self._down_since.pop(key, None)
+            self._cancel_alarm(key)
             log.info("backend %s up again for %s", backend, dev_name)
-            self._enqueue(dev_name, backend_up(backend))
+            if key in self._alarmed:
+                self._alarmed.discard(key)
+                self._enqueue(dev_name, backend_up(backend))
+
+    def _arm_alarm(self, key: tuple[str, str]) -> None:
+        """Schedule the outage's one alarm; at once when `deaf_alarm_s` is 0 (or no loop runs)."""
+        if self.deaf_alarm_s > 0:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self._alarms[key] = loop.call_later(self.deaf_alarm_s, self._raise_alarm, key)
+                return
+        self._raise_alarm(key)
+
+    def _raise_alarm(self, key: tuple[str, str]) -> None:
+        self._alarms.pop(key, None)
+        outage = self._down_since.get(key)
+        if not self._down.get(key, False) or outage is None or key in self._alarmed:
+            return
+        self._alarmed.add(key)
+        since, reason = outage
+        self._enqueue(key[0], backend_down(key[1], reason, since))
+
+    def _cancel_alarm(self, key: tuple[str, str]) -> None:
+        handle = self._alarms.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _forget_health(self, dev_name: str) -> None:
+        """`dev_name` left: drop its pending alarms and outage state, so a later attach to a
+        backend that is still down starts a fresh outage."""
+        for key in [k for k in self._down if k[0] == dev_name]:
+            self._cancel_alarm(key)
+            self._down.pop(key, None)
+            self._down_since.pop(key, None)
+            self._alarmed.discard(key)
 
     def is_down(self, dev_name: str, backend: str) -> bool:
         return self._down.get((dev_name, backend), False)
@@ -505,11 +564,14 @@ class Doorbell:
     async def detach(self, dev_name: str) -> None:
         """Stop every task of `dev_name`'s, concurrently: bounded by one `detach_timeout_s`."""
         popped = [self._tasks.pop(k) for k in [k for k in self._tasks if k[0] == dev_name]]
+        self._forget_health(dev_name)
         await asyncio.gather(*(self._stop_task(t) for t in popped))
 
     async def aclose(self) -> None:
         """Stop every agent's tasks, all agents at once: bounded by one `detach_timeout_s`."""
         await asyncio.gather(*(self.detach(d) for d in {d for d, _ in self._tasks}))
+        for dev_name in {d for d, _ in self._down}:
+            self._forget_health(dev_name)
 
     # -- token hooks (crewchat.tokens.Adapter) ----------------------------------------------
     async def on_token_rotated(self, dev_name: str) -> None:
