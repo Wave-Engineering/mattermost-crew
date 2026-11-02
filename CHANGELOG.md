@@ -7,6 +7,20 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`crewchat-waiter`: one wake delivers every queued event (#212).** While an agent was busy,
+  further events queued in the daemon and each cost a wake of its own (a hook round-trip, a
+  context re-read, a turn), and the agent never saw them together. After the first event the
+  waiter now keeps asking for the next with a short budget until the queue is empty, and wakes
+  once with all of them as a numbered list, oldest first, under a header giving the count; a
+  single event is the text it always was. `CREWCHAT_WAITER_BATCH_WINDOW_S` (default 1.0 s; `0`
+  turns batching off) and `CREWCHAT_WAITER_BATCH_MAX` (default 20, plus a 16 KB text budget)
+  bound it; past either the text says more may be queued and the rest arrive on the next wake.
+  Ids go into the seen set only after the whole text is written, and a daemon outage mid-collection
+  delivers what was already received. No daemon, hook or settings change. A lone event now wakes
+  an idle agent about one window later than before; `CREWCHAT_WAITER_BATCH_WINDOW_S=0` restores
+  that. Events the waiter holds while it waits out the window are in its memory only: a waiter
+  killed in that window, or a failed write to stderr, loses them (up to 20, where it was one), and a
+  reply landing exactly as the window times out can be acked and lost; the runbook says so.
 - **`main` now requires CI to pass (#213).** It had no required status checks: the org-level ruleset
   applied, but the per-repo branch protection every other Wave-Engineering repo carries was never set,
   so the platform would have let a red PR merge. A new `ci-gate` job in `ci.yml` needs every other
