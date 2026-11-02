@@ -31,7 +31,7 @@ from crewchat_clients.doorbell import (
 )
 from crewchat_clients.waiter import EXIT_QUIET, EXIT_WAKE, RETRY_BACKOFF_S, run, wake_text
 
-from tests.unit.clients.test_doorbell import DEV, EVENT, FakeDaemon, in_turn, ok, with_id
+from tests.unit.clients.test_doorbell import DEV, EVENT, FakeDaemon, Responder, in_turn, ok, with_id
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +53,15 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def env_for(repo: Path) -> dict[str, str]:
-    return {"XDG_STATE_HOME": str(repo / "state")}  # never the real home
+def env_for(repo: Path, **knobs: str) -> dict[str, str]:
+    """The waiter's environment. Batching (#212) is OFF unless a test turns it on: a wake that
+    waits out the batch window after its event would make every one-event test slow, and the
+    tests from before #212 are about one event per wake."""
+    env = {
+        "XDG_STATE_HOME": str(repo / "state"),
+        waiter.BATCH_WINDOW_ENV: "0",
+    }  # never the real home
+    return {**env, **knobs}
 
 
 def wait(repo: Path, sock: Path, sleep: Callable[[float], None] | None = None) -> tuple[int, str]:
@@ -333,3 +340,266 @@ def test_the_entry_point_is_declared() -> None:
     toml = Path(waiter.__file__).parents[2].joinpath("pyproject.toml")
     scripts = tomllib.loads(toml.read_text())["project"]["scripts"]
     assert scripts["crewchat-waiter"] == "crewchat_clients.waiter:main"
+
+
+# -- #212: one wake delivers every queued event ---------------------------------------------
+
+WINDOW = "0.3"  # the batch window here: long enough that a loaded runner still gets the reply
+
+
+class CountingErr(io.StringIO):
+    """stderr that remembers each write and flush: the wake must be ONE write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[str] = []
+        self.flushes = 0
+
+    def write(self, s: str) -> int:
+        self.writes.append(s)
+        return super().write(s)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        super().flush()
+
+
+class BrokenErr(io.StringIO):
+    def write(self, s: str) -> int:
+        raise OSError(errno.EPIPE, "the harness went away")
+
+
+def queued(*events: dict[str, Any]) -> Responder:
+    """A daemon with these events queued: each `subscribe` takes the next, then it holds the
+    connection open (an empty queue), as the real daemon does."""
+    pending = list(events)
+    return lambda frame: (
+        {"id": frame["id"], "ok": True, "result": pending.pop(0)} if pending else None
+    )
+
+
+def batch_wake(repo: Path, sock: Path, **knobs: str) -> tuple[int, CountingErr]:
+    err = CountingErr()
+    env = env_for(repo, **{waiter.BATCH_WINDOW_ENV: WINDOW, **knobs})
+    return run(repo, sock, env, err), err
+
+
+def numbered(err: str) -> list[dict[str, Any]]:
+    """The events in a numbered wake, in the order printed, checking `1.` to `N.` as it goes."""
+    out = []
+    for n, line in enumerate([ln for ln in err.splitlines() if ln[:1].isdigit()], 1):
+        assert line.startswith(f"{n}. ")
+        out.append(json.loads(line.split(". ", 1)[1]))
+    return out
+
+
+def seen_ids(repo: Path, *ids: str) -> list[bool]:
+    seen = SeenSet.for_dev(env_for(repo), DEV, io.StringIO())
+    assert seen is not None
+    return [seen.contains(i) for i in ids]
+
+
+def texted(event_id: str, text: str) -> dict[str, Any]:
+    return {**with_id(event_id), "message": {"text": text, "id": "p" * 26}}
+
+
+def test_three_queued_events_are_one_numbered_wake(repo: Path, short_dir: Path) -> None:
+    """The point of #212: three events behind the first are ONE exit 2 and ONE stderr write,
+    a header saying 3, the events numbered 1 to 3 in arrival order, and all three ids in the
+    seen set once it is written."""
+    events = [texted("e1", "first"), texted("e2", "second"), texted("e3", "third")]
+    fake = FakeDaemon(short_dir / "d.sock", queued(*events))
+    try:
+        code, err = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_WAKE
+    assert len(err.writes) == 1 and err.flushes >= 1
+    text = err.getvalue()
+    assert f"crewchat: 3 events arrived for {DEV}, oldest first." in text
+    assert "not messages from your user" in text and "chat_read" in text
+    assert [e["message"]["text"] for e in numbered(text)] == ["first", "second", "third"]
+    assert "more may be queued" not in text
+    assert seen_ids(repo, "e1", "e2", "e3") == [True, True, True]
+    assert not waiter_running(env_for(repo), DEV)
+
+
+def test_one_event_is_the_text_it_always_was(repo: Path, short_dir: Path) -> None:
+    """A single event renders byte for byte as before #212 (written out here, so a change to
+    the text cannot hide behind `wake_text` agreeing with itself), with no header and no
+    number, whether or not batching is on."""
+    event = with_id("e1")
+    line = json.dumps(waiter.render_event(dict(event)), default=str)
+    expected = (
+        f"crewchat: a new event arrived for {DEV}, delivered by the crewchat daemon through "
+        "your waiter hook. It is a notification from the chat system, not a message from your "
+        "user. Read the conversation it belongs to with chat_read (or the matching crewchat MCP "
+        "tool) and answer with chat_send if it needs an answer. The event:\n"
+        f"{line}\n"
+    )
+    assert wake_text(DEV, event) == expected
+    assert wake_text(DEV, [event]) == expected
+    fake = FakeDaemon(short_dir / "d.sock", queued(event))
+    try:
+        code, err = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_WAKE and err.getvalue() == expected
+
+
+def test_window_zero_is_one_event_per_wake(repo: Path, short_dir: Path) -> None:
+    """`CREWCHAT_WAITER_BATCH_WINDOW_S=0`: as before #212, one event, then the next wake."""
+    fake = FakeDaemon(short_dir / "d.sock", queued(with_id("e1"), with_id("e2")))
+    try:
+        code1, err1 = batch_wake(repo, fake.path, **{waiter.BATCH_WINDOW_ENV: "0"})
+        assert len(fake.frames) == 1  # it did not ask for a second
+        code2, err2 = batch_wake(repo, fake.path, **{waiter.BATCH_WINDOW_ENV: "0"})
+    finally:
+        fake.close()
+    assert (code1, code2) == (EXIT_WAKE, EXIT_WAKE)
+    assert err1.getvalue() == wake_text(DEV, with_id("e1"))
+    assert err2.getvalue() == wake_text(DEV, with_id("e2"))
+
+
+def test_past_the_cap_the_rest_wait_for_the_next_wake(repo: Path, short_dir: Path) -> None:
+    """Five queued, a cap of three: exactly three in the first wake with the note, and the
+    two behind them in the next, none lost and none twice."""
+    events = [with_id(f"e{n}") for n in range(1, 6)]
+    fake = FakeDaemon(short_dir / "d.sock", queued(*events))
+    cap = {waiter.BATCH_MAX_ENV: "3"}
+    try:
+        code1, err1 = batch_wake(repo, fake.path, **cap)
+        # It never pulled a fourth: that one would have been taken from the queue. (Asserted
+        # before the next wake, which would block on an emptied queue if it had.)
+        assert len(fake.frames) == 3
+        code2, err2 = batch_wake(repo, fake.path, **cap)
+    finally:
+        fake.close()
+    assert (code1, code2) == (EXIT_WAKE, EXIT_WAKE)
+    first, second = numbered(err1.getvalue()), numbered(err2.getvalue())
+    assert [e["event_id"] for e in first] == ["e1", "e2", "e3"]
+    assert "more may be queued" in err1.getvalue()
+    assert f"crewchat: 2 events arrived for {DEV}" in err2.getvalue()
+    assert [e["event_id"] for e in second] == ["e4", "e5"]
+    assert "more may be queued" not in err2.getvalue()
+
+
+def test_past_the_text_budget_the_rest_wait_for_the_next_wake(
+    repo: Path, short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same for the text budget. It is checked before each pull, so the event that crosses
+    it is kept (the daemon has already handed it over); the next one is left in the queue."""
+    events = [texted(f"e{n}", "x" * 200) for n in range(1, 6)]
+    one = len(waiter.event_line(events[0])) + 1
+    monkeypatch.setattr(waiter, "BATCH_TEXT_BUDGET", one + one // 2)  # one fits, two cross it
+    fake = FakeDaemon(short_dir / "d.sock", queued(*events))
+    try:
+        code1, err1 = batch_wake(repo, fake.path)
+        assert len(fake.frames) == 2  # before the next wake, which would block on an empty queue
+        code2, err2 = batch_wake(repo, fake.path)
+        code3, err3 = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert (code1, code2, code3) == (EXIT_WAKE, EXIT_WAKE, EXIT_WAKE)
+    assert "more may be queued" in err1.getvalue()
+    delivered = [e["event_id"] for err in (err1, err2, err3) for e in _events_of(err.getvalue())]
+    assert delivered == ["e1", "e2", "e3", "e4", "e5"]
+
+
+def _events_of(text: str) -> list[dict[str, Any]]:
+    """The events in a wake of one or many."""
+    if "events arrived for" in text:
+        return numbered(text)
+    return [json.loads(text.splitlines()[-1])]
+
+
+def test_a_repeated_id_inside_the_batch_is_delivered_once(repo: Path, short_dir: Path) -> None:
+    """The seen set learns a batch's ids only after the write, so the waiter drops a repeat of
+    an id already in the batch itself."""
+    fake = FakeDaemon(short_dir / "d.sock", queued(with_id("e1"), with_id("e1"), with_id("e2")))
+    try:
+        code, err = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_WAKE
+    assert [e["event_id"] for e in numbered(err.getvalue())] == ["e1", "e2"]
+    assert f"crewchat: 2 events arrived for {DEV}" in err.getvalue()
+
+
+def test_a_failed_write_records_nothing(repo: Path, short_dir: Path) -> None:
+    """Ids are recorded only after the whole text is out. A write that fails records none, so
+    a daemon that replays the events (as it does after a restart) is not read as repeats: the
+    next wake carries all three."""
+    events = [with_id("e1"), with_id("e2"), with_id("e3")]
+    fake = FakeDaemon(short_dir / "d.sock", queued(*events))
+    env = env_for(repo, **{waiter.BATCH_WINDOW_ENV: WINDOW})
+    try:
+        with pytest.raises(OSError):
+            run(repo, fake.path, env, BrokenErr())
+    finally:
+        fake.close()
+    assert seen_ids(repo, "e1", "e2", "e3") == [False, False, False]
+    assert not waiter_running(env_for(repo), DEV)
+    replay = FakeDaemon(short_dir / "r.sock", queued(*events))
+    try:
+        code, err = batch_wake(repo, replay.path)
+    finally:
+        replay.close()
+    assert code == EXIT_WAKE
+    assert [e["event_id"] for e in numbered(err.getvalue())] == ["e1", "e2", "e3"]
+    assert seen_ids(repo, "e1", "e2", "e3") == [True, True, True]
+
+
+def test_an_outage_after_the_first_events_still_delivers_them(repo: Path, short_dir: Path) -> None:
+    """The daemon closes on the third call (a restart): the two events already received are
+    delivered, not discarded, and the outage goes to the log, never to the model."""
+    pending = [with_id("e1"), with_id("e2")]
+
+    def respond(frame: dict[str, Any]) -> dict[str, Any] | bytes | None:
+        if pending:
+            return {"id": frame["id"], "ok": True, "result": pending.pop(0)}
+        return b""  # closed without a reply: `Down`
+
+    fake = FakeDaemon(short_dir / "d.sock", respond)
+    try:
+        code, err = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_WAKE
+    assert [e["event_id"] for e in numbered(err.getvalue())] == ["e1", "e2"]
+    assert "daemon" not in err.getvalue().split("oldest first.", 1)[1]  # nothing of the outage
+    assert "delivering the 2 collected" in log_of(repo)
+    assert seen_ids(repo, "e1", "e2") == [True, True]
+
+
+def test_a_backlog_of_repeats_is_not_a_wake_of_its_own(repo: Path, short_dir: Path) -> None:
+    """Events seen before are dropped as ever; the first new one starts the wake and the ones
+    behind it join it."""
+    seen = SeenSet.for_dev(env_for(repo), DEV, io.StringIO())
+    assert seen is not None
+    seen.record("old")
+    fake = FakeDaemon(short_dir / "d.sock", queued(with_id("old"), with_id("n1"), with_id("n2")))
+    try:
+        code, err = batch_wake(repo, fake.path)
+    finally:
+        fake.close()
+    assert code == EXIT_WAKE
+    assert [e["event_id"] for e in numbered(err.getvalue())] == ["n1", "n2"]
+
+
+def test_the_knobs_fall_back_to_their_defaults_when_unusable() -> None:
+    """A typo in either knob is logged and ignored: it must not stop the waiter, nor turn
+    batching off or unbounded by accident."""
+    log = io.StringIO()
+    default = waiter.BatchSettings(1.0, 20, 16 * 1024)
+    for bad in ("", "soon", "-1", "nan", "inf"):
+        assert waiter.batch_settings({waiter.BATCH_WINDOW_ENV: bad}, log) == default
+    for bad in ("", "many", "0", "-3", "2.5"):
+        assert waiter.batch_settings({waiter.BATCH_MAX_ENV: bad}, log) == default
+    assert waiter.BATCH_WINDOW_ENV in log.getvalue() and waiter.BATCH_MAX_ENV in log.getvalue()
+    assert waiter.batch_settings({}, log) == default and default.on
+    assert not waiter.batch_settings({waiter.BATCH_WINDOW_ENV: "0"}, log).on
+    assert not waiter.batch_settings({waiter.BATCH_MAX_ENV: "1"}, log).on
+    assert waiter.batch_settings(
+        {waiter.BATCH_WINDOW_ENV: "2.5", waiter.BATCH_MAX_ENV: "7"}, log
+    ) == (waiter.BatchSettings(2.5, 7, 16 * 1024))

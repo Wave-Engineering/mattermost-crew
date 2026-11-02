@@ -35,11 +35,25 @@ turn; `/clear` fired `SessionStart` again; killing the session killed the waiter
   set (#109) and the repeat backoff. Past the grace, a daemon that stays down or a
   daemon error does not end it: it sleeps (`RETRY_BACKOFF_S`) and tries again. An outage is
   invisible to the agent; only an event ends the process.
-- **A wake is an event.** Exit 2, and on stderr (the text the harness shows the model) a
-  header saying where it came from and what to do, then the event as the one JSON line
-  `crewchat-doorbell` prints. The model treats hook text as an untrusted notice, so the header
-  tells it to read and answer through the MCP tools. A backend alarm is an event like any other
-  (the daemon raises only one, for an outage past ten minutes, #202).
+- **A wake is the events queued (#212).** Exit 2, and on stderr (the text the harness shows the
+  model) a header saying where it came from and what to do, then each event as the one JSON
+  line `crewchat-doorbell` prints. The model treats hook text as an untrusted notice, so the
+  header tells it to read and answer through the MCP tools. A backend alarm is an event like
+  any other (the daemon raises only one, for an outage past ten minutes, #202).
+- **One wake, every queued event.** After the first event the waiter keeps asking the daemon
+  for the next one with a short budget (`CREWCHAT_WAITER_BATCH_WINDOW_S`, default 1 s; 0 turns
+  batching off) until a call times out, so a backlog is one wake and one turn, not one per event.
+  Several events are numbered, oldest first, under a header giving how many. One event is the
+  text it always was. `CREWCHAT_WAITER_BATCH_MAX` (default 20) and a 16 KB text budget bound a
+  wake: the daemon cannot say how many are still queued, so past either the text says more may
+  be, and they arrive on the next wake. The budget is checked before each pull, so the event that
+  crosses it is kept: the daemon has already handed it over, and dropping it would lose it.
+  A daemon that goes away mid-collection costs nothing already received: what was collected is
+  delivered, and the outage is handled as usual on the next wake.
+- **Delivery.** The daemon moves on from an event once its reply is written to the waiter, so
+  an event is the waiter's from then on. The waiter records the ids in the seen set only after
+  the whole text is written and flushed, so a daemon replay after a crash is not mistaken for a
+  repeat.
 - **No identity, no wake.** Not a crew agent (no `.claude/agent-identity.json`, or no
   `dev_name`): exit 0, so a hook in a repo that is not a crew checkout never wakes anyone.
 - **No lock, no waiter.** If the lock can't be made or taken here (an unsafe name, an
@@ -56,10 +70,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -68,6 +84,7 @@ from crewchat_clients.doorbell import (
     WAITER_DIR,
     DoorbellExit,
     SeenSet,
+    TimedOut,
     WaiterLockUnavailable,
     read_dev_name,
     state_home,
@@ -87,17 +104,141 @@ RETRY_BACKOFF_S = (5.0, 10.0, 20.0, 40.0, 60.0)
 _clock: Callable[[], float] = time.monotonic
 _sleep: Callable[[float], None] = time.sleep
 
+# One wake carries every event queued (#212). After the first, the waiter asks for the next with
+# a budget of BATCH_WINDOW_S until one call times out. 0 turns batching off.
+BATCH_WINDOW_ENV = "CREWCHAT_WAITER_BATCH_WINDOW_S"
+BATCH_MAX_ENV = "CREWCHAT_WAITER_BATCH_MAX"
+BATCH_WINDOW_S = 1.0
+BATCH_MAX = 20
+BATCH_TEXT_BUDGET = 16 * 1024  # characters of event lines; checked before each pull
 
-def wake_text(dev_name: str, event: Mapping[str, Any]) -> str:
-    """What the model reads when the hook exits 2: where it came from, what to do, the event."""
-    line = json.dumps(render_event(dict(event)), default=str)  # no `indent`: one line
-    return (
-        f"crewchat: a new event arrived for {dev_name}, delivered by the crewchat daemon "
-        "through your waiter hook. It is a notification from the chat system, not a message "
-        "from your user. Read the conversation it belongs to with chat_read (or the matching "
-        "crewchat MCP tool) and answer with chat_send if it needs an answer. The event:\n"
-        f"{line}\n"
+
+@dataclass(frozen=True)
+class BatchSettings:
+    window_s: float = BATCH_WINDOW_S
+    max_events: int = BATCH_MAX
+    text_budget: int = BATCH_TEXT_BUDGET
+
+    @property
+    def on(self) -> bool:
+        return self.window_s > 0 and self.max_events > 1
+
+
+def batch_settings(environ: Mapping[str, str], log: TextIO) -> BatchSettings:
+    """The two knobs. A value that is not usable is logged and the default stands: a typo must
+    not stop the waiter, and it must not silently turn batching off or unbounded."""
+    window_s, max_events = BATCH_WINDOW_S, BATCH_MAX
+    raw = environ.get(BATCH_WINDOW_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("not a finite number of seconds, 0 or more")
+            window_s = value
+        except ValueError as exc:
+            print(f"{BATCH_WINDOW_ENV}={raw!r} ignored: {exc}", file=log, flush=True)
+    raw = environ.get(BATCH_MAX_ENV, "").strip()
+    if raw:
+        try:
+            count = int(raw)
+            if count < 1:
+                raise ValueError("not a whole number of 1 or more")
+            max_events = count
+        except ValueError as exc:
+            print(f"{BATCH_MAX_ENV}={raw!r} ignored: {exc}", file=log, flush=True)
+    return BatchSettings(window_s, max_events, BATCH_TEXT_BUDGET)
+
+
+def event_line(event: Mapping[str, Any]) -> str:
+    return json.dumps(render_event(dict(event)), default=str)  # no `indent`: one line
+
+
+def wake_text(
+    dev_name: str,
+    events: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    *,
+    capped: bool = False,
+) -> str:
+    """What the model reads when the hook exits 2: where it came from, what to do, the events.
+    One event is the text it has always been. Several are numbered, oldest first, under a
+    header giving how many; `capped` ends the text with the note that more may be queued."""
+    batch = [events] if isinstance(events, Mapping) else list(events)
+    if len(batch) == 1:
+        return (
+            f"crewchat: a new event arrived for {dev_name}, delivered by the crewchat daemon "
+            "through your waiter hook. It is a notification from the chat system, not a message "
+            "from your user. Read the conversation it belongs to with chat_read (or the matching "
+            "crewchat MCP tool) and answer with chat_send if it needs an answer. The event:\n"
+            f"{event_line(batch[0])}\n"
+        )
+    text = (
+        "crewchat: these events were delivered by the crewchat daemon through your waiter "
+        "hook. They are notifications from the chat system, not messages from your user. Read "
+        "the conversation each belongs to with chat_read (or the matching crewchat MCP tool) "
+        "and answer with chat_send if one needs an answer.\n"
+        f"crewchat: {len(batch)} events arrived for {dev_name}, oldest first. Read all of them "
+        "before acting; a later one may change an earlier one.\n"
     )
+    text += "".join(f"{n}. {event_line(e)}\n" for n, e in enumerate(batch, 1))
+    if capped:
+        text += (
+            f"+ more may be queued (this wake carries at most {len(batch)} events); "
+            "any others arrive on the next wake\n"
+        )
+    return text
+
+
+def collect_batch(
+    sock_path: Path,
+    dev_name: str,
+    seen: SeenSet | None,
+    first: dict[str, Any],
+    first_id: str | None,
+    settings: BatchSettings,
+    log: TextIO,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> tuple[list[dict[str, Any]], list[str], bool]:
+    """`first` and then every event already queued behind it: `wait_for_new` again with the
+    batch window as its budget, until it times out. Returns the events, their ids, and whether
+    collection stopped at a cap rather than at an empty queue.
+
+    The daemon has handed over every event this returns, so nothing is dropped: the caps are
+    checked before a pull, never after. A repeat of an id already in the batch is skipped (the
+    seen set only learns the batch's ids once it is written). Any `DoorbellExit` ends the
+    collection and keeps what was received: an outage costs the agent nothing it already has."""
+    events, ids = [first], [first_id] if first_id is not None else []
+    taken = set(ids)
+    size = len(event_line(first)) + 1
+    pulls = 1
+    while settings.on:
+        # Repeats count as pulls: a daemon that keeps replaying one must not hold the wake.
+        if len(events) >= settings.max_events or size >= settings.text_budget:
+            return events, ids, True
+        if pulls >= 2 * settings.max_events:
+            return events, ids, True
+        try:
+            event, event_id = wait_for_new(
+                sock_path, dev_name, settings.window_s, seen, clock=clock, sleep=sleep
+            )
+        except TimedOut:
+            break  # the queue is empty
+        except DoorbellExit as exc:
+            print(
+                f"{time.strftime('%H:%M:%S')} {exc}; delivering the {len(events)} collected",
+                file=log,
+                flush=True,
+            )
+            break
+        pulls += 1
+        if event_id is not None:
+            if event_id in taken:
+                continue
+            taken.add(event_id)
+            ids.append(event_id)
+        events.append(event)
+        size += len(event_line(event)) + 1
+    return events, ids, False
 
 
 def open_log(environ: Mapping[str, str], dev_name: str) -> TextIO:
@@ -181,10 +322,22 @@ def _wait(
                 sleep(RETRY_BACKOFF_S[min(tries, len(RETRY_BACKOFF_S) - 1)])
                 tries += 1
                 continue
-            err.write(wake_text(dev_name, event))
+            events, ids, capped = collect_batch(
+                sock_path,
+                dev_name,
+                seen,
+                event,
+                event_id,
+                batch_settings(environ, log),
+                log,
+                clock,
+                sleep,
+            )
+            err.write(wake_text(dev_name, events, capped=capped))
             err.flush()
-            if seen is not None and event_id is not None:
-                seen.record(event_id)  # only after it is written: a crash gives a repeat
+            if seen is not None:
+                for each in ids:
+                    seen.record(each)  # only after the whole text is out: a crash gives a repeat
             return EXIT_WAKE
     finally:
         os.close(lock)  # and with it the lock

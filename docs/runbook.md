@@ -778,6 +778,28 @@ changes nothing by itself. In the agent user's `~/.claude/settings.json`:
   a sound. Only exit 2 wakes the model. A session that dies takes its waiter and the lock with it.
 - **Wake.** Exit 2 with a header and the event on stderr. A message that arrives while the agent
   is mid-turn is folded into that turn; one that arrives while it is idle starts a turn.
+- **One wake, every queued event (#212).** Events queue in the daemon while the agent is busy;
+  one event per wake would cost a turn each, and the agent would never see them together (a
+  "cancel" could arrive after the action it cancels). So after the first event the waiter keeps
+  asking the daemon for the next with a short budget until one call times out, and delivers all
+  of them in ONE stderr write and ONE exit 2. Several events are numbered `1.` to `N.`, oldest
+  first, under a header giving N and telling the agent to read all of them before acting; one
+  event is the text it always was. A repeat of an id inside the batch is delivered once. No
+  daemon or hook change is involved. Two knobs, read from the waiter's environment at each wake
+  (set them where the hook runs):
+  - `CREWCHAT_WAITER_BATCH_WINDOW_S` (default `1.0`): how long the waiter waits for one more
+    event after the last. `0` turns batching off: one event per wake, as before #212. An unusable
+    value is ignored (default) and noted in the log.
+  - `CREWCHAT_WAITER_BATCH_MAX` (default `20`): most events in a wake. A 16 KB text budget also
+    bounds it, checked before each pull, so the event that crosses it is kept. Past either, the
+    text ends `+ more may be queued ...` and the rest arrive on the next wake, none dropped. (The
+    daemon cannot say how many are still queued, so the line says "may be" and gives no count.)
+  - Cost: a wake waits one window after the last event before it fires, so a lone event wakes
+    an idle agent about `CREWCHAT_WAITER_BATCH_WINDOW_S` seconds later than before.
+  - Delivery: the ids are recorded in the seen set only after the whole text is written and
+    flushed. The daemon itself moves on from an event once its reply is written to the waiter,
+    so the events the waiter holds while it waits out the window are the waiter's: a waiter
+    killed inside that window (the session ending) takes them with it.
 - **An outage is invisible.** A daemon restart or a flap does not end the waiter; it retries
   (5 s, doubling to 60 s) and the first event after the daemon returns wakes the agent. What it
   hit is in `.../crewchat/waiter/<dev_name>.log` (cleared past 64 KiB), never in the wake.
