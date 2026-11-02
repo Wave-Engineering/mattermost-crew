@@ -133,3 +133,18 @@ jobs:
           name: reports-${{ matrix.leg }}
           path: reports/
           if-no-files-found: error
+
+  # The one check branch protection requires on `main` (#213). The jobs above are not named there:
+  # an image bump renames a matrix leg, and a required check that stops reporting blocks every PR.
+  # `if: always()` so it still runs, and reports, when a job it needs failed or was cancelled; it is
+  # green only if all of them succeeded. Add any new job to `needs`; a test fails if one is missing.
+  gate:
+    name: ci-gate
+    if: always()
+    needs: [unit, install, ci]
+    runs-on: ${{ vars.OAW_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: every job passed
+        run: ./scripts/ci/gate.sh unit=${{ needs.unit.result }} install=${{ needs.install.result }} ci=${{ needs.ci.result }}
