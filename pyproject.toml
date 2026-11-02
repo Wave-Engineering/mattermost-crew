@@ -1,6 +1,6 @@
 [project]
 name = "mattermost-crew"
-version = "0.3.0"
+version = "0.4.0"
 description = "Workspace root for the Mattermost program: the chat daemon, the broker and the thin clients."
 requires-python = ">=3.12"
 dependencies = [

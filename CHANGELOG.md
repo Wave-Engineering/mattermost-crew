@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-02
+
+The waiter batches. `crewchat-waiter` now wakes an agent once with every event that queued while it
+was busy, as a numbered list, instead of one wake per event. The rest is CI: `main` requires a
+`ci-gate` check, and the CI legs no longer flake on a fresh runner's apt lock.
+
+**Rollback.** No config change is needed to go back to v0.3.0: v0.4.0 adds no required setting and
+no file, and changes no daemon, hook or settings. To keep v0.4.0 but get one event per wake again,
+set `CREWCHAT_WAITER_BATCH_WINDOW_S=0` where the hook runs. Installing v0.4.0 on a host replaces
+`crewchat-waiter` for the next arm, so no daemon restart is needed for it.
+
 ### Added
 - **`crewchat-waiter`: one wake delivers every queued event (#212).** While an agent was busy,
   further events queued in the daemon and each cost a wake of its own (a hook round-trip, a
@@ -27,6 +38,14 @@ All notable changes to this project are recorded here. The format follows
   job and passes only if all succeeded (`scripts/ci/gate.sh`), and branch protection requires
   `ci-gate` alone, with `strict: true`. The `ci` matrix legs are deliberately not named in the
   protection: an image bump renames a leg, and a required check that stops reporting blocks every PR.
+
+### Fixed
+- **`host-prereqs.sh` retries `apt-get` on the lists lock (#220).** About one CI leg in three failed
+  with "Could not get lock /var/lib/apt/lists/lock": a fresh ephemeral VM still has the image's own
+  `apt-get` running for its first minute, and `DPkg::Lock::Timeout` waits for dpkg's lock, not that
+  one. `apt_retry` retries up to `HOST_PREREQS_APT_ATTEMPTS` times (12, 10 s apart) only when apt's
+  output says it could not get a lock (not on "Permission denied", not on any other failure), and the
+  dpkg wait inside each try is cut to 30 s so a lock that never clears stays bounded.
 
 ## [0.3.0] — 2026-11-01
 
