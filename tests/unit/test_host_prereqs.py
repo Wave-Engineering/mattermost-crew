@@ -9,6 +9,7 @@ host.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,9 @@ case "${FAKE_APT_MODE:-ok}" in
     exit 100 ;;
   real-error)
     echo "E: Unable to locate package acl" >&2
+    exit 100 ;;
+  perm-denied)
+    echo "E: Could not get lock /var/lib/dpkg/lock-frontend - open (13: Permission denied)" >&2
     exit 100 ;;
 esac
 if [ "$sub" = install ] && [ -z "${FAKE_APT_NO_SETFACL:-}" ]; then
@@ -108,6 +112,21 @@ def test_a_real_apt_failure_is_not_retried(host: Host) -> None:
     assert host.calls() == ["update"]  # one attempt, no retry on an error that is not a lock
     assert "Unable to locate package acl" in r.stderr
     assert "apt is locked" not in r.stderr
+
+
+def test_a_permission_denied_lock_error_is_not_retried(host: Host) -> None:
+    """Waiting cannot fix a missing root or sudo, so a lock error that is EACCES fails at once."""
+    r = host.run("perm-denied")
+    assert r.returncode != 0
+    assert host.calls() == ["update"]
+    assert "Permission denied" in r.stderr and "apt is locked" not in r.stderr
+
+
+def test_the_dpkg_lock_wait_stays_short_so_retries_do_not_multiply_it() -> None:
+    """12 tries around a 120 s wait would near the job's 30 minutes on a lock that never clears."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    waits = [int(n) for n in re.findall(r"DPkg::Lock::Timeout=(\d+)", text)]
+    assert waits and max(waits) <= 30, waits
 
 
 def test_nothing_to_install_never_calls_apt(host: Host) -> None:

@@ -43,7 +43,9 @@ apt_retry() {
       rm -f "$out"
       return 0
     fi
-    if ! grep -qE 'Could not get lock|Unable to lock' "$out" || ((try >= ATTEMPTS)); then
+    # A lock error that is really "Permission denied" (no root, no sudo) will not clear by waiting.
+    if ! grep -qE 'Could not get lock|Unable to lock' "$out" || grep -q 'Permission denied' "$out" ||
+      ((try >= ATTEMPTS)); then
       rm -f "$out"
       return "$rc"
     fi
@@ -62,7 +64,9 @@ if [[ ${#missing[@]} -eq 0 ]]; then
 fi
 command -v apt-get >/dev/null || { log "ERROR: no apt-get to install ${missing[*]}"; exit 1; }
 log "installing ${missing[*]}"
-apt_retry $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq
-apt_retry $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq \
+# The dpkg-lock wait is short on purpose: apt_retry loops around it, so a long one multiplies (12
+# tries of 120s would approach the job's 30 minutes on a lock that never clears).
+apt_retry $SUDO apt-get -o DPkg::Lock::Timeout=30 update -qq
+apt_retry $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y -qq \
   --no-install-recommends "${missing[@]}"
 [[ -x "$BIN_DIR/setfacl" ]] || { log "ERROR: acl installed, but no $BIN_DIR/setfacl"; exit 1; }
