@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`main` now requires CI to pass (#213).** It had no required status checks: the org-level ruleset
+  applied, but the per-repo branch protection every other Wave-Engineering repo carries was never set,
+  so the platform would have let a red PR merge. A new `ci-gate` job in `ci.yml` needs every other
+  job and passes only if all succeeded (`scripts/ci/gate.sh`), and branch protection requires
+  `ci-gate` alone, with `strict: true`. The `ci` matrix legs are deliberately not named in the
+  protection: an image bump renames a leg, and a required check that stops reporting blocks every PR.
+
 ## [0.3.0] — 2026-11-01
 
 Messaging stability. A Discord or scream-hole blip no longer wakes any agent (one alarm for an

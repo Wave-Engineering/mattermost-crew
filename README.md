@@ -147,6 +147,14 @@ that need native token expiry assert the server's capability against it rather t
 `crewchat`, `crewbroker`, `crewkiosk` and `agent` users and the `crewchat-clients` group on the
 runner; run it only on a runner or a throwaway container.
 
+**`main` is protected by one required check, `ci-gate`** (#213), with `strict: true` (a PR must be
+up to date with `main`) and no required reviews; force-push and deletion are blocked. `ci-gate` is
+a job in `ci.yml` that needs every other job (`unit`, `install` and the `ci` legs), runs even when
+one of them failed, and passes only if all succeeded (`scripts/ci/gate.sh`). The legs are not named
+in the protection on purpose: an image bump renames a leg, and a required check that stops
+reporting blocks every PR. When you add a job to `ci.yml`, add it to the gate's `needs`; a unit test
+fails if you forget.
+
 ## The dev-space smoke
 
 `scripts/smoke-devspace.sh` runs the three E2E flows (a cross-crew exchange, kiosk Q&A with a
