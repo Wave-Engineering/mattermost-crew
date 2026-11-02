@@ -89,7 +89,8 @@ def test_the_workflow_wires_the_gate_so_it_reports_on_every_pr() -> None:
     assert covered == set(_job_ids(text)) - {"gate"}, "the gate must cover every other job"
     # Each job's own result is passed under its own name: `unit=${{ needs.install.result }}` would
     # make the gate read the wrong job.
-    run_line = next(ln for ln in block.splitlines() if "scripts/ci/gate.sh" in ln)
+    run_line = next((ln for ln in block.splitlines() if "scripts/ci/gate.sh" in ln), "")
+    assert run_line, "the gate job must call scripts/ci/gate.sh on a single line"
     for job in covered:
         assert f"{job}=${{{{ needs.{job}.result }}}}" in run_line, f"the gate misreads {job}"
     assert len(re.findall(r"\w+=\$\{\{ needs\.\w+\.result \}\}", run_line)) == len(covered)
