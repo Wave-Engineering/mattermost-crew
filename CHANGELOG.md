@@ -18,7 +18,9 @@ All notable changes to this project are recorded here. The format follows
   Ids go into the seen set only after the whole text is written, and a daemon outage mid-collection
   delivers what was already received. No daemon, hook or settings change. A lone event now wakes
   an idle agent about one window later than before; `CREWCHAT_WAITER_BATCH_WINDOW_S=0` restores
-  that.
+  that. Events the waiter holds while it waits out the window are in its memory only: a waiter
+  killed in that window, or a failed write to stderr, loses them (up to 20, where it was one), and a
+  reply landing exactly as the window times out can be acked and lost; the runbook says so.
 - **`main` now requires CI to pass (#213).** It had no required status checks: the org-level ruleset
   applied, but the per-repo branch protection every other Wave-Engineering repo carries was never set,
   so the platform would have let a red PR merge. A new `ci-gate` job in `ci.yml` needs every other

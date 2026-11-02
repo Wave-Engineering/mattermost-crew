@@ -799,7 +799,12 @@ changes nothing by itself. In the agent user's `~/.claude/settings.json`:
   - Delivery: the ids are recorded in the seen set only after the whole text is written and
     flushed. The daemon itself moves on from an event once its reply is written to the waiter,
     so the events the waiter holds while it waits out the window are the waiter's: a waiter
-    killed inside that window (the session ending) takes them with it.
+    killed inside that window (the session ending) takes them with it, and so does a failed
+    write to stderr, which loses up to the whole batch (20 events by default) where it used to
+    lose one. One narrow race remains: if the daemon's reply lands exactly as the one-window
+    wait times out, that event can be acked and not delivered. It is the same hazard as
+    `CREWCHAT_DOORBELL_TIMEOUT`, now once per wake, and a very small window (say `0.001`) widens
+    it. `CREWCHAT_WAITER_BATCH_MAX=1` also turns batching off.
 - **An outage is invisible.** A daemon restart or a flap does not end the waiter; it retries
   (5 s, doubling to 60 s) and the first event after the daemon returns wakes the agent. What it
   hit is in `.../crewchat/waiter/<dev_name>.log` (cleared past 64 KiB), never in the wake.

@@ -528,8 +528,10 @@ def test_a_repeated_id_inside_the_batch_is_delivered_once(repo: Path, short_dir:
 
 def test_a_failed_write_records_nothing(repo: Path, short_dir: Path) -> None:
     """Ids are recorded only after the whole text is out. A write that fails records none, so
-    a daemon that replays the events (as it does after a restart) is not read as repeats: the
-    next wake carries all three."""
+    events a daemon later hands out again (it does after a restart) are not read as repeats:
+    the next wake carries all three. This does NOT make the lost write recoverable: the daemon
+    has already acked the events the failed wake held, so only a restart's replay gives them
+    back (see the runbook's Delivery note)."""
     events = [with_id("e1"), with_id("e2"), with_id("e3")]
     fake = FakeDaemon(short_dir / "d.sock", queued(*events))
     env = env_for(repo, **{waiter.BATCH_WINDOW_ENV: WINDOW})
