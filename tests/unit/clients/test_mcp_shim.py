@@ -438,6 +438,11 @@ def test_shim_chat_send_before_name_sends_nothing(tmp_path: Path) -> None:
         asyncio.run(shim.chat_send("general", "hello"))
     assert daemon.frames == []
 
+    # `/name` writes the file: the same shim registers and the same call now goes through.
+    write_identity(shim, dev_name=DEV)
+    asyncio.run(shim.chat_send("general", "hello", backend="mattermost:ci"))
+    assert len(daemon.of("register")) == 1 and len(daemon.of("send")) == 1
+
 
 def test_shim_timer_registers_within_ten_seconds_of_the_name(tmp_path: Path) -> None:
     """Through the real timer loop: the identity appears between two sleeps, and the next

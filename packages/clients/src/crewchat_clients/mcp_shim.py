@@ -780,6 +780,8 @@ class Shim:
                 raise ShimError(f"backend {named!r} is not mattermost:<server-id> or discord")
             try:
                 default = self.default()
+            except NoIdentity:
+                raise  # not a missing default: the agent is unnamed, and the caller must say so
             except ShimError:
                 default = None
             return named, named != default
