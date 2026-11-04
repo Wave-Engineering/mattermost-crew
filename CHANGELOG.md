@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`crewchat-mcp` starts without an identity file (#226).** A newly minted agent has no
+  `.claude/agent-identity.json` until `/name` runs, and `/name` runs after the MCP server has
+  started. The shim raised at construction, so `crewchat-mcp` exited 1 and the agent had no
+  chat for the whole session, until a `/mcp` reconnect or a restart. The shim now starts
+  without an identity, reads the file when it is needed until it names a `dev_name`, and
+  registers on the first call or timer tick after `/name`, in the same process. Before that, a
+  tool call fails with an error that names the file and says to run `/name`, and the timer
+  logs one INFO line instead of an error per tick. An unreadable or malformed file is still
+  reported with its path. No daemon, hook or settings change.
+
 ## [0.4.0] — 2026-11-02
 
 The waiter batches. `crewchat-waiter` now wakes an agent once with every event that queued while it

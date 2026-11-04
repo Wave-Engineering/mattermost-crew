@@ -27,8 +27,15 @@ and the daemon acts on the agent's behalf with what it holds itself.
   (`title:body`). The shim reads the file as the agent's user and streams it to the daemon in
   `upload` chunks that each fit a frame, then names the upload in the post's `attachments`. A
   file over 8 MiB, or one the daemon refuses, fails the call loudly before anything is posted.
-- **Register.** At start, `register{dev_name, dev_team, dev_avatar, crew, session_id,
-  project_key, repo}` from the identity file (`crew` omitted when the file has none).
+- **Identity (#226).** The shim starts with or without `.claude/agent-identity.json`: a new
+  agent's MCP server starts before `/name` writes it. The file is read on use, every time
+  until it names a `dev_name` and not again after, so `/name` takes effect in the running
+  process. Until then a call fails with a `NoIdentity` error that names the file and says to
+  run `/name`, and the timer waits, with one INFO line. A file that is there but unreadable
+  or not a JSON object is a plain `ShimError` with its path.
+- **Register.** Once there is an identity, `register{dev_name, dev_team, dev_avatar, crew,
+  session_id, project_key, repo}` from the identity file (`crew` omitted when the file has
+  none), at start or on the first call or tick after `/name`.
   `project_key` is `repo_key()`, the same key `chat-defaults.json` uses, for the servers'
   allowlists (#117); `repo` is `repo_ref()`, the full forge path, for the kiosk's corpus pool
   (#139).
@@ -201,6 +208,12 @@ def thread_id(ref: str) -> str:
     the thread channel the message is in), or the bare ID as given."""
     pair = discord_ref(ref)
     return pair[0] if pair else ref
+
+
+class NoIdentity(ShimError):
+    """The agent has no identity yet: `.claude/agent-identity.json` is absent or names no
+    `dev_name`. A new agent is in this state from the moment its MCP server starts until
+    `/name` runs, so it is a wait, not a failure: the shim carries on and looks again (#226)."""
 
 
 class DaemonError(ShimError):
@@ -410,12 +423,17 @@ class Shim:
         self.remote_for = remote_for
         self.session_id = session_id or env.get("CLAUDE_CODE_SESSION_ID") or str(uuid.uuid4())
         self.legacy_dir = legacy_dir
-        self.identity = self._load_identity()
-        self.legacy_identity = self._load_legacy_identity()
-        dev_name = self.identity.get("dev_name")
-        if not isinstance(dev_name, str) or not dev_name:
-            raise ShimError(f"{repo_root / IDENTITY_FILE} names no dev_name; run /name first")
-        self.dev_name: str = dev_name
+        # Nothing here may fail for want of an identity: the MCP server starts before `/name`
+        # has written the file, and a constructor that raised left a new agent with no
+        # crewchat for the whole session (#226). The identity is read on first use instead.
+        self._identity: dict[str, Any] | None = None
+        self._legacy_identity: dict[str, Any] = {}
+        self._dev_name = ""
+        self._said_no_identity = False
+        # An absent file or no name is the wait. A file that is there and unusable (bad JSON,
+        # not an object) is a real error, and fails here, at start, as it always did.
+        with contextlib.suppress(NoIdentity):
+            self._ensure_identity()
         self.registered_at: datetime | None = None
         self.registration: dict[str, Any] = {}
         self.pinged_at: datetime | None = None
@@ -430,11 +448,50 @@ class Shim:
         path = self.repo_root / IDENTITY_FILE
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise NoIdentity(f"{path} does not exist yet; run /name first") from exc
         except (OSError, ValueError) as exc:
             raise ShimError(f"cannot read {path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ShimError(f"{path} is not a JSON object")
         return raw
+
+    def _ensure_identity(self) -> dict[str, Any]:
+        """The identity file's content once it names a `dev_name`, read again on every call
+        until then (so `/name` takes effect in this process, with no reconnect) and kept
+        after. Raises `NoIdentity` while there is none, and `ShimError` for a file that is
+        there but unusable."""
+        if self._identity is not None:
+            return self._identity
+        identity = self._load_identity()
+        dev_name = identity.get("dev_name")
+        if not isinstance(dev_name, str) or not dev_name:
+            raise NoIdentity(f"{self.repo_root / IDENTITY_FILE} names no dev_name; run /name first")
+        self._identity = identity
+        self._legacy_identity = self._load_legacy_identity()
+        self._dev_name = dev_name
+        self._said_no_identity = False
+        return identity
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return self._ensure_identity()
+
+    @property
+    def legacy_identity(self) -> dict[str, Any]:
+        self._ensure_identity()
+        return self._legacy_identity
+
+    @property
+    def dev_name(self) -> str:
+        self._ensure_identity()
+        return self._dev_name
+
+    def _waiting_for_identity(self, exc: NoIdentity) -> None:
+        """Say once, at INFO, that the shim is waiting for `/name`; not an error per tick."""
+        if not self._said_no_identity:
+            log.info("%s (waiting; the timer looks again)", exc)
+            self._said_no_identity = True
 
     def legacy_identity_path(self) -> Path:
         """`/tmp/claude-agent-<md5(repo_root)>.json`, the md5 of the absolute repo-root path
@@ -585,6 +642,8 @@ class Shim:
         try:
             await self.register()
             await self.sync_files(force=True)
+        except NoIdentity as exc:
+            self._waiting_for_identity(exc)
         except ShimError as exc:
             log.error("start: %s (retried before the next call)", exc)
 
@@ -596,6 +655,8 @@ class Shim:
                 await self.ensure_registered()
                 await self.ping()
                 await self.sync_files()
+            except NoIdentity as exc:
+                self._waiting_for_identity(exc)
             except ShimError as exc:
                 log.error("tick: %s", exc)
 

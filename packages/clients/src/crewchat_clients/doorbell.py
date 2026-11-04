@@ -144,6 +144,8 @@ def read_dev_name(repo_root: Path) -> str:
     path = repo_root / IDENTITY_FILE
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DoorbellExit(f"{path} does not exist yet; run /name first") from exc
     except (OSError, ValueError) as exc:
         raise DoorbellExit(f"cannot read {path}: {exc}") from exc
     dev_name = raw.get("dev_name") if isinstance(raw, dict) else None

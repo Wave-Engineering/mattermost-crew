@@ -308,6 +308,194 @@ def test_shim_register_reads_identity(tmp_path: Path) -> None:
     assert [(a["dev_team"], a["dev_avatar"]) for a in daemon.of("register")] == [("oaw", "x")] * 2
 
 
+# -- no identity yet (#226) -------------------------------------------------------------------
+def bare_shim(tmp_path: Path, daemon: FakeDaemon, *, file_text: str | None = None) -> Shim:
+    """A shim in a repo where `/name` has not run: no identity file, or `file_text` in it."""
+    root = tmp_path / "repo"
+    (root / ".claude").mkdir(parents=True)
+    if file_text is not None:
+        (root / ".claude" / "agent-identity.json").write_text(file_text)
+    return Shim(
+        root,
+        daemon,
+        clock=Clock(),
+        headless=False,
+        defaults_file=tmp_path / "home" / ".claude" / "chat-defaults.json",
+        squawk=Squawks(),
+        remote_for=lambda _root: None,
+        session_id="s1",
+        environ={},
+        legacy_dir=tmp_path / "no-legacy",
+    )
+
+
+def write_identity(shim: Shim, **fields: Any) -> None:
+    path = shim.repo_root / ".claude" / "agent-identity.json"
+    path.write_text(json.dumps({"dev_team": "oaw", "dev_avatar": "x", **fields}))
+
+
+@pytest.mark.parametrize("text", [None, "{}", json.dumps({"dev_name": ""})])
+def test_shim_starts_without_an_identity(tmp_path: Path, text: str | None) -> None:
+    """A new agent's MCP server starts before `/name`: the shim is built, and `start` is a
+    quiet wait that sends nothing."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon, file_text=text)
+    asyncio.run(shim.start())
+    assert daemon.frames == [] and shim.registered_at is None
+
+
+def test_shim_without_an_identity_names_the_file_and_the_fix(tmp_path: Path) -> None:
+    """A tool call before `/name` fails with an error that says what to do."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+    with pytest.raises(mcp_shim.NoIdentity) as err:
+        asyncio.run(shim.chat_health())
+    assert str(shim.repo_root / ".claude" / "agent-identity.json") in str(err.value)
+    assert "/name" in str(err.value)
+    assert isinstance(err.value, ShimError) and daemon.frames == []
+
+    (shim.repo_root / ".claude" / "agent-identity.json").write_text("{}")
+    with pytest.raises(mcp_shim.NoIdentity, match="names no dev_name"):
+        asyncio.run(shim.chat_health())
+
+
+def test_shim_picks_up_the_identity_that_name_writes_later(tmp_path: Path) -> None:
+    """The point of #226: `/name` writes the file after the server started, and the next call
+    in the same shim registers and goes through. No restart, no reconnect."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+    with pytest.raises(mcp_shim.NoIdentity):
+        asyncio.run(shim.chat_health())
+
+    write_identity(shim, dev_name=DEV)
+    asyncio.run(shim.chat_health())
+    (frame,) = daemon.of("register")
+    assert (frame["dev_name"], frame["dev_team"], frame["dev_avatar"]) == (DEV, "oaw", "x")
+    assert daemon.of("health") == [{"dev_name": DEV}]
+    assert shim.dev_name == DEV
+
+
+def test_shim_keeps_the_identity_once_it_has_one(tmp_path: Path) -> None:
+    """Once the file names a `dev_name` the shim keeps it: a later rewrite or removal of the
+    file does not change who this process is."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+    write_identity(shim, dev_name=DEV)
+    assert shim.dev_name == DEV
+    write_identity(shim, dev_name="someone-else")
+    assert shim.dev_name == DEV
+    (shim.repo_root / ".claude" / "agent-identity.json").unlink()
+    assert shim.dev_name == DEV and shim.identity["dev_name"] == DEV
+
+
+def test_shim_timer_registers_after_the_identity_appears(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first tick after `/name` registers the agent and pushes its files, with no tool
+    call. Before that the timer says so once at INFO, and never at ERROR."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+
+    async def scenario() -> None:
+        await shim.start()
+        await shim.tick()
+        await shim.tick()
+
+    with caplog.at_level(logging.DEBUG, logger="crewchat_clients.mcp_shim"):
+        asyncio.run(scenario())
+    waiting = [r for r in caplog.records if "run /name" in r.getMessage()]
+    assert len(waiting) == 1 and waiting[0].levelno == logging.INFO
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert daemon.frames == []
+
+    write_identity(shim, dev_name=DEV)
+    asyncio.run(shim.tick())
+    assert len(daemon.of("register")) == 1
+    assert daemon.of("kiosk_brief") and daemon.of("squawk_ids")
+
+
+@pytest.mark.parametrize(
+    ("text", "message"), [("not json", "cannot read"), ("[1, 2]", "is not a JSON object")]
+)
+def test_shim_malformed_identity_fails_at_start_with_its_path(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    """A file that is there but unusable is not "waiting for /name": it fails at start, and
+    the error names the file."""
+    with pytest.raises(ShimError, match=message) as err:
+        bare_shim(tmp_path, FakeDaemon(), file_text=text)
+    assert not isinstance(err.value, mcp_shim.NoIdentity)
+    assert str(tmp_path / "repo" / ".claude" / "agent-identity.json") in str(err.value)
+
+
+def test_shim_chat_send_before_name_sends_nothing(tmp_path: Path) -> None:
+    """A `chat_send` while unnamed returns an error that names `/name`, and no frame goes."""
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+    with pytest.raises(ShimError, match="/name"):
+        asyncio.run(shim.chat_send("general", "hello", backend="mattermost:ci"))
+    with pytest.raises(ShimError, match="/name"):
+        asyncio.run(shim.chat_send("general", "hello"))
+    assert daemon.frames == []
+
+
+def test_shim_timer_registers_within_ten_seconds_of_the_name(tmp_path: Path) -> None:
+    """Through the real timer loop: the identity appears between two sleeps, and the next
+    tick registers. The loop's interval is the bound on "within 10 s"."""
+    assert mcp_shim.POLL_INTERVAL_S * 2 <= 10
+    daemon = FakeDaemon()
+    shim = bare_shim(tmp_path, daemon)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            write_identity(shim, dev_name=DEV)
+        if len(sleeps) == 4:
+            raise asyncio.CancelledError
+
+    async def scenario() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await shim.run_timers(sleep=fake_sleep)
+
+    asyncio.run(scenario())
+    assert len(daemon.of("register")) == 1 and set(sleeps) == {mcp_shim.POLL_INTERVAL_S}
+
+
+def test_one_shot_clients_read_the_identity_on_every_run(tmp_path: Path) -> None:
+    """#226: the doorbell, waiter and send read the identity file afresh on each invocation,
+    and each invocation is a new process (the waiter is re-armed by a hook every turn), so
+    none of them caches an absence the way the long-lived shim did. Nothing to retry: the
+    next run after `/name` finds the name. They fail with the same pointer to `/name`."""
+    from crewchat_clients.doorbell import DoorbellExit, read_dev_name
+
+    (tmp_path / ".claude").mkdir()
+    with pytest.raises(DoorbellExit, match="does not exist yet; run /name first"):
+        read_dev_name(tmp_path)
+    (tmp_path / ".claude" / "agent-identity.json").write_text("{}")
+    with pytest.raises(DoorbellExit, match="/name"):
+        read_dev_name(tmp_path)
+    (tmp_path / ".claude" / "agent-identity.json").write_text(json.dumps({"dev_name": DEV}))
+    assert read_dev_name(tmp_path) == DEV
+
+
+def test_main_runs_the_server_without_an_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`crewchat-mcp` reaches the stdio server in a repo with no identity file, instead of
+    printing an error and exiting 1 (the reported failure)."""
+    (tmp_path / ".claude").mkdir()
+    ran: list[Shim] = []
+
+    class Stub:
+        def run(self, transport: str) -> None:
+            assert transport == "stdio"
+
+    monkeypatch.setattr(mcp_shim, "build_server", lambda shim: (ran.append(shim), Stub())[1])
+    assert mcp_shim.main(["--socket", str(tmp_path / "no.sock"), "--repo-root", str(tmp_path)]) == 0
+    assert len(ran) == 1
+
+
 def test_shim_reregisters_daily(tmp_path: Path) -> None:
     daemon, clock = FakeDaemon(), Clock()
     shim = make_shim(tmp_path, daemon, clock=clock, home_backend="discord")
