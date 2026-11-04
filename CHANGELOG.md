@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-04
+
+A new agent's chat now comes up on its own. `crewchat-mcp` used to exit when the agent had no
+name yet, which is every new agent at the moment its session starts, and stayed dead until a
+person typed `/mcp` to reconnect.
+
+**Rollback.** No config change is needed to go back to v0.4.0: v0.4.1 adds no setting and no
+file, and changes no daemon, hook or settings. To return to v0.4.0, install it again from the
+`v0.4.0` tag with the same lock constraints. A session already running keeps the code it started
+with until it reconnects or restarts, so installing v0.4.1 does not change a running session
+either way.
+
 ### Fixed
 - **`crewchat-mcp` starts without an identity file (#226).** A newly minted agent has no
   `.claude/agent-identity.json` until `/name` runs, and `/name` runs after the MCP server has

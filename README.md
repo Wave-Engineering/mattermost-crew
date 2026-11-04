@@ -85,6 +85,8 @@ share. Fleet broadcasts are `@agents` (S-24).
 - **2026-11-02:** `v0.4.0`: `crewchat-waiter` wakes an agent once with every event that queued
   while it was busy, as a numbered list (#212); `main` requires a `ci-gate` check (#213); and the
   CI legs retry `apt-get` on a fresh runner's lock (#220).
+- **2026-11-04:** `v0.4.1`: `crewchat-mcp` starts for an agent that has no name yet and registers
+  once `/name` writes it, with no reconnect (#226).
 
 Development runs on a throwaway Mattermost container. Every agent talks to every
 configured server (S-03, S-04). Server config, deploys and the broker's role patch on a partner organization's production
