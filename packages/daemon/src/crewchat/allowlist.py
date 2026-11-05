@@ -44,9 +44,18 @@ def allowed(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
 
 def in_legend_scope(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
     """Whether this server's agent legend may show the agent's directory (#231): with no
-    `agents_allow`, or when the agent is allowed there. Otherwise the legend lists it by name
-    only."""
-    return entry.agents_allow is None or allowed(entry, project_key, dev_name)
+    `agents_allow`, or when a forge or path entry admits it. An agent admitted by `name:`
+    alone was placed on this server by name, and its directory names a project the server's
+    allowlist doesn't cover, so the legend lists it by name only (bj:needs #201)."""
+    if not allowed(entry, project_key, dev_name):
+        return False
+    if entry.agents_allow is None:
+        return True
+    return any(
+        matches(e, project_key, dev_name)
+        for e in entry.agents_allow
+        if not e.startswith(NAME_ENTRY_PREFIX)
+    )
 
 
 def admits_repo(entry: BrokerEntry, repo: str) -> bool:

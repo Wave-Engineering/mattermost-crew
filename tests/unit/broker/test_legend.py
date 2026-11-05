@@ -236,25 +236,26 @@ def test_register_without_project_dir(fake: Any, crew: Broker, tmp_path: Path) -
 def test_reconcile_pass_lists_three_agents_then_one_edit_per_burst(
     fake: Any, crew: Broker, crew_config: CrewConfig, tmp_path: Path, clock: Any
 ) -> None:
-    """The issue's three agents: one in scope, one admitted by `name:` (in scope, as the
-    daemon computes it), one out of scope. One pinned post; a burst of re-registers is one
-    edit; a restarted broker edits the same post."""
+    """The issue's three agents: one in scope, one admitted by `name:` alone and one out of
+    scope, both of the last listed by name only, as the daemon computes it (bj:needs #201).
+    One pinned post; a burst of re-registers is one edit; a restarted broker edits the same
+    post."""
     mint(crew, "inside", "alpha")
-    mint(crew, "byname", "beta")
+    mint(crew, "byname", "beta", in_scope=False)
     mint(crew, "outside", "gamma", in_scope=False)
     assert crew.reconcile_membership() is not None
     post_id, text = legend_post(fake, tmp_path)
     assert post_id in fake.pinned
     assert rows(text) == [
-        "| `byname.oaw` | `beta` |",
+        "| `byname.oaw` |  |",
         "| `inside.oaw` | `alpha` |",
         "| `outside.oaw` |  |",
     ]
-    assert "gamma" not in text
+    assert "beta" not in text and "gamma" not in text
 
     fake.calls.clear()
     for dev, d in (("inside", "alpha2"), ("byname", "beta2"), ("outside", "gamma2")):
-        mint(crew, dev, d, in_scope=dev != "outside")
+        mint(crew, dev, d, in_scope=dev == "inside")
     crew.reconcile_membership()
     assert legend_calls(fake) == ["patch_post"]
     assert legend_post(fake, tmp_path) == (post_id, fake.by_id[post_id]["message"])
@@ -267,6 +268,31 @@ def test_reconcile_pass_lists_three_agents_then_one_edit_per_burst(
     restarted.reconcile_membership()
     assert legend_calls(fake) == ["get_post", "patch_post"]
     assert legend_post(fake, tmp_path)[0] == post_id
+
+
+def test_an_out_of_scope_revoke_drops_the_row_to_the_name(
+    fake: Any, crew: Broker, tmp_path: Path
+) -> None:
+    """bj:needs #201: the daemon retiring an agent from this server's allowlist revokes with
+    `out_of_scope`, and the row drops to the name. A rotation's revoke changes nothing."""
+    minted = crew.mint({"dev_name": "abe", "crew": "oaw", "project_dir": "alpha", "in_scope": True})
+    crew.reconcile_membership()
+    fresh = crew.remint({"dev_name": "abe", "crew": "oaw", "current_token_id": minted["token_id"]})
+    assert crew.revoke({"token_id": minted["token_id"]}) == {}  # the daily rotation
+    recorded = crew.accounts.get("abe.oaw")
+    assert recorded is not None and recorded.in_scope
+
+    assert crew.revoke({"token_id": fresh["token_id"], "out_of_scope": True}) == {}
+    recorded = crew.accounts.get("abe.oaw")
+    assert recorded is not None and not recorded.in_scope
+    assert recorded.project_dir == "alpha"  # kept for a later in-scope mint
+    crew.reconcile_membership()
+    assert rows(legend_post(fake, tmp_path)[1]) == ["| `abe.oaw` |  |"]
+
+    # Back on the allowlist: the next mint shows the directory again.
+    mint(crew, "abe", "alpha")
+    crew.reconcile_membership()
+    assert rows(legend_post(fake, tmp_path)[1]) == ["| `abe.oaw` | `alpha` |"]
 
 
 def test_a_deactivated_agent_leaves_the_legend(fake: Any, crew: Broker, tmp_path: Path) -> None:

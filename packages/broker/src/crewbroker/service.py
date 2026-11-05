@@ -337,8 +337,13 @@ class Broker:
         if not isinstance(token_id, str) or not token_id:
             raise OpError("bad_request", "token_id is a required string")
         with self._lock:
-            if self.tokens.get(token_id) is None:
+            rec = self.tokens.get(token_id)
+            if rec is None:
                 raise OpError("not_found", "no token with that id was minted by this broker")
+            if args.get("out_of_scope") is True:
+                # The daemon retired the agent from this server's allowlist (#231): its legend
+                # row drops to the name. Marked before the revoke, so a retry still marks it.
+                self._leave_legend_scope(rec.user_id)
             try:
                 self.client.revoke_token(token_id)
             except NotFound:
@@ -347,6 +352,15 @@ class Broker:
             self.tokens.remove(token_id)
         log.info("revoke: token %s", token_id)
         return {}
+
+    def _leave_legend_scope(self, bot_user_id: str) -> None:
+        """Mark the account behind `bot_user_id` out of the legend's scope, keeping its
+        directory for a later in-scope `mint`. Call with the lock held."""
+        for acct in self.accounts.all():
+            if acct.bot_user_id == bot_user_id:
+                if self.accounts.record_legend(acct.name, acct.project_dir, False):
+                    log.info("legend: %s is out of scope; listed by name only", acct.name)
+                return
 
     def deactivate(self, args: dict[str, Any]) -> dict[str, Any]:
         """Disable an account's bot now, as the prune does after 30 idle days (#127).

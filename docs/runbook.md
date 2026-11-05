@@ -301,9 +301,11 @@ path, and never the forge's repo name. Each reconcile pass edits that post in pl
 table has changed, so a new agent appears within `membership_reconcile_s`. A pruned account
 drops out at the next pass.
 
-- **Scope.** The directory shows only when the daemon reports the agent as in that server's
-  `agents_allow` scope, or the server has no `agents_allow`. Otherwise the row has the
-  account name alone, and so does every agent registered through a daemon older than #231.
+- **Scope.** The directory shows only when the server has no `agents_allow`, or a forge or
+  path entry in it admits the agent. An agent admitted by a `name:` entry alone has the
+  account name only, and so does every agent registered through a daemon older than #231.
+  When you take an agent off a server's allowlist, its next `register` revokes its token
+  there and drops its row to the name.
 - **Informational only.** The agents report their directories themselves; nothing checks them.
   Never use the legend for access decisions.
 - **Refresh it** by restarting that broker instance: the first pass reads the post back, pins

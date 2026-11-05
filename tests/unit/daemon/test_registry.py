@@ -209,7 +209,7 @@ def test_register_sends_the_legend_fields_per_server(
     make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
 ) -> None:
     """#231: every mint carries the directory's name and whether that server's allowlist
-    puts the agent in the legend's scope."""
+    puts the agent in the legend's scope. Admitted by `name:` alone is out of scope (#201)."""
     raw = _two_servers(servers_toml)
     raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/team-a", "name:helper"]
     daemon = make_daemon(raw)
@@ -221,6 +221,15 @@ def test_register_sends_the_legend_fields_per_server(
     for sid in ("dev", "prod"):
         (args,) = daemon.broker("oaw", sid).ops("mint")
         assert (args["project_dir"], args["in_scope"]) == ("crew-231", True), sid
+
+    asyncio.run(
+        daemon.registry.register(
+            "helper", "oaw", "s1", project_key="forge.example.lan/team-b", project_dir="tools"
+        )
+    )
+    dev, prod = (daemon.broker("oaw", sid).ops("mint")[-1] for sid in ("dev", "prod"))
+    assert (dev["dev_name"], dev["in_scope"]) == ("helper", True)  # dev has no allowlist
+    assert (prod["dev_name"], prod["project_dir"], prod["in_scope"]) == ("helper", "tools", False)
 
 
 def test_register_retires_token_on_newly_disallowed_server(
@@ -243,7 +252,8 @@ def test_register_retires_token_on_newly_disallowed_server(
     assert reg.backends == ["mattermost:dev", "discord"]
     assert restarted.store.token_for("babel", "prod") is None
     assert restarted.store.token_for("babel", "dev") is not None
-    assert [a["token_id"] for a in prod.ops("revoke")] == [held]
+    # The broker drops the agent's legend row to its name (#231).
+    assert prod.ops("revoke") == [{"token_id": held, "out_of_scope": True}]
     assert held not in prod.live and prod.ops("mint") == []
     on_disk = json.loads(restarted.store.path_for("babel").read_text(encoding="utf-8"))
     assert "prod" not in on_disk["servers"] and not on_disk["pending_revoke"]
