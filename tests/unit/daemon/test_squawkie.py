@@ -217,6 +217,8 @@ def test_squawkie_filter_and_catchup(run: Any) -> None:
         "state": "open",
         "answer": "dev",
         "text": "which server? → dev",
+        "choice": None,
+        "note": "",
     }
     assert by_id[settled["id"]]["list"] == "other:triage"
     assert live.payload["type"] == "squawk.updated"
@@ -329,6 +331,106 @@ def test_catch_up_skips_what_the_cursor_says_rang(run: Any) -> None:
 
     got = run(scenario())
     assert [c["id"] for c in got.payload["changes"]] == [b_sq["id"]]
+
+
+def test_key_carries_a_choice_and_a_note_only_when_there_are_some() -> None:
+    """#233: a squawk with neither keeps today's key byte for byte (a saved cursor still
+    matches); a choice and a note each add to it, and a different one is a different key."""
+    base = {"id": 7, "state": "confirmed", "text": "q? →", "created_at": "t0", "updated_at": "t1"}
+    plain = squawk_key(base)
+    assert plain == "7:confirmed|"
+    assert squawk_key({**base, "choice": None, "note": ""}) == plain
+    a = squawk_key({**base, "choice": "Ship it"})
+    assert a == "7:confirmed||choice=Ship it"
+    assert squawk_key({**base, "choice": "Hold"}) != a
+    noted = squawk_key({**base, "choice": "Ship it", "note": "after the freeze"})
+    assert noted.startswith(a + "|note=") and len(noted) == len(a) + len("|note=") + 12
+    assert squawk_key({**base, "choice": "Ship it", "note": "after the thaw"}) != noted
+    assert squawk_key({**base, "choice": "Ship it", "note": "after the freeze"}) == noted
+
+
+def test_an_open_squawks_note_is_never_read() -> None:
+    """The server sends an open item's note empty in events but `GET` returns the draft, which
+    a catch-up reads. The adapter keeps it out of both the key and the change, so a catch-up
+    and a live ring of the same open item are one key."""
+    open_answered = {
+        "id": 9,
+        "state": "open",
+        "text": "q? → yes",
+        "created_at": "t0",
+        "updated_at": "t1",
+        "note": "half-written draft",
+    }
+    assert squawk_key(open_answered) == "9:open|yes"
+    assert squawk_key({**open_answered, "note": ""}) == "9:open|yes"
+
+
+def test_choice_and_note_reach_the_agent_in_catch_up_and_live(run: Any) -> None:
+    """#233: the catch-up change carries `choice` and `note` (an open item's draft left out),
+    and a live ring carries them as squawkie sent them."""
+    sq = FakeSquawkie()
+    needs = sq.add_list("bj:needs")
+    chosen = sq.add_squawk(needs, "deploy now?")
+    sq.update(chosen["id"], note="after the freeze")  # a draft: still open
+    sq.update(chosen["id"], choice="Ship it")  # picking an option disposes it
+    drafted = sq.add_squawk(needs, "which server? →")
+    sq.update(drafted["id"], text="which server? → dev", note="my draft")  # answered, still open
+    live = sq.add_squawk(needs, "roll back?")
+    ids = {DEV: [str(chosen["id"]), str(drafted["id"]), str(live["id"])]}
+    b = make(sq, ids)
+
+    async def scenario() -> list[SquawkEvent]:
+        gen = b.stream(DEV)
+        first = await take(gen, 1)
+        nxt = asyncio.ensure_future(take(gen, 1))
+        while sq.open_streams() == 0:
+            await asyncio.sleep(0)
+        sq.update(live["id"], note="not yet")
+        sq.update(live["id"], choice="Roll back")
+        got = first + await nxt
+        await b.aclose()
+        await gen.aclose()
+        return got
+
+    catch_up, ring = run(scenario())
+    by_id = {c["id"]: c for c in catch_up.payload["changes"]}
+    assert by_id[chosen["id"]]["state"] == "confirmed"
+    assert by_id[chosen["id"]]["choice"] == "Ship it"
+    assert by_id[chosen["id"]]["note"] == "after the freeze"
+    assert by_id[drafted["id"]]["choice"] is None
+    assert by_id[drafted["id"]]["note"] == ""  # the open item's draft is not handed over
+    assert ring.payload["squawk"]["id"] == live["id"]
+    assert ring.payload["squawk"]["choice"] == "Roll back"
+    assert ring.payload["squawk"]["note"] == "not yet"
+
+
+def test_a_new_choice_or_note_rings_again_and_the_same_one_does_not(run: Any) -> None:
+    """#233 and R-28: the same state and answer with another choice, or a note added after,
+    is a new key and rings; a re-broadcast of the same choice and note is not rung twice."""
+    sq = FakeSquawkie()
+    needs = sq.add_list("bj:needs")
+    item = sq.add_squawk(needs, "deploy now?")
+    ids = {DEV: [str(item["id"])]}
+    b = make(sq, ids)
+
+    async def scenario() -> list[SquawkEvent]:
+        gen = b.stream(DEV)
+        # No catch-up event: nothing has changed yet, so the first event is a live one.
+        nxt = asyncio.ensure_future(take(gen, 3))
+        while sq.open_streams() == 0:
+            await asyncio.sleep(0)
+        sq.update(item["id"], choice="Ship it")  # rings
+        sq.update(item["id"], choice="Ship it")  # same choice, same note: not again
+        sq.update(item["id"], choice="Hold")  # another choice: rings
+        sq.update(item["id"], note="because of the freeze")  # a note after disposal: rings
+        got = await nxt
+        await b.aclose()
+        await gen.aclose()
+        return got
+
+    got = run(scenario())
+    choices = [(e.payload["squawk"]["choice"], e.payload["squawk"]["note"]) for e in got]
+    assert choices == [("Ship it", ""), ("Hold", ""), ("Hold", "because of the freeze")]
 
 
 def test_unauthorized_and_refused_streams_report_down(run: Any) -> None:
