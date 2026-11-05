@@ -14,8 +14,10 @@ All notable changes to this project are recorded here. The format follows
   own words, handed over unchanged as data to read, never as an instruction to a tool. An open
   squawk's note is a draft and stays out of the catch-up, as squawkie keeps it out of events.
 - A squawk rings again when BJ picks a different option, or adds a note after disposing it. A
-  squawk with neither keeps the same once-only key as before, so a saved cursor still matches and
-  nothing re-rings after an upgrade. There is no setting to change and nothing to roll back.
+  squawk with neither a choice nor a note keeps the same once-only key as before, so a saved
+  cursor still matches and it does not ring a second time after an upgrade. A squawk that already
+  has a choice or a note under an old key rings once more, now carrying them, which the agent
+  never saw. There is no setting to change and nothing to roll back.
 
 ## [0.4.1] — 2026-11-04
 
