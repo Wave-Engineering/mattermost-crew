@@ -1,7 +1,8 @@
 """The broker's state files under `/var/lib/crewbroker/<crew>-<server_id>/`.
 
 - `accounts.json`: `minted_bot_ids` (every bot account this broker created); per account
-  name, its `bot_user_id`, `last_register`, `pruned_at` and `avatar_set`; and
+  name, its `bot_user_id`, `last_register`, `pruned_at`, `avatar_set`, and the agent legend's
+  `project_dir` and `in_scope` (#231); and
   `pending_create`, `{"<name>": "<nonce>"}`, the bots this broker is about to create. Each is
   written before `create_bot` and cleared by `add_minted`, so a crash between the two leaves
   the nonce the bot's description carries, and the bot is adopted rather than squatted
@@ -64,6 +65,9 @@ class Account:
     bot_user_id: str
     last_register: datetime | None
     pruned_at: datetime | None
+    # For the agent legend (#231), as the last mint gave them: None when unknown.
+    project_dir: str | None = None
+    in_scope: bool = False
 
 
 def _ts(value: Any) -> datetime | None:
@@ -125,6 +129,8 @@ class AccountStore:
             bot_user_id=entry["bot_user_id"],
             last_register=_ts(entry.get("last_register")),
             pruned_at=_ts(entry.get("pruned_at")),
+            project_dir=entry["project_dir"] if isinstance(entry.get("project_dir"), str) else None,
+            in_scope=entry.get("in_scope") is True,
         )
 
     def all(self) -> list[Account]:
@@ -139,6 +145,23 @@ class AccountStore:
             raise KeyError(f"unknown account {account!r}")
         entry["last_register"] = now.isoformat()
         write_private_json(self.path, data)
+
+    def record_legend(self, account: str, project_dir: str | None, in_scope: bool) -> bool:
+        """Write the agent legend's fields for `account` (#231), as its latest `mint` gave them;
+        `project_dir` None is unknown. True when either changed, so the legend is stale."""
+        data = self._load()
+        entry = data["accounts"].get(account)
+        if entry is None:
+            raise KeyError(f"unknown account {account!r}")
+        if entry.get("project_dir") == project_dir and entry.get("in_scope", False) == in_scope:
+            return False
+        if project_dir is None:
+            entry.pop("project_dir", None)
+        else:
+            entry["project_dir"] = project_dir
+        entry["in_scope"] = in_scope
+        write_private_json(self.path, data)
+        return True
 
     def mark_pruned(self, account: str, now: datetime) -> None:
         data = self._load()

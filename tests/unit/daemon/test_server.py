@@ -125,6 +125,20 @@ def test_register_accepts_team_and_avatar(daemon: Any) -> None:
         assert got["ok"] is False and got["error"].startswith("bad_request"), bad
 
 
+def test_register_keeps_only_the_project_dir_name(daemon: Any) -> None:
+    """#231: register keeps the last element of project_dir, and drops a malformed one."""
+    server = DaemonServer(build_handlers(daemon.config, daemon.registry))
+    base = {"dev_name": "babel", "session_id": "s1"}
+    assert call(server, "register", **base, project_dir="/home/agent/crew-231")["ok"] is True
+    assert daemon.registry.get("babel").project_dir == "crew-231"
+    # Malformed: registered anyway, with no directory. Absent: "".
+    assert call(server, "register", **base, project_dir=["x"])["ok"] is True
+    assert daemon.registry.get("babel").project_dir == ""
+    assert call(server, "register", **base, project_dir="crew-231")["ok"] is True
+    assert call(server, "register", **base)["ok"] is True
+    assert daemon.registry.get("babel").project_dir == ""
+
+
 class _Backend:
     name = "mattermost:dev"
 

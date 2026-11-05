@@ -116,14 +116,23 @@ class BrokerClient:
             raise BrokerUnavailable(f"{self.name}: {op}: the result is not an object")
         return result
 
-    async def mint(self, dev_name: str, crew: str, current_token_id: str | None) -> dict[str, Any]:
+    async def mint(
+        self,
+        dev_name: str,
+        crew: str,
+        current_token_id: str | None,
+        *,
+        legend: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """`{account, token, token_id}`. Only `Registry.register` may call this (R-30).
 
         `current_token_id` is the token the daemon holds for this account on this server, or
         None. The broker revokes the account's other tokens, so one minted by a call whose
-        reply timed out here is not left live (#41).
+        reply timed out here is not left live (#41). `legend` is the agent's `project_dir` and
+        `in_scope` for the broker's agent legend (#231).
         """
-        return await self.call("mint", self._minting(dev_name, crew, current_token_id))
+        args = self._minting(dev_name, crew, current_token_id)
+        return await self.call("mint", {**args, **(legend or {})})
 
     async def remint(self, dev_name: str, crew: str, current_token_id: str) -> dict[str, Any]:
         return await self.call("remint", self._minting(dev_name, crew, current_token_id))

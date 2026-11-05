@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
-from crewchat.allowlist import allowed
+from crewchat.allowlist import allowed, in_legend_scope
 from crewchat.config import ServersConfig
 from crewchat.tokens import (
     BrokerClient,
@@ -115,6 +115,9 @@ class Registration:
     dev_avatar: str = ""
     # The agent's full forge path (#139), for a retry's `install_minted` (#186).
     repo: str = ""
+    # The shim's `project_key` and `project_dir`, for a retry's legend fields (#231).
+    project_key: str = ""
+    project_dir: str = ""
 
     @property
     def retryable(self) -> list[str]:
@@ -176,6 +179,7 @@ class Registry:
         dev_avatar: str = "",
         project_key: str = "",
         repo: str = "",
+        project_dir: str = "",
     ) -> Registration:
         crew = crew or self.config.default_crew
         try:
@@ -202,7 +206,8 @@ class Registry:
                     # Revokes a token still held there, or retries one whose revoke failed.
                     await self.store.retire_server(dev_name, crew, server.id)
                     continue
-                why = await self._mint_on(dev_name, crew, account, server.id, now, repo)
+                legend = self._legend(crew, server.id, project_key, dev_name, project_dir)
+                why = await self._mint_on(dev_name, crew, account, server.id, now, repo, legend)
                 if why is None:
                     backends.append(mattermost_backend(server.id))
                     continue
@@ -237,6 +242,8 @@ class Registry:
             dev_team=dev_team,
             dev_avatar=dev_avatar,
             repo=repo,
+            project_key=project_key,
+            project_dir=project_dir,
         )
         self._registrations[dev_name] = reg
         if self.config.discord_enabled and self.identity_sink is not None:
@@ -255,8 +262,11 @@ class Registry:
             for server_id in reg.retryable:
                 if self._registrations.get(reg.dev_name) is not reg:
                     break
+                legend = self._legend(
+                    reg.crew, server_id, reg.project_key, reg.dev_name, reg.project_dir
+                )
                 why = await self._mint_on(
-                    reg.dev_name, reg.crew, reg.account, server_id, self.clock(), reg.repo
+                    reg.dev_name, reg.crew, reg.account, server_id, self.clock(), reg.repo, legend
                 )
                 if why == "squatted":
                     reg.squatted.append(server_id)
@@ -274,8 +284,25 @@ class Registry:
             log.info("registered %s on %s, on a retry", reg.account, ", ".join(gained))
         return gained
 
+    def _legend(
+        self, crew: str, server_id: str, project_key: str, dev_name: str, project_dir: str
+    ) -> dict[str, Any]:
+        """The `mint` frame's agent-legend fields for one server (#231)."""
+        entry = self.config.crews[crew].brokers[server_id]
+        return {
+            "project_dir": project_dir,
+            "in_scope": in_legend_scope(entry, project_key, dev_name),
+        }
+
     async def _mint_on(
-        self, dev_name: str, crew: str, account: str, server_id: str, now: datetime, repo: str
+        self,
+        dev_name: str,
+        crew: str,
+        account: str,
+        server_id: str,
+        now: datetime,
+        repo: str,
+        legend: dict[str, Any],
     ) -> str | None:
         """Mint `dev_name`'s token on `server_id` and install it. None, or why it failed:
         `"squatted"` (a retry won't help) or `"unavailable"`. The caller holds
@@ -283,7 +310,7 @@ class Registry:
         client = self.brokers[(crew, server_id)]
         try:
             held = self.store.held_token_id(dev_name, crew, server_id)
-            minted = await client.mint(dev_name, crew, held)
+            minted = await client.mint(dev_name, crew, held, legend=legend)
         except (BrokerError, BrokerUnavailable) as exc:
             log.error("register %s on %s: %s", account, server_id, exc)
             if isinstance(exc, BrokerError) and exc.code == "squatted":

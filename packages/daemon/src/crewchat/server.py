@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from crewchat.config import ServersConfig, is_repo
+from crewchat.config import ServersConfig, is_repo, legend_dir
 from crewchat.protocol import MAX_FRAME_BYTES, ProtocolError, encode, err, ok, parse_frame
 from crewchat.registry import RegisterError, Registry, mattermost_backend
 
@@ -275,6 +275,12 @@ def build_handlers(
             # Never the value: a malformed one may still hold part of a remote's credential.
             log.warning("register %s: dropping a malformed repo", dev_name)
             repo = ""
+        # The shim's project_dir(), for the agent legend (#231). Optional: an older shim sends
+        # none, and its agent is listed by name only. Only the last element is ever kept.
+        project_dir = legend_dir(args.get("project_dir", ""))
+        if project_dir is None:
+            log.warning("register %s: dropping a malformed project_dir", dev_name)
+            project_dir = ""
         reg = await registry.register(
             dev_name,
             crew,
@@ -283,6 +289,7 @@ def build_handlers(
             dev_avatar=dev_avatar,
             project_key=project_key,
             repo=repo,
+            project_dir=project_dir,
         )
         return reg.result()
 

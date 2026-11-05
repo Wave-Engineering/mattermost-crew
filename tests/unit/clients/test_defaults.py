@@ -13,6 +13,7 @@ from crewchat_clients.defaults import (
     forge_key,
     forge_repo,
     git_remote,
+    project_dir,
     repo_key,
     repo_ref,
     resolve_default,
@@ -126,3 +127,11 @@ def test_write_default_merges_and_validates(tmp_path: Path) -> None:
     with pytest.raises(DefaultsError):
         write_default("k", "discord", path)
     assert path.read_text() == "{not json"  # a broken file is never overwritten
+
+
+def test_project_dir_is_last_element(tmp_path: Path) -> None:
+    """#231: the legend gets the directory's last element, never a path or the repo name."""
+    root = tmp_path / "work" / "crew-231"
+    root.mkdir(parents=True)
+    assert project_dir(root) == "crew-231"
+    assert project_dir(root / ".." / "crew-231") == "crew-231"  # resolved first

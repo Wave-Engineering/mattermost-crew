@@ -102,6 +102,7 @@ from crewchat_clients.defaults import (
     defaults_path,
     git_remote,
     is_backend,
+    project_dir,
     repo_key,
     repo_ref,
     resolve_default,
@@ -532,6 +533,8 @@ class Shim:
             "project_key": repo_key(self.repo_root, self.remote_for),
             # For the kiosk's corpus pool (#139, D-112): `host/group/.../repo`, or "".
             "repo": repo_ref(self.repo_root, self.remote_for),
+            # For the agent legend (#231): the directory's last element only.
+            "project_dir": project_dir(self.repo_root),
         }
         crew = self.identity.get("crew")
         if isinstance(crew, str) and crew:

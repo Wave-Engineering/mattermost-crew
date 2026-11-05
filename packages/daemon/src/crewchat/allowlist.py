@@ -42,6 +42,13 @@ def allowed(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
     return any(matches(e, project_key, dev_name) for e in entry.agents_allow)
 
 
+def in_legend_scope(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
+    """Whether this server's agent legend may show the agent's directory (#231): with no
+    `agents_allow`, or when the agent is allowed there. Otherwise the legend lists it by name
+    only."""
+    return entry.agents_allow is None or allowed(entry, project_key, dev_name)
+
+
 def admits_repo(entry: BrokerEntry, repo: str) -> bool:
     """Whether a full repo may enter this server's corpus pool (D-112): its `host/org` must
     equal a forge entry in an explicit `agents_allow`, and no forge entry in `agents_deny`.

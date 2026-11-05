@@ -42,6 +42,13 @@ class FakeMattermost:
         # DM history per channel for the backfill (#159): each post as the REST API gives it.
         self.history: dict[str, list[dict[str, Any]]] = {}
         self.post_fails = False
+        # The agent legend (#231): posts by id, which are pinned or deleted, and a patch's
+        # forced error status (403 as under a post-edit time limit, 429 as a rate limit).
+        self.by_id: dict[str, dict[str, Any]] = {}
+        self.pinned: set[str] = set()
+        self.deleted: set[str] = set()
+        self.patch_status: int | None = None
+        self.pin_fails = False
         # Membership (#132): target (team or channel) id -> member user ids.
         self.members: dict[str, list[str]] = {}
         self.add_fails: set[str] = set()  # targets whose add answers 403
@@ -230,7 +237,34 @@ class FakeMattermost:
             raise MattermostError("POST", "/posts", 500, "boom")
         post = {"channel_id": channel_id, "message": message, "props": dict(props or {})}
         self.posts.append(post)
-        return post
+        # By id for the legend (#231): the same dict, so an edit shows in `posts` too.
+        pid = f"p{next(self._ids)}"
+        self.by_id[pid] = post
+        return {**post, "id": pid}
+
+    def get_post(self, post_id: str) -> dict[str, Any]:
+        self.calls.append(("get_post", post_id))
+        post = self.by_id.get(post_id)
+        if post is None or post_id in self.deleted:
+            raise NotFound("GET", f"/posts/{post_id}", 404, "not found")
+        return {**post, "id": post_id, "is_pinned": post_id in self.pinned}
+
+    def patch_post(self, post_id: str, message: str) -> dict[str, Any]:
+        self.calls.append(("patch_post", post_id))
+        if self.patch_status is not None:
+            raise MattermostError("PUT", f"/posts/{post_id}/patch", self.patch_status, "refused")
+        post = self.get_post(post_id)
+        self.calls.pop()  # the patch's own lookup isn't a call the broker made
+        self.by_id[post_id]["message"] = message
+        return {**post, "message": message}
+
+    def pin_post(self, post_id: str) -> None:
+        self.calls.append(("pin_post", post_id))
+        if self.pin_fails:
+            raise MattermostError("POST", f"/posts/{post_id}/pin", 500, "boom")
+        self.get_post(post_id)
+        self.calls.pop()
+        self.pinned.add(post_id)
 
     def _add_member(self, call: str, kind: str, target: str, user_id: str) -> None:
         self.calls.append((call, (target, user_id)))

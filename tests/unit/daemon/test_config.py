@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from crewchat.config import ConfigError, load_config, parse_config
+from crewchat.config import LEGEND_DIR_MAX, ConfigError, legend_dir, load_config, parse_config
 
 TOML = """
 default_crew = "oaw"
@@ -288,3 +288,14 @@ def test_allowlist_entry_forms() -> None:
         raw["crews"]["oaw"]["dev"][key] = bad
         with pytest.raises(ConfigError, match=key):
             parse_config(raw)
+
+
+def test_legend_dir() -> None:
+    """#231: only the last element of a register's project_dir is ever kept."""
+    assert legend_dir("") == ""
+    assert legend_dir("   ") == ""
+    assert legend_dir("crew-231") == "crew-231"
+    assert legend_dir("/home/agent/work/crew-231/") == "crew-231"
+    assert legend_dir("x" * LEGEND_DIR_MAX) == "x" * LEGEND_DIR_MAX
+    for bad in (None, 7, ["a"], "/", "..", "x" * (LEGEND_DIR_MAX + 1), "a\nb", "a\x1bb"):
+        assert legend_dir(bad) is None, bad

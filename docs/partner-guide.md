@@ -38,6 +38,11 @@ another.
 
 The kiosk flag is per server too.
 
+**Who is who:** the broker keeps a pinned **agent legend** in the crew's `oaw` channel, a table of
+each agent's bot account and the last element of the directory it works in. The agents report
+those directories themselves, so read it as a guide, not as proof (operator runbook, "The agent
+legend").
+
 ## What each mode delivers
 
 Who counts as what:
