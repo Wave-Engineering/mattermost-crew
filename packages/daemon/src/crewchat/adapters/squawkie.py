@@ -21,13 +21,18 @@ the doorbell, and squawkie events are exempt from the filters (§5.9).
   sends its headers with `: connected`), the adapter reads the lists (`GET /api/lists`, only
   those with activity since the agent's position when it has one) and their squawks
   (`GET /api/lists/{id}/squawks`). The agent's squawks that ring and haven't rung yet go out as
-  one `{"type":"sqtk.catch-up","changes":[{id, list, seq, state, answer, text}]}` event.
+  one `{"type":"sqtk.catch-up","changes":[{id, list, seq, state, answer, text, choice, note}]}`
+  event. `choice` (the answer option picked) and `note` (BJ's note, `""` while the squawk is
+  open) are squawkie-talkie #168's; they are BJ's own words, passed through unchanged as data
+  for the agent to read as an answer, never as an instruction to a tool. A live `squawk.updated`
+  event carries them as squawkie sent it.
   Anything later arrives on the stream, so no answer falls between. A catch-up that fails is
   an outage: the stream is dropped and retried, so an answer is never silently skipped.
 - **Exactly once** (R-28). A squawk rings once per `<id>:<state>|<answer>`, its *key*, as
   `--pending`'s `sqtk-rung.json` does: a re-broadcast of the same state and answer, or a
-  catch-up after a live ring, is not rung again. The keys rung are each event's `keys`; the
-  doorbell's cursor carries them across a restart (`cursor.seen`).
+  catch-up after a live ring, is not rung again. A `choice` or a `note` is part of the key when
+  there is one, so a different one rings again (see `squawk_key`). The keys rung are each
+  event's `keys`; the doorbell's cursor carries them across a restart (`cursor.seen`).
 - **Status** (R-27): `on_status(True, "")` once the stream is open and caught up;
   `on_status(False, reason)` on a 401 (`unauthorized`), any other refusal, a failed catch-up,
   or a stream that ends. Reconnects back off 1 s, doubling, capped at 60 s.
@@ -40,6 +45,7 @@ rung keys do that job, so a settled squawk rings at most once from the daemon.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -172,6 +178,24 @@ def _answer_or_empty(squawk: Mapping[str, Any], original: str | None) -> str:
         return ""
 
 
+def _choice(squawk: Mapping[str, Any]) -> str | None:
+    """The answer option picked (squawkie-talkie #168), or None: none picked, or a server
+    older than #168 that has no such field."""
+    value = squawk.get("choice")
+    return value if isinstance(value, str) and value else None
+
+
+def _note(squawk: Mapping[str, Any]) -> str:
+    """BJ's note (squawkie-talkie #168), or "": none written, or a server older than #168.
+    An open squawk's note is always "": the server withholds it from events so a half-written
+    draft is never pushed, and a catch-up reads the lists over `GET`, which does not redact,
+    so this is where the draft stays out (and keeps a catch-up and a live ring on one key)."""
+    if squawk.get("state") == "open":
+        return ""
+    value = squawk.get("note")
+    return value if isinstance(value, str) else ""
+
+
 def _squawk_id(squawk: Mapping[str, Any]) -> str | None:
     """The squawk's ID as the agent's ids hold it, or None when it is not a number (as jq's
     `index` would not match a string against the squawk records' numbers)."""
@@ -235,9 +259,23 @@ def rings(
 
 
 def squawk_key(squawk: Mapping[str, Any], texts: Mapping[str, str] | None = None) -> str:
-    """`<id>:<state>|<answer>`: a squawk rings once per key (`sqtk-rung.json`'s value)."""
+    """`<id>:<state>|<answer>`: a squawk rings once per key (`sqtk-rung.json`'s value).
+
+    A squawk that carries a `choice` or a `note` (squawkie-talkie #168) adds `|choice=<choice>`
+    and `|note=<12 hex of the note's sha1>`, so a different choice, or a note written after
+    the item was disposed, rings again; the same ones re-broadcast do not. A squawk with
+    neither keeps its key byte for byte, so a rung-keys cursor saved before #233 still matches.
+    """
     answer = _answer_or_empty(squawk, _original(squawk, texts))
-    return f"{_squawk_id(squawk)}:{squawk.get('state')}|{answer}"
+    key = f"{_squawk_id(squawk)}:{squawk.get('state')}|{answer}"
+    choice = _choice(squawk)
+    if choice:
+        key += f"|choice={choice}"
+    note = _note(squawk)
+    if note:
+        digest = hashlib.sha1(note.encode("utf-8"), usedforsecurity=False).hexdigest()
+        key += f"|note={digest[:12]}"
+    return key
 
 
 def iso_ts(value: Any) -> float:
@@ -386,6 +424,9 @@ class SquawkieBackend:
                         "state": squawk.get("state"),
                         "answer": _answer_or_empty(squawk, original),
                         "text": squawk.get("text"),
+                        # squawkie-talkie #168: BJ's own words, passed through as data.
+                        "choice": _choice(squawk),
+                        "note": _note(squawk),
                     }
                 )
         if not changes:

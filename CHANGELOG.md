@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **An agent now receives the answer option BJ picked and BJ's note** (#233). squawkie-talkie
+  v0.14.0 lets an agent offer answer options on a squawk and lets BJ write a note on it. A live
+  `squawk.updated` event already carried both; the daemon's catch-up event, which an agent gets
+  on connect, left them out, and now carries `choice` and `note` on each change. Both are BJ's
+  own words, handed over unchanged as data to read, never as an instruction to a tool. An open
+  squawk's note is a draft and stays out of the catch-up, as squawkie keeps it out of events.
+- A squawk rings again when BJ picks a different option, or adds a note after disposing it. A
+  squawk with neither keeps the same once-only key as before, so a saved cursor still matches and
+  nothing re-rings after an upgrade. There is no setting to change and nothing to roll back.
+
 ## [0.4.1] — 2026-11-04
 
 A new agent's chat now comes up on its own. `crewchat-mcp` used to exit when the agent had no

@@ -94,10 +94,23 @@ class FakeSquawkie:
             "updated_at": stamp,
             "has_image": False,
             "image_ids": [],
+            # squawkie-talkie #168: answer options, the one picked, and BJ's note.
+            "options": [],
+            "choice": None,
+            "note": "",
         }
         self.squawks[sid] = squawk
-        self.broadcast({"type": "squawk.created", "squawk": dict(squawk)})
+        self.broadcast({"type": "squawk.created", "squawk": self.event_view(squawk)})
         return squawk
+
+    @staticmethod
+    def event_view(squawk: dict[str, Any]) -> dict[str, Any]:
+        """A squawk as squawkie broadcasts it: the note is withheld (sent as "") while the
+        squawk is still open, so a half-written draft is never pushed. `GET` is not redacted."""
+        view = dict(squawk)
+        if view["state"] == "open":
+            view["note"] = ""
+        return view
 
     def update(
         self,
@@ -106,18 +119,27 @@ class FakeSquawkie:
         text: str | None = None,
         state: str | None = None,
         initials: str | None = None,
+        choice: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         """Change a squawk and broadcast `squawk.updated`. As squawkie does, `initials` records
-        who made the change (the web UI and `sqtk` always send them)."""
+        who made the change (the web UI and `sqtk` always send them). A `choice` disposes the
+        squawk as `confirmed` and records it; a plain `state` change clears any choice."""
         squawk = self.squawks[squawk_id]
         if text is not None:
             squawk["text"] = text
-        if state is not None:
+        if choice is not None:
+            squawk["state"] = "confirmed"
+            squawk["choice"] = choice
+        elif state is not None:
             squawk["state"] = state
+            squawk["choice"] = None
+        if note is not None:
+            squawk["note"] = note
         if initials is not None:
             squawk["initials"] = initials
         squawk["updated_at"] = self.now()
-        self.broadcast({"type": "squawk.updated", "squawk": dict(squawk)})
+        self.broadcast({"type": "squawk.updated", "squawk": self.event_view(squawk)})
         return squawk
 
     def last_activity(self, list_id: int) -> str:
