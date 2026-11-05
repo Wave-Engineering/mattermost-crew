@@ -194,6 +194,34 @@ def test_a_failed_pass_still_sweeps_replaced_posts(
     assert stored(tmp_path)["stale"] == [] and stored(tmp_path)["post_id"] == current
 
 
+def test_a_failed_create_in_a_new_channel_keeps_the_old_post(
+    fake: Any, legend: Legend, tmp_path: Path
+) -> None:
+    """The sweep never leaves the crew with no legend for a create that didn't happen."""
+    legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
+    fake.post_fails = True
+    assert legend.sync("cid-other", [acct("abe.oaw", "alpha")]) == "failed"
+    assert old not in fake.deleted and old in fake.pinned
+    assert stored(tmp_path)["post_id"] == old and stored(tmp_path)["stale"] == []
+
+
+def test_a_failed_pin_sweeps_only_the_replaced_post(
+    fake: Any, legend: Legend, tmp_path: Path
+) -> None:
+    """A pin that fails after the new post exists: the old post goes, the new one stays and
+    is pinned on the next pass."""
+    legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
+    fake.pin_fails = True
+    assert legend.sync("cid-other", [acct("abe.oaw", "alpha")]) == "failed"
+    new = stored(tmp_path)["post_id"]
+    assert new != old and old in fake.deleted and new not in fake.deleted
+    fake.pin_fails = False
+    assert legend.sync("cid-other", [acct("abe.oaw", "alpha")]) == "pinned"
+    assert fake.pinned == {new}
+
+
 def test_a_replaced_id_is_kept_once(fake: Any, legend: Legend, tmp_path: Path) -> None:
     legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
     old = stored(tmp_path)["post_id"]
