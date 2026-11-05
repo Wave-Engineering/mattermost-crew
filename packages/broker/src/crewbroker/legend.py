@@ -5,8 +5,10 @@ The broker owns the post. Each reconcile pass renders the legend from `accounts.
 compares it with the text it last posted: unchanged, it makes no call at all; changed, it edits
 the post in place. A burst of registrations between two passes is one edit. With no post, or
 when the stored one is gone (404) or refuses the edit (403, as under a server's post-edit time
-limit), it creates a new post and pins it. `legend.json` keeps the post's id and text, so a
-restart edits the same post rather than posting again. The first pass after a start reads the
+limit), it creates a new post and pins it, then deletes the one it replaced (a refused edit,
+or the legend in a channel the crew no longer uses), retrying each pass until the server
+agrees. `legend.json` keeps the post's id and text, so a restart edits the same post rather
+than posting again. The first pass after a start reads the
 post back once, and pins it again if someone unpinned it.
 
 The entries are the agents' own word, sent at `register` (the allowlist is an accident guard,
@@ -88,16 +90,23 @@ class Legend:
         `"created"` or `"failed"`."""
         text = render(accounts)
         state = self._load()
-        post_id = state.get("post_id") if state.get("channel_id") == channel_id else None
+        stale = [s for s in state.get("stale", []) if isinstance(s, str)]
+        post_id = state.get("post_id")
+        if not isinstance(post_id, str) or not post_id:
+            post_id = None
+        elif state.get("channel_id") != channel_id:
+            # The crew's `oaw` channel changed: the old channel's legend goes.
+            stale, post_id = [*stale, post_id], None
         try:
-            if not isinstance(post_id, str) or not post_id:
-                return self._create(channel_id, text)
-            if not self._checked and not self._check(state, post_id):
-                return self._create(channel_id, text)
-            return self._edit(state, post_id, text)
+            if post_id is None or (not self._checked and not self._check(state, post_id)):
+                result = self._create(channel_id, text, stale)
+            else:
+                result = self._edit({**state, "stale": stale}, post_id, text)
         except MattermostError as exc:
             log.warning("legend: not updated; the next pass retries: %s", exc)
             return "failed"
+        self._sweep()
+        return result
 
     def _check(self, state: dict[str, Any], post_id: str) -> bool:
         """Once per process: whether the stored post is still there. One that someone
@@ -109,7 +118,9 @@ class Legend:
             self._checked = True
             return False
         if not post.get("is_pinned"):
+            # Kept on disk, so a failed edit this pass still re-pins on the next.
             state["pinned"] = False
+            write_private_json(self.path, state)
         self._checked = True
         return True
 
@@ -124,7 +135,11 @@ class Legend:
                 if not isinstance(exc, NotFound) and exc.status != 403:
                     raise
                 log.info("legend: post %s can't be edited (%s); posting a new one", post_id, exc)
-                return self._create(str(state["channel_id"]), text)
+                # A post that refused the edit still shows the old table: it goes.
+                stale = list(state.get("stale", []))
+                if not isinstance(exc, NotFound):
+                    stale.append(post_id)
+                return self._create(str(state["channel_id"]), text, stale)
             # Kept before any pin, so a failed pin doesn't send the same edit again.
             write_private_json(self.path, {**state, "text": text})
         if not pinned:
@@ -136,14 +151,39 @@ class Legend:
             return "edited"
         return "pinned"
 
-    def _create(self, channel_id: str, text: str) -> str:
+    def _create(self, channel_id: str, text: str, stale: list[str]) -> str:
         post = self.client.create_post(channel_id, text, {MARKER_PROP: MARKER_VERSION})
         post_id = str(post["id"])
         # Kept before the pin, so a failed pin is retried on this post, not a new one.
-        state = {"channel_id": channel_id, "post_id": post_id, "text": text, "pinned": False}
+        state = {
+            "channel_id": channel_id,
+            "post_id": post_id,
+            "text": text,
+            "pinned": False,
+            "stale": stale,
+        }
         write_private_json(self.path, state)
         self._checked = True
         self.client.pin_post(post_id)
         write_private_json(self.path, {**state, "pinned": True})
         log.info("legend: posted and pinned post %s", post_id)
         return "created"
+
+    def _sweep(self) -> None:
+        """Delete each legend this one replaced, so no stale table, with a directory now out of
+        scope, stays readable. One the server won't delete yet is kept for the next pass."""
+        state = self._load()
+        stale = [s for s in state.get("stale", []) if isinstance(s, str)]
+        if not stale:
+            return
+        left: list[str] = []
+        for post_id in stale:
+            try:
+                self.client.delete_post(post_id)
+                log.info("legend: deleted the replaced post %s", post_id)
+            except NotFound:
+                pass  # already gone
+            except MattermostError as exc:
+                log.warning("legend: replaced post %s not deleted; retrying: %s", post_id, exc)
+                left.append(post_id)
+        write_private_json(self.path, {**state, "stale": left})

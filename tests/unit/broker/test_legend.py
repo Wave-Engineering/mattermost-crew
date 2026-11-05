@@ -80,7 +80,8 @@ def legend(fake: Any, tmp_path: Path) -> Legend:
 
 
 def legend_calls(fake: Any) -> list[str]:
-    return [c for c, _ in fake.calls if c in {"create_post", "get_post", "patch_post", "pin_post"}]
+    names = {"create_post", "get_post", "patch_post", "pin_post", "delete_post"}
+    return [c for c, _ in fake.calls if c in names]
 
 
 def stored(tmp_path: Path) -> dict[str, Any]:
@@ -151,12 +152,42 @@ def test_sync_repins_an_unpinned_post_after_restart(fake: Any, tmp_path: Path) -
 
 
 def test_sync_recreates_when_edit_is_refused(fake: Any, legend: Legend, tmp_path: Path) -> None:
-    """A 403 on the edit, as under a server's post-edit time limit: a new post is pinned."""
+    """A 403 on the edit, as under a server's post-edit time limit: a new post is pinned, and
+    the old one, still showing the old table, is deleted."""
     legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
     old = stored(tmp_path)["post_id"]
     fake.patch_status = 403
+    assert legend.sync(OAW_ID, [acct("abe.oaw", "alpha", in_scope=False)]) == "created"
+    new = stored(tmp_path)["post_id"]
+    assert new != old and fake.pinned == {new}
+    assert old in fake.deleted and stored(tmp_path)["stale"] == []
+
+
+def test_a_replaced_post_the_server_wont_delete_is_retried(
+    fake: Any, legend: Legend, tmp_path: Path
+) -> None:
+    legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
+    fake.patch_status, fake.delete_fails = 403, True
     assert legend.sync(OAW_ID, [acct("bo.oaw", "beta")]) == "created"
-    assert stored(tmp_path)["post_id"] != old
+    assert stored(tmp_path)["stale"] == [old]
+    fake.patch_status, fake.delete_fails = None, False
+    fake.calls.clear()
+    assert legend.sync(OAW_ID, [acct("bo.oaw", "beta")]) == "unchanged"
+    assert legend_calls(fake) == ["delete_post"]
+    assert old in fake.deleted and stored(tmp_path)["stale"] == []
+
+
+def test_an_unpin_found_at_start_survives_a_failed_edit(fake: Any, tmp_path: Path) -> None:
+    Legend(fake, tmp_path).sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    post_id = stored(tmp_path)["post_id"]
+    fake.pinned.discard(post_id)
+    fake.patch_status = 500
+    restarted = Legend(fake, tmp_path)
+    assert restarted.sync(OAW_ID, [acct("bo.oaw", "beta")]) == "failed"
+    fake.patch_status = None
+    assert restarted.sync(OAW_ID, [acct("bo.oaw", "beta")]) == "edited"
+    assert post_id in fake.pinned
 
 
 def test_sync_survives_429(fake: Any, legend: Legend, tmp_path: Path) -> None:
@@ -184,8 +215,10 @@ def test_sync_retries_a_failed_pin_on_the_same_post(
 
 def test_sync_in_a_new_channel_posts_there(fake: Any, legend: Legend, tmp_path: Path) -> None:
     legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
     assert legend.sync("cid-other", [acct("abe.oaw", "alpha")]) == "created"
     assert stored(tmp_path)["channel_id"] == "cid-other"
+    assert old in fake.deleted and fake.pinned == {stored(tmp_path)["post_id"]}
 
 
 # -- the broker: mint records, the reconcile pass edits --------------------------------------

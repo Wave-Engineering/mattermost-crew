@@ -314,8 +314,10 @@ drops out at the next pass.
   a second legend, so unpin or delete the old one by hand.
 
 The broker logs `legend: no 'oaw' channel among the crew's channels; nothing posted` at
-WARNING, once per start, when it has none. An edit or pin the server refuses is logged at WARNING
-and retried at the next pass.
+WARNING, once per start, when it has none. An edit the server refuses with 403, as under a
+post-edit time limit, gets a new pinned legend, and the broker deletes the old post. It does the
+same when the crew's `oaw` channel changes. A delete, a pin or any other call the server refuses
+is logged at WARNING and retried at the next pass.
 
 ### The credentials
 

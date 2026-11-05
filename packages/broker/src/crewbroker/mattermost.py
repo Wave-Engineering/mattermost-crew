@@ -122,6 +122,8 @@ class MattermostAPI(Protocol):
 
     def pin_post(self, post_id: str) -> None: ...
 
+    def delete_post(self, post_id: str) -> None: ...
+
     def get_team_by_name(self, name: str) -> dict[str, Any]: ...
 
     def get_channel_by_name(self, team_id: str, name: str) -> dict[str, Any]: ...
@@ -320,6 +322,9 @@ class MattermostClient:
 
     def pin_post(self, post_id: str) -> None:
         self._call("POST", f"/posts/{post_id}/pin")
+
+    def delete_post(self, post_id: str) -> None:
+        self._call("DELETE", f"/posts/{post_id}")
 
     # Membership (#132). The broker account adds only bots it owns, as a plain `team_user` that
     # is itself a member of each channel: no role beyond R-06's is needed (the #132 probe).

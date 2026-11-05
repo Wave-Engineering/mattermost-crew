@@ -49,6 +49,7 @@ class FakeMattermost:
         self.deleted: set[str] = set()
         self.patch_status: int | None = None
         self.pin_fails = False
+        self.delete_fails = False
         # Membership (#132): target (team or channel) id -> member user ids.
         self.members: dict[str, list[str]] = {}
         self.add_fails: set[str] = set()  # targets whose add answers 403
@@ -265,6 +266,15 @@ class FakeMattermost:
         self.get_post(post_id)
         self.calls.pop()
         self.pinned.add(post_id)
+
+    def delete_post(self, post_id: str) -> None:
+        self.calls.append(("delete_post", post_id))
+        if self.delete_fails:
+            raise MattermostError("DELETE", f"/posts/{post_id}", 500, "boom")
+        self.get_post(post_id)
+        self.calls.pop()
+        self.deleted.add(post_id)
+        self.pinned.discard(post_id)
 
     def _add_member(self, call: str, kind: str, target: str, user_id: str) -> None:
         self.calls.append((call, (target, user_id)))
