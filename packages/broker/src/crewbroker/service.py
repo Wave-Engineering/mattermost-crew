@@ -449,7 +449,8 @@ class Broker:
     def sync_legend(self) -> str | None:
         """One agent-legend update (#231), in the `oaw` channel among the crew's channels:
         None when the broker is in no such channel, logged at WARNING once per process.
-        Never raises."""
+        A Mattermost failure is logged and returns "failed"; a local error, such as an
+        unwritable `legend.json`, raises, and the reconcile loop logs it and carries on."""
         if self.membership is None:
             return None
         channel = next(

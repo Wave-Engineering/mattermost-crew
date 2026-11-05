@@ -328,7 +328,8 @@ def test_register_retries_failed_retire_revoke(
 
     del prod.fail["revoke"]
     asyncio.run(daemon.registry.register("babel", "oaw", "s3", project_key=other))
-    assert [a["token_id"] for a in prod.ops("revoke")] == [held, held]
+    # The retry carries the scope change too (#231, bj:needs #201).
+    assert prod.ops("revoke") == [{"token_id": held, "out_of_scope": True}] * 2
     assert held not in prod.live
     assert not daemon.store.agent("babel").pending_revoke["prod"]
     on_disk = json.loads(daemon.store.path_for("babel").read_text(encoding="utf-8"))

@@ -39,6 +39,9 @@ MARKER_PROP = "crew_legend"
 MARKER_VERSION = "v1"
 
 HEADING = "#### Agent legend"
+# Under Mattermost's default MaxPostSize (16383 characters), so a large crew's legend still
+# posts: the rows past it are counted, not listed.
+MAX_LEGEND_CHARS = 15000
 NOTE = (
     "Each agent's bot account, and the last element of the directory it works in. The agents "
     "report these themselves: informational, not verified."
@@ -61,12 +64,21 @@ def directory_cell(acct: Account) -> str:
 
 
 def render(accounts: Iterable[Account]) -> str:
-    """The legend's text: a table of every active account, by name."""
+    """The legend's text: a table of every active account, by name, cut to fit
+    `MAX_LEGEND_CHARS` with a last row counting the accounts left out."""
     rows = sorted((a for a in accounts if a.pruned_at is None), key=lambda a: a.name)
     lines = [HEADING, "", NOTE, "", "| Agent | Directory |", "|---|---|"]
-    lines += [f"| {_code(a.name)} | {directory_cell(a)} |" for a in rows]
     if not rows:
         lines.append("| (none yet) | |")
+    # Room for the "more" row, which is short; each line costs its length plus a newline.
+    size, budget = sum(len(line) + 1 for line in lines), MAX_LEGEND_CHARS - 40
+    for shown, acct_ in enumerate(rows):
+        line = f"| {_code(acct_.name)} | {directory_cell(acct_)} |"
+        if size + len(line) + 1 > budget:
+            lines.append(f"| … and {len(rows) - shown} more | |")
+            break
+        lines.append(line)
+        size += len(line) + 1
     return "\n".join(lines)
 
 
@@ -90,13 +102,13 @@ class Legend:
         `"created"` or `"failed"`."""
         text = render(accounts)
         state = self._load()
-        stale = [s for s in state.get("stale", []) if isinstance(s, str)]
+        stale = _stale(state)
         post_id = state.get("post_id")
         if not isinstance(post_id, str) or not post_id:
             post_id = None
         elif state.get("channel_id") != channel_id:
             # The crew's `oaw` channel changed: the old channel's legend goes.
-            stale, post_id = [*stale, post_id], None
+            stale, post_id = _with(stale, post_id), None
         try:
             if post_id is None or (not self._checked and not self._check(state, post_id)):
                 result = self._create(channel_id, text, stale)
@@ -104,7 +116,9 @@ class Legend:
                 result = self._edit({**state, "stale": stale}, post_id, text)
         except MattermostError as exc:
             log.warning("legend: not updated; the next pass retries: %s", exc)
-            return "failed"
+            result = "failed"
+        # Even after a failure: a replaced post may still show an out-of-scope directory. Only
+        # ids on disk are swept, and each was replaced, so the current post is never deleted.
         self._sweep()
         return result
 
@@ -136,9 +150,9 @@ class Legend:
                     raise
                 log.info("legend: post %s can't be edited (%s); posting a new one", post_id, exc)
                 # A post that refused the edit still shows the old table: it goes.
-                stale = list(state.get("stale", []))
+                stale = _stale(state)
                 if not isinstance(exc, NotFound):
-                    stale.append(post_id)
+                    stale = _with(stale, post_id)
                 return self._create(str(state["channel_id"]), text, stale)
             # Kept before any pin, so a failed pin doesn't send the same edit again.
             write_private_json(self.path, {**state, "text": text})
@@ -173,7 +187,7 @@ class Legend:
         """Delete each legend this one replaced, so no stale table, with a directory now out of
         scope, stays readable. One the server won't delete yet is kept for the next pass."""
         state = self._load()
-        stale = [s for s in state.get("stale", []) if isinstance(s, str)]
+        stale = _stale(state)
         if not stale:
             return
         left: list[str] = []
@@ -186,4 +200,17 @@ class Legend:
             except MattermostError as exc:
                 log.warning("legend: replaced post %s not deleted; retrying: %s", post_id, exc)
                 left.append(post_id)
-        write_private_json(self.path, {**state, "stale": left})
+        try:
+            write_private_json(self.path, {**state, "stale": left})
+        except OSError:
+            # Never masks the pass's own result; the ids stay on disk and are tried again.
+            log.exception("legend: could not write %s after the sweep", self.path)
+
+
+def _stale(state: dict[str, Any]) -> list[str]:
+    """`legend.json`'s replaced post ids, once each and in order (absent in an older file)."""
+    return list(dict.fromkeys(s for s in state.get("stale", []) if isinstance(s, str)))
+
+
+def _with(stale: list[str], post_id: str) -> list[str]:
+    return stale if post_id in stale else [*stale, post_id]

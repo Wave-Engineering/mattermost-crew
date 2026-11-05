@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from crewbroker.config import CrewConfig
-from crewbroker.legend import MARKER_PROP, NOTE, Legend, render
+from crewbroker.legend import MARKER_PROP, MAX_LEGEND_CHARS, NOTE, Legend, render
 from crewbroker.service import Broker
 from crewbroker.state import Account
 
@@ -176,6 +176,46 @@ def test_a_replaced_post_the_server_wont_delete_is_retried(
     assert legend.sync(OAW_ID, [acct("bo.oaw", "beta")]) == "unchanged"
     assert legend_calls(fake) == ["delete_post"]
     assert old in fake.deleted and stored(tmp_path)["stale"] == []
+
+
+def test_a_failed_pass_still_sweeps_replaced_posts(
+    fake: Any, legend: Legend, tmp_path: Path
+) -> None:
+    """A replaced post may still show an out-of-scope directory, so a pass whose own edit
+    fails deletes it anyway, and never the current post."""
+    legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
+    fake.patch_status, fake.delete_fails = 403, True
+    legend.sync(OAW_ID, [acct("bo.oaw", "beta")])
+    current = stored(tmp_path)["post_id"]
+    fake.patch_status, fake.delete_fails = 500, False
+    assert legend.sync(OAW_ID, [acct("cy.oaw", "gamma")]) == "failed"
+    assert old in fake.deleted and current not in fake.deleted
+    assert stored(tmp_path)["stale"] == [] and stored(tmp_path)["post_id"] == current
+
+
+def test_a_replaced_id_is_kept_once(fake: Any, legend: Legend, tmp_path: Path) -> None:
+    legend.sync(OAW_ID, [acct("abe.oaw", "alpha")])
+    old = stored(tmp_path)["post_id"]
+    fake.patch_status, fake.delete_fails = 403, True
+    legend.sync(OAW_ID, [acct("bo.oaw", "beta")])
+    state = {**stored(tmp_path), "stale": [old, old]}  # as a hand edit or an old bug might
+    (tmp_path / "legend.json").write_text(json.dumps(state))
+    fake.calls.clear()
+    legend.sync(OAW_ID, [acct("bo.oaw", "beta")])
+    assert legend_calls(fake) == ["delete_post"]
+    assert stored(tmp_path)["stale"] == [old]
+
+
+def test_render_fits_a_post() -> None:
+    """A crew too big for one post lists what fits, then counts the rest."""
+    many = [acct(f"agent-{i:04d}.oaw", "d" * 90) for i in range(400)]
+    text = render(many)
+    assert len(text) <= MAX_LEGEND_CHARS
+    shown = rows(text)
+    assert 0 < len(shown) < 400
+    assert text.splitlines()[-1] == f"| … and {400 - len(shown)} more | |"
+    assert rows(render(many[:3])) == [f"| `agent-000{i}.oaw` | `{'d' * 90}` |" for i in range(3)]
 
 
 def test_an_unpin_found_at_start_survives_a_failed_edit(fake: Any, tmp_path: Path) -> None:

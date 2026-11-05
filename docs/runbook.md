@@ -299,7 +299,8 @@ broker keeps one pinned post there: a table of each of its active bot accounts a
 element of the directory that agent works in, such as `mattermost-crew-231`. It is never a full
 path, and never the forge's repo name. Each reconcile pass edits that post in place when the
 table has changed, so a new agent appears within `membership_reconcile_s`. A pruned account
-drops out at the next pass.
+drops out at the next pass. A crew too big for one post (about 15,000 characters) lists the
+agents that fit, by name, and counts the rest in a last `… and N more` row.
 
 - **Scope.** The directory shows only when the server has no `agents_allow`, or a forge or
   path entry in it admits the agent. An agent admitted by a `name:` entry alone has the
