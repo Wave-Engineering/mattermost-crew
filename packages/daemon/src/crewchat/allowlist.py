@@ -42,6 +42,22 @@ def allowed(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
     return any(matches(e, project_key, dev_name) for e in entry.agents_allow)
 
 
+def in_legend_scope(entry: BrokerEntry, project_key: str, dev_name: str) -> bool:
+    """Whether this server's agent legend may show the agent's directory (#231): with no
+    `agents_allow`, or when a forge or path entry admits it. An agent admitted by `name:`
+    alone was placed on this server by name, and its directory names a project the server's
+    allowlist doesn't cover, so the legend lists it by name only (bj:needs #201)."""
+    if not allowed(entry, project_key, dev_name):
+        return False
+    if entry.agents_allow is None:
+        return True
+    return any(
+        matches(e, project_key, dev_name)
+        for e in entry.agents_allow
+        if not e.startswith(NAME_ENTRY_PREFIX)
+    )
+
+
 def admits_repo(entry: BrokerEntry, repo: str) -> bool:
     """Whether a full repo may enter this server's corpus pool (D-112): its `host/org` must
     equal a forge entry in an explicit `agents_allow`, and no forge entry in `agents_deny`.

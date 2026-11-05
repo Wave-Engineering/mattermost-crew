@@ -132,6 +132,12 @@ def repo_ref(repo_root: Path, remote_for: RemoteFor = git_remote) -> str:
     return (forge_repo(remote) if remote else None) or ""
 
 
+def project_dir(repo_root: Path) -> str:
+    """The last element of the agent's directory, for the agent legend (#231): never a full
+    path, and never the forge's repo name."""
+    return repo_root.resolve().name
+
+
 def load_defaults(path: Path) -> dict[str, Backend]:
     """The defaults file; {} when it doesn't exist."""
     try:

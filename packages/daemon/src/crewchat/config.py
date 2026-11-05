@@ -320,6 +320,24 @@ def is_repo(value: str) -> bool:
     )
 
 
+LEGEND_DIR_MAX = 100
+
+
+def legend_dir(value: Any) -> str | None:
+    """A register's `project_dir` for the agent legend (#231), cut to its last path element:
+    "" for none, None when it is not a string or not a printable name of at most
+    `LEGEND_DIR_MAX` characters. The shim sends only the last element; this keeps a full path
+    from ever being stored, whatever a client sends."""
+    if not isinstance(value, str):
+        return None
+    if not value.strip():
+        return ""
+    name = value.strip().rstrip("/").rsplit("/", 1)[-1]
+    if name in {"", ".", ".."} or len(name) > LEGEND_DIR_MAX or not name.isprintable():
+        return None
+    return name
+
+
 def _repos(value: Any, where: str, source: str) -> tuple[str, ...]:
     """A `corpus_extra` or `corpus_exclude` list of full repos."""
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from crewchat.allowlist import admits_repo, allowed, matches
+from crewchat.allowlist import admits_repo, allowed, in_legend_scope, matches
 from crewchat.config import BrokerEntry
 
 FORGE = "forge.example.lan/partner-org"
@@ -40,6 +40,22 @@ def test_allowed_rules() -> None:
     assert allowed(entry(deny=(FORGE,)), "forge.example.lan/other", "babel")
     # An empty allowlist admits nobody.
     assert not allowed(entry(allow=()), FORGE, "babel")
+
+
+def test_in_legend_scope() -> None:
+    """#231, bj:needs #201: the legend shows a directory with no allowlist, or for an agent a
+    forge or path entry admits. One admitted by `name:` alone shows by name only."""
+    assert in_legend_scope(entry(), "forge.example.lan/team-a", "babel")
+    assert in_legend_scope(entry(), "", "babel")  # an older shim, no allowlist
+    allow = entry(allow=(FORGE, "/home/agent/work", "name:helper"))
+    assert in_legend_scope(allow, FORGE, "babel")
+    assert in_legend_scope(allow, "/home/agent/work/repo", "babel")
+    assert in_legend_scope(allow, FORGE, "helper")  # by name and by forge: the forge decides
+    assert not in_legend_scope(allow, "forge.example.lan/team-a", "helper")  # by name alone
+    assert not in_legend_scope(allow, "", "helper")
+    assert not in_legend_scope(allow, "forge.example.lan/team-a", "babel")
+    assert not in_legend_scope(allow, "", "babel")
+    assert not in_legend_scope(entry(deny=("name:babel",)), FORGE, "babel")  # deny wins
 
 
 def test_admits_repo() -> None:

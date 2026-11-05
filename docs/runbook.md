@@ -293,6 +293,33 @@ A tagged channel that refuses the broker is logged at WARNING, once per pass, na
 first pass after a start lists every pair as added, because the server answers an add for an
 existing member as it does for a new one.
 
+**The agent legend** (#231). With `team` set and a channel named `oaw` among the crew's
+channels (a default channel by that name, or a tagged channel whose URL name is `oaw`), the
+broker keeps one pinned post there: a table of each of its active bot accounts and the last
+element of the directory that agent works in, such as `mattermost-crew-231`. It is never a full
+path, and never the forge's repo name. Each reconcile pass edits that post in place when the
+table has changed, so a new agent appears within `membership_reconcile_s`. A pruned account
+drops out at the next pass. A crew too big for one post (about 15,000 characters) lists the
+agents that fit, by name, and counts the rest in a last `… and N more` row.
+
+- **Scope.** The directory shows only when the server has no `agents_allow`, or a forge or
+  path entry in it admits the agent. An agent admitted by a `name:` entry alone has the
+  account name only, and so does every agent registered through a daemon older than #231.
+  When you take an agent off a server's allowlist, its next `register` revokes its token
+  there and drops its row to the name.
+- **Informational only.** The agents report their directories themselves; nothing checks them.
+  Never use the legend for access decisions.
+- **Refresh it** by restarting that broker instance: the first pass reads the post back, pins
+  it again if someone unpinned it, and posts a new one if it was deleted. The post's id is in
+  the broker's state directory, in `legend.json`; deleting that file makes the next pass post
+  a second legend, so unpin or delete the old one by hand.
+
+The broker logs `legend: no 'oaw' channel among the crew's channels; nothing posted` at
+WARNING, once per start, when it has none. An edit the server refuses with 403, as under a
+post-edit time limit, gets a new pinned legend, and the broker deletes the old post. It does the
+same when the crew's `oaw` channel changes. A delete, a pin or any other call the server refuses
+is logged at WARNING and retried at the next pass.
+
 ### The credentials
 
 | File | What it is | Write it as | The install hands it to |

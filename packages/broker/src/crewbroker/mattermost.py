@@ -116,6 +116,14 @@ class MattermostAPI(Protocol):
         self, channel_id: str, message: str, props: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
 
+    def get_post(self, post_id: str) -> dict[str, Any]: ...
+
+    def patch_post(self, post_id: str, message: str) -> dict[str, Any]: ...
+
+    def pin_post(self, post_id: str) -> None: ...
+
+    def delete_post(self, post_id: str) -> None: ...
+
     def get_team_by_name(self, name: str) -> dict[str, Any]: ...
 
     def get_channel_by_name(self, team_id: str, name: str) -> dict[str, Any]: ...
@@ -298,6 +306,25 @@ class MattermostClient:
             body["props"] = props
         result: dict[str, Any] = self._call("POST", "/posts", json=body)
         return result
+
+    # The agent legend (#231): the broker account posts, pins and edits its own post, as a
+    # member of the channel, with no role beyond R-06's (#231's spike). A deleted post answers
+    # 404 to its poster.
+    def get_post(self, post_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("GET", f"/posts/{post_id}")
+        return result
+
+    def patch_post(self, post_id: str, message: str) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "PUT", f"/posts/{post_id}/patch", json={"message": message}
+        )
+        return result
+
+    def pin_post(self, post_id: str) -> None:
+        self._call("POST", f"/posts/{post_id}/pin")
+
+    def delete_post(self, post_id: str) -> None:
+        self._call("DELETE", f"/posts/{post_id}")
 
     # Membership (#132). The broker account adds only bots it owns, as a plain `team_user` that
     # is itself a member of each channel: no role beyond R-06's is needed (the #132 probe).

@@ -47,6 +47,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from crewbroker import config as cfg
 from crewbroker.avatar import identicon_png
 from crewbroker.config import CrewConfig
+from crewbroker.legend import LEGEND_CHANNEL, Legend
 from crewbroker.mattermost import (
     DeadlineExceeded,
     MattermostAPI,
@@ -110,6 +111,14 @@ def _call_bound(deadline: float | None) -> float | None:
     return deadline - DEADLINE_RESERVE_S if deadline is not None else None
 
 
+def _legend_fields(args: dict[str, Any]) -> tuple[str | None, bool]:
+    """A `mint`'s agent-legend fields (#231): `project_dir`, None when absent or empty (an
+    older daemon or shim), and `in_scope`, false unless the daemon said true."""
+    value = args.get("project_dir")
+    project_dir = value if isinstance(value, str) and value.strip() else None
+    return project_dir, args.get("in_scope") is True
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -144,6 +153,8 @@ class Broker:
         self.tokens = TokenStore(state_dir)
         self.switch = SwitchStore(state_dir)
         self.dm_cursor = DMCursorStore(state_dir)
+        self.legend = Legend(client, state_dir)
+        self._no_legend_logged = False
         self.server_key = server_key or config.server_url
         self.clock = clock
         # A caller's `deadline` is the daemon's epoch seconds, so it is read against this,
@@ -228,11 +239,16 @@ class Broker:
         name = self._name(args)
         held = self._held(args)
         deadline = self._deadline(args)
+        legend = _legend_fields(args)
         with call_deadline(_call_bound(deadline)):
-            return self._mint(name, held, deadline)
+            return self._mint(name, held, deadline, legend)
 
     def _mint(
-        self, name: str, held: str | EllipsisType | None, deadline: float | None
+        self,
+        name: str,
+        held: str | EllipsisType | None,
+        deadline: float | None,
+        legend: tuple[str | None, bool] = (None, False),
     ) -> dict[str, Any]:
         with self._lock:
             self._check_deadline(deadline)
@@ -240,6 +256,9 @@ class Broker:
                 bot_id = ensure_bot(self.client, name, self.accounts, self.config.broker_user_id)
                 now = self.clock()
                 record_register(self.accounts, name, now)
+                # Only recorded: the next reconcile pass edits the legend (#231), so a mint
+                # makes no legend call and a burst of them is one edit.
+                self.accounts.record_legend(name, *legend)
                 token = mint_token(
                     self.client, bot_id, self.tokens, expiry_supported=self._expiry(), now=now
                 )
@@ -318,8 +337,13 @@ class Broker:
         if not isinstance(token_id, str) or not token_id:
             raise OpError("bad_request", "token_id is a required string")
         with self._lock:
-            if self.tokens.get(token_id) is None:
+            rec = self.tokens.get(token_id)
+            if rec is None:
                 raise OpError("not_found", "no token with that id was minted by this broker")
+            if args.get("out_of_scope") is True:
+                # The daemon retired the agent from this server's allowlist (#231): its legend
+                # row drops to the name. Marked before the revoke, so a retry still marks it.
+                self._leave_legend_scope(rec.user_id)
             try:
                 self.client.revoke_token(token_id)
             except NotFound:
@@ -328,6 +352,15 @@ class Broker:
             self.tokens.remove(token_id)
         log.info("revoke: token %s", token_id)
         return {}
+
+    def _leave_legend_scope(self, bot_user_id: str) -> None:
+        """Mark the account behind `bot_user_id` out of the legend's scope, keeping its
+        directory for a later in-scope `mint`. Call with the lock held."""
+        for acct in self.accounts.all():
+            if acct.bot_user_id == bot_user_id:
+                if self.accounts.record_legend(acct.name, acct.project_dir, False):
+                    log.info("legend: %s is out of scope; listed by name only", acct.name)
+                return
 
     def deactivate(self, args: dict[str, Any]) -> dict[str, Any]:
         """Disable an account's bot now, as the prune does after 30 idle days (#127).
@@ -409,7 +442,36 @@ class Broker:
                 bot_ids = self._owned_minted()
         with self._lock:
             names = {a.bot_user_id: a.name for a in self.accounts.all()}
-        return self.membership.reconcile(bot_ids, names, refresh=False)
+        result = self.membership.reconcile(bot_ids, names, refresh=False)
+        self.sync_legend()
+        return result
+
+    def sync_legend(self) -> str | None:
+        """One agent-legend update (#231), in the `oaw` channel among the crew's channels:
+        None when the broker is in no such channel, logged at WARNING once per process.
+        A Mattermost failure is logged and returns "failed"; a local error, such as an
+        unwritable `legend.json`, raises, and the reconcile loop logs it and carries on."""
+        if self.membership is None:
+            return None
+        channel = next(
+            (
+                t.id
+                for t in self.membership.channel_targets()
+                if t.id and t.name.lower() == LEGEND_CHANNEL
+            ),
+            None,
+        )
+        if channel is None:
+            if not self._no_legend_logged:
+                self._no_legend_logged = True
+                log.warning(
+                    "legend: no %r channel among the crew's channels; nothing posted",
+                    LEGEND_CHANNEL,
+                )
+            return None
+        with self._lock:
+            accounts = self.accounts.all()
+        return self.legend.sync(channel, accounts)
 
     def prune(self) -> list[str]:
         with self._lock:

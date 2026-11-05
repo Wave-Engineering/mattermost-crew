@@ -29,7 +29,14 @@ def test_register_returns_account_name(daemon: Any) -> None:
     (args,) = daemon.broker().ops("mint")
     # The broker refuses the mint once this call's 2 s timeout has passed (#41).
     assert args.pop("deadline") == pytest.approx(time.time() + 2.0, abs=1.0)
-    assert args == {"dev_name": "babel", "crew": "oaw", "current_token_id": None}
+    # The agent legend's fields (#231): no project_dir sent, and no allowlist, so in scope.
+    assert args == {
+        "dev_name": "babel",
+        "crew": "oaw",
+        "current_token_id": None,
+        "project_dir": "",
+        "in_scope": True,
+    }
     # One registration per Dev-Name, taken at its word (D-055).
     assert daemon.registry.get("babel") is reg
     assert reg.session_id == "s1"
@@ -198,6 +205,33 @@ def test_register_skips_disallowed_server(
     assert reg.backends == ["mattermost:dev", "discord"]
 
 
+def test_register_sends_the_legend_fields_per_server(
+    make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
+) -> None:
+    """#231: every mint carries the directory's name and whether that server's allowlist
+    puts the agent in the legend's scope. Admitted by `name:` alone is out of scope (#201)."""
+    raw = _two_servers(servers_toml)
+    raw["crews"]["oaw"]["prod"]["agents_allow"] = ["forge.example.lan/team-a", "name:helper"]
+    daemon = make_daemon(raw)
+    asyncio.run(
+        daemon.registry.register(
+            "kessel", "oaw", "s1", project_key="forge.example.lan/team-a", project_dir="crew-231"
+        )
+    )
+    for sid in ("dev", "prod"):
+        (args,) = daemon.broker("oaw", sid).ops("mint")
+        assert (args["project_dir"], args["in_scope"]) == ("crew-231", True), sid
+
+    asyncio.run(
+        daemon.registry.register(
+            "helper", "oaw", "s1", project_key="forge.example.lan/team-b", project_dir="tools"
+        )
+    )
+    dev, prod = (daemon.broker("oaw", sid).ops("mint")[-1] for sid in ("dev", "prod"))
+    assert (dev["dev_name"], dev["in_scope"]) == ("helper", True)  # dev has no allowlist
+    assert (prod["dev_name"], prod["project_dir"], prod["in_scope"]) == ("helper", "tools", False)
+
+
 def test_register_retires_token_on_newly_disallowed_server(
     make_daemon: Callable[[dict[str, Any]], Any], servers_toml: dict[str, Any]
 ) -> None:
@@ -218,7 +252,8 @@ def test_register_retires_token_on_newly_disallowed_server(
     assert reg.backends == ["mattermost:dev", "discord"]
     assert restarted.store.token_for("babel", "prod") is None
     assert restarted.store.token_for("babel", "dev") is not None
-    assert [a["token_id"] for a in prod.ops("revoke")] == [held]
+    # The broker drops the agent's legend row to its name (#231).
+    assert prod.ops("revoke") == [{"token_id": held, "out_of_scope": True}]
     assert held not in prod.live and prod.ops("mint") == []
     on_disk = json.loads(restarted.store.path_for("babel").read_text(encoding="utf-8"))
     assert "prod" not in on_disk["servers"] and not on_disk["pending_revoke"]
@@ -293,7 +328,8 @@ def test_register_retries_failed_retire_revoke(
 
     del prod.fail["revoke"]
     asyncio.run(daemon.registry.register("babel", "oaw", "s3", project_key=other))
-    assert [a["token_id"] for a in prod.ops("revoke")] == [held, held]
+    # The retry carries the scope change too (#231, bj:needs #201).
+    assert prod.ops("revoke") == [{"token_id": held, "out_of_scope": True}] * 2
     assert held not in prod.live
     assert not daemon.store.agent("babel").pending_revoke["prod"]
     on_disk = json.loads(daemon.store.path_for("babel").read_text(encoding="utf-8"))

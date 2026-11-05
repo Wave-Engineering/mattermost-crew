@@ -218,14 +218,20 @@ def test_register_sends_identity_and_omits_missing_crew(tmp_path: Path) -> None:
     ident = {"dev_name": DEV, "session_id": "s1", "dev_team": "oaw", "dev_avatar": "x"}
     # No remote: the project key is the repo's path (#117).
     key = str(shim.repo_root.resolve())
-    assert daemon.of("register") == [{**ident, "project_key": key, "repo": ""}]
+    # The agent legend's directory (#231): the last element only, never the path.
+    pdir = shim.repo_root.resolve().name
+    assert daemon.of("register") == [{**ident, "project_key": key, "repo": "", "project_dir": pdir}]
+    assert "/" not in pdir
     assert shim.needs_list == "bj:needs"
 
     daemon2 = FakeDaemon()
     shim2 = make_shim(tmp_path / "b", daemon2, crew="wave")
     asyncio.run(shim2.start())
     key2 = str(shim2.repo_root.resolve())
-    assert daemon2.of("register") == [{**ident, "crew": "wave", "project_key": key2, "repo": ""}]
+    pdir2 = shim2.repo_root.resolve().name
+    assert daemon2.of("register") == [
+        {**ident, "crew": "wave", "project_key": key2, "repo": "", "project_dir": pdir2}
+    ]
 
 
 def test_shim_register_sends_project_key(tmp_path: Path) -> None:

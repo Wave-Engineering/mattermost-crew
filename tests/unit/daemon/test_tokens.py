@@ -131,6 +131,7 @@ def test_deactivated_account_retires_its_token(daemon: Any, clock: Any) -> None:
     with pytest.raises(BrokerError):
         asyncio.run(daemon.store.refresh("babel", "dev", old.token))
     assert daemon.store.token_for("babel", "dev") is None
+    # No `out_of_scope`: a deactivated account hasn't left the allowlist (#231).
     assert broker.ops("revoke") == [{"token_id": old.token_id}]
     assert daemon.store.agent("babel").pending_revoke["dev"] == []
     # The next 401 on the dead token has nothing to remint.
@@ -300,9 +301,10 @@ def test_rotation_order(daemon: Any, clock: Any) -> None:
     # Revoke is never called before the swap: at each revoke the store holds the new token.
     for tid, current in at_revoke:
         assert current is not None and current != before[owner[tid]].token
-    assert [a["token_id"] for a in broker.ops("revoke")] == [
-        before["babel"].token_id,
-        before["kessel"].token_id,
+    # Exactly the token id: a rotation never takes an agent out of the legend's scope (#231).
+    assert broker.ops("revoke") == [
+        {"token_id": before["babel"].token_id},
+        {"token_id": before["kessel"].token_id},
     ]
     # Paced at 5/s or less (R-05, CT-06).
     assert sleep.waits == [pytest.approx(0.2)]

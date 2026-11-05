@@ -116,14 +116,23 @@ class BrokerClient:
             raise BrokerUnavailable(f"{self.name}: {op}: the result is not an object")
         return result
 
-    async def mint(self, dev_name: str, crew: str, current_token_id: str | None) -> dict[str, Any]:
+    async def mint(
+        self,
+        dev_name: str,
+        crew: str,
+        current_token_id: str | None,
+        *,
+        legend: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """`{account, token, token_id}`. Only `Registry.register` may call this (R-30).
 
         `current_token_id` is the token the daemon holds for this account on this server, or
         None. The broker revokes the account's other tokens, so one minted by a call whose
-        reply timed out here is not left live (#41).
+        reply timed out here is not left live (#41). `legend` is the agent's `project_dir` and
+        `in_scope` for the broker's agent legend (#231).
         """
-        return await self.call("mint", self._minting(dev_name, crew, current_token_id))
+        args = self._minting(dev_name, crew, current_token_id)
+        return await self.call("mint", {**args, **(legend or {})})
 
     async def remint(self, dev_name: str, crew: str, current_token_id: str) -> dict[str, Any]:
         return await self.call("remint", self._minting(dev_name, crew, current_token_id))
@@ -138,8 +147,12 @@ class BrokerClient:
             "deadline": time.time() + self.timeout_s,
         }
 
-    async def revoke(self, token_id: str) -> dict[str, Any]:
-        return await self.call("revoke", {"token_id": token_id})
+    async def revoke(self, token_id: str, *, out_of_scope: bool = False) -> dict[str, Any]:
+        """`out_of_scope` (#231) is sent only when true: a broker older than #231 ignores it."""
+        args: dict[str, Any] = {"token_id": token_id}
+        if out_of_scope:
+            args["out_of_scope"] = True
+        return await self.call("revoke", args)
 
     async def crew_info(self) -> dict[str, Any]:
         return await self.call("crew_info", {})
@@ -324,7 +337,11 @@ class TokenStore:
                 log.exception("on_token_rotated(%s) failed", agent.dev_name)
         await self._revoke_pending(agent, server_id)
 
-    async def _revoke_pending(self, agent: AgentTokens, server_id: str) -> None:
+    async def _revoke_pending(
+        self, agent: AgentTokens, server_id: str, *, out_of_scope: bool = False
+    ) -> None:
+        """Revoke every token still owed on `server_id`. `out_of_scope`: the agent has left
+        that server's allowlist, so the broker drops its legend row to the name (#231)."""
         pending = agent.pending_revoke.get(server_id, [])
         if not pending:
             return
@@ -332,7 +349,7 @@ class TokenStore:
         left: list[str] = []
         for token_id in pending:
             try:
-                await client.revoke(token_id)
+                await client.revoke(token_id, out_of_scope=out_of_scope)
             except BrokerError as exc:
                 if exc.code != "not_found":  # not_found: the broker no longer holds it
                     log.error("revoke %s for %s: %s", token_id, agent.dev_name, exc)
@@ -379,9 +396,13 @@ class TokenStore:
         agent = self._agents.get(dev_name)
         if agent is None or agent.crew != crew:
             return
-        await self._retire_server_locked(agent, server_id, "no longer allowed there")
+        await self._retire_server_locked(
+            agent, server_id, "no longer allowed there", out_of_scope=True
+        )
 
-    async def _retire_server_locked(self, agent: AgentTokens, server_id: str, why: str) -> None:
+    async def _retire_server_locked(
+        self, agent: AgentTokens, server_id: str, why: str, *, out_of_scope: bool = False
+    ) -> None:
         tok = agent.servers.pop(server_id, None)
         if tok is not None:
             log.info("retiring %s's token on %s: %s", agent.dev_name, server_id, why)
@@ -396,7 +417,9 @@ class TokenStore:
                     log.exception("close_server(%s, %s) failed", agent.dev_name, server_id)
         elif not agent.pending_revoke.get(server_id):
             return
-        await self._revoke_pending(agent, server_id)
+        # Off the allowlist, each retry comes back here from the next `register` that skips
+        # this server, so a failed revoke still carries the scope change.
+        await self._revoke_pending(agent, server_id, out_of_scope=out_of_scope)
 
     async def rotate(self, dev_name: str, server_id: str) -> None:
         """The daily rotation for one agent on one server: remint, swap, reconnect, revoke."""
